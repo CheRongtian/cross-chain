@@ -1,3 +1,6 @@
 *.md
 !README.md
 *.log
+contracts/cache/
+contracts/out/
+contracts/broadcast/
