@@ -22,7 +22,8 @@ valid with respect to time only while `evaluationTime < expiry`.
 All credential fields are private by default and remain with the user. The
 authorization proof publishes only `credentialCommitment`, `trustedIssuer`,
 `requiredRole`, and `currentTimestamp`. Credential fields are not placed in
-public chain state.
+public chain state. The identity application stores authorization under the
+public credential commitment and does not expose the private subject.
 
 ## Trusted issuers
 
@@ -96,6 +97,6 @@ The following capabilities are intentionally absent:
 
 - trusted issuer registry
 - revocation enforcement, revocation trees, and revocation roots
-- identity application behavior
+- automatic expiry or revocation of stored authorization
 - nullifiers and anonymous replay protection
 - SourceGateway authorization integration

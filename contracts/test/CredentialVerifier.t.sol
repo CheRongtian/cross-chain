@@ -4,11 +4,12 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 
 import {CredentialVerifier} from "../src/CredentialVerifier.sol";
-import {ICredentialVerifier} from "../src/interfaces/ICredentialVerifier.sol";
 import {Groth16Verifier} from "../generated/Groth16Verifier.sol";
 import {CredentialProofFixture} from "../generated/CredentialProofFixture.sol";
 
 contract CredentialVerifierTest is Test {
+    uint256 internal constant PUBLIC_SIGNAL_COUNT = 4;
+
     CredentialVerifier internal verifier;
 
     function setUp() public {
@@ -22,7 +23,7 @@ contract CredentialVerifierTest is Test {
     }
 
     function testAcceptsValidCredentialProof() public view {
-        uint256[4] memory publicSignals = CredentialProofFixture.publicSignals();
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
 
         bool accepted = verifier.verifyCredentialProof(
             CredentialProofFixture.proofA(),
@@ -37,16 +38,16 @@ contract CredentialVerifierTest is Test {
         assertTrue(accepted);
     }
 
-    function testRejectsTamperedProof() public {
+    function testRejectsTamperedProof() public view {
         uint256[2] memory proofA = CredentialProofFixture.proofA();
-        uint256[4] memory publicSignals = CredentialProofFixture.publicSignals();
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
         proofA[0] += 1;
 
         _assertRejected(proofA, CredentialProofFixture.proofB(), CredentialProofFixture.proofC(), publicSignals);
     }
 
-    function testRejectsWrongCredentialCommitment() public {
-        uint256[4] memory publicSignals = CredentialProofFixture.publicSignals();
+    function testRejectsWrongCredentialCommitment() public view {
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
         publicSignals[0] += 1;
 
         _assertRejected(
@@ -57,8 +58,8 @@ contract CredentialVerifierTest is Test {
         );
     }
 
-    function testRejectsWrongTrustedIssuer() public {
-        uint256[4] memory publicSignals = CredentialProofFixture.publicSignals();
+    function testRejectsWrongTrustedIssuer() public view {
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
         publicSignals[1] += 1;
 
         _assertRejected(
@@ -69,8 +70,8 @@ contract CredentialVerifierTest is Test {
         );
     }
 
-    function testRejectsWrongRequiredRole() public {
-        uint256[4] memory publicSignals = CredentialProofFixture.publicSignals();
+    function testRejectsWrongRequiredRole() public view {
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
         publicSignals[2] += 1;
 
         _assertRejected(
@@ -81,8 +82,8 @@ contract CredentialVerifierTest is Test {
         );
     }
 
-    function testRejectsWrongCurrentTimestamp() public {
-        uint256[4] memory publicSignals = CredentialProofFixture.publicSignals();
+    function testRejectsWrongCurrentTimestamp() public view {
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
         publicSignals[3] += 1;
 
         _assertRejected(
@@ -93,8 +94,8 @@ contract CredentialVerifierTest is Test {
         );
     }
 
-    function testPublicSignalOrderIsFixed() public {
-        uint256[4] memory publicSignals = CredentialProofFixture.publicSignals();
+    function testPublicSignalOrderIsFixed() public view {
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
         (publicSignals[1], publicSignals[2]) = (publicSignals[2], publicSignals[1]);
 
         _assertRejected(
@@ -109,16 +110,14 @@ contract CredentialVerifierTest is Test {
         uint256[2] memory proofA,
         uint256[2][2] memory proofB,
         uint256[2] memory proofC,
-        uint256[4] memory publicSignals
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals
     ) internal view {
-        bytes memory callData = abi.encodeCall(
-            ICredentialVerifier.verifyCredentialProof,
-            (proofA, proofB, proofC, publicSignals[0], publicSignals[1], publicSignals[2], publicSignals[3])
-        );
-        (bool callSucceeded, bytes memory returnData) = address(verifier).staticcall(callData);
-
-        if (callSucceeded) {
-            assertFalse(abi.decode(returnData, (bool)));
-        }
+        try verifier.verifyCredentialProof(
+            proofA, proofB, proofC, publicSignals[0], publicSignals[1], publicSignals[2], publicSignals[3]
+        ) returns (
+            bool accepted
+        ) {
+            assertFalse(accepted);
+        } catch {}
     }
 }

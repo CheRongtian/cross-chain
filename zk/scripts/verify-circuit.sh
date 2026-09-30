@@ -43,6 +43,21 @@ expect_witness_rejection() {
     printf 'Verified expected circuit rejection: %s\n' "$case_name"
 }
 
+verify_policy_proof() {
+    local case_name="$1"
+    local input_file="$INPUT_DIR/$case_name.json"
+    local witness_file="$PROVING_DIR/$case_name.wtns"
+    local proof_file="$PROVING_DIR/$case_name-proof.json"
+    local public_file="$PROVING_DIR/$case_name-public.json"
+
+    printf '\n[valid credential proof: %s]\n' "$case_name"
+    node "$WITNESS_GENERATOR" "$WASM_FILE" "$input_file" "$witness_file"
+    "$SNARKJS" wtns check "$R1CS_FILE" "$witness_file"
+    "$SNARKJS" groth16 prove "$ZKEY_FINAL" "$witness_file" "$proof_file" "$public_file"
+    "$SNARKJS" groth16 verify "$VERIFICATION_KEY" "$public_file" "$proof_file"
+    printf 'Verified credential proof: %s\n' "$case_name"
+}
+
 printf '\n========================================\n'
 printf 'Minimal ZK Circuit Verification\n'
 printf '========================================\n'
@@ -106,6 +121,9 @@ node "$WITNESS_GENERATOR" "$WASM_FILE" "$INPUT_DIR/valid.json" "$VALID_WITNESS"
 "$SNARKJS" groth16 prove "$ZKEY_FINAL" "$VALID_WITNESS" "$VALID_PROOF" "$VALID_PUBLIC"
 "$SNARKJS" groth16 verify "$VERIFICATION_KEY" "$VALID_PUBLIC" "$VALID_PROOF"
 printf 'Verified valid credential proof.\n'
+
+verify_policy_proof "application-alternate-issuer"
+verify_policy_proof "application-auditor-role"
 
 GENERATED_VERIFIER="$GENERATED_CONTRACTS_DIR/Groth16Verifier.sol"
 

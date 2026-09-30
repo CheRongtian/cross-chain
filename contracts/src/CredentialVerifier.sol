@@ -11,6 +11,8 @@ contract CredentialVerifier is ICredentialVerifier {
     uint256 public constant REQUIRED_ROLE_INDEX = 2;
     uint256 public constant CURRENT_TIMESTAMP_INDEX = 3;
 
+    // Lower camel case preserves the existing project-facing getter name.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
     IGroth16Verifier public immutable groth16Verifier;
 
     error InvalidGroth16Verifier();

@@ -85,9 +85,9 @@ async function writeCalldata(name, proofA, proofB, proofC, publicSignals) {
   console.log(`Prepared Solidity calldata: ${path.relative(PROJECT_ROOT, outputPath)}`);
 }
 
-async function main() {
-  const proof = await loadJson(PROOF_PATH);
-  const publicSignalsFromProof = await loadJson(PUBLIC_PATH);
+async function loadSolidityCalldata(proofPath, publicPath) {
+  const proof = await loadJson(proofPath);
+  const publicSignalsFromProof = await loadJson(publicPath);
   const exported = await groth16.exportSolidityCallData(proof, publicSignalsFromProof);
   const [proofA, proofB, proofC, publicSignals] = JSON.parse(`[${exported}]`);
 
@@ -98,6 +98,13 @@ async function main() {
   );
   requireCondition(Array.isArray(proofC) && proofC.length === 2, "invalid Solidity proof C");
   requireCondition(Array.isArray(publicSignals) && publicSignals.length === 4, "expected four public signals");
+
+  return { proofA, proofB, proofC, publicSignals };
+}
+
+async function main() {
+  const valid = await loadSolidityCalldata(PROOF_PATH, PUBLIC_PATH);
+  const { proofA, proofB, proofC, publicSignals } = valid;
 
   await mkdir(GENERATED_CONTRACTS_DIR, { recursive: true });
   await mkdir(CALLDATA_DIR, { recursive: true });
@@ -121,6 +128,20 @@ async function main() {
     const modifiedSignals = clone(publicSignals);
     modifiedSignals[index] = incrementField(modifiedSignals[index], SCALAR_FIELD);
     await writeCalldata(name, proofA, proofB, proofC, modifiedSignals);
+  }
+
+  for (const name of ["application-alternate-issuer", "application-auditor-role"]) {
+    const proofPath = path.join(PROVING_DIR, `${name}-proof.json`);
+    const publicPath = path.join(PROVING_DIR, `${name}-public.json`);
+    const calldata = await loadSolidityCalldata(proofPath, publicPath);
+
+    await writeCalldata(
+      name,
+      calldata.proofA,
+      calldata.proofB,
+      calldata.proofC,
+      calldata.publicSignals,
+    );
   }
 }
 

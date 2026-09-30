@@ -36,6 +36,26 @@
       "commitmentSource": "self",
       "privateOverrides": {},
       "expected": "witness-rejected"
+    },
+    {
+      "name": "application-alternate-issuer",
+      "fixture": "untrusted-issuer.json",
+      "commitmentSource": "self",
+      "privateOverrides": {},
+      "policyOverrides": {
+        "trustedIssuer": "urn:cross-chain:issuer:test:untrusted"
+      },
+      "expected": "proof-verifies"
+    },
+    {
+      "name": "application-auditor-role",
+      "fixture": "wrong-role.json",
+      "commitmentSource": "self",
+      "privateOverrides": {},
+      "policyOverrides": {
+        "requiredRole": "AUDITOR"
+      },
+      "expected": "proof-verifies"
     }
   ]
 }

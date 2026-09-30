@@ -12,6 +12,8 @@ CHAIN_A_RPC="http://127.0.0.1:4545"
 CHAIN_B_RPC="http://127.0.0.1:9545"
 CHAIN_A_ID="10011"
 CHAIN_B_ID="2001"
+PROOF_TIMESTAMP_OFFSET="3600"
+APPLICATION_MAX_PROOF_AGE="3600"
 
 ANVIL_DEV_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 SOURCE_SENDER="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
@@ -233,12 +235,12 @@ cleanup() {
     if [[ "$exit_code" -eq 0 ]]; then
         printf '\n========================================\n'
         printf 'VERIFICATION PASSED\n'
-        printf 'On-chain ZK Credential Verification\n'
+        printf 'ZK Identity Authorization on Chain A\n'
         printf '========================================\n'
     else
         printf '\n========================================\n' >&2
         printf 'VERIFICATION FAILED during: %s (exit code %s)\n' "$CURRENT_STEP" "$exit_code" >&2
-        printf 'On-chain ZK Credential Verification\n' >&2
+        printf 'ZK Identity Authorization on Chain A\n' >&2
         printf '========================================\n' >&2
     fi
 
@@ -251,7 +253,7 @@ trap 'exit 143' TERM
 
 printf '========================================\n'
 printf '%s\n' "$VERIFICATION_NAME"
-printf 'On-chain ZK Credential Verification\n'
+printf 'ZK Identity Authorization on Chain A\n'
 printf '========================================\n'
 printf 'Verification time: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
 printf 'Project root: %s\n' "$PROJECT_ROOT"
@@ -280,23 +282,58 @@ else
 fi
 
 printf '\nVerification steps:\n'
-printf '  1. Validate the credential model and fixtures\n'
-printf '  2. Compile the ZK circuit and verify local proof cases\n'
-printf '  3. Export the Solidity Groth16 verifier and proof fixtures\n'
-printf '  4. Format generated Solidity sources\n'
-printf '  5. forge fmt --check\n'
-printf '  6. forge build\n'
-printf '  7. forge test -vv\n'
-printf '  8. Run focused canonical-message and credential-verifier tests\n'
-printf '  9. Check or start Chain A and Chain B\n'
-printf ' 10. Verify chain IDs\n'
-printf ' 11. Deploy and verify the Groth16 verifier on Chain A\n'
-printf ' 12. Deploy SourceGateway to Chain A\n'
-printf ' 13. Verify deployment and initial state\n'
-printf ' 14. Verify payload text and payload hash\n'
-printf ' 15. Predict, send, and verify two messages\n'
-printf ' 16. Verify nonce progression\n'
-printf ' 17. Verify invalid destination domain and receiver reverts\n'
+printf '  1. Check or start Chain A and Chain B\n'
+printf '  2. Verify chain IDs and select the proof timestamp\n'
+printf '  3. Validate the credential model and fixtures\n'
+printf '  4. Compile the ZK circuit and verify local proof cases\n'
+printf '  5. Export the Solidity verifier and application proof fixtures\n'
+printf '  6. Format generated Solidity sources\n'
+printf '  7. forge fmt --check\n'
+printf '  8. forge build\n'
+printf '  9. forge test -vv\n'
+printf ' 10. Run focused gateway, verifier, and identity application tests\n'
+printf ' 11. Deploy the verifier, adapter, and identity application to Chain A\n'
+printf ' 12. Verify future, fresh, stale, tampered, and policy-mismatch cases\n'
+printf ' 13. Deploy SourceGateway to Chain A\n'
+printf ' 14. Verify deployment and initial state\n'
+printf ' 15. Verify payload text and payload hash\n'
+printf ' 16. Predict, send, and verify two messages\n'
+printf ' 17. Verify nonce progression\n'
+printf ' 18. Verify invalid destination domain and receiver reverts\n'
+
+CURRENT_STEP="local chain availability check"
+printf '\n[%s]\n' "$CURRENT_STEP"
+
+CHAIN_A_CURRENT_ID="$(probe_chain_id "$CHAIN_A_RPC")"
+CHAIN_B_CURRENT_ID="$(probe_chain_id "$CHAIN_B_RPC")"
+
+if [[ -z "$CHAIN_A_CURRENT_ID" ]] && [[ -z "$CHAIN_B_CURRENT_ID" ]]; then
+    printf 'No local chains detected; starting them with scripts/start-chains.sh.\n'
+    "$PROJECT_ROOT/scripts/start-chains.sh" &
+    CHAINS_PID=$!
+    STARTED_CHAINS="true"
+
+    wait_for_chain "Chain A" "$CHAIN_A_RPC" "$CHAIN_A_ID"
+    wait_for_chain "Chain B" "$CHAIN_B_RPC" "$CHAIN_B_ID"
+elif [[ -n "$CHAIN_A_CURRENT_ID" ]] && [[ -n "$CHAIN_B_CURRENT_ID" ]]; then
+    assert_equal "$CHAIN_A_CURRENT_ID" "$CHAIN_A_ID" "Chain A ID"
+    assert_equal "$CHAIN_B_CURRENT_ID" "$CHAIN_B_ID" "Chain B ID"
+    printf 'Using the existing local chains; they will remain running after verification.\n'
+else
+    fail "only one expected local chain is reachable; start or stop both chains before retrying"
+fi
+
+CURRENT_STEP="chain ID and proof timestamp verification"
+printf '\n[%s]\n' "$CURRENT_STEP"
+assert_equal "$(cast chain-id --rpc-url "$CHAIN_A_RPC")" "$CHAIN_A_ID" "Chain A ID"
+assert_equal "$(cast chain-id --rpc-url "$CHAIN_B_RPC")" "$CHAIN_B_ID" "Chain B ID"
+
+CHAIN_A_LATEST_TIMESTAMP="$(cast block latest --field timestamp --rpc-url "$CHAIN_A_RPC")"
+[[ "$CHAIN_A_LATEST_TIMESTAMP" =~ ^[0-9]+$ ]] \
+    || fail "Chain A timestamp must be an unsigned integer"
+PROOF_TIMESTAMP=$((CHAIN_A_LATEST_TIMESTAMP + PROOF_TIMESTAMP_OFFSET))
+printf 'Chain A latest timestamp: %s\n' "$CHAIN_A_LATEST_TIMESTAMP"
+printf 'Credential proof timestamp: %s\n' "$PROOF_TIMESTAMP"
 
 CURRENT_STEP="credential model validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -305,7 +342,8 @@ python3 "$PROJECT_ROOT/zk/credential-model/validate.py"
 
 CURRENT_STEP="ZK circuit verification and Solidity verifier export"
 printf '\n[%s]\n' "$CURRENT_STEP"
-bash "$PROJECT_ROOT/zk/scripts/verify-circuit.sh"
+CREDENTIAL_PROOF_TIMESTAMP="$PROOF_TIMESTAMP" \
+    bash "$PROJECT_ROOT/zk/scripts/verify-circuit.sh"
 
 cd "$CONTRACTS_DIR"
 
@@ -345,38 +383,16 @@ CURRENT_STEP="credential verifier tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test --match-contract CredentialVerifierTest -vvv
 
-CURRENT_STEP="local chain availability check"
+CURRENT_STEP="identity application tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
+forge test --match-contract IdentityApplicationATest -vvv
 
-CHAIN_A_CURRENT_ID="$(probe_chain_id "$CHAIN_A_RPC")"
-CHAIN_B_CURRENT_ID="$(probe_chain_id "$CHAIN_B_RPC")"
-
-if [[ -z "$CHAIN_A_CURRENT_ID" ]] && [[ -z "$CHAIN_B_CURRENT_ID" ]]; then
-    printf 'No local chains detected; starting them with scripts/start-chains.sh.\n'
-    "$PROJECT_ROOT/scripts/start-chains.sh" &
-    CHAINS_PID=$!
-    STARTED_CHAINS="true"
-
-    wait_for_chain "Chain A" "$CHAIN_A_RPC" "$CHAIN_A_ID"
-    wait_for_chain "Chain B" "$CHAIN_B_RPC" "$CHAIN_B_ID"
-elif [[ -n "$CHAIN_A_CURRENT_ID" ]] && [[ -n "$CHAIN_B_CURRENT_ID" ]]; then
-    assert_equal "$CHAIN_A_CURRENT_ID" "$CHAIN_A_ID" "Chain A ID"
-    assert_equal "$CHAIN_B_CURRENT_ID" "$CHAIN_B_ID" "Chain B ID"
-    printf 'Using the existing local chains; they will remain running after verification.\n'
-else
-    fail "only one expected local chain is reachable; start or stop both chains before retrying"
-fi
-
-CURRENT_STEP="chain ID verification"
-printf '\n[%s]\n' "$CURRENT_STEP"
-assert_equal "$(cast chain-id --rpc-url "$CHAIN_A_RPC")" "$CHAIN_A_ID" "Chain A ID"
-assert_equal "$(cast chain-id --rpc-url "$CHAIN_B_RPC")" "$CHAIN_B_ID" "Chain B ID"
-
-CURRENT_STEP="on-chain Groth16 credential verification"
+CURRENT_STEP="on-chain ZK identity authorization"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_EXPECTED_ID="$CHAIN_A_ID" \
 VERIFIER_DEPLOYER_KEY="$ANVIL_DEV_KEY" \
+APPLICATION_MAX_PROOF_AGE="$APPLICATION_MAX_PROOF_AGE" \
     bash "$PROJECT_ROOT/scripts/deploy-verifier.sh"
 
 CURRENT_STEP="SourceGateway deployment"

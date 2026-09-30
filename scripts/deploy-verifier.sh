@@ -9,8 +9,11 @@ CALLDATA_DIR="$PROJECT_ROOT/zk/build/proving/solidity-calldata"
 CHAIN_A_RPC_URL="${CHAIN_A_RPC_URL:-http://127.0.0.1:4545}"
 CHAIN_A_EXPECTED_ID="${CHAIN_A_EXPECTED_ID:-10011}"
 VERIFIER_DEPLOYER_KEY="${VERIFIER_DEPLOYER_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
+APPLICATION_MAX_PROOF_AGE="${APPLICATION_MAX_PROOF_AGE:-3600}"
+APPLICATION_SUBMITTER="${APPLICATION_SUBMITTER:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
 TEMP_DIR=""
 LAST_DEPLOYED_ADDRESS=""
+LAST_TX_HASH=""
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -21,6 +24,24 @@ normalize() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+timestamp_to_decimal() {
+    local encoded_timestamp="$1"
+    local decoded_timestamp
+
+    if [[ "$encoded_timestamp" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$encoded_timestamp"
+        return 0
+    fi
+
+    if [[ "$encoded_timestamp" =~ ^0x[[:xdigit:]]+$ ]]; then
+        decoded_timestamp="$(cast to-dec "$encoded_timestamp")" || return 1
+        printf '%s' "$decoded_timestamp"
+        return 0
+    fi
+
+    return 1
+}
+
 cleanup() {
     local exit_code=$?
 
@@ -28,7 +49,10 @@ cleanup() {
     set +e
 
     if [[ -n "$TEMP_DIR" ]] && [[ -d "$TEMP_DIR" ]]; then
-        rm -f -- "$TEMP_DIR/generated-verifier.log" "$TEMP_DIR/credential-verifier.log"
+        rm -f -- \
+            "$TEMP_DIR/generated-verifier.log" \
+            "$TEMP_DIR/credential-verifier.log" \
+            "$TEMP_DIR/identity-application.log"
         rmdir "$TEMP_DIR" 2>/dev/null || true
     fi
 
@@ -87,6 +111,118 @@ call_credential_verifier() {
         --rpc-url "$CHAIN_A_RPC_URL"
 }
 
+call_identity_application() {
+    cast call "$IDENTITY_APPLICATION_ADDRESS" \
+        "verifySupplier(uint256[2],uint256[2][2],uint256[2],uint256,uint256,uint256,uint256)" \
+        "$PROOF_A" \
+        "$PROOF_B" \
+        "$PROOF_C" \
+        "$CREDENTIAL_COMMITMENT" \
+        "$TRUSTED_ISSUER" \
+        "$REQUIRED_ROLE" \
+        "$CURRENT_TIMESTAMP" \
+        --from "$APPLICATION_SUBMITTER" \
+        --rpc-url "$CHAIN_A_RPC_URL"
+}
+
+authorization_status() {
+    local credential_commitment="$1"
+
+    cast call "$IDENTITY_APPLICATION_ADDRESS" \
+        "authorizationStatus(uint256)(uint8)" \
+        "$credential_commitment" \
+        --rpc-url "$CHAIN_A_RPC_URL"
+}
+
+assert_authorization_status() {
+    local credential_commitment="$1"
+    local expected_status="$2"
+    local label="$3"
+    local actual_status
+
+    actual_status="$(authorization_status "$credential_commitment")"
+    [[ "$(normalize "$actual_status")" == "$(normalize "$expected_status")" ]] \
+        || fail "$label: expected status $expected_status, got $actual_status"
+    printf 'Verified %s authorization status: %s\n' "$label" "$actual_status"
+}
+
+expect_application_revert() {
+    local label="$1"
+    local error_signature="$2"
+    local error_name="${error_signature%%(*}"
+    local error_selector
+    local output
+
+    error_selector="$(cast sig "$error_signature")"
+
+    if output="$(call_identity_application 2>&1)"; then
+        printf '%s\n' "$output"
+        fail "$label unexpectedly succeeded"
+    fi
+
+    printf '%s\n' "$output"
+
+    if [[ "$(normalize "$output")" != *"$(normalize "$error_selector")"* ]] \
+        && [[ "$output" != *"$error_name"* ]]; then
+        fail "$label reverted without $error_signature"
+    fi
+
+    printf 'Verified expected application rejection: %s (%s)\n' "$label" "$error_name"
+}
+
+set_next_block_timestamp() {
+    local timestamp="$1"
+
+    cast rpc --rpc-url "$CHAIN_A_RPC_URL" evm_setNextBlockTimestamp "$timestamp" >/dev/null
+    cast rpc --rpc-url "$CHAIN_A_RPC_URL" evm_mine >/dev/null
+}
+
+send_identity_authorization() {
+    local output
+
+    output="$(
+        cast send "$IDENTITY_APPLICATION_ADDRESS" \
+            "verifySupplier(uint256[2],uint256[2][2],uint256[2],uint256,uint256,uint256,uint256)" \
+            "$PROOF_A" \
+            "$PROOF_B" \
+            "$PROOF_C" \
+            "$CREDENTIAL_COMMITMENT" \
+            "$TRUSTED_ISSUER" \
+            "$REQUIRED_ROLE" \
+            "$CURRENT_TIMESTAMP" \
+            --rpc-url "$CHAIN_A_RPC_URL" \
+            --private-key "$VERIFIER_DEPLOYER_KEY" \
+            --async
+    )"
+
+    printf 'cast send output: %s\n' "$output"
+    LAST_TX_HASH="$(
+        printf '%s\n' "$output" \
+            | sed -nE 's/.*(0x[[:xdigit:]]{64}).*/\1/p' \
+            | tail -n 1
+    )"
+
+    [[ "$LAST_TX_HASH" =~ ^0x[[:xdigit:]]{64}$ ]] \
+        || fail "could not extract IdentityApplicationA transaction hash"
+}
+
+assert_transaction_success() {
+    local transaction_hash="$1"
+    local label="$2"
+    local status
+
+    status="$(cast receipt "$transaction_hash" status --rpc-url "$CHAIN_A_RPC_URL")"
+
+    case "$(normalize "$status")" in
+        1|0x1|0x01|true)
+            printf 'Verified %s transaction status: %s\n' "$label" "$status"
+            ;;
+        *)
+            fail "$label transaction failed with status '$status'"
+            ;;
+    esac
+}
+
 assert_true_result() {
     local result
     result="$(normalize "$1")"
@@ -123,6 +259,8 @@ trap 'exit 143' TERM
     || fail "generated Groth16 verifier is missing"
 [[ -f "$CONTRACTS_DIR/generated/CredentialProofFixture.sol" ]] \
     || fail "generated credential proof fixture is missing"
+[[ "$APPLICATION_MAX_PROOF_AGE" =~ ^[1-9][0-9]*$ ]] \
+    || fail "APPLICATION_MAX_PROOF_AGE must be a positive integer"
 
 ACTUAL_CHAIN_ID="$(cast chain-id --rpc-url "$CHAIN_A_RPC_URL")"
 [[ "$ACTUAL_CHAIN_ID" == "$CHAIN_A_EXPECTED_ID" ]] \
@@ -132,6 +270,11 @@ TEMP_PARENT="${TMPDIR:-/tmp}"
 TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-verifier-deployment.XXXXXX")"
 
 cd "$CONTRACTS_DIR"
+
+load_calldata "valid"
+if ! PROOF_TIMESTAMP_DECIMAL="$(timestamp_to_decimal "$CURRENT_TIMESTAMP")"; then
+    fail "valid proof timestamp must be an unsigned decimal or hexadecimal integer"
+fi
 
 printf '\n[deploy generated Groth16 verifier to Chain A]\n'
 deploy_contract \
@@ -148,10 +291,25 @@ deploy_contract \
 CREDENTIAL_VERIFIER_ADDRESS="$LAST_DEPLOYED_ADDRESS"
 printf 'Credential verifier adapter: %s\n' "$CREDENTIAL_VERIFIER_ADDRESS"
 
-for deployed_address in "$GROTH16_VERIFIER_ADDRESS" "$CREDENTIAL_VERIFIER_ADDRESS"; do
+printf '\n[deploy identity application to Chain A]\n'
+deploy_contract \
+    "src/IdentityApplicationA.sol:IdentityApplicationA" \
+    "$TEMP_DIR/identity-application.log" \
+    --constructor-args \
+    "$CREDENTIAL_VERIFIER_ADDRESS" \
+    "$TRUSTED_ISSUER" \
+    "$REQUIRED_ROLE" \
+    "$APPLICATION_MAX_PROOF_AGE"
+IDENTITY_APPLICATION_ADDRESS="$LAST_DEPLOYED_ADDRESS"
+printf 'Identity application: %s\n' "$IDENTITY_APPLICATION_ADDRESS"
+
+for deployed_address in \
+    "$GROTH16_VERIFIER_ADDRESS" \
+    "$CREDENTIAL_VERIFIER_ADDRESS" \
+    "$IDENTITY_APPLICATION_ADDRESS"; do
     DEPLOYED_CODE="$(cast code "$deployed_address" --rpc-url "$CHAIN_A_RPC_URL")"
     [[ -n "$DEPLOYED_CODE" ]] && [[ "$DEPLOYED_CODE" != "0x" ]] \
-        || fail "no bytecode at deployed verifier address $deployed_address"
+        || fail "no bytecode at deployed address $deployed_address"
 done
 
 printf '\n[valid on-chain credential proof]\n'
@@ -175,4 +333,57 @@ for case_spec in \
     assert_false_result "$CASE_RESULT" "$CASE_LABEL"
 done
 
-printf '\nON-CHAIN ZK CREDENTIAL VERIFICATION PASSED\n'
+printf '\n[expected application rejection: future proof timestamp]\n'
+load_calldata "valid"
+CHAIN_TIMESTAMP="$(cast block latest --field timestamp --rpc-url "$CHAIN_A_RPC_URL")"
+[[ "$CHAIN_TIMESTAMP" =~ ^[0-9]+$ ]] || fail "Chain A timestamp must be an unsigned integer"
+(( PROOF_TIMESTAMP_DECIMAL > CHAIN_TIMESTAMP )) \
+    || fail "proof timestamp $PROOF_TIMESTAMP_DECIMAL must be later than current Chain A timestamp $CHAIN_TIMESTAMP"
+expect_application_revert "future proof timestamp" "FutureProofTimestamp()"
+assert_authorization_status "$CREDENTIAL_COMMITMENT" "0" "future proof"
+
+FRESH_BLOCK_TIMESTAMP=$((PROOF_TIMESTAMP_DECIMAL + 1))
+printf '\n[advance Chain A to fresh proof window: %s]\n' "$FRESH_BLOCK_TIMESTAMP"
+set_next_block_timestamp "$FRESH_BLOCK_TIMESTAMP"
+
+printf '\n[expected application rejection: tampered proof]\n'
+load_calldata "tampered-proof"
+expect_application_revert "tampered proof" "InvalidCredentialProof()"
+assert_authorization_status "$CREDENTIAL_COMMITMENT" "0" "tampered proof"
+
+printf '\n[expected application rejection: alternate issuer policy]\n'
+load_calldata "application-alternate-issuer"
+ALTERNATE_ISSUER_RESULT="$(call_credential_verifier)"
+assert_true_result "$ALTERNATE_ISSUER_RESULT"
+printf 'Verified alternate issuer proof is cryptographically valid on Chain A.\n'
+expect_application_revert "alternate issuer policy" "InvalidIssuerPolicy()"
+assert_authorization_status "$CREDENTIAL_COMMITMENT" "0" "alternate issuer policy"
+
+printf '\n[expected application rejection: auditor role policy]\n'
+load_calldata "application-auditor-role"
+AUDITOR_ROLE_RESULT="$(call_credential_verifier)"
+assert_true_result "$AUDITOR_ROLE_RESULT"
+printf 'Verified auditor role proof is cryptographically valid on Chain A.\n'
+expect_application_revert "auditor role policy" "InvalidRolePolicy()"
+assert_authorization_status "$CREDENTIAL_COMMITMENT" "0" "auditor role policy"
+
+printf '\n[valid application authorization]\n'
+load_calldata "valid"
+send_identity_authorization
+assert_transaction_success "$LAST_TX_HASH" "IdentityApplicationA authorization"
+assert_authorization_status "$CREDENTIAL_COMMITMENT" "1" "valid supplier proof"
+
+printf '\n[idempotent application authorization]\n'
+send_identity_authorization
+assert_transaction_success "$LAST_TX_HASH" "duplicate IdentityApplicationA authorization"
+assert_authorization_status "$CREDENTIAL_COMMITMENT" "1" "duplicate valid supplier proof"
+
+STALE_BLOCK_TIMESTAMP=$((PROOF_TIMESTAMP_DECIMAL + APPLICATION_MAX_PROOF_AGE + 1))
+printf '\n[advance Chain A beyond proof freshness window: %s]\n' "$STALE_BLOCK_TIMESTAMP"
+set_next_block_timestamp "$STALE_BLOCK_TIMESTAMP"
+
+printf '\n[expected application rejection: stale proof timestamp]\n'
+expect_application_revert "stale proof timestamp" "StaleProofTimestamp()"
+assert_authorization_status "$CREDENTIAL_COMMITMENT" "1" "stored supplier authorization after proof becomes stale"
+
+printf '\nON-CHAIN ZK IDENTITY AUTHORIZATION PASSED\n'

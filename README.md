@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain messaging and zero-knowledge credential authorization. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, and credential proofs that can be verified locally or by a Solidity Groth16 verifier on Chain A.
+This repository is a prototype for canonical cross-chain messaging and zero-knowledge credential authorization. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, and an application that records verified supplier authorization.
 
 The current implementation can:
 
@@ -9,8 +9,10 @@ The current implementation can:
 - run and verify two independent local Anvil chains;
 - describe private credentials, issuer trust, roles, expiry, and revocation status;
 - commit to credential fields and prove that a credential satisfies issuer, role, and expiry policies;
-- verify a valid proof and reject an invalid witness, expired credential, wrong role, untrusted issuer, or tampered public input.
-- generate a Solidity verifier from the active Groth16 proving key and verify the same proof on Chain A.
+- verify a valid proof and reject an invalid witness, expired credential, wrong role, untrusted issuer, or tampered public input;
+- generate a Solidity verifier from the active Groth16 proving key and verify the same proof on Chain A;
+- enforce a fixed issuer, the `VERIFIED_SUPPLIER` role, and proof freshness in `IdentityApplicationA`;
+- store supplier authorization by public credential commitment without publishing private credential fields.
 
 ## Architecture
 
@@ -18,17 +20,26 @@ The current implementation can:
                                   ┌──────────────────────────┐
 Private credential ──> encoding ─>│ CredentialAuthorization  │
                                   │ Circom + Poseidon        │
-Public authorization policy ─────>│ Groth16 / BN254          │ ──> proof + public signals
+Public proof context ─────────────>│ Groth16 / BN254          │ ──> proof + public signals
                                   └──────────────────────────┘              │
                                                                             v
                                                          Solidity verifier on Chain A
+                                                                            │
+                                                                            v
+                                                         CredentialVerifier adapter
+                                                                            │
+                                                                            v
+                                                         IdentityApplicationA policy
+                                                                            │
+                                                                            v
+                                                         commitment => VERIFIED_SUPPLIER
 
 Caller ──> SourceGateway on Chain A ──> CrossChainMessage event
                                                     │
                                                     └──> Relayer and destination execution are not implemented
 ```
 
-Cross-chain messaging and zero-knowledge authorization remain independent paths. The generated Groth16 verifier and its credential adapter are deployed to Chain A during verification, while `SourceGateway` does not yet require callers to submit a proof.
+Cross-chain messaging and zero-knowledge authorization remain independent paths. The generated Groth16 verifier, its credential adapter, and `IdentityApplicationA` are deployed to Chain A during verification. `SourceGateway` does not require callers to submit a proof and does not consume application authorization state.
 
 ## Cross-Chain Messages
 
@@ -188,7 +199,26 @@ Proof coordinates are converted with snarkjs `groth16.exportSolidityCallData`, i
 
 The Solidity verifier establishes that a Groth16 proof is valid for the supplied public signals. It does not decide which issuer is trusted, which role an application should require, or whether a caller may send a cross-chain message.
 
-`currentTimestamp` is a verifier-supplied public input bound by the proof. The credential adapter does not compare it with `block.timestamp`, so proof freshness and reuse require an application-level policy that is not present here.
+`currentTimestamp` is a public input bound by the proof. The credential adapter passes it to the generated verifier without applying wall-clock policy. `IdentityApplicationA` performs the corresponding comparison against `block.timestamp`.
+
+### Identity application on Chain A
+
+`contracts/src/IdentityApplicationA.sol` consumes the stable `CredentialVerifier` interface and owns the business policy. Its deployment configuration contains:
+
+- the credential verifier address;
+- one trusted issuer field value;
+- the required role, fixed to the existing `VERIFIED_SUPPLIER = 1` encoding;
+- a non-zero maximum proof age.
+
+`verifySupplier` accepts the same proof coordinates and four public values used by the credential verifier. Before calling the verifier, the application requires the proof issuer and role to equal its deployment policy, rejects timestamps later than `block.timestamp`, and rejects timestamps older than `maxProofAge`. A successful verification sets:
+
+```text
+authorizationStatus[credentialCommitment] = VERIFIED_SUPPLIER
+```
+
+Authorization is keyed by the public `credentialCommitment`. The current circuit proves knowledge of a private credential subject but does not bind that subject to an EVM address, so submitting a proof does not grant account-level authorization to `msg.sender`. The `SupplierVerified` event contains only the commitment, transaction submitter, and proof timestamp; it contains no private credential fields.
+
+Submitting the same valid proof again leaves the commitment in the same state. This idempotent behavior does not provide a nullifier or anonymous replay protection. Freshness is checked when a proof is submitted; stored `VERIFIED_SUPPLIER` state does not automatically expire or revoke after `maxProofAge` elapses.
 
 ## Local Two-Chain Environment
 
@@ -207,7 +237,7 @@ Start both chains from the repository root:
 
 The command remains active until interrupted with `Ctrl+C`. Chain output is written to `chain-a.log` and `chain-b.log` in the repository root.
 
-Chain A hosts the generated Groth16 verifier, its credential adapter, and `SourceGateway` during complete verification. Chain B verifies the two-chain environment and supplies the destination domain. No destination message receiver is deployed to Chain B.
+Chain A hosts the generated Groth16 verifier, its credential adapter, `IdentityApplicationA`, and `SourceGateway` during complete verification. Chain B verifies the two-chain environment and supplies the destination domain. No destination message receiver is deployed to Chain B.
 
 ## Prerequisites
 
@@ -304,8 +334,9 @@ The script:
 - prepares deterministic test inputs;
 - creates Powers of Tau and Groth16 proving material for local verification only;
 - generates and verifies a proof for the valid credential;
+- generates valid alternate-issuer and `AUDITOR` proofs for application policy checks;
 - confirms rejection of an invalid witness, expired credential, wrong role, and untrusted issuer;
-- confirms that the original proof fails after its public commitment is changed.
+- confirms that the original proof fails after its public commitment is changed;
 - exports the Solidity Groth16 verifier from the active zkey;
 - generates a Solidity proof fixture and Chain A calldata through the snarkjs calldata converter.
 
@@ -321,16 +352,18 @@ Run the unified verification script from the repository root:
 
 The script uses strict error handling and performs:
 
-1. credential model and fixture validation;
-2. ZK circuit compilation and positive and negative local proof verification;
-3. Solidity verifier export and proof-fixture generation;
-4. Solidity formatting, build, and tests against the real generated verifier;
-5. focused canonical-message and credential-verifier tests;
-6. local-chain availability and chain ID checks;
-7. deployment of the generated verifier and credential adapter to Chain A;
-8. valid on-chain proof verification;
-9. on-chain rejection of a tampered proof and modified public policy values;
-10. `SourceGateway` deployment and existing cross-chain message verification.
+1. local-chain availability and chain ID checks;
+2. selection of a proof timestamp relative to the current Chain A block;
+3. credential model and fixture validation;
+4. ZK circuit compilation and positive and negative local proof verification;
+5. Solidity verifier export and proof-fixture generation;
+6. Solidity formatting, build, and tests against the real generated verifier;
+7. focused canonical-message, credential-verifier, and identity-application tests;
+8. deployment of the generated verifier, credential adapter, and identity application to Chain A;
+9. valid on-chain proof verification and supplier authorization;
+10. rejection of future, stale, tampered, alternate-issuer, and alternate-role submissions;
+11. confirmation that stored authorization remains after the proof becomes stale;
+12. `SourceGateway` deployment and existing cross-chain message verification.
 
 If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
 
@@ -344,7 +377,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-On-chain ZK Credential Verification
+ZK Identity Authorization on Chain A
 ```
 
 ### Expected error output
@@ -356,9 +389,14 @@ Error: execution reverted: InvalidDestinationDomain
 Error: execution reverted: InvalidDestinationReceiver
 Error: Assert Failed.
 Invalid proof
+FutureProofTimestamp
+InvalidCredentialProof
+InvalidIssuerPolicy
+InvalidRolePolicy
+StaleProofTimestamp
 ```
 
-These messages demonstrate that the contracts reject invalid destinations, the circuit rejects invalid witnesses, and a proof cannot be reused with a tampered public input. Each expected failure is followed by `Verified rejection` or `Verified expected ... rejection`. Complete verification succeeds only when the script exits with code `0` and the log ends with `VERIFICATION PASSED`.
+These messages demonstrate that the contracts reject invalid destinations, the circuit rejects invalid witnesses, a proof cannot be reused with a tampered public input, and the identity application enforces its policy and freshness window. Each expected failure is followed by `Verified rejection` or `Verified expected ... rejection`. Complete verification succeeds only when the script exits with code `0` and the log ends with `VERIFICATION PASSED`.
 
 The on-chain negative cases normally return `false` and are reported as `Verified expected on-chain rejection`. A successful result for any modified proof or public policy value fails the complete verification.
 
@@ -373,10 +411,14 @@ Cross-Chain/
 │   │   │   ├── ICredentialVerifier.sol
 │   │   │   └── IGroth16Verifier.sol
 │   │   ├── CredentialVerifier.sol
+│   │   ├── IdentityApplicationA.sol
 │   │   ├── MessageCodec.sol
 │   │   └── SourceGateway.sol
 │   └── test/
 │       ├── CredentialVerifier.t.sol
+│       ├── IdentityApplicationA.t.sol
+│       ├── mocks/
+│       │   └── MockCredentialVerifier.sol
 │       └── SourceGateway.t.sol
 ├── scripts/
 │   ├── deploy-verifier.sh
@@ -411,12 +453,13 @@ Cross-Chain/
 - The ZK verification script uses fixed local-development entropy. Its proving material must not be used in production.
 - The circuit does not verify issuer signatures.
 - `trustedIssuer` is a public policy input supplied to the verification flow.
-- The Solidity verifier validates proofs for supplied public signals; it does not select or authenticate policy values.
-- The proof's public `currentTimestamp` is not bound to `block.timestamp` by the credential adapter.
+- The Solidity verifier validates proofs for supplied public signals; `IdentityApplicationA` selects the issuer and role policy it accepts.
+- The credential adapter does not compare the public timestamp with chain time; `IdentityApplicationA` enforces this check for its authorization entry point.
+- Authorization belongs to a credential commitment because the circuit does not bind its private subject to `msg.sender`.
+- Stored authorization does not automatically expire or revoke when the proof freshness window passes.
 - Revocation is not enforced by the circuit, and no revocation tree or on-chain revocation registry exists.
 - The repository does not provide nullifiers or anonymous replay protection.
 - `SourceGateway` does not yet integrate credential-proof verification.
-- No identity application consumes successful verifier results yet.
 - The repository does not provide a relayer, destination execution, finality proof, or production cross-chain security model.
 
-Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, revocation enforcement, application policy and freshness enforcement, message relay, and a destination-chain execution security design.
+Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, revocation enforcement, authorization lifecycle management, message relay, and a destination-chain execution security design.

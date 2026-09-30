@@ -76,6 +76,27 @@ function decimalInput(encoded, commitment, policy) {
   };
 }
 
+function evaluationTime(manifest) {
+  const configuredTimestamp = process.env.CREDENTIAL_PROOF_TIMESTAMP;
+
+  if (configuredTimestamp === undefined) {
+    return manifest.evaluationTime;
+  }
+
+  requireCondition(
+    /^(0|[1-9][0-9]*)$/.test(configuredTimestamp),
+    "CREDENTIAL_PROOF_TIMESTAMP must be an unsigned decimal integer",
+  );
+
+  const parsedTimestamp = Number(configuredTimestamp);
+  requireCondition(
+    Number.isSafeInteger(parsedTimestamp),
+    "CREDENTIAL_PROOF_TIMESTAMP must be a safe integer",
+  );
+
+  return parsedTimestamp;
+}
+
 async function main() {
   const encoding = await loadJson(path.join(ZK_ROOT, "encoding.json"));
   const proofCases = await loadJson(path.join(ZK_ROOT, "proof-cases.json"));
@@ -86,20 +107,12 @@ async function main() {
 
   requireCondition(trustedIssuers.length === 1, "proof policy requires exactly one trusted issuer fixture");
   requireCondition(Array.isArray(proofCases.cases), "proof cases must be an array");
-  requireCondition(Number.isSafeInteger(manifest.evaluationTime), "evaluation time must be a safe integer");
+  requireCondition(
+    Number.isSafeInteger(manifest.evaluationTime) && manifest.evaluationTime >= 0,
+    "evaluation time must be a non-negative safe integer",
+  );
 
-  const requiredRole = encoding.roleEncoding.values[manifest.requiredRole];
-  requireCondition(Number.isInteger(requiredRole) && requiredRole > 0, "required role has no field encoding");
-
-  const policy = {
-    trustedIssuer: encodeString(
-      trustedIssuers[0].issuer,
-      encoding.stringEncoding.domains.issuer,
-      fieldPrime,
-    ),
-    requiredRole: BigInt(requiredRole),
-    currentTimestamp: BigInt(manifest.evaluationTime),
-  };
+  const currentTimestamp = evaluationTime(manifest);
 
   const poseidon = await buildPoseidon();
   const fixtureCache = new Map();
@@ -119,6 +132,29 @@ async function main() {
 
     const fixture = await loadFixture(proofCase.fixture);
     const witnessCredential = { ...fixture, ...proofCase.privateOverrides };
+    const policyOverrides = proofCase.policyOverrides ?? {};
+    const trustedIssuer = policyOverrides.trustedIssuer ?? trustedIssuers[0].issuer;
+    const requiredRoleName = policyOverrides.requiredRole ?? manifest.requiredRole;
+    const requiredRole = encoding.roleEncoding.values[requiredRoleName];
+
+    requireCondition(
+      typeof trustedIssuer === "string" && trustedIssuer.length > 0,
+      `${proofCase.name} has an invalid trusted issuer policy`,
+    );
+    requireCondition(
+      Number.isInteger(requiredRole) && requiredRole > 0,
+      `${proofCase.name} required role has no field encoding`,
+    );
+
+    const policy = {
+      trustedIssuer: encodeString(
+        trustedIssuer,
+        encoding.stringEncoding.domains.issuer,
+        fieldPrime,
+      ),
+      requiredRole: BigInt(requiredRole),
+      currentTimestamp: BigInt(currentTimestamp),
+    };
     const commitmentFixture =
       proofCase.commitmentSource === "self"
         ? fixture

@@ -63,6 +63,8 @@ inputs are serialized as unsigned decimal field elements in generated JSON.
 [`proof-cases.json`](proof-cases.json) defines deterministic synthetic cases:
 
 - a valid credential produces a proof that verifies;
+- alternate issuer and `AUDITOR` credentials produce valid proofs when their
+  public proof policy matches those credentials;
 - a modified private subject paired with the original commitment is rejected;
 - an expired credential is rejected;
 - a credential with the wrong role is rejected;
@@ -91,7 +93,13 @@ The Solidity public-signal order is:
 
 `contracts/src/CredentialVerifier.sol` converts its named policy arguments into
 this array and delegates to the generated verifier. The public timestamp is
-proof context and is not compared with `block.timestamp`.
+proof context and is not compared with `block.timestamp` by this adapter.
+
+`contracts/src/IdentityApplicationA.sol` selects a trusted issuer and the
+`VERIFIED_SUPPLIER` role, applies a proof freshness window against
+`block.timestamp`, and records successful authorization by public credential
+commitment. The circuit does not bind its private subject to an EVM account,
+so application authorization is not keyed by the transaction submitter.
 
 ## Running verification
 
@@ -103,9 +111,10 @@ From the project root, run:
 
 The root verification script validates the credential model, calls
 `zk/scripts/verify-circuit.sh`, builds the generated Solidity verifier, and
-deploys it to Chain A for integration checks. It expects `circom` on `PATH` and the exact npm
-dependencies from `zk/package.json` to already exist in `zk/node_modules`; it
-does not install or initialize the development environment.
+deploys the verifier, adapter, and identity application to Chain A for
+integration checks. It expects `circom` on `PATH` and the exact npm dependencies
+from `zk/package.json` to already exist in `zk/node_modules`; it does not install
+or initialize the development environment.
 
 The Powers of Tau contribution and Groth16 setup performed by the script use
 fixed local-development entropy to avoid interactive input. Those generated
@@ -117,4 +126,5 @@ production trusted setup.
 - issuer signature verification and issuer registry management
 - revocation enforcement, trees, and roots
 - nullifiers and anonymous replay protection
-- application behavior and SourceGateway authorization integration
+- automatic expiry or revocation of stored application authorization
+- SourceGateway authorization integration
