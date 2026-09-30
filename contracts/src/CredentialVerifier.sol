@@ -11,6 +11,10 @@ contract CredentialVerifier is ICredentialVerifier {
     uint256 public constant REQUIRED_ROLE_INDEX = 2;
     uint256 public constant CURRENT_TIMESTAMP_INDEX = 3;
     uint256 public constant CREDENTIAL_STATE_ROOT_INDEX = 4;
+    uint256 public constant APPLICATION_DOMAIN_INDEX = 5;
+    uint256 public constant POLICY_EPOCH_INDEX = 6;
+    uint256 public constant ACTION_CONTEXT_INDEX = 7;
+    uint256 public constant NULLIFIER_INDEX = 8;
 
     // Lower camel case preserves the existing project-facing getter name.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
@@ -30,18 +34,18 @@ contract CredentialVerifier is ICredentialVerifier {
         uint256[2] calldata proofA,
         uint256[2][2] calldata proofB,
         uint256[2] calldata proofC,
-        uint256 credentialCommitment,
-        uint256 trustedIssuer,
-        uint256 requiredRole,
-        uint256 currentTimestamp,
-        uint256 credentialStateRoot
+        CredentialPublicInputs calldata publicInputs
     ) external view returns (bool) {
-        uint256[5] memory publicSignals;
-        publicSignals[CREDENTIAL_COMMITMENT_INDEX] = credentialCommitment;
-        publicSignals[TRUSTED_ISSUER_INDEX] = trustedIssuer;
-        publicSignals[REQUIRED_ROLE_INDEX] = requiredRole;
-        publicSignals[CURRENT_TIMESTAMP_INDEX] = currentTimestamp;
-        publicSignals[CREDENTIAL_STATE_ROOT_INDEX] = credentialStateRoot;
+        uint256[9] memory publicSignals;
+        publicSignals[CREDENTIAL_COMMITMENT_INDEX] = publicInputs.credentialCommitment;
+        publicSignals[TRUSTED_ISSUER_INDEX] = publicInputs.trustedIssuer;
+        publicSignals[REQUIRED_ROLE_INDEX] = publicInputs.requiredRole;
+        publicSignals[CURRENT_TIMESTAMP_INDEX] = publicInputs.currentTimestamp;
+        publicSignals[CREDENTIAL_STATE_ROOT_INDEX] = publicInputs.credentialStateRoot;
+        publicSignals[APPLICATION_DOMAIN_INDEX] = publicInputs.applicationDomain;
+        publicSignals[POLICY_EPOCH_INDEX] = publicInputs.policyEpoch;
+        publicSignals[ACTION_CONTEXT_INDEX] = publicInputs.actionContext;
+        publicSignals[NULLIFIER_INDEX] = publicInputs.nullifier;
 
         return groth16Verifier.verifyProof(proofA, proofB, proofC, publicSignals);
     }

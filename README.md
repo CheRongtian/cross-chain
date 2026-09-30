@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain messaging and zero-knowledge credential authorization with revocation. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, and an application that records and revokes supplier authorization.
+This repository is a prototype for canonical cross-chain messaging and zero-knowledge credential authorization with revocation and replay protection. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, and an application that records and revokes supplier authorization while consuming context-bound nullifiers.
 
 The current implementation can:
 
@@ -10,11 +10,14 @@ The current implementation can:
 - describe private credentials, issuer trust, roles, expiry, and active or revoked lifecycle state;
 - build deterministic Poseidon Merkle roots for active credentials;
 - commit to credential fields and prove issuer, role, expiry, and active-state membership in one circuit;
+- derive a deterministic Poseidon nullifier from the private credential identifier and a public application, epoch, and action context;
 - verify a valid proof and reject an invalid witness, expired credential, wrong role, untrusted issuer, or tampered public input;
 - generate a Solidity verifier from the active Groth16 proving key and verify the same proof on Chain A;
 - enforce a fixed issuer, the `VERIFIED_SUPPLIER` role, proof freshness, and the current credential-state root in `IdentityApplicationA`;
 - rotate the accepted root through an explicit authority and remove effective authorization for revoked commitments;
-- preserve authorization for an unaffected active credential across a root rotation.
+- preserve authorization for an unaffected active credential across a root rotation;
+- reject both exact proof replay and a newly generated proof for the same credential and authorization context;
+- advance the application policy epoch without deleting previously consumed nullifiers.
 
 ## Architecture
 
@@ -22,7 +25,7 @@ The current implementation can:
                                   ┌──────────────────────────┐
 Private credential ──> encoding ─>│ CredentialAuthorization  │
 Active-set Merkle path ──────────>│ Circom + Poseidon        │
-Public policy + state root ──────>│ Groth16 / BN254          │ ──> proof + public signals
+Public policy, state + context ──>│ Groth16 / BN254          │ ──> proof + public signals
                                   └──────────────────────────┘              │
                                                                             v
                                                          Solidity verifier on Chain A
@@ -32,11 +35,9 @@ Public policy + state root ──────>│ Groth16 / BN254          │ �
                                                                             │
                                                                             v
                                                          IdentityApplicationA policy
-                                                                            │
-                                                                            v
-                                                         commitment => UNVERIFIED /
-                                                                       VERIFIED_SUPPLIER /
-                                                                       REVOKED
+                                                           │                │
+                                                           v                v
+                                                usedNullifiers       commitment status
 
 Caller ──> SourceGateway on Chain A ──> CrossChainMessage event
                                                     │
@@ -154,6 +155,34 @@ Poseidon(1, credentialCommitment)
 
 Unused leaves are `0`, every parent is `Poseidon(left, right)`, and empty space is right-padded. This gives the same root for the same active set regardless of fixture insertion order. Removing credential A creates Root N+1, while an unaffected credential B receives a valid membership path under the new root.
 
+### Context-bound nullifier
+
+Each authorization proof exposes a deterministic nullifier while keeping `credentialId` private:
+
+```text
+Poseidon(
+    1,
+    credentialIdField,
+    applicationDomain,
+    policyEpoch,
+    actionContext
+)
+```
+
+The leading `1` is the nullifier version. `applicationDomain` is bound to the deployed application and chain:
+
+```text
+keccak256(
+    abi.encode(
+        keccak256("cross-chain:identity-application-domain:v1"),
+        chainId,
+        applicationAddress
+    )
+) mod BN254_SCALAR_FIELD
+```
+
+`policyEpoch` starts at `1` and can only increase by one. It is the authorization-policy context owned by `IdentityApplicationA`; it is unrelated to any future validator or consensus epoch. The supplier-verification action is encoded as `1`. The same private credential and the same three public context values produce the same nullifier. Changing the application, epoch, or action produces a different nullifier. Machine-readable definitions are in `zk/nullifier.json`; reusable relation vectors are in `test-vectors/nullifiers.json`, and verification writes their concrete Poseidon results to `zk/build/nullifier-vectors.json`.
+
 ### Circuit statement
 
 `zk/circuits/CredentialAuthorization.circom` proves that:
@@ -164,6 +193,7 @@ Unused leaves are `0`, every parent is `Poseidon(left, right)`, and empty space 
 - `currentTimestamp < expiry`;
 - `currentTimestamp` and `expiry` both fit in uint64;
 - the active leaf derived from `credentialCommitment` belongs to the public `credentialStateRoot`.
+- the public `nullifier` is the Poseidon hash of the private `credentialId` and the public application, epoch, and action context.
 
 Private witness inputs:
 
@@ -185,6 +215,10 @@ trustedIssuer
 requiredRole
 currentTimestamp
 credentialStateRoot
+applicationDomain
+policyEpoch
+actionContext
+nullifier
 ```
 
 Issuer trust remains an external policy decision. The circuit proves that the committed issuer matches the supplied public policy value. It does not verify an issuer signature or query an issuer registry.
@@ -200,11 +234,11 @@ verifyProof(
     uint256[2] proofA,
     uint256[2][2] proofB,
     uint256[2] proofC,
-    uint256[5] publicSignals
+    uint256[9] publicSignals
 ) returns (bool)
 ```
 
-`contracts/src/CredentialVerifier.sol` provides the stable project-facing `verifyCredentialProof` interface. It accepts named policy values and constructs the public-signal array in this protocol order:
+`contracts/src/CredentialVerifier.sol` provides the stable project-facing `verifyCredentialProof` interface. It accepts a named `CredentialPublicInputs` struct and constructs the public-signal array in this protocol order:
 
 ```text
 [0] credentialCommitment
@@ -212,6 +246,10 @@ verifyProof(
 [2] requiredRole
 [3] currentTimestamp
 [4] credentialStateRoot
+[5] applicationDomain
+[6] policyEpoch
+[7] actionContext
+[8] nullifier
 ```
 
 Proof coordinates are converted with snarkjs `groth16.exportSolidityCallData`, including the required G2 coordinate ordering. The same generated calldata is used by Forge tests and Chain A integration verification.
@@ -231,9 +269,10 @@ The Solidity verifier establishes that a Groth16 proof is valid for the supplied
 - a non-zero credential-state authority;
 - a non-zero initial credential-state root.
 
-`verifySupplier` accepts the same proof coordinates and five public values used by the credential verifier. Before calling the verifier, the application requires the proof issuer and role to equal its deployment policy, rejects timestamps later than `block.timestamp`, rejects timestamps older than `maxProofAge`, requires the proof root to equal the current application root, and rejects commitments already marked `REVOKED`. A successful verification sets:
+`verifySupplier` accepts the proof coordinates and the nine-field public-input struct used by the credential verifier. Before calling the verifier, the application requires the proof issuer and role to equal its deployment policy, rejects timestamps later than `block.timestamp`, rejects timestamps older than `maxProofAge`, requires the proof root to equal the current application root, rejects commitments already marked `REVOKED`, and requires the canonical application domain, current policy epoch, and supplier action context. It also rejects out-of-field or previously consumed nullifiers. A successful verification atomically sets:
 
 ```text
+usedNullifiers[nullifier] = true
 authorizationStatus[credentialCommitment] = VERIFIED_SUPPLIER
 ```
 
@@ -241,7 +280,11 @@ Authorization is keyed by the public `credentialCommitment`. The current circuit
 
 The credential-state authority calls `updateCredentialStateRoot` with a new non-zero root and the commitments revoked by that transition. The update changes the accepted root and marks those commitments `REVOKED` in one transaction. `isVerifiedSupplier` then returns `false` for a previously verified revoked commitment. Proofs bound to the old root are rejected, while an unaffected credential can authorize under the new root.
 
-Submitting the same valid proof again leaves the commitment in the same state. This idempotent behavior does not provide a nullifier or anonymous replay protection. Freshness is checked when a proof is submitted; stored `VERIFIED_SUPPLIER` state does not automatically expire when `maxProofAge` elapses, while an authority root update can explicitly revoke it.
+The same authority calls `advancePolicyEpoch` to increment the application epoch. Existing nullifier history is retained. A credential can therefore authorize once in the new epoch with its new context-bound nullifier, while its old-epoch proof remains rejected as an epoch mismatch or consumed nullifier depending on the checked context.
+
+An exact proof replay and a newly generated proof for the same credential and context both expose the same nullifier and are rejected after the first successful use. The nullifier prevents duplicate authorization within its defined context; it does not hide the public credential commitment or provide global unlinkability. Freshness is checked when a proof is submitted. Stored `VERIFIED_SUPPLIER` state does not automatically expire when `maxProofAge` elapses, while an authority root update can explicitly revoke it.
+
+Revocation and nullifier consumption answer separate questions and are enforced together. Active-state membership answers whether the credential is still active. The nullifier registry answers whether that credential has already performed the protected action in the current application context. A fresh, unused nullifier cannot make a revoked credential valid.
 
 ## Local Two-Chain Environment
 
@@ -341,7 +384,7 @@ Run from the repository root:
 python3 zk/credential-model/validate.py
 ```
 
-The validator checks the schema, field names and order, data types, issuer trust fixtures, expiry semantics, role cases, revocation status, commitment encoding, and credential-state tree configuration.
+The validator checks the schema, field names and order, data types, issuer trust fixtures, expiry semantics, role cases, revocation status, commitment encoding, credential-state tree configuration, nullifier definition, and nullifier vector relations.
 
 ### ZK circuit
 
@@ -355,13 +398,15 @@ The script:
 
 - compiles `CredentialAuthorization.circom`;
 - builds deterministic Root N and Root N+1 active-credential states and Merkle witnesses;
+- computes shared nullifier vectors and proof inputs for equal and separated contexts;
 - prepares deterministic test inputs;
 - creates Powers of Tau and Groth16 proving material for local verification only;
 - generates and verifies a proof for the valid credential;
 - generates valid alternate-issuer and `AUDITOR` proofs for application policy checks;
+- generates valid proofs for replay, alternate-domain, next-epoch, and alternate-action application checks;
 - confirms rejection of an invalid credential witness, expired credential, wrong role, untrusted issuer, invalid Merkle path, wrong root, and revoked credential under the current root;
 - generates a valid credential B proof under Root N+1;
-- confirms that the original proof fails after its public commitment is changed;
+- confirms that the original proof fails after any public signal is changed, including its nullifier context;
 - exports the Solidity Groth16 verifier from the active zkey;
 - generates a Solidity proof fixture and Chain A calldata through the snarkjs calldata converter.
 
@@ -380,17 +425,19 @@ The script uses strict error handling and performs:
 1. local-chain availability and chain ID checks;
 2. selection of a proof timestamp relative to the current Chain A block;
 3. credential model, fixture, and state-tree configuration validation;
-4. deterministic Root N and Root N+1 construction, followed by ZK circuit compilation and positive and negative local proof verification;
+4. deterministic Root N and Root N+1 construction, nullifier-vector generation, and ZK circuit compilation with positive and negative local proof verification;
 5. Solidity verifier export and proof-fixture generation;
 6. Solidity formatting, build, and tests against the real generated verifier;
 7. focused canonical-message, credential-verifier, and identity-application tests;
 8. deployment of the generated verifier, credential adapter, and identity application to Chain A;
 9. valid on-chain proof verification and credential A authorization under Root N;
-10. rejection of future, stale, tampered, alternate-issuer, alternate-role, and non-current-root submissions;
-11. rejection of unauthorized and zero-root credential-state updates;
-12. rotation to Root N+1, revocation of credential A, and rejection of A's old-root proof;
-13. authorization and retained active status for credential B under Root N+1;
-14. `SourceGateway` deployment and existing cross-chain message verification.
+10. rejection of future, stale, tampered, alternate-policy, alternate-domain, alternate-epoch, alternate-action, and non-current-root submissions;
+11. rejection of exact and regenerated same-context proof replays;
+12. authorized policy-epoch advancement and acceptance of credential A's new-epoch nullifier;
+13. rejection of unauthorized and zero-root credential-state updates;
+14. rotation to Root N+1, revocation of credential A, preservation of consumed-nullifier history, and rejection of A's old-root proof;
+15. authorization and retained active status for credential B under Root N+1;
+16. `SourceGateway` deployment and existing cross-chain message verification.
 
 If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
 
@@ -404,7 +451,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-ZK Credential Revocation Lifecycle
+ZK Identity Authorization with Revocation and Nullifiers
 ```
 
 ### Expected error output
@@ -421,11 +468,16 @@ InvalidCredentialProof
 InvalidIssuerPolicy
 InvalidRolePolicy
 InvalidCredentialStateRoot
+InvalidApplicationDomain
+InvalidPolicyEpoch
+InvalidActionContext
+NullifierAlreadyUsed
+UnauthorizedPolicyEpochAuthority
 UnauthorizedCredentialStateAuthority
 StaleProofTimestamp
 ```
 
-These messages demonstrate that the contracts reject invalid destinations, the circuit rejects invalid witnesses, a proof cannot be reused with a tampered public input, and the identity application enforces policy, freshness, state-root authority, and revocation. Each expected failure is followed by `Verified rejection` or `Verified expected ... rejection`. Complete verification succeeds only when the script exits with code `0` and the log ends with `VERIFICATION PASSED`.
+These messages demonstrate that the contracts reject invalid destinations, the circuit rejects invalid witnesses, a proof cannot be reused with a tampered public input, and the identity application enforces policy, freshness, context-bound replay protection, state-root authority, and revocation. Each expected failure is followed by `Verified rejection` or `Verified expected ... rejection`. Complete verification succeeds only when the script exits with code `0` and the log ends with `VERIFICATION PASSED`.
 
 The on-chain negative cases normally return `false` and are reported as `Verified expected on-chain rejection`. A successful result for any modified proof or public policy value fails the complete verification.
 
@@ -454,7 +506,8 @@ Cross-Chain/
 │   ├── start-chains.sh
 │   └── verify.sh
 ├── test-vectors/
-│   └── canonical-messages.json
+│   ├── canonical-messages.json
+│   └── nullifiers.json
 ├── zk/
 │   ├── circuits/
 │   │   └── CredentialAuthorization.circom
@@ -467,12 +520,15 @@ Cross-Chain/
 │   ├── scripts/
 │   │   ├── build-credential-state.mjs
 │   │   ├── build-inputs.mjs
+│   │   ├── build-nullifier-vectors.mjs
 │   │   ├── build-solidity-fixtures.mjs
 │   │   ├── credential-state.mjs
+│   │   ├── nullifier.mjs
 │   │   ├── tamper-public.mjs
 │   │   └── verify-circuit.sh
 │   ├── credential-state.json
 │   ├── encoding.json
+│   ├── nullifier.json
 │   ├── proof-cases.json
 │   ├── package.json
 │   └── package-lock.json
@@ -490,8 +546,9 @@ Cross-Chain/
 - Authorization belongs to a credential commitment because the circuit does not bind its private subject to `msg.sender`.
 - Stored authorization does not automatically expire when the proof freshness window passes.
 - Revocation uses membership in a deterministic active-credential root and an explicit Chain A root authority. The authority is responsible for publishing a root and revoked-commitment list that describe the same transition.
-- The repository does not provide nullifiers or anonymous replay protection.
+- Nullifiers prevent repeated authorization for the same credential, application, epoch, and action. They do not hide the public credential commitment, prevent correlation through other public signals, or provide global replay protection across distinct contexts.
 - `SourceGateway` does not yet integrate credential-proof verification.
-- The repository does not provide a relayer, destination execution, finality proof, or production cross-chain security model.
+- The repository does not provide an indexer, relayer, Merkle batching, PBFT validation, destination gateway or execution, finality proof, or production cross-chain security model.
+- ZK authorization is local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.

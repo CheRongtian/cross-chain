@@ -8,9 +8,9 @@ if (!inputPath || !outputPath || !scalarFieldPrime) {
 
 const publicSignals = JSON.parse(await readFile(inputPath, "utf8"));
 
-if (!Array.isArray(publicSignals) || publicSignals.length !== 5) {
+if (!Array.isArray(publicSignals) || publicSignals.length !== 9) {
   throw new Error(
-    "expected five public signals ordered as commitment, issuer, role, timestamp, state root",
+    "expected nine public signals ordered as commitment, issuer, role, timestamp, state root, application domain, policy epoch, action context, nullifier",
   );
 }
 

@@ -11,6 +11,8 @@ MODEL_ROOT = Path(__file__).resolve().parent
 FIXTURES_ROOT = MODEL_ROOT / "fixtures"
 ENCODING_PATH = MODEL_ROOT.parent / "encoding.json"
 CREDENTIAL_STATE_PATH = MODEL_ROOT.parent / "credential-state.json"
+NULLIFIER_PATH = MODEL_ROOT.parent / "nullifier.json"
+NULLIFIER_VECTORS_PATH = MODEL_ROOT.parent.parent / "test-vectors" / "nullifiers.json"
 
 CANONICAL_FIELDS = ["subject", "issuer", "role", "expiry", "credentialId"]
 LIFECYCLE_FIELD = "status"
@@ -103,6 +105,14 @@ def validate_model(model: dict[str, Any]) -> list[dict[str, str]]:
     require(
         revocation.get("stateEncodingSpecification") == "../credential-state.json",
         "credential state encoding path is not canonical",
+    )
+
+    nullifier = model.get("nullifier", {})
+    require(nullifier.get("privateIdentityField") == "credentialId", "nullifier must use private credentialId")
+    require(nullifier.get("publicOutput") == "nullifier", "nullifier public output name is not canonical")
+    require(
+        nullifier.get("encodingSpecification") == "../nullifier.json",
+        "nullifier encoding path is not canonical",
     )
 
     issuer_trust = model.get("issuerTrust", {})
@@ -214,6 +224,99 @@ def validate_credential_state(state: dict[str, Any]) -> None:
     require(
         state.get("rootRepresentation") == "unsigned decimal BN254 field element",
         "credential state root representation is not canonical",
+    )
+
+
+def validate_nullifier(nullifier: dict[str, Any]) -> None:
+    require(nullifier.get("nullifierVersion") == 1, "unsupported nullifier version")
+    require(nullifier.get("algorithm") == "Poseidon", "nullifier must use Poseidon")
+    require(nullifier.get("arity") == 5, "nullifier Poseidon arity must be five")
+    require(
+        nullifier.get("inputOrder")
+        == [
+            "nullifierVersion",
+            "credentialIdField",
+            "applicationDomain",
+            "policyEpoch",
+            "actionContext",
+        ],
+        "nullifier input order is not canonical",
+    )
+    require(
+        nullifier.get("privateIdentitySource") == "credentialIdField",
+        "nullifier private identity source is not canonical",
+    )
+    require(
+        nullifier.get("outputRepresentation") == "unsigned decimal BN254 field element",
+        "nullifier output representation is not canonical",
+    )
+
+    application_domain = nullifier.get("applicationDomain", {})
+    require(
+        application_domain.get("algorithm") == "keccak256-abi-encode-mod-p",
+        "application domain algorithm is not canonical",
+    )
+    require(
+        application_domain.get("protocolNamespace") == "cross-chain:identity-application-domain:v1",
+        "application domain namespace is not canonical",
+    )
+    require(
+        application_domain.get("inputOrder")
+        == ["protocolNamespaceHash", "chainId", "applicationAddress"],
+        "application domain input order is not canonical",
+    )
+    require(
+        application_domain.get("abiTypes") == ["bytes32", "uint256", "address"],
+        "application domain ABI types are not canonical",
+    )
+    require(
+        application_domain.get("fieldReduction") == "mod-bn254-scalar-field",
+        "application domain reduction is not canonical",
+    )
+
+    policy_epoch = nullifier.get("policyEpoch", {})
+    require(policy_epoch.get("initialValue") == 1, "initial policy epoch must be one")
+    require(policy_epoch.get("advancement") == "increment-by-one", "policy epoch advancement is not canonical")
+    require(
+        nullifier.get("actionContexts") == {"VERIFY_SUPPLIER": 1, "OTHER_TEST_ACTION": 2},
+        "nullifier action contexts are not canonical",
+    )
+
+
+def validate_nullifier_vectors(vectors: dict[str, Any]) -> None:
+    require(vectors.get("vectorVersion") == 1, "unsupported nullifier vector version")
+    cases = vectors.get("cases")
+    require(isinstance(cases, list) and len(cases) == 5, "nullifier vectors must contain five cases")
+    names = [case.get("name") for case in cases]
+    require(
+        names
+        == ["baseline", "same-context", "different-application", "different-epoch", "different-action"],
+        "nullifier vector case order is not canonical",
+    )
+    for case in cases:
+        require(type(case.get("credentialIdField")) is str, "nullifier vector credentialIdField must be a string")
+        require(type(case.get("applicationDomain")) is str, "nullifier vector applicationDomain must be a string")
+        require(type(case.get("policyEpoch")) is str, "nullifier vector policyEpoch must be a string")
+        require(
+            case.get("actionContext") in {"VERIFY_SUPPLIER", "OTHER_TEST_ACTION"},
+            "nullifier vector action context is unsupported",
+        )
+        require(
+            case.get("expectedNullifier") == "generated-by-zk/scripts/build-nullifier-vectors.mjs",
+            "nullifier vectors must delegate concrete Poseidon output generation",
+        )
+
+    require(
+        vectors.get("expectedRelations")
+        == {
+            "equal": [["baseline", "same-context"]],
+            "different": [
+                ["baseline", "different-application"],
+                ["baseline", "different-epoch"],
+                ["baseline", "different-action"],
+            ],
+        },
+        "nullifier vector relations are not canonical",
     )
 
 
@@ -343,6 +446,8 @@ def main() -> int:
         model = load_json(MODEL_ROOT / "credential-model.json")
         encoding = load_json(ENCODING_PATH)
         credential_state = load_json(CREDENTIAL_STATE_PATH)
+        nullifier = load_json(NULLIFIER_PATH)
+        nullifier_vectors = load_json(NULLIFIER_VECTORS_PATH)
         issuer_document = load_json(MODEL_ROOT / "trusted-issuers.json")
         manifest = load_json(FIXTURES_ROOT / "manifest.json")
 
@@ -350,6 +455,8 @@ def main() -> int:
         commitment_fields = validate_model(model)
         validate_encoding(encoding)
         validate_credential_state(credential_state)
+        validate_nullifier(nullifier)
+        validate_nullifier_vectors(nullifier_vectors)
         trust_by_issuer = load_issuer_trust(issuer_document)
         validate_fixtures(schema, manifest, trust_by_issuer, commitment_fields)
     except ValidationError as error:

@@ -1,0 +1,69 @@
+{
+  "vectorVersion": 1,
+  "description": "Synthetic context vectors for deterministic Poseidon nullifier generation.",
+  "generatedOutput": "zk/build/nullifier-vectors.json",
+  "cases": [
+    {
+      "name": "baseline",
+      "credentialIdField": "101",
+      "applicationDomain": "1001",
+      "policyEpoch": "1",
+      "actionContext": "VERIFY_SUPPLIER",
+      "expectedNullifier": "generated-by-zk/scripts/build-nullifier-vectors.mjs"
+    },
+    {
+      "name": "same-context",
+      "credentialIdField": "101",
+      "applicationDomain": "1001",
+      "policyEpoch": "1",
+      "actionContext": "VERIFY_SUPPLIER",
+      "expectedNullifier": "generated-by-zk/scripts/build-nullifier-vectors.mjs"
+    },
+    {
+      "name": "different-application",
+      "credentialIdField": "101",
+      "applicationDomain": "1002",
+      "policyEpoch": "1",
+      "actionContext": "VERIFY_SUPPLIER",
+      "expectedNullifier": "generated-by-zk/scripts/build-nullifier-vectors.mjs"
+    },
+    {
+      "name": "different-epoch",
+      "credentialIdField": "101",
+      "applicationDomain": "1001",
+      "policyEpoch": "2",
+      "actionContext": "VERIFY_SUPPLIER",
+      "expectedNullifier": "generated-by-zk/scripts/build-nullifier-vectors.mjs"
+    },
+    {
+      "name": "different-action",
+      "credentialIdField": "101",
+      "applicationDomain": "1001",
+      "policyEpoch": "1",
+      "actionContext": "OTHER_TEST_ACTION",
+      "expectedNullifier": "generated-by-zk/scripts/build-nullifier-vectors.mjs"
+    }
+  ],
+  "expectedRelations": {
+    "equal": [
+      [
+        "baseline",
+        "same-context"
+      ]
+    ],
+    "different": [
+      [
+        "baseline",
+        "different-application"
+      ],
+      [
+        "baseline",
+        "different-epoch"
+      ],
+      [
+        "baseline",
+        "different-action"
+      ]
+    ]
+  }
+}

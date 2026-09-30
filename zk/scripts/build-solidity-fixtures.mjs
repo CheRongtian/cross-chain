@@ -63,12 +63,16 @@ library CredentialProofFixture {
         value[1] = uint256(${proofC[1]});
     }
 
-    function publicSignals() internal pure returns (uint256[5] memory value) {
+    function publicSignals() internal pure returns (uint256[9] memory value) {
         value[0] = uint256(${publicSignals[0]});
         value[1] = uint256(${publicSignals[1]});
         value[2] = uint256(${publicSignals[2]});
         value[3] = uint256(${publicSignals[3]});
         value[4] = uint256(${publicSignals[4]});
+        value[5] = uint256(${publicSignals[5]});
+        value[6] = uint256(${publicSignals[6]});
+        value[7] = uint256(${publicSignals[7]});
+        value[8] = uint256(${publicSignals[8]});
     }
 }
 `;
@@ -98,7 +102,7 @@ async function loadSolidityCalldata(proofPath, publicPath) {
     "invalid Solidity proof B",
   );
   requireCondition(Array.isArray(proofC) && proofC.length === 2, "invalid Solidity proof C");
-  requireCondition(Array.isArray(publicSignals) && publicSignals.length === 5, "expected five public signals");
+  requireCondition(Array.isArray(publicSignals) && publicSignals.length === 9, "expected nine public signals");
 
   return { proofA, proofB, proofC, publicSignals };
 }
@@ -124,6 +128,10 @@ async function main() {
     ["wrong-required-role", 2],
     ["wrong-current-timestamp", 3],
     ["wrong-credential-state-root", 4],
+    ["tampered-application-domain", 5],
+    ["tampered-policy-epoch", 6],
+    ["tampered-action-context", 7],
+    ["tampered-nullifier", 8],
   ];
 
   for (const [name, index] of publicCases) {
@@ -135,6 +143,10 @@ async function main() {
   for (const name of [
     "application-alternate-issuer",
     "application-auditor-role",
+    "valid-replay",
+    "application-next-epoch",
+    "application-alternate-domain",
+    "application-other-action",
     "active-secondary-current",
   ]) {
     const proofPath = path.join(PROVING_DIR, `${name}-proof.json`);

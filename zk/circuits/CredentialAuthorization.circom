@@ -6,6 +6,7 @@ include "circomlib/circuits/comparators.circom";
 template CredentialAuthorization() {
     var CREDENTIAL_STATE_TREE_DEPTH = 8;
     var CREDENTIAL_STATE_LEAF_VERSION = 1;
+    var NULLIFIER_VERSION = 1;
 
     signal input subject;
     signal input issuer;
@@ -18,6 +19,10 @@ template CredentialAuthorization() {
     signal input requiredRole;
     signal input currentTimestamp;
     signal input credentialStateRoot;
+    signal input applicationDomain;
+    signal input policyEpoch;
+    signal input actionContext;
+    signal input nullifier;
 
     signal input statePathElements[CREDENTIAL_STATE_TREE_DEPTH];
     signal input statePathIndices[CREDENTIAL_STATE_TREE_DEPTH];
@@ -30,6 +35,14 @@ template CredentialAuthorization() {
     commitment.inputs[4] <== expiry;
     commitment.inputs[5] <== credentialId;
     commitment.out === credentialCommitment;
+
+    component nullifierHash = Poseidon(5);
+    nullifierHash.inputs[0] <== NULLIFIER_VERSION;
+    nullifierHash.inputs[1] <== credentialId;
+    nullifierHash.inputs[2] <== applicationDomain;
+    nullifierHash.inputs[3] <== policyEpoch;
+    nullifierHash.inputs[4] <== actionContext;
+    nullifierHash.out === nullifier;
 
     component activeLeaf = Poseidon(2);
     activeLeaf.inputs[0] <== CREDENTIAL_STATE_LEAF_VERSION;
@@ -73,4 +86,4 @@ template CredentialAuthorization() {
     unexpired.out === 1;
 }
 
-component main {public [credentialCommitment, trustedIssuer, requiredRole, currentTimestamp, credentialStateRoot]} = CredentialAuthorization();
+component main {public [credentialCommitment, trustedIssuer, requiredRole, currentTimestamp, credentialStateRoot, applicationDomain, policyEpoch, actionContext, nullifier]} = CredentialAuthorization();

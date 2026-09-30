@@ -4,11 +4,12 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 
 import {CredentialVerifier} from "../src/CredentialVerifier.sol";
+import {ICredentialVerifier} from "../src/interfaces/ICredentialVerifier.sol";
 import {Groth16Verifier} from "../generated/Groth16Verifier.sol";
 import {CredentialProofFixture} from "../generated/CredentialProofFixture.sol";
 
 contract CredentialVerifierTest is Test {
-    uint256 internal constant PUBLIC_SIGNAL_COUNT = 5;
+    uint256 internal constant PUBLIC_SIGNAL_COUNT = 9;
 
     CredentialVerifier internal verifier;
 
@@ -29,11 +30,7 @@ contract CredentialVerifierTest is Test {
             CredentialProofFixture.proofA(),
             CredentialProofFixture.proofB(),
             CredentialProofFixture.proofC(),
-            publicSignals[0],
-            publicSignals[1],
-            publicSignals[2],
-            publicSignals[3],
-            publicSignals[4]
+            _publicInputs(publicSignals)
         );
 
         assertTrue(accepted);
@@ -107,6 +104,54 @@ contract CredentialVerifierTest is Test {
         );
     }
 
+    function testRejectsWrongApplicationDomain() public view {
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
+        publicSignals[5] += 1;
+
+        _assertRejected(
+            CredentialProofFixture.proofA(),
+            CredentialProofFixture.proofB(),
+            CredentialProofFixture.proofC(),
+            publicSignals
+        );
+    }
+
+    function testRejectsWrongPolicyEpoch() public view {
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
+        publicSignals[6] += 1;
+
+        _assertRejected(
+            CredentialProofFixture.proofA(),
+            CredentialProofFixture.proofB(),
+            CredentialProofFixture.proofC(),
+            publicSignals
+        );
+    }
+
+    function testRejectsWrongActionContext() public view {
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
+        publicSignals[7] += 1;
+
+        _assertRejected(
+            CredentialProofFixture.proofA(),
+            CredentialProofFixture.proofB(),
+            CredentialProofFixture.proofC(),
+            publicSignals
+        );
+    }
+
+    function testRejectsWrongNullifier() public view {
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
+        publicSignals[8] += 1;
+
+        _assertRejected(
+            CredentialProofFixture.proofA(),
+            CredentialProofFixture.proofB(),
+            CredentialProofFixture.proofC(),
+            publicSignals
+        );
+    }
+
     function testPublicSignalOrderIsFixed() public view {
         uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
         (publicSignals[1], publicSignals[2]) = (publicSignals[2], publicSignals[1]);
@@ -125,19 +170,28 @@ contract CredentialVerifierTest is Test {
         uint256[2] memory proofC,
         uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals
     ) internal view {
-        try verifier.verifyCredentialProof(
-            proofA,
-            proofB,
-            proofC,
-            publicSignals[0],
-            publicSignals[1],
-            publicSignals[2],
-            publicSignals[3],
-            publicSignals[4]
-        ) returns (
+        try verifier.verifyCredentialProof(proofA, proofB, proofC, _publicInputs(publicSignals)) returns (
             bool accepted
         ) {
             assertFalse(accepted);
         } catch {}
+    }
+
+    function _publicInputs(uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals)
+        internal
+        pure
+        returns (ICredentialVerifier.CredentialPublicInputs memory)
+    {
+        return ICredentialVerifier.CredentialPublicInputs({
+            credentialCommitment: publicSignals[0],
+            trustedIssuer: publicSignals[1],
+            requiredRole: publicSignals[2],
+            currentTimestamp: publicSignals[3],
+            credentialStateRoot: publicSignals[4],
+            applicationDomain: publicSignals[5],
+            policyEpoch: publicSignals[6],
+            actionContext: publicSignals[7],
+            nullifier: publicSignals[8]
+        });
     }
 }

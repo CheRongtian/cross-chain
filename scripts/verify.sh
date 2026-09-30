@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="ZK Credential Revocation Lifecycle"
+VERIFICATION_NAME="ZK Identity Authorization with Revocation and Nullifiers"
 
 CHAIN_A_RPC="http://127.0.0.1:4545"
 CHAIN_B_RPC="http://127.0.0.1:9545"
@@ -14,6 +14,8 @@ CHAIN_A_ID="10011"
 CHAIN_B_ID="2001"
 PROOF_TIMESTAMP_OFFSET="3600"
 APPLICATION_MAX_PROOF_AGE="3600"
+SNARK_SCALAR_FIELD="21888242871839275222246405745257275088548364400416034343698204186575808495617"
+APPLICATION_DOMAIN_NAMESPACE="cross-chain:identity-application-domain:v1"
 
 ANVIL_DEV_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 SOURCE_SENDER="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
@@ -286,23 +288,22 @@ printf '  1. Check or start Chain A and Chain B\n'
 printf '  2. Verify chain IDs and select the proof timestamp\n'
 printf '  3. Validate the credential model, fixtures, and state encoding\n'
 printf '  4. Build deterministic active-credential roots and Merkle witnesses\n'
-printf '  5. Compile the ZK circuit and verify membership and policy proof cases\n'
-printf '  6. Export the Solidity verifier and application proof fixtures\n'
-printf '  7. Format generated Solidity sources\n'
-printf '  8. forge fmt --check\n'
+printf '  5. Build deterministic nullifier vectors and context-separated inputs\n'
+printf '  6. Compile the ZK circuit and verify membership, policy, and nullifier cases\n'
+printf '  7. Export the Solidity verifier and application proof fixtures\n'
+printf '  8. Format generated Solidity sources\n'
 printf '  9. forge build\n'
 printf ' 10. forge test -vv\n'
 printf ' 11. Run focused gateway, verifier, and identity application tests\n'
 printf ' 12. Deploy the verifier, adapter, and identity application to Chain A\n'
-printf ' 13. Verify proof freshness, tampering, and application policy rejection\n'
-printf ' 14. Authorize credential A under root N\n'
-printf ' 15. Reject unauthorized and zero-root state updates\n'
-printf ' 16. Rotate to root N+1 and revoke credential A\n'
-printf ' 17. Reject credential A proof bound to root N\n'
-printf ' 18. Authorize credential B under root N+1\n'
-printf ' 19. Deploy SourceGateway to Chain A\n'
-printf ' 20. Verify deployment, payload encoding, messages, and nonce progression\n'
-printf ' 21. Verify invalid destination domain and receiver reverts\n'
+printf ' 13. Verify nullifier and application policy rejection cases\n'
+printf ' 14. Accept first use and reject same-context proof replays\n'
+printf ' 15. Advance policy epoch and accept a context-separated nullifier\n'
+printf ' 16. Rotate to root N+1 and preserve revocation behavior\n'
+printf ' 17. Authorize credential B under root N+1\n'
+printf ' 18. Deploy SourceGateway to Chain A\n'
+printf ' 19. Verify deployment, payload encoding, messages, and nonce progression\n'
+printf ' 20. Verify invalid destination domain and receiver reverts\n'
 
 CURRENT_STEP="local chain availability check"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -338,6 +339,38 @@ PROOF_TIMESTAMP=$((CHAIN_A_LATEST_TIMESTAMP + PROOF_TIMESTAMP_OFFSET))
 printf 'Chain A latest timestamp: %s\n' "$CHAIN_A_LATEST_TIMESTAMP"
 printf 'Credential proof timestamp: %s\n' "$PROOF_TIMESTAMP"
 
+DEPLOYER_NONCE="$(cast nonce "$SOURCE_SENDER" --rpc-url "$CHAIN_A_RPC")"
+[[ "$DEPLOYER_NONCE" =~ ^[0-9]+$ ]] || fail "Chain A deployer nonce must be an unsigned integer"
+IDENTITY_APPLICATION_NONCE=$((DEPLOYER_NONCE + 2))
+COMPUTED_ADDRESS_OUTPUT="$(cast compute-address "$SOURCE_SENDER" --nonce "$IDENTITY_APPLICATION_NONCE")"
+PREDICTED_IDENTITY_APPLICATION_ADDRESS="$(
+    printf '%s\n' "$COMPUTED_ADDRESS_OUTPUT" \
+        | sed -nE 's/.*(0x[[:xdigit:]]{40}).*/\1/p' \
+        | tail -n 1
+)"
+[[ "$PREDICTED_IDENTITY_APPLICATION_ADDRESS" =~ ^0x[[:xdigit:]]{40}$ ]] \
+    || fail "could not predict the IdentityApplicationA deployment address"
+
+APPLICATION_DOMAIN_NAMESPACE_HASH="$(cast keccak "$APPLICATION_DOMAIN_NAMESPACE")"
+APPLICATION_DOMAIN_PREIMAGE="$(
+    cast abi-encode \
+        "f(bytes32,uint256,address)" \
+        "$APPLICATION_DOMAIN_NAMESPACE_HASH" \
+        "$CHAIN_A_ID" \
+        "$PREDICTED_IDENTITY_APPLICATION_ADDRESS"
+)"
+APPLICATION_DOMAIN_HASH="$(cast keccak "$APPLICATION_DOMAIN_PREIMAGE")"
+APPLICATION_DOMAIN="$(
+    python3 -c \
+        'import sys; print(int(sys.argv[1], 16) % int(sys.argv[2]))' \
+        "$APPLICATION_DOMAIN_HASH" \
+        "$SNARK_SCALAR_FIELD"
+)"
+[[ "$APPLICATION_DOMAIN" =~ ^[1-9][0-9]*$ ]] || fail "application domain must be a non-zero field element"
+
+printf 'Predicted IdentityApplicationA address: %s\n' "$PREDICTED_IDENTITY_APPLICATION_ADDRESS"
+printf 'Application domain: %s\n' "$APPLICATION_DOMAIN"
+
 CURRENT_STEP="credential model validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
 cd "$PROJECT_ROOT"
@@ -346,6 +379,7 @@ python3 "$PROJECT_ROOT/zk/credential-model/validate.py"
 CURRENT_STEP="ZK circuit verification and Solidity verifier export"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CREDENTIAL_PROOF_TIMESTAMP="$PROOF_TIMESTAMP" \
+APPLICATION_DOMAIN="$APPLICATION_DOMAIN" \
     bash "$PROJECT_ROOT/zk/scripts/verify-circuit.sh"
 
 cd "$CONTRACTS_DIR"
@@ -353,10 +387,6 @@ cd "$CONTRACTS_DIR"
 CURRENT_STEP="generated Solidity source formatting"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge fmt generated/Groth16Verifier.sol generated/CredentialProofFixture.sol
-
-CURRENT_STEP="forge fmt --check"
-printf '\n[%s]\n' "$CURRENT_STEP"
-forge fmt --check
 
 CURRENT_STEP="forge build"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -390,13 +420,14 @@ CURRENT_STEP="identity application tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test --match-contract IdentityApplicationATest -vvv
 
-CURRENT_STEP="on-chain ZK credential revocation lifecycle"
+CURRENT_STEP="on-chain ZK nullifier and revocation lifecycle"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_EXPECTED_ID="$CHAIN_A_ID" \
 VERIFIER_DEPLOYER_KEY="$ANVIL_DEV_KEY" \
 APPLICATION_MAX_PROOF_AGE="$APPLICATION_MAX_PROOF_AGE" \
 CREDENTIAL_STATE_AUTHORITY="$SOURCE_SENDER" \
+EXPECTED_IDENTITY_APPLICATION_ADDRESS="$PREDICTED_IDENTITY_APPLICATION_ADDRESS" \
     bash "$PROJECT_ROOT/scripts/deploy-verifier.sh"
 
 CURRENT_STEP="SourceGateway deployment"

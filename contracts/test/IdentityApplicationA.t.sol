@@ -5,6 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
 
 import {IdentityApplicationA} from "../src/IdentityApplicationA.sol";
+import {ICredentialVerifier} from "../src/interfaces/ICredentialVerifier.sol";
 import {MockCredentialVerifier} from "./mocks/MockCredentialVerifier.sol";
 
 contract IdentityApplicationATest is Test {
@@ -16,6 +17,12 @@ contract IdentityApplicationATest is Test {
     uint256 internal constant CURRENT_TIME = 2_000_000_000;
     uint256 internal constant ROOT_N = 111_111;
     uint256 internal constant ROOT_N_PLUS_ONE = 222_222;
+    uint256 internal constant INITIAL_POLICY_EPOCH = 1;
+    uint256 internal constant ACTION_VERIFY_SUPPLIER = 1;
+    uint256 internal constant NULLIFIER_A_EPOCH_ONE = 333_331;
+    uint256 internal constant NULLIFIER_B_EPOCH_ONE = 333_332;
+    uint256 internal constant NULLIFIER_A_EPOCH_TWO = 333_333;
+    uint256 internal constant NULLIFIER_B_EPOCH_TWO = 333_334;
     uint256 internal constant INDEXED_EVENT_TOPIC_COUNT = 3;
     address internal constant SUBMITTER = address(0xA11CE);
     address internal constant STATE_AUTHORITY = address(0xA11CE5);
@@ -23,6 +30,8 @@ contract IdentityApplicationATest is Test {
 
     MockCredentialVerifier internal verifier;
     IdentityApplicationA internal application;
+    uint256 internal proofApplicationDomain;
+    uint256 internal proofPolicyEpoch;
 
     function setUp() public {
         vm.warp(CURRENT_TIME);
@@ -31,6 +40,8 @@ contract IdentityApplicationATest is Test {
         application = new IdentityApplicationA(
             address(verifier), TRUSTED_ISSUER, REQUIRED_ROLE, MAX_PROOF_AGE, STATE_AUTHORITY, ROOT_N
         );
+        proofApplicationDomain = application.applicationDomain();
+        proofPolicyEpoch = INITIAL_POLICY_EPOCH;
     }
 
     function testConstructorConfiguration() public view {
@@ -41,6 +52,15 @@ contract IdentityApplicationATest is Test {
         assertEq(application.VERIFIED_SUPPLIER_ROLE(), REQUIRED_ROLE);
         assertEq(application.credentialStateAuthority(), STATE_AUTHORITY);
         assertEq(application.credentialStateRoot(), ROOT_N);
+        assertEq(application.currentPolicyEpoch(), application.INITIAL_POLICY_EPOCH());
+        assertEq(application.ACTION_VERIFY_SUPPLIER(), 1);
+
+        uint256 expectedApplicationDomain = uint256(
+            keccak256(
+                abi.encode(application.APPLICATION_DOMAIN_NAMESPACE(), block.chainid, address(application))
+            )
+        ) % application.SNARK_SCALAR_FIELD();
+        assertEq(application.applicationDomain(), expectedApplicationDomain);
     }
 
     function testCommitmentStartsUnverified() public view {
@@ -49,6 +69,7 @@ contract IdentityApplicationATest is Test {
             uint256(IdentityApplicationA.AuthorizationStatus.UNVERIFIED)
         );
         assertFalse(application.isVerifiedSupplier(CREDENTIAL_COMMITMENT));
+        assertFalse(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
     }
 
     function testRejectsZeroVerifierAddress() public {
@@ -89,22 +110,32 @@ contract IdentityApplicationATest is Test {
             uint256(IdentityApplicationA.AuthorizationStatus.VERIFIED_SUPPLIER)
         );
         assertTrue(application.isVerifiedSupplier(CREDENTIAL_COMMITMENT));
+        assertTrue(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
     }
 
-    function testEmitsSupplierVerified() public {
+    function testEmitsNullifierConsumedAndSupplierVerified() public {
         vm.recordLogs();
         vm.prank(SUBMITTER);
         _verifySupplier(CREDENTIAL_COMMITMENT, TRUSTED_ISSUER, REQUIRED_ROLE, CURRENT_TIME);
 
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
-        assertEq(logs.length, 1);
+        assertEq(logs.length, 2);
         assertEq(logs[0].emitter, address(application));
         assertEq(logs[0].topics.length, INDEXED_EVENT_TOPIC_COUNT);
-        assertEq(logs[0].topics[0], IdentityApplicationA.SupplierVerified.selector);
-        assertEq(logs[0].topics[1], bytes32(CREDENTIAL_COMMITMENT));
-        assertEq(logs[0].topics[2], bytes32(uint256(uint160(SUBMITTER))));
-        assertEq(abi.decode(logs[0].data, (uint256)), CURRENT_TIME);
+        assertEq(logs[0].topics[0], IdentityApplicationA.NullifierConsumed.selector);
+        assertEq(logs[0].topics[1], bytes32(NULLIFIER_A_EPOCH_ONE));
+        assertEq(logs[0].topics[2], bytes32(CREDENTIAL_COMMITMENT));
+        (uint256 policyEpoch, uint256 actionContext) = abi.decode(logs[0].data, (uint256, uint256));
+        assertEq(policyEpoch, application.INITIAL_POLICY_EPOCH());
+        assertEq(actionContext, application.ACTION_VERIFY_SUPPLIER());
+
+        assertEq(logs[1].emitter, address(application));
+        assertEq(logs[1].topics.length, INDEXED_EVENT_TOPIC_COUNT);
+        assertEq(logs[1].topics[0], IdentityApplicationA.SupplierVerified.selector);
+        assertEq(logs[1].topics[1], bytes32(CREDENTIAL_COMMITMENT));
+        assertEq(logs[1].topics[2], bytes32(uint256(uint160(SUBMITTER))));
+        assertEq(abi.decode(logs[1].data, (uint256)), CURRENT_TIME);
     }
 
     function testRejectsVerifierFailureAndLeavesStatusUnchanged() public {
@@ -117,6 +148,7 @@ contract IdentityApplicationATest is Test {
             uint256(application.authorizationStatus(CREDENTIAL_COMMITMENT)),
             uint256(IdentityApplicationA.AuthorizationStatus.UNVERIFIED)
         );
+        assertFalse(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
     }
 
     function testRejectsWrongIssuerBeforeVerifierCall() public {
@@ -124,6 +156,8 @@ contract IdentityApplicationATest is Test {
         vm.expectRevert(IdentityApplicationA.InvalidIssuerPolicy.selector);
 
         _verifySupplier(CREDENTIAL_COMMITMENT, TRUSTED_ISSUER + 1, REQUIRED_ROLE, CURRENT_TIME);
+
+        assertFalse(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
     }
 
     function testRejectsWrongRoleBeforeVerifierCall() public {
@@ -131,18 +165,24 @@ contract IdentityApplicationATest is Test {
         vm.expectRevert(IdentityApplicationA.InvalidRolePolicy.selector);
 
         _verifySupplier(CREDENTIAL_COMMITMENT, TRUSTED_ISSUER, 2, CURRENT_TIME);
+
+        assertFalse(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
     }
 
     function testRejectsFutureProofTimestamp() public {
         vm.expectRevert(IdentityApplicationA.FutureProofTimestamp.selector);
 
         _verifySupplier(CREDENTIAL_COMMITMENT, TRUSTED_ISSUER, REQUIRED_ROLE, CURRENT_TIME + 1);
+
+        assertFalse(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
     }
 
     function testRejectsStaleProofTimestamp() public {
         vm.expectRevert(IdentityApplicationA.StaleProofTimestamp.selector);
 
         _verifySupplier(CREDENTIAL_COMMITMENT, TRUSTED_ISSUER, REQUIRED_ROLE, CURRENT_TIME - MAX_PROOF_AGE - 1);
+
+        assertFalse(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
     }
 
     function testRejectsProofForNonCurrentCredentialStateRoot() public {
@@ -154,6 +194,7 @@ contract IdentityApplicationATest is Test {
             uint256(application.authorizationStatus(CREDENTIAL_COMMITMENT)),
             uint256(IdentityApplicationA.AuthorizationStatus.UNVERIFIED)
         );
+        assertFalse(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
     }
 
     function testAcceptsProofAtMaximumAge() public {
@@ -165,14 +206,138 @@ contract IdentityApplicationATest is Test {
         );
     }
 
-    function testDuplicateValidProofIsIdempotent() public {
+    function testDuplicateValidProofIsRejectedByNullifier() public {
         _verifySupplier(CREDENTIAL_COMMITMENT, TRUSTED_ISSUER, REQUIRED_ROLE, CURRENT_TIME);
+        vm.expectRevert(IdentityApplicationA.NullifierAlreadyUsed.selector);
         _verifySupplier(CREDENTIAL_COMMITMENT, TRUSTED_ISSUER, REQUIRED_ROLE, CURRENT_TIME);
 
         assertEq(
             uint256(application.authorizationStatus(CREDENTIAL_COMMITMENT)),
             uint256(IdentityApplicationA.AuthorizationStatus.VERIFIED_SUPPLIER)
         );
+        assertTrue(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
+    }
+
+    function testWrongApplicationDomainDoesNotConsumeNullifier() public {
+        vm.expectRevert(IdentityApplicationA.InvalidApplicationDomain.selector);
+
+        _verifySupplierWithContext(
+            CREDENTIAL_COMMITMENT,
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            CURRENT_TIME,
+            ROOT_N,
+            proofApplicationDomain + 1,
+            proofPolicyEpoch,
+            ACTION_VERIFY_SUPPLIER,
+            NULLIFIER_A_EPOCH_ONE
+        );
+
+        assertFalse(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
+    }
+
+    function testWrongPolicyEpochDoesNotConsumeNullifier() public {
+        vm.expectRevert(IdentityApplicationA.InvalidPolicyEpoch.selector);
+
+        _verifySupplierWithContext(
+            CREDENTIAL_COMMITMENT,
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            CURRENT_TIME,
+            ROOT_N,
+            proofApplicationDomain,
+            proofPolicyEpoch + 1,
+            ACTION_VERIFY_SUPPLIER,
+            NULLIFIER_A_EPOCH_TWO
+        );
+
+        assertFalse(application.usedNullifiers(NULLIFIER_A_EPOCH_TWO));
+    }
+
+    function testWrongActionContextDoesNotConsumeNullifier() public {
+        vm.expectRevert(IdentityApplicationA.InvalidActionContext.selector);
+
+        _verifySupplierWithContext(
+            CREDENTIAL_COMMITMENT,
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            CURRENT_TIME,
+            ROOT_N,
+            proofApplicationDomain,
+            proofPolicyEpoch,
+            ACTION_VERIFY_SUPPLIER + 1,
+            NULLIFIER_A_EPOCH_ONE
+        );
+
+        assertFalse(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
+    }
+
+    function testOutOfFieldNullifierIsRejectedWithoutConsumption() public {
+        uint256 outOfFieldNullifier = application.SNARK_SCALAR_FIELD();
+        vm.expectRevert(IdentityApplicationA.InvalidNullifier.selector);
+
+        _verifySupplierWithContext(
+            CREDENTIAL_COMMITMENT,
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            CURRENT_TIME,
+            ROOT_N,
+            proofApplicationDomain,
+            proofPolicyEpoch,
+            ACTION_VERIFY_SUPPLIER,
+            outOfFieldNullifier
+        );
+
+        assertFalse(application.usedNullifiers(outOfFieldNullifier));
+    }
+
+    function testUnauthorizedPolicyEpochAdvanceIsRejected() public {
+        vm.prank(UNAUTHORIZED_CALLER);
+        vm.expectRevert(IdentityApplicationA.UnauthorizedPolicyEpochAuthority.selector);
+        application.advancePolicyEpoch();
+
+        assertEq(application.currentPolicyEpoch(), application.INITIAL_POLICY_EPOCH());
+    }
+
+    function testAuthorizedPolicyEpochAdvancesAndEmitsEvent() public {
+        vm.recordLogs();
+        vm.prank(STATE_AUTHORITY);
+        application.advancePolicyEpoch();
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(application.currentPolicyEpoch(), application.INITIAL_POLICY_EPOCH() + 1);
+        assertEq(logs.length, 1);
+        assertEq(logs[0].emitter, address(application));
+        assertEq(logs[0].topics.length, INDEXED_EVENT_TOPIC_COUNT);
+        assertEq(logs[0].topics[0], IdentityApplicationA.PolicyEpochAdvanced.selector);
+        assertEq(logs[0].topics[1], bytes32(application.INITIAL_POLICY_EPOCH()));
+        assertEq(logs[0].topics[2], bytes32(application.INITIAL_POLICY_EPOCH() + 1));
+        assertEq(logs[0].data.length, 0);
+    }
+
+    function testNewPolicyEpochAllowsDifferentNullifierAndPreservesHistory() public {
+        _verifySupplier(CREDENTIAL_COMMITMENT, TRUSTED_ISSUER, REQUIRED_ROLE, CURRENT_TIME);
+
+        vm.prank(STATE_AUTHORITY);
+        application.advancePolicyEpoch();
+        proofPolicyEpoch += 1;
+
+        _verifySupplierWithContext(
+            CREDENTIAL_COMMITMENT,
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            CURRENT_TIME,
+            ROOT_N,
+            proofApplicationDomain,
+            proofPolicyEpoch,
+            ACTION_VERIFY_SUPPLIER,
+            NULLIFIER_A_EPOCH_TWO
+        );
+
+        assertTrue(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
+        assertTrue(application.usedNullifiers(NULLIFIER_A_EPOCH_TWO));
+        assertTrue(application.isVerifiedSupplier(CREDENTIAL_COMMITMENT));
     }
 
     function testAuthorizedCredentialStateRootUpdateSucceeds() public {
@@ -227,6 +392,7 @@ contract IdentityApplicationATest is Test {
             uint256(IdentityApplicationA.AuthorizationStatus.REVOKED)
         );
         assertFalse(application.isVerifiedSupplier(CREDENTIAL_COMMITMENT));
+        assertTrue(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
         assertEq(logs.length, 2);
         assertEq(logs[1].emitter, address(application));
         assertEq(logs[1].topics.length, 2);
@@ -246,6 +412,7 @@ contract IdentityApplicationATest is Test {
             uint256(IdentityApplicationA.AuthorizationStatus.REVOKED)
         );
         assertFalse(application.isVerifiedSupplier(CREDENTIAL_COMMITMENT));
+        assertFalse(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
     }
 
     function testRevokedCredentialCannotBeReauthorizedAgainstCurrentRoot() public {
@@ -268,6 +435,8 @@ contract IdentityApplicationATest is Test {
 
         assertFalse(application.isVerifiedSupplier(CREDENTIAL_COMMITMENT));
         assertTrue(application.isVerifiedSupplier(SECOND_CREDENTIAL_COMMITMENT));
+        assertTrue(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
+        assertTrue(application.usedNullifiers(NULLIFIER_B_EPOCH_ONE));
     }
 
     function _verifySupplier(
@@ -276,7 +445,17 @@ contract IdentityApplicationATest is Test {
         uint256 proofRequiredRole,
         uint256 proofTimestamp
     ) internal {
-        _verifySupplierWithRoot(credentialCommitment, proofTrustedIssuer, proofRequiredRole, proofTimestamp, ROOT_N);
+        _verifySupplierWithContext(
+            credentialCommitment,
+            proofTrustedIssuer,
+            proofRequiredRole,
+            proofTimestamp,
+            ROOT_N,
+            proofApplicationDomain,
+            proofPolicyEpoch,
+            ACTION_VERIFY_SUPPLIER,
+            _nullifierFor(credentialCommitment, proofPolicyEpoch)
+        );
     }
 
     function _verifySupplierWithRoot(
@@ -286,16 +465,56 @@ contract IdentityApplicationATest is Test {
         uint256 proofTimestamp,
         uint256 proofCredentialStateRoot
     ) internal {
-        application.verifySupplier(
-            [uint256(1), uint256(2)],
-            [[uint256(3), uint256(4)], [uint256(5), uint256(6)]],
-            [uint256(7), uint256(8)],
+        _verifySupplierWithContext(
             credentialCommitment,
             proofTrustedIssuer,
             proofRequiredRole,
             proofTimestamp,
-            proofCredentialStateRoot
+            proofCredentialStateRoot,
+            proofApplicationDomain,
+            proofPolicyEpoch,
+            ACTION_VERIFY_SUPPLIER,
+            _nullifierFor(credentialCommitment, proofPolicyEpoch)
         );
+    }
+
+    function _verifySupplierWithContext(
+        uint256 credentialCommitment,
+        uint256 proofTrustedIssuer,
+        uint256 proofRequiredRole,
+        uint256 proofTimestamp,
+        uint256 proofCredentialStateRoot,
+        uint256 proofApplicationDomain,
+        uint256 proofPolicyEpoch,
+        uint256 proofActionContext,
+        uint256 proofNullifier
+    ) internal {
+        ICredentialVerifier.CredentialPublicInputs memory publicInputs = ICredentialVerifier.CredentialPublicInputs({
+            credentialCommitment: credentialCommitment,
+            trustedIssuer: proofTrustedIssuer,
+            requiredRole: proofRequiredRole,
+            currentTimestamp: proofTimestamp,
+            credentialStateRoot: proofCredentialStateRoot,
+            applicationDomain: proofApplicationDomain,
+            policyEpoch: proofPolicyEpoch,
+            actionContext: proofActionContext,
+            nullifier: proofNullifier
+        });
+
+        application.verifySupplier(
+            [uint256(1), uint256(2)],
+            [[uint256(3), uint256(4)], [uint256(5), uint256(6)]],
+            [uint256(7), uint256(8)],
+            publicInputs
+        );
+    }
+
+    function _nullifierFor(uint256 credentialCommitment, uint256 policyEpoch) internal pure returns (uint256) {
+        if (credentialCommitment == SECOND_CREDENTIAL_COMMITMENT) {
+            return policyEpoch == 1 ? NULLIFIER_B_EPOCH_ONE : NULLIFIER_B_EPOCH_TWO;
+        }
+
+        return policyEpoch == 1 ? NULLIFIER_A_EPOCH_ONE : NULLIFIER_A_EPOCH_TWO;
     }
 
     function _revokeCredential(uint256 credentialCommitment) internal {

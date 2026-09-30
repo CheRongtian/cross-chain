@@ -1,0 +1,37 @@
+{
+  "nullifierVersion": 1,
+  "algorithm": "Poseidon",
+  "arity": 5,
+  "inputOrder": [
+    "nullifierVersion",
+    "credentialIdField",
+    "applicationDomain",
+    "policyEpoch",
+    "actionContext"
+  ],
+  "privateIdentitySource": "credentialIdField",
+  "outputRepresentation": "unsigned decimal BN254 field element",
+  "applicationDomain": {
+    "algorithm": "keccak256-abi-encode-mod-p",
+    "protocolNamespace": "cross-chain:identity-application-domain:v1",
+    "inputOrder": [
+      "protocolNamespaceHash",
+      "chainId",
+      "applicationAddress"
+    ],
+    "abiTypes": [
+      "bytes32",
+      "uint256",
+      "address"
+    ],
+    "fieldReduction": "mod-bn254-scalar-field"
+  },
+  "policyEpoch": {
+    "initialValue": 1,
+    "advancement": "increment-by-one"
+  },
+  "actionContexts": {
+    "VERIFY_SUPPLIER": 1,
+    "OTHER_TEST_ACTION": 2
+  }
+}

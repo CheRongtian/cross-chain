@@ -20,11 +20,13 @@ valid with respect to time only while `evaluationTime < expiry`.
 ## Privacy boundary
 
 All credential fields are private by default and remain with the user. The
-authorization proof publishes only `credentialCommitment`, `trustedIssuer`,
-`requiredRole`, `currentTimestamp`, and `credentialStateRoot`. Credential
-fields and Merkle paths are not placed in public chain state. The identity
-application stores authorization under the public credential commitment and
-does not expose the private subject.
+authorization proof publishes `credentialCommitment`, `trustedIssuer`,
+`requiredRole`, `currentTimestamp`, `credentialStateRoot`,
+`applicationDomain`, `policyEpoch`, `actionContext`, and `nullifier`.
+Credential fields and Merkle paths are not placed in public chain state. The
+identity application stores authorization under the public credential
+commitment and does not expose the private subject or credential identifier.
+The public commitment and the remaining public signals can still be correlated.
 
 ## Trusted issuers
 
@@ -82,6 +84,27 @@ The circuit proves a private membership path against the public current root.
 Changing a fixture from `ACTIVE` to `REVOKED` preserves its credential
 commitment and removes it from the next active-state root.
 
+## Nullifier boundary
+
+The private `credentialId` is encoded to `credentialIdField` and bound to the
+proof's public authorization context:
+
+```text
+nullifier = Poseidon(
+    1,
+    credentialIdField,
+    applicationDomain,
+    policyEpoch,
+    actionContext
+)
+```
+
+The nullifier version and ordered inputs are fixed in
+[`../nullifier.json`](../nullifier.json). A verifier can detect repeated use in
+the same application, epoch, and action without learning the credential ID.
+Changing any context component creates a different nullifier. This separation
+is intentional and means that the nullifier is not a global identifier.
+
 ## Fixtures
 
 The fixtures are synthetic and contain no real identity or secret material:
@@ -101,8 +124,9 @@ fixture, keeping validation deterministic.
 
 `validate.py` uses only the Python standard library. It checks the schema,
 canonical names and types, issuer trust fixtures, expiry semantics, role and
-revocation cases, targeted fixture differences, commitment encoding, and the
-active credential-state tree configuration.
+revocation cases, targeted fixture differences, commitment encoding, the
+active credential-state tree configuration, the nullifier definition, and its
+shared context-relation vectors.
 
 ## Deferred work
 
@@ -111,5 +135,5 @@ The following capabilities are intentionally absent:
 - trusted issuer registry
 - automatic expiry of stored authorization
 - decentralized credential-state root publication or governance
-- nullifiers and anonymous replay protection
+- anonymous unlinkability for the public commitment and other public signals
 - SourceGateway authorization integration

@@ -8,6 +8,7 @@ import {
   encodeString,
   requireCondition,
 } from "./credential-state.mjs";
+import { computeNullifier, resolveActionContext } from "./nullifier.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ZK_ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -21,7 +22,7 @@ async function loadJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
 }
 
-function decimalInput(encoded, commitment, policy, credentialState) {
+function decimalInput(encoded, commitment, policy, credentialState, nullifierContext) {
   return {
     subject: encoded.subject.toString(),
     issuer: encoded.issuer.toString(),
@@ -33,9 +34,23 @@ function decimalInput(encoded, commitment, policy, credentialState) {
     requiredRole: policy.requiredRole.toString(),
     currentTimestamp: policy.currentTimestamp.toString(),
     credentialStateRoot: credentialState.root.toString(),
+    applicationDomain: nullifierContext.applicationDomain.toString(),
+    policyEpoch: nullifierContext.policyEpoch.toString(),
+    actionContext: nullifierContext.actionContext.toString(),
+    nullifier: nullifierContext.nullifier.toString(),
     statePathElements: credentialState.pathElements.map(String),
     statePathIndices: credentialState.pathIndices.map(String),
   };
+}
+
+function parseFieldElement(value, fieldPrime, label) {
+  requireCondition(
+    typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value),
+    `${label} must be an unsigned decimal integer`,
+  );
+  const parsed = BigInt(value);
+  requireCondition(parsed >= 0n && parsed < fieldPrime, `${label} must fit the BN254 scalar field`);
+  return parsed;
 }
 
 function incrementField(value, fieldPrime) {
@@ -66,6 +81,7 @@ function evaluationTime(manifest) {
 async function main() {
   const encoding = await loadJson(path.join(ZK_ROOT, "encoding.json"));
   const stateConfig = await loadJson(path.join(ZK_ROOT, "credential-state.json"));
+  const nullifierConfig = await loadJson(path.join(ZK_ROOT, "nullifier.json"));
   const proofCases = await loadJson(path.join(ZK_ROOT, "proof-cases.json"));
   const manifest = await loadJson(path.join(FIXTURES_ROOT, "manifest.json"));
   const issuerDocument = await loadJson(path.join(MODEL_ROOT, "trusted-issuers.json"));
@@ -80,10 +96,32 @@ async function main() {
   );
 
   const currentTimestamp = evaluationTime(manifest);
+  const configuredApplicationDomain =
+    process.env.APPLICATION_DOMAIN ?? proofCases.defaultContext.applicationDomain;
+  const defaultContext = {
+    applicationDomain: parseFieldElement(
+      configuredApplicationDomain,
+      fieldPrime,
+      "APPLICATION_DOMAIN",
+    ),
+    policyEpoch: parseFieldElement(
+      proofCases.defaultContext.policyEpoch,
+      fieldPrime,
+      "default policyEpoch",
+    ),
+    actionContext: resolveActionContext(
+      proofCases.defaultContext.actionContext,
+      nullifierConfig,
+    ),
+  };
+
+  requireCondition(defaultContext.applicationDomain !== 0n, "applicationDomain must be non-zero");
+  requireCondition(defaultContext.policyEpoch !== 0n, "policyEpoch must be non-zero");
 
   const poseidon = await buildPoseidon();
   const fixtureCache = new Map();
   const stateCache = new Map();
+  const generatedNullifiers = new Map();
 
   async function loadFixture(fileName) {
     if (!fixtureCache.has(fileName)) {
@@ -110,6 +148,7 @@ async function main() {
     const fixture = await loadFixture(proofCase.fixture);
     const witnessCredential = { ...fixture, ...proofCase.privateOverrides };
     const policyOverrides = proofCase.policyOverrides ?? {};
+    const contextOverrides = proofCase.contextOverrides ?? {};
     const trustedIssuer = policyOverrides.trustedIssuer ?? trustedIssuers[0].issuer;
     const requiredRoleName = policyOverrides.requiredRole ?? manifest.requiredRole;
     const requiredRole = encoding.roleEncoding.values[requiredRoleName];
@@ -177,12 +216,67 @@ async function main() {
       credentialState.root = incrementField(credentialState.root, fieldPrime);
     }
 
-    const output = decimalInput(encodedWitness, commitment, policy, credentialState);
+    const nullifierContext = {
+      applicationDomain: defaultContext.applicationDomain,
+      policyEpoch:
+        contextOverrides.policyEpoch === undefined
+          ? defaultContext.policyEpoch
+          : parseFieldElement(contextOverrides.policyEpoch, fieldPrime, `${proofCase.name} policyEpoch`),
+      actionContext:
+        contextOverrides.actionContext === undefined
+          ? defaultContext.actionContext
+          : resolveActionContext(contextOverrides.actionContext, nullifierConfig),
+    };
+
+    if (contextOverrides.applicationDomainMutation === "increment") {
+      nullifierContext.applicationDomain = incrementField(
+        nullifierContext.applicationDomain,
+        fieldPrime,
+      );
+    }
+
+    requireCondition(nullifierContext.applicationDomain !== 0n, `${proofCase.name} applicationDomain is zero`);
+    requireCondition(nullifierContext.policyEpoch !== 0n, `${proofCase.name} policyEpoch is zero`);
+
+    let nullifier = computeNullifier(
+      poseidon,
+      encodedWitness.credentialId,
+      nullifierContext,
+      nullifierConfig,
+      fieldPrime,
+    );
+
+    if (proofCase.nullifierMutation === "increment") {
+      nullifier = incrementField(nullifier, fieldPrime);
+    }
+
+    const outputContext = { ...nullifierContext, nullifier };
+
+    const output = decimalInput(encodedWitness, commitment, policy, credentialState, outputContext);
     const outputPath = path.join(OUTPUT_ROOT, `${proofCase.name}.json`);
 
     await writeFile(outputPath, `${JSON.stringify(output, null, 2)}\n`, "utf8");
+    generatedNullifiers.set(proofCase.name, nullifier);
     console.log(`Prepared proof input: ${path.relative(PROJECT_ROOT, outputPath)}`);
   }
+
+  requireCondition(
+    generatedNullifiers.get("valid") === generatedNullifiers.get("valid-replay"),
+    "same credential and context must produce the same nullifier",
+  );
+  requireCondition(
+    generatedNullifiers.get("valid") !== generatedNullifiers.get("application-next-epoch"),
+    "different policy epochs must produce different nullifiers",
+  );
+  requireCondition(
+    generatedNullifiers.get("valid") !== generatedNullifiers.get("application-alternate-domain"),
+    "different application domains must produce different nullifiers",
+  );
+  requireCondition(
+    generatedNullifiers.get("valid") !== generatedNullifiers.get("application-other-action"),
+    "different action contexts must produce different nullifiers",
+  );
+  console.log("Verified proof-input nullifier determinism and context separation.");
 }
 
 await main();

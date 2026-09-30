@@ -14,11 +14,7 @@ contract MockCredentialVerifier is ICredentialVerifier {
         uint256[2] calldata,
         uint256[2][2] calldata,
         uint256[2] calldata,
-        uint256,
-        uint256,
-        uint256,
-        uint256,
-        uint256
+        CredentialPublicInputs calldata
     ) external view returns (bool) {
         return verificationResult;
     }

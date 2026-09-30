@@ -21,6 +21,11 @@
       ]
     }
   ],
+  "defaultContext": {
+    "applicationDomain": "1001",
+    "policyEpoch": "1",
+    "actionContext": "VERIFY_SUPPLIER"
+  },
   "cases": [
     {
       "name": "valid",
@@ -29,6 +34,51 @@
       "credentialState": "root-n",
       "membershipSource": "valid.json",
       "privateOverrides": {},
+      "expected": "proof-verifies"
+    },
+    {
+      "name": "valid-replay",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "expected": "proof-verifies"
+    },
+    {
+      "name": "application-next-epoch",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "contextOverrides": {
+        "policyEpoch": "2"
+      },
+      "expected": "proof-verifies"
+    },
+    {
+      "name": "application-alternate-domain",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "contextOverrides": {
+        "applicationDomainMutation": "increment"
+      },
+      "expected": "proof-verifies"
+    },
+    {
+      "name": "application-other-action",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "contextOverrides": {
+        "actionContext": "OTHER_TEST_ACTION"
+      },
       "expected": "proof-verifies"
     },
     {
@@ -100,6 +150,9 @@
       "credentialState": "root-n-plus-1",
       "membershipSource": "active-secondary.json",
       "privateOverrides": {},
+      "contextOverrides": {
+        "policyEpoch": "2"
+      },
       "expected": "proof-verifies"
     },
     {
@@ -120,6 +173,16 @@
       "membershipSource": "valid.json",
       "privateOverrides": {},
       "stateRootMutation": "increment",
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "wrong-nullifier",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "nullifierMutation": "increment",
       "expected": "witness-rejected"
     },
     {

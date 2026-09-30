@@ -59,7 +59,7 @@ verify_policy_proof() {
 }
 
 printf '\n========================================\n'
-printf 'ZK Credential State Verification\n'
+printf 'ZK Credential State and Nullifier Verification\n'
 printf '========================================\n'
 
 require_command circom
@@ -83,6 +83,7 @@ circom "$CIRCUIT_FILE" \
 
 printf '\n[prepare deterministic proof inputs]\n'
 node "$SCRIPT_DIR/build-credential-state.mjs"
+node "$SCRIPT_DIR/build-nullifier-vectors.mjs"
 node "$SCRIPT_DIR/build-inputs.mjs"
 
 POT_INITIAL="$PROVING_DIR/pot14_0000.ptau"
@@ -125,6 +126,10 @@ printf 'Verified valid credential proof.\n'
 
 verify_policy_proof "application-alternate-issuer"
 verify_policy_proof "application-auditor-role"
+verify_policy_proof "valid-replay"
+verify_policy_proof "application-next-epoch"
+verify_policy_proof "application-alternate-domain"
+verify_policy_proof "application-other-action"
 verify_policy_proof "active-secondary-current"
 
 GENERATED_VERIFIER="$GENERATED_CONTRACTS_DIR/Groth16Verifier.sol"
@@ -141,7 +146,9 @@ expect_witness_rejection "wrong-role"
 expect_witness_rejection "untrusted-issuer"
 expect_witness_rejection "wrong-merkle-path"
 expect_witness_rejection "wrong-state-root"
+expect_witness_rejection "wrong-nullifier"
 expect_witness_rejection "revoked-current"
+printf 'EXPECTED FAILURE: revoked credential remains rejected\n'
 
 TAMPERED_PUBLIC="$PROVING_DIR/public-tampered.json"
 
@@ -153,4 +160,4 @@ if "$SNARKJS" groth16 verify "$VERIFICATION_KEY" "$TAMPERED_PUBLIC" "$VALID_PROO
 fi
 
 printf 'Verified expected proof rejection: tampered public commitment\n'
-printf '\nZK CREDENTIAL STATE VERIFICATION AND SOLIDITY VERIFIER EXPORT PASSED\n'
+printf '\nZK CREDENTIAL STATE AND NULLIFIER VERIFICATION PASSED\n'
