@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Cross-Chain Protocol Verification"
+VERIFICATION_NAME="ZK Credential Revocation Lifecycle"
 
 CHAIN_A_RPC="http://127.0.0.1:4545"
 CHAIN_B_RPC="http://127.0.0.1:9545"
@@ -235,12 +235,12 @@ cleanup() {
     if [[ "$exit_code" -eq 0 ]]; then
         printf '\n========================================\n'
         printf 'VERIFICATION PASSED\n'
-        printf 'ZK Identity Authorization on Chain A\n'
+        printf '%s\n' "$VERIFICATION_NAME"
         printf '========================================\n'
     else
         printf '\n========================================\n' >&2
         printf 'VERIFICATION FAILED during: %s (exit code %s)\n' "$CURRENT_STEP" "$exit_code" >&2
-        printf 'ZK Identity Authorization on Chain A\n' >&2
+        printf '%s\n' "$VERIFICATION_NAME" >&2
         printf '========================================\n' >&2
     fi
 
@@ -253,7 +253,7 @@ trap 'exit 143' TERM
 
 printf '========================================\n'
 printf '%s\n' "$VERIFICATION_NAME"
-printf 'ZK Identity Authorization on Chain A\n'
+printf 'Cross-Chain Protocol Verification\n'
 printf '========================================\n'
 printf 'Verification time: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
 printf 'Project root: %s\n' "$PROJECT_ROOT"
@@ -284,22 +284,25 @@ fi
 printf '\nVerification steps:\n'
 printf '  1. Check or start Chain A and Chain B\n'
 printf '  2. Verify chain IDs and select the proof timestamp\n'
-printf '  3. Validate the credential model and fixtures\n'
-printf '  4. Compile the ZK circuit and verify local proof cases\n'
-printf '  5. Export the Solidity verifier and application proof fixtures\n'
-printf '  6. Format generated Solidity sources\n'
-printf '  7. forge fmt --check\n'
-printf '  8. forge build\n'
-printf '  9. forge test -vv\n'
-printf ' 10. Run focused gateway, verifier, and identity application tests\n'
-printf ' 11. Deploy the verifier, adapter, and identity application to Chain A\n'
-printf ' 12. Verify future, fresh, stale, tampered, and policy-mismatch cases\n'
-printf ' 13. Deploy SourceGateway to Chain A\n'
-printf ' 14. Verify deployment and initial state\n'
-printf ' 15. Verify payload text and payload hash\n'
-printf ' 16. Predict, send, and verify two messages\n'
-printf ' 17. Verify nonce progression\n'
-printf ' 18. Verify invalid destination domain and receiver reverts\n'
+printf '  3. Validate the credential model, fixtures, and state encoding\n'
+printf '  4. Build deterministic active-credential roots and Merkle witnesses\n'
+printf '  5. Compile the ZK circuit and verify membership and policy proof cases\n'
+printf '  6. Export the Solidity verifier and application proof fixtures\n'
+printf '  7. Format generated Solidity sources\n'
+printf '  8. forge fmt --check\n'
+printf '  9. forge build\n'
+printf ' 10. forge test -vv\n'
+printf ' 11. Run focused gateway, verifier, and identity application tests\n'
+printf ' 12. Deploy the verifier, adapter, and identity application to Chain A\n'
+printf ' 13. Verify proof freshness, tampering, and application policy rejection\n'
+printf ' 14. Authorize credential A under root N\n'
+printf ' 15. Reject unauthorized and zero-root state updates\n'
+printf ' 16. Rotate to root N+1 and revoke credential A\n'
+printf ' 17. Reject credential A proof bound to root N\n'
+printf ' 18. Authorize credential B under root N+1\n'
+printf ' 19. Deploy SourceGateway to Chain A\n'
+printf ' 20. Verify deployment, payload encoding, messages, and nonce progression\n'
+printf ' 21. Verify invalid destination domain and receiver reverts\n'
 
 CURRENT_STEP="local chain availability check"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -387,12 +390,13 @@ CURRENT_STEP="identity application tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test --match-contract IdentityApplicationATest -vvv
 
-CURRENT_STEP="on-chain ZK identity authorization"
+CURRENT_STEP="on-chain ZK credential revocation lifecycle"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_EXPECTED_ID="$CHAIN_A_ID" \
 VERIFIER_DEPLOYER_KEY="$ANVIL_DEV_KEY" \
 APPLICATION_MAX_PROOF_AGE="$APPLICATION_MAX_PROOF_AGE" \
+CREDENTIAL_STATE_AUTHORITY="$SOURCE_SENDER" \
     bash "$PROJECT_ROOT/scripts/deploy-verifier.sh"
 
 CURRENT_STEP="SourceGateway deployment"

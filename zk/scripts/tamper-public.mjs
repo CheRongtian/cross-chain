@@ -8,8 +8,10 @@ if (!inputPath || !outputPath || !scalarFieldPrime) {
 
 const publicSignals = JSON.parse(await readFile(inputPath, "utf8"));
 
-if (!Array.isArray(publicSignals) || publicSignals.length !== 4) {
-  throw new Error("expected four public signals ordered as commitment, issuer, role, timestamp");
+if (!Array.isArray(publicSignals) || publicSignals.length !== 5) {
+  throw new Error(
+    "expected five public signals ordered as commitment, issuer, role, timestamp, state root",
+  );
 }
 
 const prime = BigInt(scalarFieldPrime);

@@ -1,9 +1,33 @@
 {
+  "credentialStates": [
+    {
+      "name": "root-n",
+      "fixtures": [
+        "valid.json",
+        "active-secondary.json",
+        "expired.json",
+        "wrong-role.json",
+        "untrusted-issuer.json"
+      ]
+    },
+    {
+      "name": "root-n-plus-1",
+      "fixtures": [
+        "revoked.json",
+        "active-secondary.json",
+        "expired.json",
+        "wrong-role.json",
+        "untrusted-issuer.json"
+      ]
+    }
+  ],
   "cases": [
     {
       "name": "valid",
       "fixture": "valid.json",
       "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
       "privateOverrides": {},
       "expected": "proof-verifies"
     },
@@ -11,6 +35,8 @@
       "name": "invalid-witness",
       "fixture": "valid.json",
       "commitmentSource": "valid.json",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
       "privateOverrides": {
         "subject": "urn:cross-chain:subject:test:supplier-002"
       },
@@ -20,6 +46,8 @@
       "name": "expired",
       "fixture": "expired.json",
       "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "expired.json",
       "privateOverrides": {},
       "expected": "witness-rejected"
     },
@@ -27,6 +55,8 @@
       "name": "wrong-role",
       "fixture": "wrong-role.json",
       "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "wrong-role.json",
       "privateOverrides": {},
       "expected": "witness-rejected"
     },
@@ -34,6 +64,8 @@
       "name": "untrusted-issuer",
       "fixture": "untrusted-issuer.json",
       "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "untrusted-issuer.json",
       "privateOverrides": {},
       "expected": "witness-rejected"
     },
@@ -41,6 +73,8 @@
       "name": "application-alternate-issuer",
       "fixture": "untrusted-issuer.json",
       "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "untrusted-issuer.json",
       "privateOverrides": {},
       "policyOverrides": {
         "trustedIssuer": "urn:cross-chain:issuer:test:untrusted"
@@ -51,11 +85,51 @@
       "name": "application-auditor-role",
       "fixture": "wrong-role.json",
       "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "wrong-role.json",
       "privateOverrides": {},
       "policyOverrides": {
         "requiredRole": "AUDITOR"
       },
       "expected": "proof-verifies"
+    },
+    {
+      "name": "active-secondary-current",
+      "fixture": "active-secondary.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n-plus-1",
+      "membershipSource": "active-secondary.json",
+      "privateOverrides": {},
+      "expected": "proof-verifies"
+    },
+    {
+      "name": "wrong-merkle-path",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "stateWitnessMutation": "increment-first-path-element",
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "wrong-state-root",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "stateRootMutation": "increment",
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "revoked-current",
+      "fixture": "revoked.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n-plus-1",
+      "membershipSource": "active-secondary.json",
+      "privateOverrides": {},
+      "expected": "witness-rejected"
     }
   ]
 }

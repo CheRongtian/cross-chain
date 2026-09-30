@@ -10,6 +10,7 @@ from typing import Any
 MODEL_ROOT = Path(__file__).resolve().parent
 FIXTURES_ROOT = MODEL_ROOT / "fixtures"
 ENCODING_PATH = MODEL_ROOT.parent / "encoding.json"
+CREDENTIAL_STATE_PATH = MODEL_ROOT.parent / "credential-state.json"
 
 CANONICAL_FIELDS = ["subject", "issuer", "role", "expiry", "credentialId"]
 LIFECYCLE_FIELD = "status"
@@ -29,6 +30,7 @@ STRING_DOMAINS = {
 }
 EXPECTED_CASES = {
     "valid": set(),
+    "active-secondary": {"subject", "credentialId"},
     "expired": {"expiry"},
     "wrong-role": {"role"},
     "untrusted-issuer": {"issuer"},
@@ -93,7 +95,15 @@ def validate_model(model: dict[str, Any]) -> list[dict[str, str]]:
     revocation = model.get("revocation", {})
     require(revocation.get("field") == LIFECYCLE_FIELD, "revocation field must be status")
     require(revocation.get("states") == ["ACTIVE", "REVOKED"], "revocation states are not canonical")
-    require(revocation.get("enforcementImplemented") is False, "revocation enforcement must remain deferred")
+    require(revocation.get("enforcementImplemented") is True, "revocation enforcement must be enabled")
+    require(
+        revocation.get("mechanism") == "active-credential-state-membership",
+        "revocation must use active credential state membership",
+    )
+    require(
+        revocation.get("stateEncodingSpecification") == "../credential-state.json",
+        "credential state encoding path is not canonical",
+    )
 
     issuer_trust = model.get("issuerTrust", {})
     require(issuer_trust.get("identifierField") == "issuer", "issuer trust must use the issuer identifier")
@@ -166,6 +176,44 @@ def validate_encoding(encoding: dict[str, Any]) -> None:
     require(
         commitment.get("outputRepresentation") == "unsigned decimal BN254 field element",
         "encoded commitment output representation is not canonical",
+    )
+
+
+def validate_credential_state(state: dict[str, Any]) -> None:
+    require(state.get("stateVersion") == 1, "unsupported credential state version")
+    require(state.get("treeDepth") == 8, "credential state tree depth must be eight")
+    require(state.get("capacity") == 256, "credential state capacity must be 256")
+
+    leaf = state.get("leafEncoding", {})
+    require(leaf.get("algorithm") == "Poseidon", "active leaf must use Poseidon")
+    require(leaf.get("arity") == 2, "active leaf Poseidon arity must be two")
+    require(leaf.get("stateLeafVersion") == 1, "active leaf version must be one")
+    require(
+        leaf.get("inputOrder") == ["stateLeafVersion", "credentialCommitment"],
+        "active leaf input order is not canonical",
+    )
+
+    internal_node = state.get("internalNodeEncoding", {})
+    require(internal_node.get("algorithm") == "Poseidon", "internal nodes must use Poseidon")
+    require(internal_node.get("arity") == 2, "internal node Poseidon arity must be two")
+    require(internal_node.get("inputOrder") == ["left", "right"], "internal node order is not canonical")
+
+    require(state.get("emptyLeaf") == "0", "empty credential state leaf must be zero")
+    require(
+        state.get("emptySubtreeDerivation") == "recursively hash each pair as Poseidon(left, right)",
+        "empty subtree derivation is not canonical",
+    )
+
+    placement = state.get("leafPlacement", {})
+    require(
+        placement.get("ordering") == "ascending-numeric-credential-commitment",
+        "active commitments must use canonical numeric ordering",
+    )
+    require(placement.get("startIndex") == 0, "active credential leaves must start at index zero")
+    require(placement.get("padding") == "right-pad-with-empty-leaf", "credential state padding is not canonical")
+    require(
+        state.get("rootRepresentation") == "unsigned decimal BN254 field element",
+        "credential state root representation is not canonical",
     )
 
 
@@ -294,12 +342,14 @@ def main() -> int:
         schema = load_json(MODEL_ROOT / "credential.schema.json")
         model = load_json(MODEL_ROOT / "credential-model.json")
         encoding = load_json(ENCODING_PATH)
+        credential_state = load_json(CREDENTIAL_STATE_PATH)
         issuer_document = load_json(MODEL_ROOT / "trusted-issuers.json")
         manifest = load_json(FIXTURES_ROOT / "manifest.json")
 
         validate_schema(schema)
         commitment_fields = validate_model(model)
         validate_encoding(encoding)
+        validate_credential_state(credential_state)
         trust_by_issuer = load_issuer_trust(issuer_document)
         validate_fixtures(schema, manifest, trust_by_issuer, commitment_fields)
     except ValidationError as error:

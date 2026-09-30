@@ -10,6 +10,7 @@ interface ICredentialVerifier {
         uint256 credentialCommitment,
         uint256 trustedIssuer,
         uint256 requiredRole,
-        uint256 currentTimestamp
+        uint256 currentTimestamp,
+        uint256 credentialStateRoot
     ) external view returns (bool);
 }

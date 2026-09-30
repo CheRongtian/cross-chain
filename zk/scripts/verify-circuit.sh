@@ -59,7 +59,7 @@ verify_policy_proof() {
 }
 
 printf '\n========================================\n'
-printf 'Minimal ZK Circuit Verification\n'
+printf 'ZK Credential State Verification\n'
 printf '========================================\n'
 
 require_command circom
@@ -82,18 +82,19 @@ circom "$CIRCUIT_FILE" \
     -o "$CIRCUIT_BUILD_DIR"
 
 printf '\n[prepare deterministic proof inputs]\n'
+node "$SCRIPT_DIR/build-credential-state.mjs"
 node "$SCRIPT_DIR/build-inputs.mjs"
 
-POT_INITIAL="$PROVING_DIR/pot12_0000.ptau"
-POT_CONTRIBUTED="$PROVING_DIR/pot12_0001.ptau"
-POT_FINAL="$PROVING_DIR/pot12_final.ptau"
+POT_INITIAL="$PROVING_DIR/pot14_0000.ptau"
+POT_CONTRIBUTED="$PROVING_DIR/pot14_0001.ptau"
+POT_FINAL="$PROVING_DIR/pot14_final.ptau"
 ZKEY_INITIAL="$PROVING_DIR/${CIRCUIT_NAME}_0000.zkey"
 ZKEY_FINAL="$PROVING_DIR/${CIRCUIT_NAME}_final.zkey"
 VERIFICATION_KEY="$PROVING_DIR/verification_key.json"
 
 printf '\n[create local development proving material]\n'
 printf 'This local ceremony is for development verification only and is not production trusted setup.\n'
-"$SNARKJS" powersoftau new bn128 12 "$POT_INITIAL" -v
+"$SNARKJS" powersoftau new bn128 14 "$POT_INITIAL" -v
 "$SNARKJS" powersoftau contribute \
     "$POT_INITIAL" \
     "$POT_CONTRIBUTED" \
@@ -124,6 +125,7 @@ printf 'Verified valid credential proof.\n'
 
 verify_policy_proof "application-alternate-issuer"
 verify_policy_proof "application-auditor-role"
+verify_policy_proof "active-secondary-current"
 
 GENERATED_VERIFIER="$GENERATED_CONTRACTS_DIR/Groth16Verifier.sol"
 
@@ -137,6 +139,9 @@ expect_witness_rejection "invalid-witness"
 expect_witness_rejection "expired"
 expect_witness_rejection "wrong-role"
 expect_witness_rejection "untrusted-issuer"
+expect_witness_rejection "wrong-merkle-path"
+expect_witness_rejection "wrong-state-root"
+expect_witness_rejection "revoked-current"
 
 TAMPERED_PUBLIC="$PROVING_DIR/public-tampered.json"
 
@@ -148,4 +153,4 @@ if "$SNARKJS" groth16 verify "$VERIFICATION_KEY" "$TAMPERED_PUBLIC" "$VALID_PROO
 fi
 
 printf 'Verified expected proof rejection: tampered public commitment\n'
-printf '\nZK CIRCUIT VERIFICATION AND SOLIDITY VERIFIER EXPORT PASSED\n'
+printf '\nZK CREDENTIAL STATE VERIFICATION AND SOLIDITY VERIFIER EXPORT PASSED\n'

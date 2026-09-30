@@ -63,11 +63,12 @@ library CredentialProofFixture {
         value[1] = uint256(${proofC[1]});
     }
 
-    function publicSignals() internal pure returns (uint256[4] memory value) {
+    function publicSignals() internal pure returns (uint256[5] memory value) {
         value[0] = uint256(${publicSignals[0]});
         value[1] = uint256(${publicSignals[1]});
         value[2] = uint256(${publicSignals[2]});
         value[3] = uint256(${publicSignals[3]});
+        value[4] = uint256(${publicSignals[4]});
     }
 }
 `;
@@ -97,7 +98,7 @@ async function loadSolidityCalldata(proofPath, publicPath) {
     "invalid Solidity proof B",
   );
   requireCondition(Array.isArray(proofC) && proofC.length === 2, "invalid Solidity proof C");
-  requireCondition(Array.isArray(publicSignals) && publicSignals.length === 4, "expected four public signals");
+  requireCondition(Array.isArray(publicSignals) && publicSignals.length === 5, "expected five public signals");
 
   return { proofA, proofB, proofC, publicSignals };
 }
@@ -122,6 +123,7 @@ async function main() {
     ["wrong-trusted-issuer", 1],
     ["wrong-required-role", 2],
     ["wrong-current-timestamp", 3],
+    ["wrong-credential-state-root", 4],
   ];
 
   for (const [name, index] of publicCases) {
@@ -130,7 +132,11 @@ async function main() {
     await writeCalldata(name, proofA, proofB, proofC, modifiedSignals);
   }
 
-  for (const name of ["application-alternate-issuer", "application-auditor-role"]) {
+  for (const name of [
+    "application-alternate-issuer",
+    "application-auditor-role",
+    "active-secondary-current",
+  ]) {
     const proofPath = path.join(PROVING_DIR, `${name}-proof.json`);
     const publicPath = path.join(PROVING_DIR, `${name}-public.json`);
     const calldata = await loadSolidityCalldata(proofPath, publicPath);

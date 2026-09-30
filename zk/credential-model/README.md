@@ -21,9 +21,10 @@ valid with respect to time only while `evaluationTime < expiry`.
 
 All credential fields are private by default and remain with the user. The
 authorization proof publishes only `credentialCommitment`, `trustedIssuer`,
-`requiredRole`, and `currentTimestamp`. Credential fields are not placed in
-public chain state. The identity application stores authorization under the
-public credential commitment and does not expose the private subject.
+`requiredRole`, `currentTimestamp`, and `credentialStateRoot`. Credential
+fields and Merkle paths are not placed in public chain state. The identity
+application stores authorization under the public credential commitment and
+does not expose the private subject.
 
 ## Trusted issuers
 
@@ -68,14 +69,26 @@ The lifecycle representation has two states:
 - `ACTIVE`
 - `REVOKED`
 
-This representation allows fixtures to describe credential state. It does not
-enforce revocation and does not define a registry, tree, root, or proof.
+Revocation is represented by absence from the active-credential set. The
+deterministic tree definition lives in [`../credential-state.json`](../credential-state.json):
+
+- fixed depth `8` and capacity `256`;
+- active leaf `Poseidon(1, credentialCommitment)`;
+- internal node `Poseidon(left, right)`;
+- zero empty leaves with recursively hashed empty subtrees;
+- active commitments sorted numerically and placed from the leftmost leaf.
+
+The circuit proves a private membership path against the public current root.
+Changing a fixture from `ACTIVE` to `REVOKED` preserves its credential
+commitment and removes it from the next active-state root.
 
 ## Fixtures
 
 The fixtures are synthetic and contain no real identity or secret material:
 
 - `valid.json`: active, unexpired, expected role, trusted issuer.
+- `active-secondary.json`: a different active supplier that remains present
+  after the first credential is revoked.
 - `expired.json`: differs from valid only in `expiry`.
 - `wrong-role.json`: differs from valid only in `role`.
 - `untrusted-issuer.json`: differs from valid only in `issuer`.
@@ -88,15 +101,15 @@ fixture, keeping validation deterministic.
 
 `validate.py` uses only the Python standard library. It checks the schema,
 canonical names and types, issuer trust fixtures, expiry semantics, role and
-revocation cases, targeted fixture differences, and the selected field and
-commitment encoding.
+revocation cases, targeted fixture differences, commitment encoding, and the
+active credential-state tree configuration.
 
 ## Deferred work
 
 The following capabilities are intentionally absent:
 
 - trusted issuer registry
-- revocation enforcement, revocation trees, and revocation roots
-- automatic expiry or revocation of stored authorization
+- automatic expiry of stored authorization
+- decentralized credential-state root publication or governance
 - nullifiers and anonymous replay protection
 - SourceGateway authorization integration

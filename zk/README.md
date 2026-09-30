@@ -14,7 +14,9 @@ The prover demonstrates all of the following in one circuit:
 - the private issuer equals the public `trustedIssuer` selected by policy;
 - the private role equals the public `requiredRole` selected by policy;
 - the credential is unexpired under the strict rule
-  `currentTimestamp < expiry`.
+  `currentTimestamp < expiry`;
+- the active leaf derived from `credentialCommitment` belongs to the public
+  `credentialStateRoot` through the private Merkle path.
 
 Issuer trust is an external policy decision. Equality with `trustedIssuer`
 shows that the committed issuer matches that policy value; this circuit does
@@ -29,6 +31,8 @@ Private witness inputs:
 - `role`
 - `expiry`
 - `credentialId`
+- `statePathElements[8]`
+- `statePathIndices[8]`
 
 Public inputs, in circuit order:
 
@@ -36,6 +40,7 @@ Public inputs, in circuit order:
 - `trustedIssuer`
 - `requiredRole`
 - `currentTimestamp`
+- `credentialStateRoot`
 
 The circuit range-constrains `expiry` and `currentTimestamp` to unsigned
 64-bit values before applying the strict comparison.
@@ -58,6 +63,19 @@ Poseidon(1, subjectField, issuerField, roleField, expiry, credentialIdField)
 The leading `1` is the commitment preimage version. Commitment and all circuit
 inputs are serialized as unsigned decimal field elements in generated JSON.
 
+## Active credential state
+
+[`credential-state.json`](credential-state.json) defines a fixed-depth tree of
+256 leaves. Active credential commitments are sorted numerically, placed from
+the leftmost leaf, and right-padded with zero leaves. An occupied leaf is
+`Poseidon(1, credentialCommitment)` and every parent is
+`Poseidon(left, right)`.
+
+`scripts/build-credential-state.mjs` creates deterministic Root N and Root N+1
+artifacts. Credential A is active under Root N and removed from Root N+1;
+credential B remains active and receives a valid Root N+1 membership witness.
+Reversing fixture input order is checked to produce the same root.
+
 ## Verification cases
 
 [`proof-cases.json`](proof-cases.json) defines deterministic synthetic cases:
@@ -69,6 +87,10 @@ inputs are serialized as unsigned decimal field elements in generated JSON.
 - an expired credential is rejected;
 - a credential with the wrong role is rejected;
 - a credential from a different issuer is rejected;
+- an invalid Merkle path is rejected;
+- a valid path paired with the wrong public root is rejected;
+- the revoked credential cannot satisfy membership under Root N+1;
+- the unaffected credential produces a valid proof under Root N+1;
 - changing the public commitment after proof generation makes verification
   fail.
 
@@ -89,6 +111,7 @@ The Solidity public-signal order is:
 [1] trustedIssuer
 [2] requiredRole
 [3] currentTimestamp
+[4] credentialStateRoot
 ```
 
 `contracts/src/CredentialVerifier.sol` converts its named policy arguments into
@@ -97,9 +120,11 @@ proof context and is not compared with `block.timestamp` by this adapter.
 
 `contracts/src/IdentityApplicationA.sol` selects a trusted issuer and the
 `VERIFIED_SUPPLIER` role, applies a proof freshness window against
-`block.timestamp`, and records successful authorization by public credential
-commitment. The circuit does not bind its private subject to an EVM account,
-so application authorization is not keyed by the transaction submitter.
+`block.timestamp`, accepts only the current credential-state root, and records
+successful authorization by public credential commitment. Its root authority
+can rotate the root and mark commitments revoked in one transaction. The
+circuit does not bind its private subject to an EVM account, so application
+authorization is not keyed by the transaction submitter.
 
 ## Running verification
 
@@ -124,7 +149,7 @@ production trusted setup.
 ## Deliberately absent
 
 - issuer signature verification and issuer registry management
-- revocation enforcement, trees, and roots
 - nullifiers and anonymous replay protection
-- automatic expiry or revocation of stored application authorization
+- automatic expiry of stored application authorization
+- decentralized credential-state root publication or governance
 - SourceGateway authorization integration

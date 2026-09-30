@@ -1,26 +1,28 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain messaging and zero-knowledge credential authorization. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, and an application that records verified supplier authorization.
+This repository is a prototype for canonical cross-chain messaging and zero-knowledge credential authorization with revocation. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, and an application that records and revokes supplier authorization.
 
 The current implementation can:
 
 - produce deterministic message identifiers that can be reproduced across implementations;
 - emit complete canonical message data from a source-chain gateway;
 - run and verify two independent local Anvil chains;
-- describe private credentials, issuer trust, roles, expiry, and revocation status;
-- commit to credential fields and prove that a credential satisfies issuer, role, and expiry policies;
+- describe private credentials, issuer trust, roles, expiry, and active or revoked lifecycle state;
+- build deterministic Poseidon Merkle roots for active credentials;
+- commit to credential fields and prove issuer, role, expiry, and active-state membership in one circuit;
 - verify a valid proof and reject an invalid witness, expired credential, wrong role, untrusted issuer, or tampered public input;
 - generate a Solidity verifier from the active Groth16 proving key and verify the same proof on Chain A;
-- enforce a fixed issuer, the `VERIFIED_SUPPLIER` role, and proof freshness in `IdentityApplicationA`;
-- store supplier authorization by public credential commitment without publishing private credential fields.
+- enforce a fixed issuer, the `VERIFIED_SUPPLIER` role, proof freshness, and the current credential-state root in `IdentityApplicationA`;
+- rotate the accepted root through an explicit authority and remove effective authorization for revoked commitments;
+- preserve authorization for an unaffected active credential across a root rotation.
 
 ## Architecture
 
 ```text
                                   ┌──────────────────────────┐
 Private credential ──> encoding ─>│ CredentialAuthorization  │
-                                  │ Circom + Poseidon        │
-Public proof context ─────────────>│ Groth16 / BN254          │ ──> proof + public signals
+Active-set Merkle path ──────────>│ Circom + Poseidon        │
+Public policy + state root ──────>│ Groth16 / BN254          │ ──> proof + public signals
                                   └──────────────────────────┘              │
                                                                             v
                                                          Solidity verifier on Chain A
@@ -32,7 +34,9 @@ Public proof context ─────────────>│ Groth16 / BN254
                                                          IdentityApplicationA policy
                                                                             │
                                                                             v
-                                                         commitment => VERIFIED_SUPPLIER
+                                                         commitment => UNVERIFIED /
+                                                                       VERIFIED_SUPPLIER /
+                                                                       REVOKED
 
 Caller ──> SourceGateway on Chain A ──> CrossChainMessage event
                                                     │
@@ -104,7 +108,7 @@ A credential contains the following canonical fields:
 | `expiry` | uint64 Unix seconds | Credential expiry time |
 | `credentialId` | UTF-8 string | Unique credential identifier |
 
-A credential also has an external lifecycle status of `ACTIVE` or `REVOKED`. Status is excluded from the credential commitment, and the current circuit does not enforce revocation.
+A credential also has an external lifecycle status of `ACTIVE` or `REVOKED`. Status is excluded from the credential commitment so that revoking a credential preserves its identifier. Revocation is enforced by proving membership in the current active-credential Merkle root.
 
 ### Field encoding
 
@@ -140,6 +144,16 @@ Poseidon(
 
 The leading `1` is the commitment preimage version. The output is serialized as an unsigned decimal BN254 scalar-field element.
 
+### Active credential state
+
+`zk/credential-state.json` defines a fixed-depth Poseidon Merkle tree with 256 leaves. Active credential commitments are sorted numerically and placed from the leftmost leaf. Each occupied leaf is:
+
+```text
+Poseidon(1, credentialCommitment)
+```
+
+Unused leaves are `0`, every parent is `Poseidon(left, right)`, and empty space is right-padded. This gives the same root for the same active set regardless of fixture insertion order. Removing credential A creates Root N+1, while an unaffected credential B receives a valid membership path under the new root.
+
 ### Circuit statement
 
 `zk/circuits/CredentialAuthorization.circom` proves that:
@@ -148,7 +162,8 @@ The leading `1` is the commitment preimage version. The output is serialized as 
 - the private `issuer` equals the public policy value `trustedIssuer`;
 - the private `role` equals the public policy value `requiredRole`;
 - `currentTimestamp < expiry`;
-- `currentTimestamp` and `expiry` both fit in uint64.
+- `currentTimestamp` and `expiry` both fit in uint64;
+- the active leaf derived from `credentialCommitment` belongs to the public `credentialStateRoot`.
 
 Private witness inputs:
 
@@ -158,6 +173,8 @@ issuer
 role
 expiry
 credentialId
+statePathElements[8]
+statePathIndices[8]
 ```
 
 Public inputs, in circuit order:
@@ -167,6 +184,7 @@ credentialCommitment
 trustedIssuer
 requiredRole
 currentTimestamp
+credentialStateRoot
 ```
 
 Issuer trust remains an external policy decision. The circuit proves that the committed issuer matches the supplied public policy value. It does not verify an issuer signature or query an issuer registry.
@@ -182,7 +200,7 @@ verifyProof(
     uint256[2] proofA,
     uint256[2][2] proofB,
     uint256[2] proofC,
-    uint256[4] publicSignals
+    uint256[5] publicSignals
 ) returns (bool)
 ```
 
@@ -193,6 +211,7 @@ verifyProof(
 [1] trustedIssuer
 [2] requiredRole
 [3] currentTimestamp
+[4] credentialStateRoot
 ```
 
 Proof coordinates are converted with snarkjs `groth16.exportSolidityCallData`, including the required G2 coordinate ordering. The same generated calldata is used by Forge tests and Chain A integration verification.
@@ -208,9 +227,11 @@ The Solidity verifier establishes that a Groth16 proof is valid for the supplied
 - the credential verifier address;
 - one trusted issuer field value;
 - the required role, fixed to the existing `VERIFIED_SUPPLIER = 1` encoding;
-- a non-zero maximum proof age.
+- a non-zero maximum proof age;
+- a non-zero credential-state authority;
+- a non-zero initial credential-state root.
 
-`verifySupplier` accepts the same proof coordinates and four public values used by the credential verifier. Before calling the verifier, the application requires the proof issuer and role to equal its deployment policy, rejects timestamps later than `block.timestamp`, and rejects timestamps older than `maxProofAge`. A successful verification sets:
+`verifySupplier` accepts the same proof coordinates and five public values used by the credential verifier. Before calling the verifier, the application requires the proof issuer and role to equal its deployment policy, rejects timestamps later than `block.timestamp`, rejects timestamps older than `maxProofAge`, requires the proof root to equal the current application root, and rejects commitments already marked `REVOKED`. A successful verification sets:
 
 ```text
 authorizationStatus[credentialCommitment] = VERIFIED_SUPPLIER
@@ -218,7 +239,9 @@ authorizationStatus[credentialCommitment] = VERIFIED_SUPPLIER
 
 Authorization is keyed by the public `credentialCommitment`. The current circuit proves knowledge of a private credential subject but does not bind that subject to an EVM address, so submitting a proof does not grant account-level authorization to `msg.sender`. The `SupplierVerified` event contains only the commitment, transaction submitter, and proof timestamp; it contains no private credential fields.
 
-Submitting the same valid proof again leaves the commitment in the same state. This idempotent behavior does not provide a nullifier or anonymous replay protection. Freshness is checked when a proof is submitted; stored `VERIFIED_SUPPLIER` state does not automatically expire or revoke after `maxProofAge` elapses.
+The credential-state authority calls `updateCredentialStateRoot` with a new non-zero root and the commitments revoked by that transition. The update changes the accepted root and marks those commitments `REVOKED` in one transaction. `isVerifiedSupplier` then returns `false` for a previously verified revoked commitment. Proofs bound to the old root are rejected, while an unaffected credential can authorize under the new root.
+
+Submitting the same valid proof again leaves the commitment in the same state. This idempotent behavior does not provide a nullifier or anonymous replay protection. Freshness is checked when a proof is submitted; stored `VERIFIED_SUPPLIER` state does not automatically expire when `maxProofAge` elapses, while an authority root update can explicitly revoke it.
 
 ## Local Two-Chain Environment
 
@@ -318,7 +341,7 @@ Run from the repository root:
 python3 zk/credential-model/validate.py
 ```
 
-The validator checks the schema, field names and order, data types, issuer trust fixtures, expiry semantics, role cases, revocation status, and commitment encoding configuration.
+The validator checks the schema, field names and order, data types, issuer trust fixtures, expiry semantics, role cases, revocation status, commitment encoding, and credential-state tree configuration.
 
 ### ZK circuit
 
@@ -331,11 +354,13 @@ bash zk/scripts/verify-circuit.sh
 The script:
 
 - compiles `CredentialAuthorization.circom`;
+- builds deterministic Root N and Root N+1 active-credential states and Merkle witnesses;
 - prepares deterministic test inputs;
 - creates Powers of Tau and Groth16 proving material for local verification only;
 - generates and verifies a proof for the valid credential;
 - generates valid alternate-issuer and `AUDITOR` proofs for application policy checks;
-- confirms rejection of an invalid witness, expired credential, wrong role, and untrusted issuer;
+- confirms rejection of an invalid credential witness, expired credential, wrong role, untrusted issuer, invalid Merkle path, wrong root, and revoked credential under the current root;
+- generates a valid credential B proof under Root N+1;
 - confirms that the original proof fails after its public commitment is changed;
 - exports the Solidity Groth16 verifier from the active zkey;
 - generates a Solidity proof fixture and Chain A calldata through the snarkjs calldata converter.
@@ -354,16 +379,18 @@ The script uses strict error handling and performs:
 
 1. local-chain availability and chain ID checks;
 2. selection of a proof timestamp relative to the current Chain A block;
-3. credential model and fixture validation;
-4. ZK circuit compilation and positive and negative local proof verification;
+3. credential model, fixture, and state-tree configuration validation;
+4. deterministic Root N and Root N+1 construction, followed by ZK circuit compilation and positive and negative local proof verification;
 5. Solidity verifier export and proof-fixture generation;
 6. Solidity formatting, build, and tests against the real generated verifier;
 7. focused canonical-message, credential-verifier, and identity-application tests;
 8. deployment of the generated verifier, credential adapter, and identity application to Chain A;
-9. valid on-chain proof verification and supplier authorization;
-10. rejection of future, stale, tampered, alternate-issuer, and alternate-role submissions;
-11. confirmation that stored authorization remains after the proof becomes stale;
-12. `SourceGateway` deployment and existing cross-chain message verification.
+9. valid on-chain proof verification and credential A authorization under Root N;
+10. rejection of future, stale, tampered, alternate-issuer, alternate-role, and non-current-root submissions;
+11. rejection of unauthorized and zero-root credential-state updates;
+12. rotation to Root N+1, revocation of credential A, and rejection of A's old-root proof;
+13. authorization and retained active status for credential B under Root N+1;
+14. `SourceGateway` deployment and existing cross-chain message verification.
 
 If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
 
@@ -377,7 +404,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-ZK Identity Authorization on Chain A
+ZK Credential Revocation Lifecycle
 ```
 
 ### Expected error output
@@ -393,10 +420,12 @@ FutureProofTimestamp
 InvalidCredentialProof
 InvalidIssuerPolicy
 InvalidRolePolicy
+InvalidCredentialStateRoot
+UnauthorizedCredentialStateAuthority
 StaleProofTimestamp
 ```
 
-These messages demonstrate that the contracts reject invalid destinations, the circuit rejects invalid witnesses, a proof cannot be reused with a tampered public input, and the identity application enforces its policy and freshness window. Each expected failure is followed by `Verified rejection` or `Verified expected ... rejection`. Complete verification succeeds only when the script exits with code `0` and the log ends with `VERIFICATION PASSED`.
+These messages demonstrate that the contracts reject invalid destinations, the circuit rejects invalid witnesses, a proof cannot be reused with a tampered public input, and the identity application enforces policy, freshness, state-root authority, and revocation. Each expected failure is followed by `Verified rejection` or `Verified expected ... rejection`. Complete verification succeeds only when the script exits with code `0` and the log ends with `VERIFICATION PASSED`.
 
 The on-chain negative cases normally return `false` and are reported as `Verified expected on-chain rejection`. A successful result for any modified proof or public policy value fails the complete verification.
 
@@ -436,10 +465,13 @@ Cross-Chain/
 │   │   ├── trusted-issuers.json
 │   │   └── validate.py
 │   ├── scripts/
+│   │   ├── build-credential-state.mjs
 │   │   ├── build-inputs.mjs
 │   │   ├── build-solidity-fixtures.mjs
+│   │   ├── credential-state.mjs
 │   │   ├── tamper-public.mjs
 │   │   └── verify-circuit.sh
+│   ├── credential-state.json
 │   ├── encoding.json
 │   ├── proof-cases.json
 │   ├── package.json
@@ -456,10 +488,10 @@ Cross-Chain/
 - The Solidity verifier validates proofs for supplied public signals; `IdentityApplicationA` selects the issuer and role policy it accepts.
 - The credential adapter does not compare the public timestamp with chain time; `IdentityApplicationA` enforces this check for its authorization entry point.
 - Authorization belongs to a credential commitment because the circuit does not bind its private subject to `msg.sender`.
-- Stored authorization does not automatically expire or revoke when the proof freshness window passes.
-- Revocation is not enforced by the circuit, and no revocation tree or on-chain revocation registry exists.
+- Stored authorization does not automatically expire when the proof freshness window passes.
+- Revocation uses membership in a deterministic active-credential root and an explicit Chain A root authority. The authority is responsible for publishing a root and revoked-commitment list that describe the same transition.
 - The repository does not provide nullifiers or anonymous replay protection.
 - `SourceGateway` does not yet integrate credential-proof verification.
 - The repository does not provide a relayer, destination execution, finality proof, or production cross-chain security model.
 
-Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, revocation enforcement, authorization lifecycle management, message relay, and a destination-chain execution security design.
+Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.

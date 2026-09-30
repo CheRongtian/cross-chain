@@ -10,6 +10,7 @@ contract CredentialVerifier is ICredentialVerifier {
     uint256 public constant TRUSTED_ISSUER_INDEX = 1;
     uint256 public constant REQUIRED_ROLE_INDEX = 2;
     uint256 public constant CURRENT_TIMESTAMP_INDEX = 3;
+    uint256 public constant CREDENTIAL_STATE_ROOT_INDEX = 4;
 
     // Lower camel case preserves the existing project-facing getter name.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
@@ -32,13 +33,15 @@ contract CredentialVerifier is ICredentialVerifier {
         uint256 credentialCommitment,
         uint256 trustedIssuer,
         uint256 requiredRole,
-        uint256 currentTimestamp
+        uint256 currentTimestamp,
+        uint256 credentialStateRoot
     ) external view returns (bool) {
-        uint256[4] memory publicSignals;
+        uint256[5] memory publicSignals;
         publicSignals[CREDENTIAL_COMMITMENT_INDEX] = credentialCommitment;
         publicSignals[TRUSTED_ISSUER_INDEX] = trustedIssuer;
         publicSignals[REQUIRED_ROLE_INDEX] = requiredRole;
         publicSignals[CURRENT_TIMESTAMP_INDEX] = currentTimestamp;
+        publicSignals[CREDENTIAL_STATE_ROOT_INDEX] = credentialStateRoot;
 
         return groth16Verifier.verifyProof(proofA, proofB, proofC, publicSignals);
     }

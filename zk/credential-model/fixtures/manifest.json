@@ -11,6 +11,15 @@
         "revoked": false
       }
     },
+    "active-secondary": {
+      "file": "active-secondary.json",
+      "expected": {
+        "expired": false,
+        "trustedIssuer": true,
+        "roleMatches": true,
+        "revoked": false
+      }
+    },
     "expired": {
       "file": "expired.json",
       "expected": {

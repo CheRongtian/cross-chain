@@ -7,7 +7,8 @@ import {ICredentialVerifier} from "./interfaces/ICredentialVerifier.sol";
 contract IdentityApplicationA {
     enum AuthorizationStatus {
         UNVERIFIED,
-        VERIFIED_SUPPLIER
+        VERIFIED_SUPPLIER,
+        REVOKED
     }
 
     uint256 public constant VERIFIED_SUPPLIER_ROLE = 1;
@@ -21,12 +22,20 @@ contract IdentityApplicationA {
     uint256 public immutable requiredRole;
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     uint256 public immutable maxProofAge;
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    address public immutable credentialStateAuthority;
+
+    uint256 public credentialStateRoot;
 
     mapping(uint256 credentialCommitment => AuthorizationStatus status) public authorizationStatus;
 
     error InvalidCredentialVerifier();
     error InvalidRequiredRole();
     error InvalidMaxProofAge();
+    error InvalidCredentialStateAuthority();
+    error InvalidCredentialStateRoot();
+    error UnauthorizedCredentialStateAuthority();
+    error RevokedCredential();
     error InvalidIssuerPolicy();
     error InvalidRolePolicy();
     error FutureProofTimestamp();
@@ -34,12 +43,16 @@ contract IdentityApplicationA {
     error InvalidCredentialProof();
 
     event SupplierVerified(uint256 indexed credentialCommitment, address indexed submitter, uint256 proofTimestamp);
+    event CredentialStateRootUpdated(uint256 indexed oldRoot, uint256 indexed newRoot);
+    event CredentialRevoked(uint256 indexed credentialCommitment);
 
     constructor(
         address credentialVerifierAddress,
         uint256 trustedIssuer_,
         uint256 requiredRole_,
-        uint256 maxProofAge_
+        uint256 maxProofAge_,
+        address credentialStateAuthorityAddress,
+        uint256 initialCredentialStateRoot
     ) {
         if (credentialVerifierAddress.code.length == 0) {
             revert InvalidCredentialVerifier();
@@ -50,11 +63,41 @@ contract IdentityApplicationA {
         if (maxProofAge_ == 0) {
             revert InvalidMaxProofAge();
         }
+        if (credentialStateAuthorityAddress == address(0)) {
+            revert InvalidCredentialStateAuthority();
+        }
+        if (initialCredentialStateRoot == 0) {
+            revert InvalidCredentialStateRoot();
+        }
 
         credentialVerifier = ICredentialVerifier(credentialVerifierAddress);
         trustedIssuer = trustedIssuer_;
         requiredRole = requiredRole_;
         maxProofAge = maxProofAge_;
+        credentialStateAuthority = credentialStateAuthorityAddress;
+        credentialStateRoot = initialCredentialStateRoot;
+    }
+
+    function updateCredentialStateRoot(uint256 newRoot, uint256[] calldata revokedCredentialCommitments) external {
+        if (msg.sender != credentialStateAuthority) {
+            revert UnauthorizedCredentialStateAuthority();
+        }
+        if (newRoot == 0) {
+            revert InvalidCredentialStateRoot();
+        }
+
+        uint256 oldRoot = credentialStateRoot;
+        credentialStateRoot = newRoot;
+        emit CredentialStateRootUpdated(oldRoot, newRoot);
+
+        for (uint256 index = 0; index < revokedCredentialCommitments.length; index++) {
+            uint256 credentialCommitment = revokedCredentialCommitments[index];
+
+            if (authorizationStatus[credentialCommitment] != AuthorizationStatus.REVOKED) {
+                authorizationStatus[credentialCommitment] = AuthorizationStatus.REVOKED;
+                emit CredentialRevoked(credentialCommitment);
+            }
+        }
     }
 
     function verifySupplier(
@@ -64,7 +107,8 @@ contract IdentityApplicationA {
         uint256 credentialCommitment,
         uint256 proofTrustedIssuer,
         uint256 proofRequiredRole,
-        uint256 proofTimestamp
+        uint256 proofTimestamp,
+        uint256 proofCredentialStateRoot
     ) external {
         if (proofTrustedIssuer != trustedIssuer) {
             revert InvalidIssuerPolicy();
@@ -81,9 +125,22 @@ contract IdentityApplicationA {
         if (block.timestamp - proofTimestamp > maxProofAge) {
             revert StaleProofTimestamp();
         }
+        if (proofCredentialStateRoot != credentialStateRoot) {
+            revert InvalidCredentialStateRoot();
+        }
+        if (authorizationStatus[credentialCommitment] == AuthorizationStatus.REVOKED) {
+            revert RevokedCredential();
+        }
 
         bool valid = credentialVerifier.verifyCredentialProof(
-            proofA, proofB, proofC, credentialCommitment, proofTrustedIssuer, proofRequiredRole, proofTimestamp
+            proofA,
+            proofB,
+            proofC,
+            credentialCommitment,
+            proofTrustedIssuer,
+            proofRequiredRole,
+            proofTimestamp,
+            proofCredentialStateRoot
         );
         if (!valid) {
             revert InvalidCredentialProof();
@@ -91,5 +148,9 @@ contract IdentityApplicationA {
 
         authorizationStatus[credentialCommitment] = AuthorizationStatus.VERIFIED_SUPPLIER;
         emit SupplierVerified(credentialCommitment, msg.sender, proofTimestamp);
+    }
+
+    function isVerifiedSupplier(uint256 credentialCommitment) external view returns (bool) {
+        return authorizationStatus[credentialCommitment] == AuthorizationStatus.VERIFIED_SUPPLIER;
     }
 }

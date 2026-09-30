@@ -8,7 +8,7 @@ import {Groth16Verifier} from "../generated/Groth16Verifier.sol";
 import {CredentialProofFixture} from "../generated/CredentialProofFixture.sol";
 
 contract CredentialVerifierTest is Test {
-    uint256 internal constant PUBLIC_SIGNAL_COUNT = 4;
+    uint256 internal constant PUBLIC_SIGNAL_COUNT = 5;
 
     CredentialVerifier internal verifier;
 
@@ -32,7 +32,8 @@ contract CredentialVerifierTest is Test {
             publicSignals[0],
             publicSignals[1],
             publicSignals[2],
-            publicSignals[3]
+            publicSignals[3],
+            publicSignals[4]
         );
 
         assertTrue(accepted);
@@ -94,6 +95,18 @@ contract CredentialVerifierTest is Test {
         );
     }
 
+    function testRejectsWrongCredentialStateRoot() public view {
+        uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
+        publicSignals[4] += 1;
+
+        _assertRejected(
+            CredentialProofFixture.proofA(),
+            CredentialProofFixture.proofB(),
+            CredentialProofFixture.proofC(),
+            publicSignals
+        );
+    }
+
     function testPublicSignalOrderIsFixed() public view {
         uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals = CredentialProofFixture.publicSignals();
         (publicSignals[1], publicSignals[2]) = (publicSignals[2], publicSignals[1]);
@@ -113,7 +126,14 @@ contract CredentialVerifierTest is Test {
         uint256[PUBLIC_SIGNAL_COUNT] memory publicSignals
     ) internal view {
         try verifier.verifyCredentialProof(
-            proofA, proofB, proofC, publicSignals[0], publicSignals[1], publicSignals[2], publicSignals[3]
+            proofA,
+            proofB,
+            proofC,
+            publicSignals[0],
+            publicSignals[1],
+            publicSignals[2],
+            publicSignals[3],
+            publicSignals[4]
         ) returns (
             bool accepted
         ) {
