@@ -2,6 +2,8 @@
 
 This directory contains a minimal credential authorization proof built with
 Circom 2, circomlib Poseidon, snarkjs, Groth16, and the BN254 curve.
+The proof can be verified locally and by a Solidity verifier exported from the
+same Groth16 proving key.
 
 ## Proven statement
 
@@ -72,6 +74,25 @@ The fixtures come from [`credential-model/fixtures`](credential-model/fixtures).
 Generated inputs, witnesses, proving keys, proofs, and public signals are kept
 under `zk/build/` and are ignored by version control.
 
+## Solidity verification
+
+The verification script exports `Groth16Verifier.sol` directly from the active
+zkey and generates proof fixtures with snarkjs `exportSolidityCallData`. The
+generated Solidity files are placed under `contracts/generated/` and ignored.
+
+The Solidity public-signal order is:
+
+```text
+[0] credentialCommitment
+[1] trustedIssuer
+[2] requiredRole
+[3] currentTimestamp
+```
+
+`contracts/src/CredentialVerifier.sol` converts its named policy arguments into
+this array and delegates to the generated verifier. The public timestamp is
+proof context and is not compared with `block.timestamp`.
+
 ## Running verification
 
 From the project root, run:
@@ -80,9 +101,9 @@ From the project root, run:
 ./scripts/verify.sh
 ```
 
-The root verification script preserves the Solidity and local-chain checks,
-validates the credential model, and then calls
-`zk/scripts/verify-circuit.sh`. It expects `circom` on `PATH` and the exact npm
+The root verification script validates the credential model, calls
+`zk/scripts/verify-circuit.sh`, builds the generated Solidity verifier, and
+deploys it to Chain A for integration checks. It expects `circom` on `PATH` and the exact npm
 dependencies from `zk/package.json` to already exist in `zk/node_modules`; it
 does not install or initialize the development environment.
 
@@ -93,7 +114,6 @@ production trusted setup.
 
 ## Deliberately absent
 
-- on-chain verifier generation or deployment
 - issuer signature verification and issuer registry management
 - revocation enforcement, trees, and roots
 - nullifiers and anonymous replay protection

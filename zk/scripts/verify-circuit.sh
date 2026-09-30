@@ -9,6 +9,7 @@ BUILD_DIR="$ZK_ROOT/build"
 CIRCUIT_BUILD_DIR="$BUILD_DIR/circuit"
 INPUT_DIR="$BUILD_DIR/inputs"
 PROVING_DIR="$BUILD_DIR/proving"
+GENERATED_CONTRACTS_DIR="$PROJECT_ROOT/contracts/generated"
 CIRCUIT_FILE="$ZK_ROOT/circuits/CredentialAuthorization.circom"
 CIRCUIT_NAME="CredentialAuthorization"
 R1CS_FILE="$CIRCUIT_BUILD_DIR/$CIRCUIT_NAME.r1cs"
@@ -53,7 +54,9 @@ require_command node
 [[ -d "$ZK_ROOT/node_modules/circomlibjs" ]] || fail "circomlibjs is unavailable"
 
 rm -rf -- "$BUILD_DIR"
+rm -rf -- "$GENERATED_CONTRACTS_DIR"
 mkdir -p "$CIRCUIT_BUILD_DIR" "$INPUT_DIR" "$PROVING_DIR"
+mkdir -p "$GENERATED_CONTRACTS_DIR"
 
 printf '\n[compile authorization circuit]\n'
 circom "$CIRCUIT_FILE" \
@@ -74,7 +77,7 @@ ZKEY_FINAL="$PROVING_DIR/${CIRCUIT_NAME}_final.zkey"
 VERIFICATION_KEY="$PROVING_DIR/verification_key.json"
 
 printf '\n[create local development proving material]\n'
-printf 'This deterministic ceremony is for local verification only and is not production trusted setup.\n'
+printf 'This local ceremony is for development verification only and is not production trusted setup.\n'
 "$SNARKJS" powersoftau new bn128 12 "$POT_INITIAL" -v
 "$SNARKJS" powersoftau contribute \
     "$POT_INITIAL" \
@@ -104,6 +107,14 @@ node "$WITNESS_GENERATOR" "$WASM_FILE" "$INPUT_DIR/valid.json" "$VALID_WITNESS"
 "$SNARKJS" groth16 verify "$VERIFICATION_KEY" "$VALID_PUBLIC" "$VALID_PROOF"
 printf 'Verified valid credential proof.\n'
 
+GENERATED_VERIFIER="$GENERATED_CONTRACTS_DIR/Groth16Verifier.sol"
+
+printf '\n[export Solidity Groth16 verifier]\n'
+"$SNARKJS" zkey export solidityverifier "$ZKEY_FINAL" "$GENERATED_VERIFIER"
+
+printf '\n[prepare Solidity proof fixtures and calldata]\n'
+node "$SCRIPT_DIR/build-solidity-fixtures.mjs"
+
 expect_witness_rejection "invalid-witness"
 expect_witness_rejection "expired"
 expect_witness_rejection "wrong-role"
@@ -119,4 +130,4 @@ if "$SNARKJS" groth16 verify "$VERIFICATION_KEY" "$TAMPERED_PUBLIC" "$VALID_PROO
 fi
 
 printf 'Verified expected proof rejection: tampered public commitment\n'
-printf '\nMINIMAL ZK CIRCUIT VERIFICATION PASSED\n'
+printf '\nZK CIRCUIT VERIFICATION AND SOLIDITY VERIFIER EXPORT PASSED\n'

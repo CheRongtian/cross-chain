@@ -5,6 +5,7 @@
 contracts/cache/
 contracts/out/
 contracts/broadcast/
+contracts/generated/
 zk/node_modules/
 zk/build/
 zk/generated/

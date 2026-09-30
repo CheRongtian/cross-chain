@@ -94,7 +94,7 @@ commitment encoding.
 
 The following capabilities are intentionally absent:
 
-- on-chain verifier and trusted issuer registry
+- trusted issuer registry
 - revocation enforcement, revocation trees, and revocation roots
 - identity application behavior
 - nullifiers and anonymous replay protection

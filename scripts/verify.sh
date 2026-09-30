@@ -233,12 +233,12 @@ cleanup() {
     if [[ "$exit_code" -eq 0 ]]; then
         printf '\n========================================\n'
         printf 'VERIFICATION PASSED\n'
-        printf 'Credential Model and Minimal ZK Circuit\n'
+        printf 'On-chain ZK Credential Verification\n'
         printf '========================================\n'
     else
         printf '\n========================================\n' >&2
         printf 'VERIFICATION FAILED during: %s (exit code %s)\n' "$CURRENT_STEP" "$exit_code" >&2
-        printf 'Credential Model and Minimal ZK Circuit\n' >&2
+        printf 'On-chain ZK Credential Verification\n' >&2
         printf '========================================\n' >&2
     fi
 
@@ -251,7 +251,7 @@ trap 'exit 143' TERM
 
 printf '========================================\n'
 printf '%s\n' "$VERIFICATION_NAME"
-printf 'Credential Model and Minimal ZK Circuit\n'
+printf 'On-chain ZK Credential Verification\n'
 printf '========================================\n'
 printf 'Verification time: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
 printf 'Project root: %s\n' "$PROJECT_ROOT"
@@ -280,23 +280,38 @@ else
 fi
 
 printf '\nVerification steps:\n'
-printf '  1. forge fmt --check\n'
-printf '  2. forge build\n'
-printf '  3. forge test -vv\n'
-printf '  4. Run four canonical-message focused tests with -vvv\n'
-printf '  5. Check or start Chain A and Chain B\n'
-printf '  6. Verify chain IDs\n'
-printf '  7. Deploy SourceGateway to Chain A\n'
-printf '  8. Verify deployment and initial state\n'
-printf '  9. Verify payload text and payload hash\n'
-printf ' 10. Predict, send, and verify the first message\n'
-printf ' 11. Predict, send, and verify the second message\n'
-printf ' 12. Verify nonce progression\n'
-printf ' 13. Verify invalid destination domain and receiver reverts\n'
-printf ' 14. Validate the credential model and fixtures\n'
-printf ' 15. Compile and verify the minimal ZK authorization circuit\n'
+printf '  1. Validate the credential model and fixtures\n'
+printf '  2. Compile the ZK circuit and verify local proof cases\n'
+printf '  3. Export the Solidity Groth16 verifier and proof fixtures\n'
+printf '  4. Format generated Solidity sources\n'
+printf '  5. forge fmt --check\n'
+printf '  6. forge build\n'
+printf '  7. forge test -vv\n'
+printf '  8. Run focused canonical-message and credential-verifier tests\n'
+printf '  9. Check or start Chain A and Chain B\n'
+printf ' 10. Verify chain IDs\n'
+printf ' 11. Deploy and verify the Groth16 verifier on Chain A\n'
+printf ' 12. Deploy SourceGateway to Chain A\n'
+printf ' 13. Verify deployment and initial state\n'
+printf ' 14. Verify payload text and payload hash\n'
+printf ' 15. Predict, send, and verify two messages\n'
+printf ' 16. Verify nonce progression\n'
+printf ' 17. Verify invalid destination domain and receiver reverts\n'
+
+CURRENT_STEP="credential model validation"
+printf '\n[%s]\n' "$CURRENT_STEP"
+cd "$PROJECT_ROOT"
+python3 "$PROJECT_ROOT/zk/credential-model/validate.py"
+
+CURRENT_STEP="ZK circuit verification and Solidity verifier export"
+printf '\n[%s]\n' "$CURRENT_STEP"
+bash "$PROJECT_ROOT/zk/scripts/verify-circuit.sh"
 
 cd "$CONTRACTS_DIR"
+
+CURRENT_STEP="generated Solidity source formatting"
+printf '\n[%s]\n' "$CURRENT_STEP"
+forge fmt generated/Groth16Verifier.sol generated/CredentialProofFixture.sol
 
 CURRENT_STEP="forge fmt --check"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -326,6 +341,10 @@ CURRENT_STEP="event consistency test"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test --match-test testEmitsCrossChainMessage -vvv
 
+CURRENT_STEP="credential verifier tests"
+printf '\n[%s]\n' "$CURRENT_STEP"
+forge test --match-contract CredentialVerifierTest -vvv
+
 CURRENT_STEP="local chain availability check"
 printf '\n[%s]\n' "$CURRENT_STEP"
 
@@ -352,6 +371,13 @@ CURRENT_STEP="chain ID verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
 assert_equal "$(cast chain-id --rpc-url "$CHAIN_A_RPC")" "$CHAIN_A_ID" "Chain A ID"
 assert_equal "$(cast chain-id --rpc-url "$CHAIN_B_RPC")" "$CHAIN_B_ID" "Chain B ID"
+
+CURRENT_STEP="on-chain Groth16 credential verification"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
+CHAIN_A_EXPECTED_ID="$CHAIN_A_ID" \
+VERIFIER_DEPLOYER_KEY="$ANVIL_DEV_KEY" \
+    bash "$PROJECT_ROOT/scripts/deploy-verifier.sh"
 
 CURRENT_STEP="SourceGateway deployment"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -507,14 +533,5 @@ if cast call "$SOURCE_GATEWAY" \
 else
     printf 'Verified rejection of the zero destination receiver.\n'
 fi
-
-CURRENT_STEP="credential model validation"
-printf '\n[%s]\n' "$CURRENT_STEP"
-cd "$PROJECT_ROOT"
-python3 "$PROJECT_ROOT/zk/credential-model/validate.py"
-
-CURRENT_STEP="minimal ZK circuit verification"
-printf '\n[%s]\n' "$CURRENT_STEP"
-bash "$PROJECT_ROOT/zk/scripts/verify-circuit.sh"
 
 CURRENT_STEP="complete"
