@@ -36,20 +36,20 @@ library MessageCodec {
         uint256 nonce,
         bytes32 payloadHash
     ) internal pure returns (bytes32) {
-        // abi.encode is the canonical, cross-language protocol encoding.
-        // forge-lint: disable-next-line(asm-keccak256)
-        return keccak256(
-            abi.encode(
-                version,
-                sourceDomain,
-                sourceGateway,
-                sourceSender,
-                destinationDomain,
-                destinationReceiver,
-                nonce,
-                payloadHash
-            )
+        bytes memory encodedMessage = abi.encode(
+            version,
+            sourceDomain,
+            sourceGateway,
+            sourceSender,
+            destinationDomain,
+            destinationReceiver,
+            nonce,
+            payloadHash
         );
+
+        // abi.encode above is the canonical, cross-language protocol encoding.
+        // forge-lint: disable-next-line(asm-keccak256)
+        return keccak256(encodedMessage);
     }
 
     function computeMessageId(Message memory message) internal pure returns (bytes32) {

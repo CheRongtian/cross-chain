@@ -1,0 +1,8 @@
+{
+  "subject": "urn:cross-chain:subject:test:supplier-001",
+  "issuer": "urn:cross-chain:issuer:test:trusted",
+  "role": "VERIFIED_SUPPLIER",
+  "expiry": 2208988800,
+  "credentialId": "urn:cross-chain:credential:test:supplier-001",
+  "status": "ACTIVE"
+}

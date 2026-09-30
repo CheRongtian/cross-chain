@@ -1,0 +1,51 @@
+{
+  "evaluationTime": 1893456000,
+  "requiredRole": "VERIFIED_SUPPLIER",
+  "cases": {
+    "valid": {
+      "file": "valid.json",
+      "expected": {
+        "expired": false,
+        "trustedIssuer": true,
+        "roleMatches": true,
+        "revoked": false
+      }
+    },
+    "expired": {
+      "file": "expired.json",
+      "expected": {
+        "expired": true,
+        "trustedIssuer": true,
+        "roleMatches": true,
+        "revoked": false
+      }
+    },
+    "wrong-role": {
+      "file": "wrong-role.json",
+      "expected": {
+        "expired": false,
+        "trustedIssuer": true,
+        "roleMatches": false,
+        "revoked": false
+      }
+    },
+    "untrusted-issuer": {
+      "file": "untrusted-issuer.json",
+      "expected": {
+        "expired": false,
+        "trustedIssuer": false,
+        "roleMatches": true,
+        "revoked": false
+      }
+    },
+    "revoked": {
+      "file": "revoked.json",
+      "expected": {
+        "expired": false,
+        "trustedIssuer": true,
+        "roleMatches": true,
+        "revoked": true
+      }
+    }
+  }
+}

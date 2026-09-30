@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {MessageCodec} from "../src/MessageCodec.sol";
 import {SourceGateway} from "../src/SourceGateway.sol";
 
@@ -22,18 +23,6 @@ contract SourceGatewayTest is Test {
 
     uint256 internal constant DESTINATION_DOMAIN = 2001;
 
-    event CrossChainMessage(
-        bytes32 indexed messageId,
-        uint8 version,
-        uint256 sourceDomain,
-        address sourceGateway,
-        address indexed sourceSender,
-        uint256 indexed destinationDomain,
-        address destinationReceiver,
-        uint256 nonce,
-        bytes payload
-    );
-
     function setUp() public {
         gateway = new SourceGateway();
     }
@@ -46,15 +35,13 @@ contract SourceGatewayTest is Test {
         bytes memory payload = bytes("hello chain b");
 
         vm.prank(SENDER);
-        (bytes32 firstMessageId, uint256 firstNonce) =
-            gateway.sendMessage(DESTINATION_DOMAIN, RECEIVER, payload);
+        (bytes32 firstMessageId, uint256 firstNonce) = gateway.sendMessage(DESTINATION_DOMAIN, RECEIVER, payload);
 
         assertEq(firstNonce, 1);
         assertEq(gateway.nextNonce(), 2);
 
         vm.prank(SENDER);
-        (bytes32 secondMessageId, uint256 secondNonce) =
-            gateway.sendMessage(DESTINATION_DOMAIN, RECEIVER, payload);
+        (bytes32 secondMessageId, uint256 secondNonce) = gateway.sendMessage(DESTINATION_DOMAIN, RECEIVER, payload);
 
         assertEq(secondNonce, 2);
         assertNotEq(firstMessageId, secondMessageId);
@@ -100,9 +87,8 @@ contract SourceGatewayTest is Test {
             MessageCodec.hashPayload(payload)
         );
 
-        bytes32 actualId = gateway.computeMessageId(
-            SENDER, DESTINATION_DOMAIN, RECEIVER, 1, MessageCodec.hashPayload(payload)
-        );
+        bytes32 actualId =
+            gateway.computeMessageId(SENDER, DESTINATION_DOMAIN, RECEIVER, 1, MessageCodec.hashPayload(payload));
 
         assertEq(actualId, expectedId);
     }
@@ -184,27 +170,40 @@ contract SourceGatewayTest is Test {
             MessageCodec.hashPayload(payload)
         );
 
-        vm.expectEmit(true, true, true, true, address(gateway));
-
-        emit CrossChainMessage(
-            expectedId,
-            MESSAGE_VERSION,
-            block.chainid,
-            address(gateway),
-            SENDER,
-            DESTINATION_DOMAIN,
-            RECEIVER,
-            1,
-            payload
-        );
-
+        vm.recordLogs();
         vm.prank(SENDER);
 
-        (bytes32 actualId, uint256 actualNonce) =
-            gateway.sendMessage(DESTINATION_DOMAIN, RECEIVER, payload);
+        (bytes32 actualId, uint256 actualNonce) = gateway.sendMessage(DESTINATION_DOMAIN, RECEIVER, payload);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
 
         assertEq(actualId, expectedId);
         assertEq(actualNonce, 1);
+        assertEq(logs.length, 1);
+
+        Vm.Log memory messageLog = logs[0];
+
+        assertEq(messageLog.emitter, address(gateway));
+        assertEq(messageLog.topics.length, 4);
+        assertEq(messageLog.topics[0], SourceGateway.CrossChainMessage.selector);
+        assertEq(messageLog.topics[1], expectedId);
+        assertEq(messageLog.topics[2], bytes32(uint256(uint160(SENDER))));
+        assertEq(messageLog.topics[3], bytes32(DESTINATION_DOMAIN));
+
+        (
+            uint8 emittedVersion,
+            uint256 emittedSourceDomain,
+            address emittedSourceGateway,
+            address emittedDestinationReceiver,
+            uint256 emittedNonce,
+            bytes memory emittedPayload
+        ) = abi.decode(messageLog.data, (uint8, uint256, address, address, uint256, bytes));
+
+        assertEq(emittedVersion, MESSAGE_VERSION);
+        assertEq(emittedSourceDomain, block.chainid);
+        assertEq(emittedSourceGateway, address(gateway));
+        assertEq(emittedDestinationReceiver, RECEIVER);
+        assertEq(emittedNonce, 1);
+        assertEq(emittedPayload, payload);
     }
 
     function testRejectsSameChainDestination() public {
@@ -245,9 +244,7 @@ contract SourceGatewayTest is Test {
     function _loadGoldenVector(uint256 index) internal view returns (GoldenVector memory vector) {
         // The configured permission is read-only and limited to repository-owned vectors.
         // forge-lint: disable-next-line(unsafe-cheatcode)
-        string memory json = vm.readFile(
-            string.concat(vm.projectRoot(), "/../test-vectors/canonical-messages.json")
-        );
+        string memory json = vm.readFile(string.concat(vm.projectRoot(), "/../test-vectors/canonical-messages.json"));
         string memory key = string.concat(".vectors[", vm.toString(index), "]");
         uint256 version = vm.parseJsonUint(json, string.concat(key, ".version"));
 

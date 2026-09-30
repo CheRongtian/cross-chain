@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-STAGE_NAME="Module 1 — Project Foundation and Two-Chain Environment / Stage 3 — Shared Domain and Message Model"
+VERIFICATION_NAME="Cross-Chain Protocol Verification"
 
 CHAIN_A_RPC="http://127.0.0.1:4545"
 CHAIN_B_RPC="http://127.0.0.1:9545"
@@ -231,9 +231,15 @@ cleanup() {
     fi
 
     if [[ "$exit_code" -eq 0 ]]; then
-        printf '\nSTAGE VERIFICATION PASSED\n'
+        printf '\n========================================\n'
+        printf 'VERIFICATION PASSED\n'
+        printf 'Credential Model\n'
+        printf '========================================\n'
     else
-        printf '\nSTAGE VERIFICATION FAILED during: %s (exit code %s)\n' "$CURRENT_STEP" "$exit_code" >&2
+        printf '\n========================================\n' >&2
+        printf 'VERIFICATION FAILED during: %s (exit code %s)\n' "$CURRENT_STEP" "$exit_code" >&2
+        printf 'Credential Model\n' >&2
+        printf '========================================\n' >&2
     fi
 
     exit "$exit_code"
@@ -243,8 +249,11 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+printf '========================================\n'
+printf '%s\n' "$VERIFICATION_NAME"
+printf 'Credential Model\n'
+printf '========================================\n'
 printf 'Verification time: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
-printf 'Stage: %s\n' "$STAGE_NAME"
 printf 'Project root: %s\n' "$PROJECT_ROOT"
 printf 'Contracts directory: %s\n' "$CONTRACTS_DIR"
 printf 'Log file: %s\n' "$LOG_FILE"
@@ -271,20 +280,26 @@ else
 fi
 
 printf '\nVerification steps:\n'
-printf '  1. forge build\n'
-printf '  2. forge test -vv\n'
-printf '  3. Run four canonical-message focused tests with -vvv\n'
-printf '  4. Check or start Chain A and Chain B\n'
-printf '  5. Verify chain IDs\n'
-printf '  6. Deploy SourceGateway to Chain A\n'
-printf '  7. Verify deployment and initial state\n'
-printf '  8. Verify payload text and payload hash\n'
-printf '  9. Predict, send, and verify the first message\n'
-printf ' 10. Predict, send, and verify the second message\n'
-printf ' 11. Verify nonce progression\n'
-printf ' 12. Verify invalid destination domain and receiver reverts\n'
+printf '  1. forge fmt --check\n'
+printf '  2. forge build\n'
+printf '  3. forge test -vv\n'
+printf '  4. Run four canonical-message focused tests with -vvv\n'
+printf '  5. Check or start Chain A and Chain B\n'
+printf '  6. Verify chain IDs\n'
+printf '  7. Deploy SourceGateway to Chain A\n'
+printf '  8. Verify deployment and initial state\n'
+printf '  9. Verify payload text and payload hash\n'
+printf ' 10. Predict, send, and verify the first message\n'
+printf ' 11. Predict, send, and verify the second message\n'
+printf ' 12. Verify nonce progression\n'
+printf ' 13. Verify invalid destination domain and receiver reverts\n'
+printf ' 14. Validate the credential model and fixtures\n'
 
 cd "$CONTRACTS_DIR"
+
+CURRENT_STEP="forge fmt --check"
+printf '\n[%s]\n' "$CURRENT_STEP"
+forge fmt --check
 
 CURRENT_STEP="forge build"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -341,7 +356,7 @@ CURRENT_STEP="SourceGateway deployment"
 printf '\n[%s]\n' "$CURRENT_STEP"
 
 TEMP_PARENT="${TMPDIR:-/tmp}"
-TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-stage3.XXXXXX")"
+TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-verification.XXXXXX")"
 DEPLOY_OUTPUT_FILE="$TEMP_DIR/deploy-output.log"
 
 forge create src/SourceGateway.sol:SourceGateway \
@@ -491,5 +506,10 @@ if cast call "$SOURCE_GATEWAY" \
 else
     printf 'Verified rejection of the zero destination receiver.\n'
 fi
+
+CURRENT_STEP="credential model validation"
+printf '\n[%s]\n' "$CURRENT_STEP"
+cd "$PROJECT_ROOT"
+python3 "$PROJECT_ROOT/zk/credential-model/validate.py"
 
 CURRENT_STEP="complete"

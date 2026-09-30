@@ -1,0 +1,12 @@
+{
+  "issuers": [
+    {
+      "issuer": "urn:cross-chain:issuer:test:trusted",
+      "trusted": true
+    },
+    {
+      "issuer": "urn:cross-chain:issuer:test:untrusted",
+      "trusted": false
+    }
+  ]
+}
