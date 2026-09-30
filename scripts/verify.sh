@@ -233,12 +233,12 @@ cleanup() {
     if [[ "$exit_code" -eq 0 ]]; then
         printf '\n========================================\n'
         printf 'VERIFICATION PASSED\n'
-        printf 'Credential Model\n'
+        printf 'Credential Model and Minimal ZK Circuit\n'
         printf '========================================\n'
     else
         printf '\n========================================\n' >&2
         printf 'VERIFICATION FAILED during: %s (exit code %s)\n' "$CURRENT_STEP" "$exit_code" >&2
-        printf 'Credential Model\n' >&2
+        printf 'Credential Model and Minimal ZK Circuit\n' >&2
         printf '========================================\n' >&2
     fi
 
@@ -251,7 +251,7 @@ trap 'exit 143' TERM
 
 printf '========================================\n'
 printf '%s\n' "$VERIFICATION_NAME"
-printf 'Credential Model\n'
+printf 'Credential Model and Minimal ZK Circuit\n'
 printf '========================================\n'
 printf 'Verification time: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
 printf 'Project root: %s\n' "$PROJECT_ROOT"
@@ -294,6 +294,7 @@ printf ' 11. Predict, send, and verify the second message\n'
 printf ' 12. Verify nonce progression\n'
 printf ' 13. Verify invalid destination domain and receiver reverts\n'
 printf ' 14. Validate the credential model and fixtures\n'
+printf ' 15. Compile and verify the minimal ZK authorization circuit\n'
 
 cd "$CONTRACTS_DIR"
 
@@ -511,5 +512,9 @@ CURRENT_STEP="credential model validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
 cd "$PROJECT_ROOT"
 python3 "$PROJECT_ROOT/zk/credential-model/validate.py"
+
+CURRENT_STEP="minimal ZK circuit verification"
+printf '\n[%s]\n' "$CURRENT_STEP"
+bash "$PROJECT_ROOT/zk/scripts/verify-circuit.sh"
 
 CURRENT_STEP="complete"

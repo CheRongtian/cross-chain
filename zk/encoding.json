@@ -1,0 +1,45 @@
+{
+  "encodingVersion": 1,
+  "scalarField": {
+    "curve": "BN254",
+    "prime": "21888242871839275222246405745257275088548364400416034343698204186575808495617",
+    "integerRepresentation": "unsigned decimal string"
+  },
+  "stringEncoding": {
+    "algorithm": "sha256-domain-separated-mod-p",
+    "byteEncoding": "utf-8",
+    "separatorByteHex": "00",
+    "digestIntegerEndianness": "big",
+    "reduction": "mod-p",
+    "domains": {
+      "subject": "cross-chain:credential:subject:v1",
+      "issuer": "cross-chain:credential:issuer:v1",
+      "credentialId": "cross-chain:credential:id:v1"
+    }
+  },
+  "roleEncoding": {
+    "representation": "explicit-positive-integer",
+    "values": {
+      "VERIFIED_SUPPLIER": 1,
+      "AUDITOR": 2
+    }
+  },
+  "expiryEncoding": {
+    "source": "uint64-unix-seconds",
+    "fieldValue": "identity"
+  },
+  "commitment": {
+    "algorithm": "Poseidon",
+    "arity": 6,
+    "preimageVersion": 1,
+    "inputOrder": [
+      "preimageVersion",
+      "subjectField",
+      "issuerField",
+      "roleField",
+      "expiry",
+      "credentialIdField"
+    ],
+    "outputRepresentation": "unsigned decimal BN254 field element"
+  }
+}

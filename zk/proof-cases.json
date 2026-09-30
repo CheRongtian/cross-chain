@@ -1,0 +1,41 @@
+{
+  "cases": [
+    {
+      "name": "valid",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "privateOverrides": {},
+      "expected": "proof-verifies"
+    },
+    {
+      "name": "invalid-witness",
+      "fixture": "valid.json",
+      "commitmentSource": "valid.json",
+      "privateOverrides": {
+        "subject": "urn:cross-chain:subject:test:supplier-002"
+      },
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "expired",
+      "fixture": "expired.json",
+      "commitmentSource": "self",
+      "privateOverrides": {},
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "wrong-role",
+      "fixture": "wrong-role.json",
+      "commitmentSource": "self",
+      "privateOverrides": {},
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "untrusted-issuer",
+      "fixture": "untrusted-issuer.json",
+      "commitmentSource": "self",
+      "privateOverrides": {},
+      "expected": "witness-rejected"
+    }
+  ]
+}

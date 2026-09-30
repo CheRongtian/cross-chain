@@ -9,9 +9,24 @@ from typing import Any
 
 MODEL_ROOT = Path(__file__).resolve().parent
 FIXTURES_ROOT = MODEL_ROOT / "fixtures"
+ENCODING_PATH = MODEL_ROOT.parent / "encoding.json"
 
 CANONICAL_FIELDS = ["subject", "issuer", "role", "expiry", "credentialId"]
 LIFECYCLE_FIELD = "status"
+BN254_SCALAR_FIELD = "21888242871839275222246405745257275088548364400416034343698204186575808495617"
+COMMITMENT_INPUTS = [
+    "preimageVersion",
+    "subjectField",
+    "issuerField",
+    "roleField",
+    "expiry",
+    "credentialIdField",
+]
+STRING_DOMAINS = {
+    "subject": "cross-chain:credential:subject:v1",
+    "issuer": "cross-chain:credential:issuer:v1",
+    "credentialId": "cross-chain:credential:id:v1",
+}
 EXPECTED_CASES = {
     "valid": set(),
     "expired": {"expiry"},
@@ -95,11 +110,63 @@ def validate_model(model: dict[str, Any]) -> list[dict[str, str]]:
     require(commitment_fields == canonical_fields, "commitment must bind every canonical credential field")
     require(LIFECYCLE_FIELD in commitment.get("excludedFields", []), "status must be excluded from commitment")
     require("issuerTrusted" in commitment.get("excludedFields", []), "issuer trust must be excluded from commitment")
-    require(commitment.get("hashPrimitive") is None, "hash primitive must remain undecided")
-    require(commitment.get("outputRepresentation") is None, "commitment output representation must remain undecided")
-    require(commitment.get("cryptographicSelectionDeferred") is True, "cryptographic selection must remain deferred")
+    require(commitment.get("hashPrimitive") == "Poseidon(6)-BN254", "commitment must use Poseidon(6) over BN254")
+    require(commitment.get("hashInputs") == COMMITMENT_INPUTS, "commitment hash input order is not canonical")
+    require(commitment.get("encodingSpecification") == "../encoding.json", "encoding specification path is not canonical")
+    require(
+        commitment.get("outputRepresentation") == "unsigned decimal BN254 field element",
+        "commitment output representation is not canonical",
+    )
+    require(commitment.get("cryptographicSelectionDeferred") is False, "cryptographic selection must be fixed")
 
     return commitment_fields
+
+
+def validate_encoding(encoding: dict[str, Any]) -> None:
+    require(encoding.get("encodingVersion") == 1, "unsupported field encoding version")
+
+    scalar_field = encoding.get("scalarField", {})
+    require(scalar_field.get("curve") == "BN254", "field encoding must target BN254")
+    require(scalar_field.get("prime") == BN254_SCALAR_FIELD, "BN254 scalar field prime is incorrect")
+    require(
+        scalar_field.get("integerRepresentation") == "unsigned decimal string",
+        "field elements must use unsigned decimal strings",
+    )
+
+    string_encoding = encoding.get("stringEncoding", {})
+    require(
+        string_encoding.get("algorithm") == "sha256-domain-separated-mod-p",
+        "string field encoding algorithm is not canonical",
+    )
+    require(string_encoding.get("byteEncoding") == "utf-8", "string field encoding must use UTF-8")
+    require(string_encoding.get("separatorByteHex") == "00", "string domain separator byte is not canonical")
+    require(string_encoding.get("digestIntegerEndianness") == "big", "SHA-256 digest must use big-endian conversion")
+    require(string_encoding.get("reduction") == "mod-p", "string digest must be reduced modulo the scalar field")
+    require(string_encoding.get("domains") == STRING_DOMAINS, "string field domains are not canonical")
+
+    role_encoding = encoding.get("roleEncoding", {})
+    require(
+        role_encoding.get("representation") == "explicit-positive-integer",
+        "role encoding representation is not canonical",
+    )
+    require(
+        role_encoding.get("values") == {"VERIFIED_SUPPLIER": 1, "AUDITOR": 2},
+        "role encoding table is not canonical",
+    )
+
+    expiry_encoding = encoding.get("expiryEncoding", {})
+    require(expiry_encoding.get("source") == "uint64-unix-seconds", "expiry source encoding is not canonical")
+    require(expiry_encoding.get("fieldValue") == "identity", "expiry must map directly into the scalar field")
+
+    commitment = encoding.get("commitment", {})
+    require(commitment.get("algorithm") == "Poseidon", "commitment encoding must use Poseidon")
+    require(commitment.get("arity") == 6, "commitment Poseidon arity must be six")
+    require(commitment.get("preimageVersion") == 1, "commitment preimage version is not canonical")
+    require(commitment.get("inputOrder") == COMMITMENT_INPUTS, "encoded commitment input order is not canonical")
+    require(
+        commitment.get("outputRepresentation") == "unsigned decimal BN254 field element",
+        "encoded commitment output representation is not canonical",
+    )
 
 
 def validate_credential(credential: dict[str, Any], schema: dict[str, Any], fixture_name: str) -> None:
@@ -226,11 +293,13 @@ def main() -> int:
     try:
         schema = load_json(MODEL_ROOT / "credential.schema.json")
         model = load_json(MODEL_ROOT / "credential-model.json")
+        encoding = load_json(ENCODING_PATH)
         issuer_document = load_json(MODEL_ROOT / "trusted-issuers.json")
         manifest = load_json(FIXTURES_ROOT / "manifest.json")
 
         validate_schema(schema)
         commitment_fields = validate_model(model)
+        validate_encoding(encoding)
         trust_by_issuer = load_issuer_trust(issuer_document)
         validate_fixtures(schema, manifest, trust_by_issuer, commitment_fields)
     except ValidationError as error:

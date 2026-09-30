@@ -1,8 +1,8 @@
 # Credential Model
 
-This directory defines a framework-neutral, user-held credential model. It
-contains data definitions and synthetic fixtures only. No credential is stored
-in Solidity public state.
+This directory defines the canonical user-held credential model used by the
+authorization circuit. It contains data definitions and synthetic fixtures.
+No credential is stored in Solidity public state.
 
 ## Credential fields
 
@@ -19,10 +19,10 @@ valid with respect to time only while `evaluationTime < expiry`.
 
 ## Privacy boundary
 
-All credential fields are private by default and remain with the user. A future
-proof policy may reveal only the minimum information required by that policy.
-This model does not define a public-input layout and does not place credential
-data in public chain state.
+All credential fields are private by default and remain with the user. The
+authorization proof publishes only `credentialCommitment`, `trustedIssuer`,
+`requiredRole`, and `currentTimestamp`. Credential fields are not placed in
+public chain state.
 
 ## Trusted issuers
 
@@ -40,24 +40,25 @@ required by the fixture policy.
 
 ## Credential commitment boundary
 
-`credentialCommitment` denotes a deterministic cryptographic reference to the
-credential without revealing its fields. Its canonical preimage is version 1
-of this ordered, typed sequence:
+`credentialCommitment` is a Poseidon commitment over the BN254 scalar field.
+Its canonical preimage is version 1 of this ordered field-element sequence:
 
 ```text
-subject      : utf8-string
-issuer       : utf8-string
-role         : utf8-string
-expiry       : uint64-unix-seconds
-credentialId : utf8-string
+preimageVersion  : constant 1
+subjectField     : encoded subject
+issuerField      : encoded issuer
+roleField        : encoded role
+expiry           : uint64 Unix seconds
+credentialIdField: encoded credentialId
 ```
 
 `status` is external lifecycle state, so changing ACTIVE to REVOKED preserves
 the commitment preimage. Issuer trust is also external policy state.
 
-No hash primitive, field mapping, byte serialization, or output representation
-has been selected. Those choices must be made together with the proof system;
-the current files do not claim to provide a cryptographic commitment value.
+String fields use domain-separated SHA-256, big-endian digest conversion, and
+reduction modulo the BN254 scalar field. Roles use the explicit integer mapping
+in [`../encoding.json`](../encoding.json). The Poseidon output is represented as
+an unsigned decimal BN254 field element.
 
 ## Revocation state
 
@@ -86,15 +87,13 @@ fixture, keeping validation deterministic.
 
 `validate.py` uses only the Python standard library. It checks the schema,
 canonical names and types, issuer trust fixtures, expiry semantics, role and
-revocation cases, targeted fixture differences, and deterministic commitment
-preimage construction.
+revocation cases, targeted fixture differences, and the selected field and
+commitment encoding.
 
 ## Deferred work
 
 The following capabilities are intentionally absent:
 
-- ZK circuits, witnesses, proof generation, and proof verification
-- selection of a ZK-friendly hash or commitment output encoding
 - on-chain verifier and trusted issuer registry
 - revocation enforcement, revocation trees, and revocation roots
 - identity application behavior
