@@ -1,0 +1,35 @@
+{
+  "schema": "cross-chain-canonical-message-v1",
+  "derivation": {
+    "payloadHash": "keccak256(payload)",
+    "messageId": "keccak256(abi.encode(uint8 version,uint256 sourceDomain,address sourceGateway,address sourceSender,uint256 destinationDomain,address destinationReceiver,uint256 nonce,bytes32 payloadHash))"
+  },
+  "vectors": [
+    {
+      "name": "hello-chain-b-nonce-1",
+      "version": 1,
+      "sourceDomain": 10011,
+      "sourceGateway": "0x1111111111111111111111111111111111111111",
+      "sourceSender": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+      "destinationDomain": 2001,
+      "destinationReceiver": "0x000000000000000000000000000000000000beef",
+      "nonce": 1,
+      "payload": "0x68656c6c6f20636861696e2062",
+      "payloadHash": "0x758a9838e83061770f5b75d8544bc7a27cc795a8741c6b50bdf738ee276d23a6",
+      "messageId": "0x1ccc4bce64de976006493f9b2b7e57f813149202bc40dd449335e16f7f9332a0"
+    },
+    {
+      "name": "hello-chain-b-nonce-2",
+      "version": 1,
+      "sourceDomain": 10011,
+      "sourceGateway": "0x1111111111111111111111111111111111111111",
+      "sourceSender": "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266",
+      "destinationDomain": 2001,
+      "destinationReceiver": "0x000000000000000000000000000000000000beef",
+      "nonce": 2,
+      "payload": "0x68656c6c6f20636861696e2062",
+      "payloadHash": "0x758a9838e83061770f5b75d8544bc7a27cc795a8741c6b50bdf738ee276d23a6",
+      "messageId": "0x11e0c2581e7c8a8cc38c80491a769fc4201a146b4636ec4b05ef32893dded7ac"
+    }
+  ]
+}

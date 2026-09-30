@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {MessageCodec} from "./MessageCodec.sol";
+
 contract SourceGateway {
     uint8 public constant MESSAGE_VERSION = 1;
 
@@ -36,7 +38,7 @@ contract SourceGateway {
         nonce = nextNonce;
         nextNonce++;
 
-        bytes32 payloadHash = keccak256(payload);
+        bytes32 payloadHash = MessageCodec.hashPayload(payload);
 
         messageId = computeMessageId(msg.sender, destinationDomain, destinationReceiver, nonce, payloadHash);
 
@@ -60,17 +62,15 @@ contract SourceGateway {
         uint256 nonce,
         bytes32 payloadHash
     ) public view returns (bytes32) {
-        return keccak256(
-            abi.encode(
-                MESSAGE_VERSION,
-                block.chainid,
-                address(this),
-                sourceSender,
-                destinationDomain,
-                destinationReceiver,
-                nonce,
-                payloadHash
-            )
+        return MessageCodec.computeMessageId(
+            MESSAGE_VERSION,
+            block.chainid,
+            address(this),
+            sourceSender,
+            destinationDomain,
+            destinationReceiver,
+            nonce,
+            payloadHash
         );
     }
 }
