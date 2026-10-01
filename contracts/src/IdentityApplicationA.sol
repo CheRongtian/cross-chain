@@ -2,6 +2,7 @@
 pragma solidity ^0.8.24;
 
 import {ICredentialVerifier} from "./interfaces/ICredentialVerifier.sol";
+import {ISourceGateway} from "./interfaces/ISourceGateway.sol";
 
 /// @notice Applies Chain A supplier policy to credential authorization proofs.
 contract IdentityApplicationA {
@@ -21,6 +22,9 @@ contract IdentityApplicationA {
     // Lower camel case gives the public configuration getters conventional ABI names.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     ICredentialVerifier public immutable credentialVerifier;
+    // Lower camel case preserves the project-facing getter name.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    ISourceGateway public immutable sourceGateway;
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
     uint256 public immutable trustedIssuer;
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
@@ -39,6 +43,7 @@ contract IdentityApplicationA {
     mapping(uint256 nullifier => bool used) public usedNullifiers;
 
     error InvalidCredentialVerifier();
+    error InvalidSourceGateway();
     error InvalidRequiredRole();
     error InvalidMaxProofAge();
     error InvalidCredentialStateAuthority();
@@ -70,6 +75,7 @@ contract IdentityApplicationA {
 
     constructor(
         address credentialVerifierAddress,
+        address sourceGatewayAddress,
         uint256 trustedIssuer_,
         uint256 requiredRole_,
         uint256 maxProofAge_,
@@ -78,6 +84,9 @@ contract IdentityApplicationA {
     ) {
         if (credentialVerifierAddress.code.length == 0) {
             revert InvalidCredentialVerifier();
+        }
+        if (sourceGatewayAddress.code.length == 0) {
+            revert InvalidSourceGateway();
         }
         if (requiredRole_ != VERIFIED_SUPPLIER_ROLE) {
             revert InvalidRequiredRole();
@@ -93,6 +102,7 @@ contract IdentityApplicationA {
         }
 
         credentialVerifier = ICredentialVerifier(credentialVerifierAddress);
+        sourceGateway = ISourceGateway(sourceGatewayAddress);
         trustedIssuer = trustedIssuer_;
         requiredRole = requiredRole_;
         maxProofAge = maxProofAge_;
@@ -163,6 +173,15 @@ contract IdentityApplicationA {
             publicInputs.actionContext
         );
         emit SupplierVerified(publicInputs.credentialCommitment, msg.sender, publicInputs.currentTimestamp);
+    }
+
+    function sendCrossChainMessage(
+        uint256 destinationDomain,
+        address destinationReceiver,
+        bytes calldata payload,
+        uint256 deadline
+    ) external returns (bytes32 messageId, uint256 nonce) {
+        return sourceGateway.sendMessage(destinationDomain, destinationReceiver, payload, deadline);
     }
 
     function isVerifiedSupplier(uint256 credentialCommitment) external view returns (bool) {

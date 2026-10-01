@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {ISourceGateway} from "./interfaces/ISourceGateway.sol";
 import {MessageCodec} from "./MessageCodec.sol";
 
-contract SourceGateway {
-    uint8 public constant MESSAGE_VERSION = 1;
+/// @notice Creates canonical outbound messages on the source chain.
+contract SourceGateway is ISourceGateway {
+    uint8 public constant MESSAGE_VERSION = 2;
 
     uint256 public nextNonce = 1;
 
     error InvalidDestinationDomain();
     error InvalidDestinationReceiver();
+    error InvalidDeadline();
 
     event CrossChainMessage(
         bytes32 indexed messageId,
@@ -20,27 +23,37 @@ contract SourceGateway {
         uint256 indexed destinationDomain,
         address destinationReceiver,
         uint256 nonce,
-        bytes payload
+        bytes payload,
+        uint256 deadline
     );
 
-    function sendMessage(uint256 destinationDomain, address destinationReceiver, bytes calldata payload)
-        external
-        returns (bytes32 messageId, uint256 nonce)
-    {
+    function sendMessage(
+        uint256 destinationDomain,
+        address destinationReceiver,
+        bytes calldata payload,
+        uint256 deadline
+    ) external returns (bytes32 messageId, uint256 nonce) {
         if (destinationDomain == 0 || destinationDomain == block.chainid) {
             revert InvalidDestinationDomain();
         }
-
         if (destinationReceiver == address(0)) {
             revert InvalidDestinationReceiver();
         }
+        // forge-lint: disable-next-line(block-timestamp)
+        if (deadline <= block.timestamp) {
+            revert InvalidDeadline();
+        }
 
         nonce = nextNonce;
-        nextNonce++;
-
-        bytes32 payloadHash = MessageCodec.hashPayload(payload);
-
-        messageId = computeMessageId(msg.sender, destinationDomain, destinationReceiver, nonce, payloadHash);
+        nextNonce = nonce + 1;
+        messageId = computeMessageId(
+            msg.sender,
+            destinationDomain,
+            destinationReceiver,
+            nonce,
+            keccak256(payload),
+            deadline
+        );
 
         emit CrossChainMessage(
             messageId,
@@ -51,7 +64,8 @@ contract SourceGateway {
             destinationDomain,
             destinationReceiver,
             nonce,
-            payload
+            payload,
+            deadline
         );
     }
 
@@ -60,17 +74,21 @@ contract SourceGateway {
         uint256 destinationDomain,
         address destinationReceiver,
         uint256 nonce,
-        bytes32 payloadHash
+        bytes32 payloadHash,
+        uint256 deadline
     ) public view returns (bytes32) {
         return MessageCodec.computeMessageId(
-            MESSAGE_VERSION,
-            block.chainid,
-            address(this),
-            sourceSender,
-            destinationDomain,
-            destinationReceiver,
-            nonce,
-            payloadHash
+            MessageCodec.CanonicalMessage({
+                version: MESSAGE_VERSION,
+                sourceDomain: block.chainid,
+                sourceGateway: address(this),
+                sourceSender: sourceSender,
+                destinationDomain: destinationDomain,
+                destinationReceiver: destinationReceiver,
+                nonce: nonce,
+                payloadHash: payloadHash,
+                deadline: deadline
+            })
         );
     }
 }

@@ -178,8 +178,8 @@ From the project root, run:
 
 The root verification script validates the credential model, calls
 `zk/scripts/verify-circuit.sh`, builds the generated Solidity verifier, and
-deploys the verifier, adapter, and identity application to Chain A for
-integration checks. It expects `circom` on `PATH` and the exact npm dependencies
+deploys the verifier, adapter, source gateway, and identity application to
+Chain A for integration checks. It expects `circom` on `PATH` and the exact npm dependencies
 from `zk/package.json` to already exist in `zk/node_modules`; it does not install
 or initialize the development environment.
 

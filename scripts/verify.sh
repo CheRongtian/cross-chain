@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="ZK Identity Authorization with Revocation and Nullifiers"
+VERIFICATION_NAME="Chain A Source Messaging"
 
 CHAIN_A_RPC="http://127.0.0.1:4545"
 CHAIN_B_RPC="http://127.0.0.1:9545"
@@ -24,7 +24,7 @@ ZERO_ADDRESS="0x0000000000000000000000000000000000000000"
 PAYLOAD="0x68656c6c6f20636861696e2062"
 EXPECTED_PAYLOAD_TEXT="hello chain b"
 EXPECTED_PAYLOAD_HASH="0x758a9838e83061770f5b75d8544bc7a27cc795a8741c6b50bdf738ee276d23a6"
-EVENT_SIGNATURE="CrossChainMessage(bytes32,uint8,uint256,address,address,uint256,address,uint256,bytes)"
+EVENT_SIGNATURE="CrossChainMessage(bytes32,uint8,uint256,address,address,uint256,address,uint256,bytes,uint256)"
 
 STARTED_CHAINS="false"
 CHAINS_PID=""
@@ -134,10 +134,11 @@ send_message() {
 
     output="$(
         cast send "$SOURCE_GATEWAY" \
-            "sendMessage(uint256,address,bytes)" \
+            "sendMessage(uint256,address,bytes,uint256)" \
             "$CHAIN_B_ID" \
             "$DESTINATION_RECEIVER" \
             "$PAYLOAD" \
+            "$MESSAGE_DEADLINE" \
             --rpc-url "$CHAIN_A_RPC" \
             --private-key "$ANVIL_DEV_KEY" \
             --async
@@ -158,11 +159,41 @@ send_message() {
     printf 'Transaction hash: %s\n' "$LAST_TX_HASH"
 }
 
+send_application_message() {
+    local output
+
+    output="$(
+        cast send "$IDENTITY_APPLICATION_ADDRESS" \
+            "sendCrossChainMessage(uint256,address,bytes,uint256)" \
+            "$CHAIN_B_ID" \
+            "$DESTINATION_RECEIVER" \
+            "$PAYLOAD" \
+            "$MESSAGE_DEADLINE" \
+            --rpc-url "$CHAIN_A_RPC" \
+            --private-key "$ANVIL_DEV_KEY" \
+            --async
+    )"
+
+    printf 'cast send output: %s\n' "$output"
+
+    LAST_TX_HASH="$(
+        printf '%s\n' "$output" \
+            | sed -nE 's/.*(0x[[:xdigit:]]{64}).*/\1/p' \
+            | tail -n 1
+    )"
+
+    [[ "$LAST_TX_HASH" =~ ^0x[[:xdigit:]]{64}$ ]] \
+        || fail "could not extract IdentityApplicationA message transaction hash"
+    printf 'Transaction hash: %s\n' "$LAST_TX_HASH"
+}
+
 verify_message_event() {
     local transaction_hash="$1"
     local expected_message_id="$2"
     local expected_nonce="$3"
-    local label="$4"
+    local expected_source_sender="$4"
+    local expected_deadline="$5"
+    local label="$6"
     local block_number
     local receipt_json
     local normalized_receipt
@@ -189,17 +220,18 @@ verify_message_event() {
     normalized_receipt="$(normalize "$receipt_json")"
 
     event_topic="$(cast keccak "$EVENT_SIGNATURE")"
-    sender_topic="$(cast abi-encode "f(address)" "$SOURCE_SENDER")"
+    sender_topic="$(cast abi-encode "f(address)" "$expected_source_sender")"
     destination_domain_topic="$(cast abi-encode "f(uint256)" "$CHAIN_B_ID")"
     expected_data="$(
         cast abi-encode \
-            "f(uint8,uint256,address,address,uint256,bytes)" \
-            1 \
+            "f(uint8,uint256,address,address,uint256,bytes,uint256)" \
+            2 \
             "$CHAIN_A_ID" \
             "$SOURCE_GATEWAY" \
             "$DESTINATION_RECEIVER" \
             "$expected_nonce" \
-            "$PAYLOAD"
+            "$PAYLOAD" \
+            "$expected_deadline"
     )"
 
     for expected_value in \
@@ -230,7 +262,9 @@ cleanup() {
     fi
 
     if [[ -n "$TEMP_DIR" ]] && [[ -d "$TEMP_DIR" ]]; then
-        rm -f -- "$TEMP_DIR/deploy-output.log"
+        rm -f -- \
+            "$TEMP_DIR/deploy-output.log" \
+            "$TEMP_DIR/deployment-addresses.env"
         rmdir "$TEMP_DIR" 2>/dev/null || true
     fi
 
@@ -291,18 +325,18 @@ printf '  4. Build deterministic active-credential roots and Merkle witnesses\n'
 printf '  5. Build deterministic nullifier vectors and context-separated inputs\n'
 printf '  6. Compile the ZK circuit and verify membership, policy, and nullifier cases\n'
 printf '  7. Export the Solidity verifier and application proof fixtures\n'
-printf '  8. Format generated Solidity sources\n'
-printf '  9. forge build\n'
-printf ' 10. forge test -vv\n'
-printf ' 11. Run focused gateway, verifier, and identity application tests\n'
-printf ' 12. Deploy the verifier, adapter, and identity application to Chain A\n'
-printf ' 13. Verify nullifier and application policy rejection cases\n'
-printf ' 14. Accept first use and reject same-context proof replays\n'
-printf ' 15. Advance policy epoch and accept a context-separated nullifier\n'
-printf ' 16. Rotate to root N+1 and preserve revocation behavior\n'
-printf ' 17. Authorize credential B under root N+1\n'
-printf ' 18. Deploy SourceGateway to Chain A\n'
-printf ' 19. Verify deployment, payload encoding, messages, and nonce progression\n'
+printf '  8. Generate the canonical deadline-bound message vector\n'
+printf '  9. Format generated Solidity sources\n'
+printf ' 10. forge build\n'
+printf ' 11. forge test -vv\n'
+printf ' 12. Run focused gateway, verifier, and identity application tests\n'
+printf ' 13. Deploy verifier, adapter, SourceGateway, and IdentityApplicationA\n'
+printf ' 14. Preserve nullifier, policy epoch, and revocation verification\n'
+printf ' 15. Verify direct SourceGateway messages and nonce progression\n'
+printf ' 16. Verify Application A to SourceGateway message creation\n'
+printf ' 17. Decode and validate the Application A CrossChainMessage event\n'
+printf ' 18. Recompute message IDs with deadline binding\n'
+printf ' 19. Verify expired deadline rejection without nonce consumption\n'
 printf ' 20. Verify invalid destination domain and receiver reverts\n'
 
 CURRENT_STEP="local chain availability check"
@@ -341,7 +375,7 @@ printf 'Credential proof timestamp: %s\n' "$PROOF_TIMESTAMP"
 
 DEPLOYER_NONCE="$(cast nonce "$SOURCE_SENDER" --rpc-url "$CHAIN_A_RPC")"
 [[ "$DEPLOYER_NONCE" =~ ^[0-9]+$ ]] || fail "Chain A deployer nonce must be an unsigned integer"
-IDENTITY_APPLICATION_NONCE=$((DEPLOYER_NONCE + 2))
+IDENTITY_APPLICATION_NONCE=$((DEPLOYER_NONCE + 3))
 COMPUTED_ADDRESS_OUTPUT="$(cast compute-address "$SOURCE_SENDER" --nonce "$IDENTITY_APPLICATION_NONCE")"
 PREDICTED_IDENTITY_APPLICATION_ADDRESS="$(
     printf '%s\n' "$COMPUTED_ADDRESS_OUTPUT" \
@@ -382,11 +416,18 @@ CREDENTIAL_PROOF_TIMESTAMP="$PROOF_TIMESTAMP" \
 APPLICATION_DOMAIN="$APPLICATION_DOMAIN" \
     bash "$PROJECT_ROOT/zk/scripts/verify-circuit.sh"
 
+CURRENT_STEP="canonical message vector generation"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node "$PROJECT_ROOT/scripts/build-canonical-message-vector.mjs"
+
 cd "$CONTRACTS_DIR"
 
 CURRENT_STEP="generated Solidity source formatting"
 printf '\n[%s]\n' "$CURRENT_STEP"
-forge fmt generated/Groth16Verifier.sol generated/CredentialProofFixture.sol
+forge fmt \
+    generated/Groth16Verifier.sol \
+    generated/CredentialProofFixture.sol \
+    generated/CanonicalMessageVector.sol
 
 CURRENT_STEP="forge build"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -422,47 +463,35 @@ forge test --match-contract IdentityApplicationATest -vvv
 
 CURRENT_STEP="on-chain ZK nullifier and revocation lifecycle"
 printf '\n[%s]\n' "$CURRENT_STEP"
+TEMP_PARENT="${TMPDIR:-/tmp}"
+TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-verification.XXXXXX")"
+DEPLOYMENT_ADDRESSES_FILE="$TEMP_DIR/deployment-addresses.env"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_EXPECTED_ID="$CHAIN_A_ID" \
 VERIFIER_DEPLOYER_KEY="$ANVIL_DEV_KEY" \
 APPLICATION_MAX_PROOF_AGE="$APPLICATION_MAX_PROOF_AGE" \
 CREDENTIAL_STATE_AUTHORITY="$SOURCE_SENDER" \
 EXPECTED_IDENTITY_APPLICATION_ADDRESS="$PREDICTED_IDENTITY_APPLICATION_ADDRESS" \
+DEPLOYMENT_OUTPUT_FILE="$DEPLOYMENT_ADDRESSES_FILE" \
     bash "$PROJECT_ROOT/scripts/deploy-verifier.sh"
 
-CURRENT_STEP="SourceGateway deployment"
+[[ -f "$DEPLOYMENT_ADDRESSES_FILE" ]] || fail "deployment address output is missing"
+SOURCE_GATEWAY="$(sed -nE 's/^SOURCE_GATEWAY_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' "$DEPLOYMENT_ADDRESSES_FILE")"
+IDENTITY_APPLICATION_ADDRESS="$(
+    sed -nE 's/^IDENTITY_APPLICATION_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' "$DEPLOYMENT_ADDRESSES_FILE"
+)"
+[[ "$SOURCE_GATEWAY" =~ ^0x[[:xdigit:]]{40}$ ]] || fail "invalid deployed SourceGateway address"
+[[ "$IDENTITY_APPLICATION_ADDRESS" =~ ^0x[[:xdigit:]]{40}$ ]] \
+    || fail "invalid deployed IdentityApplicationA address"
+assert_hex_equal \
+    "$IDENTITY_APPLICATION_ADDRESS" \
+    "$PREDICTED_IDENTITY_APPLICATION_ADDRESS" \
+    "predicted IdentityApplicationA address"
+
+CURRENT_STEP="SourceGateway deployment reuse"
 printf '\n[%s]\n' "$CURRENT_STEP"
-
-TEMP_PARENT="${TMPDIR:-/tmp}"
-TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-verification.XXXXXX")"
-DEPLOY_OUTPUT_FILE="$TEMP_DIR/deploy-output.log"
-
-forge create src/SourceGateway.sol:SourceGateway \
-    --rpc-url "$CHAIN_A_RPC" \
-    --private-key "$ANVIL_DEV_KEY" \
-    --broadcast \
-    2>&1 | tee "$DEPLOY_OUTPUT_FILE"
-
-SOURCE_GATEWAY="$(
-    sed -nE 's/^[[:space:]]*Deployed to:[[:space:]]*(0x[[:xdigit:]]{40}).*$/\1/p' "$DEPLOY_OUTPUT_FILE" \
-        | tail -n 1
-)"
-DEPLOY_TX_HASH="$(
-    sed -nE 's/^[[:space:]]*Transaction hash:[[:space:]]*(0x[[:xdigit:]]{64}).*$/\1/p' "$DEPLOY_OUTPUT_FILE" \
-        | tail -n 1
-)"
-
-if [[ ! "$SOURCE_GATEWAY" =~ ^0x[[:xdigit:]]{40}$ ]]; then
-    fail "could not extract the SourceGateway deployment address"
-fi
-
-if [[ ! "$DEPLOY_TX_HASH" =~ ^0x[[:xdigit:]]{64}$ ]]; then
-    fail "could not extract the SourceGateway deployment transaction hash"
-fi
-
 printf 'SourceGateway: %s\n' "$SOURCE_GATEWAY"
-printf 'Deployment transaction: %s\n' "$DEPLOY_TX_HASH"
-assert_transaction_success "$DEPLOY_TX_HASH" "SourceGateway deployment"
+printf 'IdentityApplicationA: %s\n' "$IDENTITY_APPLICATION_ADDRESS"
 
 CURRENT_STEP="deployment code verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -474,11 +503,16 @@ fi
 
 printf 'Verified deployed bytecode at %s.\n' "$SOURCE_GATEWAY"
 
+MESSAGE_CHAIN_TIMESTAMP="$(cast block latest --field timestamp --rpc-url "$CHAIN_A_RPC")"
+[[ "$MESSAGE_CHAIN_TIMESTAMP" =~ ^[0-9]+$ ]] || fail "Chain A timestamp must be an unsigned integer"
+MESSAGE_DEADLINE=$((MESSAGE_CHAIN_TIMESTAMP + 3600))
+printf 'Source message deadline: %s\n' "$MESSAGE_DEADLINE"
+
 CURRENT_STEP="initial contract state verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
 assert_equal \
     "$(cast call "$SOURCE_GATEWAY" "MESSAGE_VERSION()(uint8)" --rpc-url "$CHAIN_A_RPC")" \
-    "1" \
+    "2" \
     "message version"
 assert_equal \
     "$(cast call "$SOURCE_GATEWAY" "nextNonce()(uint256)" --rpc-url "$CHAIN_A_RPC")" \
@@ -497,12 +531,13 @@ CURRENT_STEP="first message ID prediction"
 printf '\n[%s]\n' "$CURRENT_STEP"
 FIRST_EXPECTED_MESSAGE_ID="$(
     cast call "$SOURCE_GATEWAY" \
-        "computeMessageId(address,uint256,address,uint256,bytes32)(bytes32)" \
+        "computeMessageId(address,uint256,address,uint256,bytes32,uint256)(bytes32)" \
         "$SOURCE_SENDER" \
         "$CHAIN_B_ID" \
         "$DESTINATION_RECEIVER" \
         1 \
         "$PAYLOAD_HASH" \
+        "$MESSAGE_DEADLINE" \
         --rpc-url "$CHAIN_A_RPC"
 )"
 printf 'First expected message ID: %s\n' "$FIRST_EXPECTED_MESSAGE_ID"
@@ -513,7 +548,13 @@ send_message
 FIRST_TX_HASH="$LAST_TX_HASH"
 
 CURRENT_STEP="first message event verification"
-verify_message_event "$FIRST_TX_HASH" "$FIRST_EXPECTED_MESSAGE_ID" 1 "first message"
+verify_message_event \
+    "$FIRST_TX_HASH" \
+    "$FIRST_EXPECTED_MESSAGE_ID" \
+    1 \
+    "$SOURCE_SENDER" \
+    "$MESSAGE_DEADLINE" \
+    "first message"
 
 CURRENT_STEP="nonce verification after first message"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -526,12 +567,13 @@ CURRENT_STEP="second message ID prediction"
 printf '\n[%s]\n' "$CURRENT_STEP"
 SECOND_EXPECTED_MESSAGE_ID="$(
     cast call "$SOURCE_GATEWAY" \
-        "computeMessageId(address,uint256,address,uint256,bytes32)(bytes32)" \
+        "computeMessageId(address,uint256,address,uint256,bytes32,uint256)(bytes32)" \
         "$SOURCE_SENDER" \
         "$CHAIN_B_ID" \
         "$DESTINATION_RECEIVER" \
         2 \
         "$PAYLOAD_HASH" \
+        "$MESSAGE_DEADLINE" \
         --rpc-url "$CHAIN_A_RPC"
 )"
 printf 'Second expected message ID: %s\n' "$SECOND_EXPECTED_MESSAGE_ID"
@@ -548,7 +590,13 @@ send_message
 SECOND_TX_HASH="$LAST_TX_HASH"
 
 CURRENT_STEP="second message event verification"
-verify_message_event "$SECOND_TX_HASH" "$SECOND_EXPECTED_MESSAGE_ID" 2 "second message"
+verify_message_event \
+    "$SECOND_TX_HASH" \
+    "$SECOND_EXPECTED_MESSAGE_ID" \
+    2 \
+    "$SOURCE_SENDER" \
+    "$MESSAGE_DEADLINE" \
+    "second message"
 
 CURRENT_STEP="nonce verification after second message"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -557,13 +605,73 @@ assert_equal \
     "3" \
     "nonce after second message"
 
+CURRENT_STEP="Application A message ID prediction"
+printf '\n[%s]\n' "$CURRENT_STEP"
+APPLICATION_EXPECTED_MESSAGE_ID="$(
+    cast call "$SOURCE_GATEWAY" \
+        "computeMessageId(address,uint256,address,uint256,bytes32,uint256)(bytes32)" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
+        "$CHAIN_B_ID" \
+        "$DESTINATION_RECEIVER" \
+        3 \
+        "$PAYLOAD_HASH" \
+        "$MESSAGE_DEADLINE" \
+        --rpc-url "$CHAIN_A_RPC"
+)"
+printf 'Application A expected message ID: %s\n' "$APPLICATION_EXPECTED_MESSAGE_ID"
+
+CURRENT_STEP="Application A to SourceGateway message send"
+printf '\n[%s]\n' "$CURRENT_STEP"
+send_application_message
+APPLICATION_MESSAGE_TX_HASH="$LAST_TX_HASH"
+
+CURRENT_STEP="Application A CrossChainMessage verification"
+verify_message_event \
+    "$APPLICATION_MESSAGE_TX_HASH" \
+    "$APPLICATION_EXPECTED_MESSAGE_ID" \
+    3 \
+    "$IDENTITY_APPLICATION_ADDRESS" \
+    "$MESSAGE_DEADLINE" \
+    "Application A message"
+printf 'VALID: Application A called SourceGateway\n'
+printf 'VALID: CrossChainMessage sourceSender equals IdentityApplicationA\n'
+printf 'VALID: deadline is bound to the recomputed message ID\n'
+
+CURRENT_STEP="nonce verification after Application A message"
+printf '\n[%s]\n' "$CURRENT_STEP"
+assert_equal \
+    "$(cast call "$SOURCE_GATEWAY" "nextNonce()(uint256)" --rpc-url "$CHAIN_A_RPC")" \
+    "4" \
+    "nonce after Application A message"
+
+CURRENT_STEP="expired Application A message rejection"
+printf '\n[%s]\n' "$CURRENT_STEP"
+EXPIRED_MESSAGE_DEADLINE="$(cast block latest --field timestamp --rpc-url "$CHAIN_A_RPC")"
+if cast call "$IDENTITY_APPLICATION_ADDRESS" \
+    "sendCrossChainMessage(uint256,address,bytes,uint256)(bytes32,uint256)" \
+    "$CHAIN_B_ID" \
+    "$DESTINATION_RECEIVER" \
+    "$PAYLOAD" \
+    "$EXPIRED_MESSAGE_DEADLINE" \
+    --from "$SOURCE_SENDER" \
+    --rpc-url "$CHAIN_A_RPC"; then
+    fail "expired Application A message unexpectedly succeeded"
+else
+    printf 'EXPECTED FAILURE: expired deadline rejected\n'
+fi
+assert_equal \
+    "$(cast call "$SOURCE_GATEWAY" "nextNonce()(uint256)" --rpc-url "$CHAIN_A_RPC")" \
+    "4" \
+    "nonce after expired deadline rejection"
+
 CURRENT_STEP="same-chain destination rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
 if cast call "$SOURCE_GATEWAY" \
-    "sendMessage(uint256,address,bytes)(bytes32,uint256)" \
+    "sendMessage(uint256,address,bytes,uint256)(bytes32,uint256)" \
     "$CHAIN_A_ID" \
     "$DESTINATION_RECEIVER" \
     "$PAYLOAD" \
+    "$MESSAGE_DEADLINE" \
     --from "$SOURCE_SENDER" \
     --rpc-url "$CHAIN_A_RPC"; then
     fail "same-chain destination call unexpectedly succeeded"
@@ -574,10 +682,11 @@ fi
 CURRENT_STEP="zero destination receiver rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
 if cast call "$SOURCE_GATEWAY" \
-    "sendMessage(uint256,address,bytes)(bytes32,uint256)" \
+    "sendMessage(uint256,address,bytes,uint256)(bytes32,uint256)" \
     "$CHAIN_B_ID" \
     "$ZERO_ADDRESS" \
     "$PAYLOAD" \
+    "$MESSAGE_DEADLINE" \
     --from "$SOURCE_SENDER" \
     --rpc-url "$CHAIN_A_RPC"; then
     fail "zero destination receiver call unexpectedly succeeded"

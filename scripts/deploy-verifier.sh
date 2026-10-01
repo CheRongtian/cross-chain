@@ -7,6 +7,7 @@ PUBLIC_INPUTS_SIGNATURE="(uint256,uint256,uint256,uint256,uint256,uint256,uint25
 VERIFY_CREDENTIAL_SIGNATURE="verifyCredentialProof(uint256[2],uint256[2][2],uint256[2],${PUBLIC_INPUTS_SIGNATURE})(bool)"
 VERIFY_SUPPLIER_SIGNATURE="verifySupplier(uint256[2],uint256[2][2],uint256[2],${PUBLIC_INPUTS_SIGNATURE})"
 EXPECTED_IDENTITY_APPLICATION_ADDRESS="${EXPECTED_IDENTITY_APPLICATION_ADDRESS:-}"
+DEPLOYMENT_OUTPUT_FILE="${DEPLOYMENT_OUTPUT_FILE:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -60,6 +61,7 @@ cleanup() {
         rm -f -- \
             "$TEMP_DIR/generated-verifier.log" \
             "$TEMP_DIR/credential-verifier.log" \
+            "$TEMP_DIR/source-gateway.log" \
             "$TEMP_DIR/identity-application.log"
         rmdir "$TEMP_DIR" 2>/dev/null || true
     fi
@@ -535,12 +537,20 @@ deploy_contract \
 CREDENTIAL_VERIFIER_ADDRESS="$LAST_DEPLOYED_ADDRESS"
 printf 'Credential verifier adapter: %s\n' "$CREDENTIAL_VERIFIER_ADDRESS"
 
+printf '\n[deploy source gateway to Chain A]\n'
+deploy_contract \
+    "src/SourceGateway.sol:SourceGateway" \
+    "$TEMP_DIR/source-gateway.log"
+SOURCE_GATEWAY_ADDRESS="$LAST_DEPLOYED_ADDRESS"
+printf 'Source gateway: %s\n' "$SOURCE_GATEWAY_ADDRESS"
+
 printf '\n[deploy identity application to Chain A]\n'
 deploy_contract \
     "src/IdentityApplicationA.sol:IdentityApplicationA" \
     "$TEMP_DIR/identity-application.log" \
     --constructor-args \
     "$CREDENTIAL_VERIFIER_ADDRESS" \
+    "$SOURCE_GATEWAY_ADDRESS" \
     "$TRUSTED_ISSUER" \
     "$REQUIRED_ROLE" \
     "$APPLICATION_MAX_PROOF_AGE" \
@@ -558,6 +568,7 @@ fi
 for deployed_address in \
     "$GROTH16_VERIFIER_ADDRESS" \
     "$CREDENTIAL_VERIFIER_ADDRESS" \
+    "$SOURCE_GATEWAY_ADDRESS" \
     "$IDENTITY_APPLICATION_ADDRESS"; do
     DEPLOYED_CODE="$(cast code "$deployed_address" --rpc-url "$CHAIN_A_RPC_URL")"
     [[ -n "$DEPLOYED_CODE" ]] && [[ "$DEPLOYED_CODE" != "0x" ]] \
@@ -576,6 +587,14 @@ DEPLOYED_STATE_AUTHORITY="$(
 [[ "$(normalize "$DEPLOYED_STATE_AUTHORITY")" == "$(normalize "$CREDENTIAL_STATE_AUTHORITY")" ]] \
     || fail "credential state authority: expected $CREDENTIAL_STATE_AUTHORITY, got $DEPLOYED_STATE_AUTHORITY"
 printf 'Verified credential state authority: %s\n' "$DEPLOYED_STATE_AUTHORITY"
+DEPLOYED_SOURCE_GATEWAY="$(
+    cast call "$IDENTITY_APPLICATION_ADDRESS" \
+        "sourceGateway()(address)" \
+        --rpc-url "$CHAIN_A_RPC_URL"
+)"
+[[ "$(normalize "$DEPLOYED_SOURCE_GATEWAY")" == "$(normalize "$SOURCE_GATEWAY_ADDRESS")" ]] \
+    || fail "source gateway: expected $SOURCE_GATEWAY_ADDRESS, got $DEPLOYED_SOURCE_GATEWAY"
+printf 'Verified identity application source gateway: %s\n' "$DEPLOYED_SOURCE_GATEWAY"
 assert_uint_equal \
     "$(cast call "$IDENTITY_APPLICATION_ADDRESS" "applicationDomain()(uint256)" --rpc-url "$CHAIN_A_RPC_URL")" \
     "$APPLICATION_DOMAIN_VALUE" \
@@ -810,3 +829,10 @@ assert_authorization_status "$CREDENTIAL_B_COMMITMENT" "1" "credential B after p
 assert_effective_supplier_authorization "$CREDENTIAL_B_COMMITMENT" "true" "credential B after proof becomes stale"
 
 printf '\nZK IDENTITY AUTHORIZATION WITH REVOCATION AND NULLIFIERS PASSED\n'
+
+if [[ -n "$DEPLOYMENT_OUTPUT_FILE" ]]; then
+    printf 'SOURCE_GATEWAY_ADDRESS=%s\nIDENTITY_APPLICATION_ADDRESS=%s\n' \
+        "$SOURCE_GATEWAY_ADDRESS" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
+        > "$DEPLOYMENT_OUTPUT_FILE"
+fi

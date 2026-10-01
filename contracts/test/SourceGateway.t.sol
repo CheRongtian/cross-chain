@@ -3,27 +3,26 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 import {Vm} from "forge-std/Vm.sol";
+
+import {CanonicalMessageVector} from "../generated/CanonicalMessageVector.sol";
 import {MessageCodec} from "../src/MessageCodec.sol";
 import {SourceGateway} from "../src/SourceGateway.sol";
 
 contract SourceGatewayTest is Test {
-    struct GoldenVector {
-        MessageCodec.Message message;
-        bytes32 payloadHash;
-        bytes32 messageId;
-    }
+    uint256 internal constant SOURCE_DOMAIN = 10_011;
+    uint256 internal constant DESTINATION_DOMAIN = 2001;
+    uint256 internal constant CURRENT_TIME = 2_000_000_000;
+    uint256 internal constant DEADLINE = CURRENT_TIME + 1 hours;
+    uint256 internal constant EVENT_TOPIC_COUNT = 4;
+    address internal constant SOURCE_SENDER = address(0xA11CE);
+    address internal constant DESTINATION_RECEIVER = address(0xBEEF);
+    string internal constant PAYLOAD_TEXT = "hello chain b";
 
     SourceGateway internal gateway;
 
-    uint8 internal constant MESSAGE_VERSION = 1;
-    uint256 internal constant SOURCE_DOMAIN = 10011;
-    address internal constant SOURCE_GATEWAY_FIXTURE = address(0x1111);
-    address internal constant SENDER = address(0xA11CE);
-    address internal constant RECEIVER = address(0xBEEF);
-
-    uint256 internal constant DESTINATION_DOMAIN = 2001;
-
     function setUp() public {
+        vm.chainId(SOURCE_DOMAIN);
+        vm.warp(CURRENT_TIME);
         gateway = new SourceGateway();
     }
 
@@ -31,238 +30,206 @@ contract SourceGatewayTest is Test {
         assertEq(gateway.nextNonce(), 1);
     }
 
+    function testPayloadHashMatchesCanonicalDefinition() public pure {
+        assertEq(keccak256(_payload()), keccak256(bytes("hello chain b")));
+    }
+
+    function testGatewayUsesCanonicalMessageIdEncoding() public view {
+        bytes32 expected = keccak256(
+            abi.encode(
+                gateway.MESSAGE_VERSION(),
+                SOURCE_DOMAIN,
+                address(gateway),
+                SOURCE_SENDER,
+                DESTINATION_DOMAIN,
+                DESTINATION_RECEIVER,
+                1,
+                keccak256(_payload()),
+                DEADLINE
+            )
+        );
+
+        assertEq(_messageId(SOURCE_SENDER, 1, DEADLINE), expected);
+    }
+
+    function testEveryIdentityFieldChangesMessageId() public view {
+        MessageCodec.CanonicalMessage memory message = _canonicalMessage();
+        bytes32 baseline = MessageCodec.computeMessageId(message);
+
+        message.version += 1;
+        assertNotEq(MessageCodec.computeMessageId(message), baseline);
+        message = _canonicalMessage();
+        message.sourceDomain += 1;
+        assertNotEq(MessageCodec.computeMessageId(message), baseline);
+        message = _canonicalMessage();
+        message.sourceGateway = address(0x1111);
+        assertNotEq(MessageCodec.computeMessageId(message), baseline);
+        message = _canonicalMessage();
+        message.sourceSender = address(0x2222);
+        assertNotEq(MessageCodec.computeMessageId(message), baseline);
+        message = _canonicalMessage();
+        message.destinationDomain += 1;
+        assertNotEq(MessageCodec.computeMessageId(message), baseline);
+        message = _canonicalMessage();
+        message.destinationReceiver = address(0x3333);
+        assertNotEq(MessageCodec.computeMessageId(message), baseline);
+        message = _canonicalMessage();
+        message.nonce += 1;
+        assertNotEq(MessageCodec.computeMessageId(message), baseline);
+        message = _canonicalMessage();
+        message.payloadHash = keccak256("different payload");
+        assertNotEq(MessageCodec.computeMessageId(message), baseline);
+        message = _canonicalMessage();
+        message.deadline += 1;
+        assertNotEq(MessageCodec.computeMessageId(message), baseline);
+    }
+
+    function testIdenticalCanonicalInputsProduceIdenticalMessageId() public view {
+        assertEq(_messageId(SOURCE_SENDER, 1, DEADLINE), _messageId(SOURCE_SENDER, 1, DEADLINE));
+    }
+
+    function testSharedGoldenVectorsMatchCanonicalEncoding() public pure {
+        bytes32 actual = MessageCodec.computeMessageId(
+            MessageCodec.CanonicalMessage({
+                version: CanonicalMessageVector.version(),
+                sourceDomain: CanonicalMessageVector.sourceDomain(),
+                sourceGateway: CanonicalMessageVector.sourceGateway(),
+                sourceSender: CanonicalMessageVector.sourceSender(),
+                destinationDomain: CanonicalMessageVector.destinationDomain(),
+                destinationReceiver: CanonicalMessageVector.destinationReceiver(),
+                nonce: CanonicalMessageVector.nonce(),
+                payloadHash: CanonicalMessageVector.payloadHash(),
+                deadline: CanonicalMessageVector.deadline()
+            })
+        );
+
+        assertEq(actual, CanonicalMessageVector.expectedMessageId());
+    }
+
+    function testMessageIdCanBeRecomputed() public {
+        bytes32 expected = _messageId(SOURCE_SENDER, 1, DEADLINE);
+
+        vm.prank(SOURCE_SENDER);
+        (bytes32 messageId, uint256 nonce) =
+            gateway.sendMessage(DESTINATION_DOMAIN, DESTINATION_RECEIVER, _payload(), DEADLINE);
+
+        assertEq(messageId, expected);
+        assertEq(nonce, 1);
+    }
+
     function testSendMessageIncrementsNonce() public {
-        bytes memory payload = bytes("hello chain b");
-
-        vm.prank(SENDER);
-        (bytes32 firstMessageId, uint256 firstNonce) = gateway.sendMessage(DESTINATION_DOMAIN, RECEIVER, payload);
-
-        assertEq(firstNonce, 1);
+        _sendMessage(DEADLINE);
         assertEq(gateway.nextNonce(), 2);
+    }
 
-        vm.prank(SENDER);
-        (bytes32 secondMessageId, uint256 secondNonce) = gateway.sendMessage(DESTINATION_DOMAIN, RECEIVER, payload);
+    function testSamePayloadProducesDifferentMessageIds() public {
+        (bytes32 firstMessageId,) = _sendMessage(DEADLINE);
+        (bytes32 secondMessageId,) = _sendMessage(DEADLINE);
 
-        assertEq(secondNonce, 2);
         assertNotEq(firstMessageId, secondMessageId);
         assertEq(gateway.nextNonce(), 3);
     }
 
-    function testSamePayloadProducesDifferentMessageIds() public {
-        bytes memory payload = bytes("hello chain b");
-
-        vm.prank(SENDER);
-        (bytes32 firstId, uint256 firstNonce) = gateway.sendMessage(DESTINATION_DOMAIN, RECEIVER, payload);
-
-        vm.prank(SENDER);
-        (bytes32 secondId, uint256 secondNonce) = gateway.sendMessage(DESTINATION_DOMAIN, RECEIVER, payload);
-
-        assertEq(firstNonce, 1);
-        assertEq(secondNonce, 2);
-        assertNotEq(firstId, secondId);
-    }
-
-    function testMessageIdCanBeRecomputed() public {
-        bytes memory payload = bytes("hello chain b");
-
-        bytes32 expectedId = gateway.computeMessageId(SENDER, DESTINATION_DOMAIN, RECEIVER, 1, keccak256(payload));
-
-        vm.prank(SENDER);
-        (bytes32 actualId, uint256 nonce) = gateway.sendMessage(DESTINATION_DOMAIN, RECEIVER, payload);
-
-        assertEq(nonce, 1);
-        assertEq(actualId, expectedId);
-    }
-
-    function testGatewayUsesCanonicalMessageIdEncoding() public view {
-        bytes memory payload = bytes("hello chain b");
-        bytes32 expectedId = MessageCodec.computeMessageId(
-            gateway.MESSAGE_VERSION(),
-            block.chainid,
-            address(gateway),
-            SENDER,
-            DESTINATION_DOMAIN,
-            RECEIVER,
-            1,
-            MessageCodec.hashPayload(payload)
-        );
-
-        bytes32 actualId =
-            gateway.computeMessageId(SENDER, DESTINATION_DOMAIN, RECEIVER, 1, MessageCodec.hashPayload(payload));
-
-        assertEq(actualId, expectedId);
-    }
-
-    function testPayloadHashMatchesCanonicalDefinition() public pure {
-        assertEq(
-            MessageCodec.hashPayload(bytes("hello chain b")),
-            0x758a9838e83061770f5b75d8544bc7a27cc795a8741c6b50bdf738ee276d23a6
-        );
-    }
-
-    function testEveryIdentityFieldChangesMessageId() public pure {
-        MessageCodec.Message memory message = _baseMessage();
-        bytes32 baseline = MessageCodec.computeMessageId(message);
-
-        message.version = 2;
-        assertNotEq(MessageCodec.computeMessageId(message), baseline);
-        message.version = 1;
-
-        message.sourceDomain = 10012;
-        assertNotEq(MessageCodec.computeMessageId(message), baseline);
-        message.sourceDomain = SOURCE_DOMAIN;
-
-        message.sourceGateway = address(0x2222);
-        assertNotEq(MessageCodec.computeMessageId(message), baseline);
-        message.sourceGateway = SOURCE_GATEWAY_FIXTURE;
-
-        message.sourceSender = address(0xA11CF);
-        assertNotEq(MessageCodec.computeMessageId(message), baseline);
-        message.sourceSender = SENDER;
-
-        message.destinationDomain = 2002;
-        assertNotEq(MessageCodec.computeMessageId(message), baseline);
-        message.destinationDomain = DESTINATION_DOMAIN;
-
-        message.destinationReceiver = address(0xBEF0);
-        assertNotEq(MessageCodec.computeMessageId(message), baseline);
-        message.destinationReceiver = RECEIVER;
-
-        message.nonce = 2;
-        assertNotEq(MessageCodec.computeMessageId(message), baseline);
-        message.nonce = 1;
-
-        message.payload = bytes("hello chain c");
-        assertNotEq(MessageCodec.computeMessageId(message), baseline);
-    }
-
-    function testIdenticalCanonicalInputsProduceIdenticalMessageId() public pure {
-        MessageCodec.Message memory first = _baseMessage();
-        MessageCodec.Message memory second = _baseMessage();
-
-        assertEq(MessageCodec.computeMessageId(first), MessageCodec.computeMessageId(second));
-    }
-
-    function testSharedGoldenVectorsMatchCanonicalEncoding() public view {
-        GoldenVector memory first = _loadGoldenVector(0);
-        GoldenVector memory second = _loadGoldenVector(1);
-
-        assertEq(MessageCodec.hashPayload(first.message.payload), first.payloadHash);
-        assertEq(MessageCodec.computeMessageId(first.message), first.messageId);
-
-        assertEq(MessageCodec.hashPayload(second.message.payload), second.payloadHash);
-        assertEq(MessageCodec.computeMessageId(second.message), second.messageId);
-
-        assertNotEq(first.messageId, second.messageId);
+    function testDeadlineChangesMessageId() public view {
+        assertNotEq(_messageId(SOURCE_SENDER, 1, DEADLINE), _messageId(SOURCE_SENDER, 1, DEADLINE + 1));
     }
 
     function testEmitsCrossChainMessage() public {
-        bytes memory payload = bytes("hello chain b");
-
-        bytes32 expectedId = MessageCodec.computeMessageId(
-            MESSAGE_VERSION,
-            block.chainid,
-            address(gateway),
-            SENDER,
-            DESTINATION_DOMAIN,
-            RECEIVER,
-            1,
-            MessageCodec.hashPayload(payload)
-        );
-
+        bytes32 expectedMessageId = _messageId(SOURCE_SENDER, 1, DEADLINE);
         vm.recordLogs();
-        vm.prank(SENDER);
 
-        (bytes32 actualId, uint256 actualNonce) = gateway.sendMessage(DESTINATION_DOMAIN, RECEIVER, payload);
+        vm.prank(SOURCE_SENDER);
+        gateway.sendMessage(DESTINATION_DOMAIN, DESTINATION_RECEIVER, _payload(), DEADLINE);
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
-        assertEq(actualId, expectedId);
-        assertEq(actualNonce, 1);
         assertEq(logs.length, 1);
-
-        Vm.Log memory messageLog = logs[0];
-
-        assertEq(messageLog.emitter, address(gateway));
-        assertEq(messageLog.topics.length, 4);
-        assertEq(messageLog.topics[0], SourceGateway.CrossChainMessage.selector);
-        assertEq(messageLog.topics[1], expectedId);
-        assertEq(messageLog.topics[2], bytes32(uint256(uint160(SENDER))));
-        assertEq(messageLog.topics[3], bytes32(DESTINATION_DOMAIN));
+        assertEq(logs[0].emitter, address(gateway));
+        assertEq(logs[0].topics.length, EVENT_TOPIC_COUNT);
+        assertEq(logs[0].topics[0], SourceGateway.CrossChainMessage.selector);
+        assertEq(logs[0].topics[1], expectedMessageId);
+        assertEq(logs[0].topics[2], bytes32(uint256(uint160(SOURCE_SENDER))));
+        assertEq(logs[0].topics[3], bytes32(DESTINATION_DOMAIN));
 
         (
-            uint8 emittedVersion,
-            uint256 emittedSourceDomain,
-            address emittedSourceGateway,
-            address emittedDestinationReceiver,
-            uint256 emittedNonce,
-            bytes memory emittedPayload
-        ) = abi.decode(messageLog.data, (uint8, uint256, address, address, uint256, bytes));
+            uint8 version,
+            uint256 sourceDomain,
+            address sourceGateway,
+            address destinationReceiver,
+            uint256 nonce,
+            bytes memory payload,
+            uint256 deadline
+        ) = abi.decode(logs[0].data, (uint8, uint256, address, address, uint256, bytes, uint256));
 
-        assertEq(emittedVersion, MESSAGE_VERSION);
-        assertEq(emittedSourceDomain, block.chainid);
-        assertEq(emittedSourceGateway, address(gateway));
-        assertEq(emittedDestinationReceiver, RECEIVER);
-        assertEq(emittedNonce, 1);
-        assertEq(emittedPayload, payload);
+        assertEq(version, gateway.MESSAGE_VERSION());
+        assertEq(sourceDomain, SOURCE_DOMAIN);
+        assertEq(sourceGateway, address(gateway));
+        assertEq(destinationReceiver, DESTINATION_RECEIVER);
+        assertEq(nonce, 1);
+        assertEq(payload, _payload());
+        assertEq(deadline, DEADLINE);
     }
 
-    function testRejectsSameChainDestination() public {
-        bytes memory payload = bytes("hello");
-
-        vm.prank(SENDER);
+    function testRejectsZeroDestinationDomainWithoutConsumingNonce() public {
         vm.expectRevert(SourceGateway.InvalidDestinationDomain.selector);
+        gateway.sendMessage(0, DESTINATION_RECEIVER, _payload(), DEADLINE);
 
-        // A reverting call cannot produce usable return values.
-        // forge-lint: disable-next-line(unused-return)
-        gateway.sendMessage(block.chainid, RECEIVER, payload);
+        assertEq(gateway.nextNonce(), 1);
     }
 
-    function testRejectsZeroReceiver() public {
-        bytes memory payload = bytes("hello");
+    function testRejectsSameChainDestinationWithoutConsumingNonce() public {
+        vm.expectRevert(SourceGateway.InvalidDestinationDomain.selector);
+        gateway.sendMessage(SOURCE_DOMAIN, DESTINATION_RECEIVER, _payload(), DEADLINE);
 
-        vm.prank(SENDER);
+        assertEq(gateway.nextNonce(), 1);
+    }
+
+    function testRejectsZeroReceiverWithoutConsumingNonce() public {
         vm.expectRevert(SourceGateway.InvalidDestinationReceiver.selector);
+        gateway.sendMessage(DESTINATION_DOMAIN, address(0), _payload(), DEADLINE);
 
-        // A reverting call cannot produce usable return values.
-        // forge-lint: disable-next-line(unused-return)
-        gateway.sendMessage(DESTINATION_DOMAIN, address(0), payload);
+        assertEq(gateway.nextNonce(), 1);
     }
 
-    function _baseMessage() internal pure returns (MessageCodec.Message memory message) {
-        message = MessageCodec.Message({
-            version: MESSAGE_VERSION,
+    function testRejectsCurrentDeadlineWithoutConsumingNonce() public {
+        vm.expectRevert(SourceGateway.InvalidDeadline.selector);
+        gateway.sendMessage(DESTINATION_DOMAIN, DESTINATION_RECEIVER, _payload(), CURRENT_TIME);
+
+        assertEq(gateway.nextNonce(), 1);
+    }
+
+    function testRejectsExpiredDeadlineWithoutConsumingNonce() public {
+        vm.expectRevert(SourceGateway.InvalidDeadline.selector);
+        gateway.sendMessage(DESTINATION_DOMAIN, DESTINATION_RECEIVER, _payload(), CURRENT_TIME - 1);
+
+        assertEq(gateway.nextNonce(), 1);
+    }
+
+    function _sendMessage(uint256 deadline) internal returns (bytes32 messageId, uint256 nonce) {
+        vm.prank(SOURCE_SENDER);
+        return gateway.sendMessage(DESTINATION_DOMAIN, DESTINATION_RECEIVER, _payload(), deadline);
+    }
+
+    function _messageId(address sourceSender, uint256 nonce, uint256 deadline) internal view returns (bytes32) {
+        return gateway.computeMessageId(
+            sourceSender, DESTINATION_DOMAIN, DESTINATION_RECEIVER, nonce, keccak256(_payload()), deadline
+        );
+    }
+
+    function _canonicalMessage() internal view returns (MessageCodec.CanonicalMessage memory) {
+        return MessageCodec.CanonicalMessage({
+            version: gateway.MESSAGE_VERSION(),
             sourceDomain: SOURCE_DOMAIN,
-            sourceGateway: SOURCE_GATEWAY_FIXTURE,
-            sourceSender: SENDER,
+            sourceGateway: address(gateway),
+            sourceSender: SOURCE_SENDER,
             destinationDomain: DESTINATION_DOMAIN,
-            destinationReceiver: RECEIVER,
+            destinationReceiver: DESTINATION_RECEIVER,
             nonce: 1,
-            payload: bytes("hello chain b")
+            payloadHash: keccak256(_payload()),
+            deadline: DEADLINE
         });
     }
 
-    function _loadGoldenVector(uint256 index) internal view returns (GoldenVector memory vector) {
-        // The configured permission is read-only and limited to repository-owned vectors.
-        // forge-lint: disable-next-line(unsafe-cheatcode)
-        string memory json = vm.readFile(string.concat(vm.projectRoot(), "/../test-vectors/canonical-messages.json"));
-        string memory key = string.concat(".vectors[", vm.toString(index), "]");
-        uint256 version = vm.parseJsonUint(json, string.concat(key, ".version"));
-
-        require(version <= type(uint8).max, "golden vector version exceeds uint8");
-
-        vector.message = MessageCodec.Message({
-            // The range check above makes this conversion lossless.
-            // forge-lint: disable-next-line(unsafe-typecast)
-            version: uint8(version),
-            sourceDomain: vm.parseJsonUint(json, string.concat(key, ".sourceDomain")),
-            sourceGateway: vm.parseJsonAddress(json, string.concat(key, ".sourceGateway")),
-            sourceSender: vm.parseJsonAddress(json, string.concat(key, ".sourceSender")),
-            destinationDomain: vm.parseJsonUint(json, string.concat(key, ".destinationDomain")),
-            destinationReceiver: vm.parseJsonAddress(json, string.concat(key, ".destinationReceiver")),
-            nonce: vm.parseJsonUint(json, string.concat(key, ".nonce")),
-            payload: vm.parseJsonBytes(json, string.concat(key, ".payload"))
-        });
-        vector.payloadHash = vm.parseJsonBytes32(json, string.concat(key, ".payloadHash"));
-        vector.messageId = vm.parseJsonBytes32(json, string.concat(key, ".messageId"));
+    function _payload() internal pure returns (bytes memory) {
+        return bytes(PAYLOAD_TEXT);
     }
 }

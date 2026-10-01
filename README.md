@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain messaging and zero-knowledge credential authorization with revocation and replay protection. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, and an application that records and revokes supplier authorization while consuming context-bound nullifiers.
+This repository is a prototype for canonical cross-chain source messaging and zero-knowledge credential authorization with revocation and replay protection. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, and an identity application that can create canonical outbound messages through the gateway.
 
 The current implementation can:
 
@@ -17,7 +17,9 @@ The current implementation can:
 - rotate the accepted root through an explicit authority and remove effective authorization for revoked commitments;
 - preserve authorization for an unaffected active credential across a root rotation;
 - reject both exact proof replay and a newly generated proof for the same credential and authorization context;
-- advance the application policy epoch without deleting previously consumed nullifiers.
+- advance the application policy epoch without deleting previously consumed nullifiers;
+- bind a future Unix deadline into every canonical source message;
+- let `IdentityApplicationA` call `SourceGateway` while preserving the gateway as the canonical message and nonce authority.
 
 ## Architecture
 
@@ -35,16 +37,21 @@ Public policy, state + context ──>│ Groth16 / BN254          │ ──> p
                                                                             │
                                                                             v
                                                          IdentityApplicationA policy
-                                                           │                │
-                                                           v                v
-                                                usedNullifiers       commitment status
+                                                           │       │        │
+                                                           │       v        v
+                                                           │ usedNullifiers commitment status
+                                                           v
+                                                     SourceGateway
+                                                           │
+                                                           v
+                                                CrossChainMessage event
 
 Caller ──> SourceGateway on Chain A ──> CrossChainMessage event
                                                     │
                                                     └──> Relayer and destination execution are not implemented
 ```
 
-Cross-chain messaging and zero-knowledge authorization remain independent paths. The generated Groth16 verifier, its credential adapter, and `IdentityApplicationA` are deployed to Chain A during verification. `SourceGateway` does not require callers to submit a proof and does not consume application authorization state.
+`IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
 
 ## Cross-Chain Messages
 
@@ -61,6 +68,7 @@ destinationDomain
 destinationReceiver
 nonce
 payloadHash
+deadline
 ```
 
 The hashes are defined as:
@@ -70,7 +78,7 @@ payloadHash = keccak256(payload)
 messageId   = keccak256(abi.encode(...canonical fields))
 ```
 
-`epoch`, message status, and other runtime lifecycle values are excluded from the message ID. Shared vectors in `test-vectors/canonical-messages.json` ensure that independent implementations can reproduce the same results.
+`deadline` is the latest Unix timestamp at which the message is intended to remain valid and is part of the message identity. Changing only the deadline changes the message ID. Policy epoch, message status, and other runtime lifecycle values are excluded. Shared inputs in `test-vectors/canonical-messages.json` are evaluated with standard Solidity ABI encoding during verification, producing a concrete expected message ID under `zk/build/` and a generated Solidity fixture.
 
 ### SourceGateway
 
@@ -80,20 +88,25 @@ messageId   = keccak256(abi.encode(...canonical fields))
 sendMessage(
     uint256 destinationDomain,
     address destinationReceiver,
-    bytes payload
+    bytes payload,
+    uint256 deadline
 ) returns (bytes32 messageId, uint256 nonce)
 ```
 
 Gateway behavior:
 
-- the message version is fixed at `1`;
+- the canonical wire-format version is `2`;
 - the nonce starts at `1` and increments after each message;
 - the destination domain cannot be `0` or the current chain ID;
 - the destination receiver cannot be the zero address;
+- the deadline must be strictly greater than `block.timestamp`;
+- rejected messages do not consume a nonce;
 - a successful call emits `CrossChainMessage`;
 - the event contains the original payload, so event payloads are public.
 
-The repository currently implements source-chain message production and event verification. It does not yet provide a relayer, destination gateway, message confirmation, destination execution, or cross-chain replay protection.
+The event records the direct Gateway caller as `sourceSender`. When `IdentityApplicationA` calls the Gateway, this value is the application contract address rather than the originating EOA. The Gateway currently accepts calls from arbitrary addresses and contracts; recording a caller does not classify it as a trusted source application.
+
+The repository currently implements source-chain message production and event verification. It does not yet provide a relayer, destination gateway, message confirmation, destination execution, or destination-side replay protection.
 
 ## Credentials and Zero-Knowledge Authorization
 
@@ -263,6 +276,7 @@ The Solidity verifier establishes that a Groth16 proof is valid for the supplied
 `contracts/src/IdentityApplicationA.sol` consumes the stable `CredentialVerifier` interface and owns the business policy. Its deployment configuration contains:
 
 - the credential verifier address;
+- the source gateway address;
 - one trusted issuer field value;
 - the required role, fixed to the existing `VERIFIED_SUPPLIER = 1` encoding;
 - a non-zero maximum proof age;
@@ -285,6 +299,12 @@ The same authority calls `advancePolicyEpoch` to increment the application epoch
 An exact proof replay and a newly generated proof for the same credential and context both expose the same nullifier and are rejected after the first successful use. The nullifier prevents duplicate authorization within its defined context; it does not hide the public credential commitment or provide global unlinkability. Freshness is checked when a proof is submitted. Stored `VERIFIED_SUPPLIER` state does not automatically expire when `maxProofAge` elapses, while an authority root update can explicitly revoke it.
 
 Revocation and nullifier consumption answer separate questions and are enforced together. Active-state membership answers whether the credential is still active. The nullifier registry answers whether that credential has already performed the protected action in the current application context. A fresh, unused nullifier cannot make a revoked credential valid.
+
+### Application source messaging
+
+`IdentityApplicationA.sendCrossChainMessage` forwards the destination domain, destination receiver, payload, and deadline to its configured `ISourceGateway`. It returns the Gateway-created message ID and nonce and does not maintain a second nonce or message encoding implementation. The Gateway observes `address(IdentityApplicationA)` as the direct `sourceSender`.
+
+This transport entry point is currently separate from `verifySupplier`. It does not require a proof, check stored supplier authorization, or consume a nullifier. Direct calls to `SourceGateway` also remain available because no trusted-source registry is implemented yet.
 
 ## Local Two-Chain Environment
 
@@ -356,10 +376,11 @@ The Python validator uses only the standard library, so the repository does not 
 
 ### Solidity
 
-The Solidity build depends on verifier and proof-fixture source generated from the current Groth16 zkey and proof. Generate those files first:
+The Solidity build depends on verifier and proof-fixture source generated from the current Groth16 zkey and proof, plus the canonical message fixture generated from the shared vector. Generate those files first:
 
 ```bash
 bash zk/scripts/verify-circuit.sh
+node scripts/build-canonical-message-vector.mjs
 ```
 
 Then build and test:
@@ -426,10 +447,10 @@ The script uses strict error handling and performs:
 2. selection of a proof timestamp relative to the current Chain A block;
 3. credential model, fixture, and state-tree configuration validation;
 4. deterministic Root N and Root N+1 construction, nullifier-vector generation, and ZK circuit compilation with positive and negative local proof verification;
-5. Solidity verifier export and proof-fixture generation;
+5. Solidity verifier, proof-fixture, and deadline-bound canonical message fixture generation;
 6. Solidity formatting, build, and tests against the real generated verifier;
 7. focused canonical-message, credential-verifier, and identity-application tests;
-8. deployment of the generated verifier, credential adapter, and identity application to Chain A;
+8. deployment of the generated verifier, credential adapter, source gateway, and identity application to Chain A;
 9. valid on-chain proof verification and credential A authorization under Root N;
 10. rejection of future, stale, tampered, alternate-policy, alternate-domain, alternate-epoch, alternate-action, and non-current-root submissions;
 11. rejection of exact and regenerated same-context proof replays;
@@ -437,7 +458,10 @@ The script uses strict error handling and performs:
 13. rejection of unauthorized and zero-root credential-state updates;
 14. rotation to Root N+1, revocation of credential A, preservation of consumed-nullifier history, and rejection of A's old-root proof;
 15. authorization and retained active status for credential B under Root N+1;
-16. `SourceGateway` deployment and existing cross-chain message verification.
+16. direct `SourceGateway` message creation with deadline-bound message ID and nonce verification;
+17. real `IdentityApplicationA → SourceGateway` message creation and event decoding;
+18. verification that the Gateway records the application address as `sourceSender`;
+19. rejection of current or expired deadlines without nonce consumption.
 
 If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
 
@@ -451,7 +475,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-ZK Identity Authorization with Revocation and Nullifiers
+Chain A Source Messaging
 ```
 
 ### Expected error output
@@ -461,6 +485,7 @@ Complete verification intentionally executes negative cases, so a passing log ca
 ```text
 Error: execution reverted: InvalidDestinationDomain
 Error: execution reverted: InvalidDestinationReceiver
+Error: execution reverted: InvalidDeadline
 Error: Assert Failed.
 Invalid proof
 FutureProofTimestamp
@@ -477,7 +502,7 @@ UnauthorizedCredentialStateAuthority
 StaleProofTimestamp
 ```
 
-These messages demonstrate that the contracts reject invalid destinations, the circuit rejects invalid witnesses, a proof cannot be reused with a tampered public input, and the identity application enforces policy, freshness, context-bound replay protection, state-root authority, and revocation. Each expected failure is followed by `Verified rejection` or `Verified expected ... rejection`. Complete verification succeeds only when the script exits with code `0` and the log ends with `VERIFICATION PASSED`.
+These messages demonstrate that the contracts reject invalid destinations and deadlines, the circuit rejects invalid witnesses, a proof cannot be reused with a tampered public input, and the identity application enforces policy, freshness, context-bound replay protection, state-root authority, and revocation. Each expected failure is followed by `Verified rejection`, `EXPECTED FAILURE`, or `Verified expected ... rejection`. Complete verification succeeds only when the script exits with code `0` and the log ends with `VERIFICATION PASSED`.
 
 The on-chain negative cases normally return `false` and are reported as `Verified expected on-chain rejection`. A successful result for any modified proof or public policy value fails the complete verification.
 
@@ -490,7 +515,8 @@ Cross-Chain/
 │   ├── src/
 │   │   ├── interfaces/
 │   │   │   ├── ICredentialVerifier.sol
-│   │   │   └── IGroth16Verifier.sol
+│   │   │   ├── IGroth16Verifier.sol
+│   │   │   └── ISourceGateway.sol
 │   │   ├── CredentialVerifier.sol
 │   │   ├── IdentityApplicationA.sol
 │   │   ├── MessageCodec.sol
@@ -499,9 +525,11 @@ Cross-Chain/
 │       ├── CredentialVerifier.t.sol
 │       ├── IdentityApplicationA.t.sol
 │       ├── mocks/
-│       │   └── MockCredentialVerifier.sol
+│       │   ├── MockCredentialVerifier.sol
+│       │   └── MockSourceGateway.sol
 │       └── SourceGateway.t.sol
 ├── scripts/
+│   ├── build-canonical-message-vector.mjs
 │   ├── deploy-verifier.sh
 │   ├── start-chains.sh
 │   └── verify.sh
@@ -547,8 +575,10 @@ Cross-Chain/
 - Stored authorization does not automatically expire when the proof freshness window passes.
 - Revocation uses membership in a deterministic active-credential root and an explicit Chain A root authority. The authority is responsible for publishing a root and revoked-commitment list that describe the same transition.
 - Nullifiers prevent repeated authorization for the same credential, application, epoch, and action. They do not hide the public credential commitment, prevent correlation through other public signals, or provide global replay protection across distinct contexts.
-- `SourceGateway` does not yet integrate credential-proof verification.
-- The repository does not provide an indexer, relayer, Merkle batching, PBFT validation, destination gateway or execution, finality proof, or production cross-chain security model.
-- ZK authorization is local to `IdentityApplicationA` on Chain A and is not propagated across chains.
+- `SourceGateway` records its direct caller as `sourceSender` and currently has no trusted-source application registry or allowlist.
+- `IdentityApplicationA` can call `SourceGateway`, while mandatory ZK-gated message creation and proof-to-message nullifier binding remain unimplemented.
+- The current message binds its source chain, source gateway, destination domain, and destination receiver. Complete remote-gateway domain separation and a remote gateway registry remain unimplemented.
+- The repository does not provide an indexer, finality watcher, reorg handling, relayer, Merkle batching, PBFT validation, destination gateway or execution, Application B, finality proof, or production cross-chain security model.
+- ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.

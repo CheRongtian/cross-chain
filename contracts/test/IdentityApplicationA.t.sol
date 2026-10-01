@@ -6,7 +6,9 @@ import {Vm} from "forge-std/Vm.sol";
 
 import {IdentityApplicationA} from "../src/IdentityApplicationA.sol";
 import {ICredentialVerifier} from "../src/interfaces/ICredentialVerifier.sol";
+import {SourceGateway} from "../src/SourceGateway.sol";
 import {MockCredentialVerifier} from "./mocks/MockCredentialVerifier.sol";
+import {MockSourceGateway} from "./mocks/MockSourceGateway.sol";
 
 contract IdentityApplicationATest is Test {
     uint256 internal constant TRUSTED_ISSUER = 12_345;
@@ -24,11 +26,15 @@ contract IdentityApplicationATest is Test {
     uint256 internal constant NULLIFIER_A_EPOCH_TWO = 333_333;
     uint256 internal constant NULLIFIER_B_EPOCH_TWO = 333_334;
     uint256 internal constant INDEXED_EVENT_TOPIC_COUNT = 3;
+    uint256 internal constant GATEWAY_EVENT_TOPIC_COUNT = 4;
+    uint256 internal constant DESTINATION_DOMAIN = 2001;
     address internal constant SUBMITTER = address(0xA11CE);
+    address internal constant DESTINATION_RECEIVER = address(0xBEEF);
     address internal constant STATE_AUTHORITY = address(0xA11CE5);
     address internal constant UNAUTHORIZED_CALLER = address(0xBAD);
 
     MockCredentialVerifier internal verifier;
+    MockSourceGateway internal sourceGateway;
     IdentityApplicationA internal application;
     uint256 internal proofApplicationDomain;
     uint256 internal proofPolicyEpoch;
@@ -37,8 +43,15 @@ contract IdentityApplicationATest is Test {
         vm.warp(CURRENT_TIME);
         verifier = new MockCredentialVerifier();
         verifier.setVerificationResult(true);
+        sourceGateway = new MockSourceGateway();
         application = new IdentityApplicationA(
-            address(verifier), TRUSTED_ISSUER, REQUIRED_ROLE, MAX_PROOF_AGE, STATE_AUTHORITY, ROOT_N
+            address(verifier),
+            address(sourceGateway),
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            MAX_PROOF_AGE,
+            STATE_AUTHORITY,
+            ROOT_N
         );
         proofApplicationDomain = application.applicationDomain();
         proofPolicyEpoch = INITIAL_POLICY_EPOCH;
@@ -46,6 +59,7 @@ contract IdentityApplicationATest is Test {
 
     function testConstructorConfiguration() public view {
         assertEq(address(application.credentialVerifier()), address(verifier));
+        assertEq(address(application.sourceGateway()), address(sourceGateway));
         assertEq(application.trustedIssuer(), TRUSTED_ISSUER);
         assertEq(application.requiredRole(), REQUIRED_ROLE);
         assertEq(application.maxProofAge(), MAX_PROOF_AGE);
@@ -74,32 +88,94 @@ contract IdentityApplicationATest is Test {
 
     function testRejectsZeroVerifierAddress() public {
         vm.expectRevert(IdentityApplicationA.InvalidCredentialVerifier.selector);
-        new IdentityApplicationA(address(0), TRUSTED_ISSUER, REQUIRED_ROLE, MAX_PROOF_AGE, STATE_AUTHORITY, ROOT_N);
+        new IdentityApplicationA(
+            address(0),
+            address(sourceGateway),
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            MAX_PROOF_AGE,
+            STATE_AUTHORITY,
+            ROOT_N
+        );
     }
 
     function testRejectsAddressWithoutVerifierCode() public {
         vm.expectRevert(IdentityApplicationA.InvalidCredentialVerifier.selector);
-        new IdentityApplicationA(address(0xBEEF), TRUSTED_ISSUER, REQUIRED_ROLE, MAX_PROOF_AGE, STATE_AUTHORITY, ROOT_N);
+        new IdentityApplicationA(
+            address(0xBEEF),
+            address(sourceGateway),
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            MAX_PROOF_AGE,
+            STATE_AUTHORITY,
+            ROOT_N
+        );
+    }
+
+    function testRejectsZeroSourceGatewayAddress() public {
+        vm.expectRevert(IdentityApplicationA.InvalidSourceGateway.selector);
+        new IdentityApplicationA(
+            address(verifier),
+            address(0),
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            MAX_PROOF_AGE,
+            STATE_AUTHORITY,
+            ROOT_N
+        );
+    }
+
+    function testRejectsSourceGatewayAddressWithoutCode() public {
+        vm.expectRevert(IdentityApplicationA.InvalidSourceGateway.selector);
+        new IdentityApplicationA(
+            address(verifier),
+            address(0xBEEF),
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            MAX_PROOF_AGE,
+            STATE_AUTHORITY,
+            ROOT_N
+        );
     }
 
     function testRejectsNonSupplierRoleConfiguration() public {
         vm.expectRevert(IdentityApplicationA.InvalidRequiredRole.selector);
-        new IdentityApplicationA(address(verifier), TRUSTED_ISSUER, 2, MAX_PROOF_AGE, STATE_AUTHORITY, ROOT_N);
+        new IdentityApplicationA(
+            address(verifier), address(sourceGateway), TRUSTED_ISSUER, 2, MAX_PROOF_AGE, STATE_AUTHORITY, ROOT_N
+        );
     }
 
     function testRejectsZeroMaxProofAge() public {
         vm.expectRevert(IdentityApplicationA.InvalidMaxProofAge.selector);
-        new IdentityApplicationA(address(verifier), TRUSTED_ISSUER, REQUIRED_ROLE, 0, STATE_AUTHORITY, ROOT_N);
+        new IdentityApplicationA(
+            address(verifier), address(sourceGateway), TRUSTED_ISSUER, REQUIRED_ROLE, 0, STATE_AUTHORITY, ROOT_N
+        );
     }
 
     function testRejectsZeroCredentialStateAuthority() public {
         vm.expectRevert(IdentityApplicationA.InvalidCredentialStateAuthority.selector);
-        new IdentityApplicationA(address(verifier), TRUSTED_ISSUER, REQUIRED_ROLE, MAX_PROOF_AGE, address(0), ROOT_N);
+        new IdentityApplicationA(
+            address(verifier),
+            address(sourceGateway),
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            MAX_PROOF_AGE,
+            address(0),
+            ROOT_N
+        );
     }
 
     function testRejectsZeroInitialCredentialStateRoot() public {
         vm.expectRevert(IdentityApplicationA.InvalidCredentialStateRoot.selector);
-        new IdentityApplicationA(address(verifier), TRUSTED_ISSUER, REQUIRED_ROLE, MAX_PROOF_AGE, STATE_AUTHORITY, 0);
+        new IdentityApplicationA(
+            address(verifier),
+            address(sourceGateway),
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            MAX_PROOF_AGE,
+            STATE_AUTHORITY,
+            0
+        );
     }
 
     function testValidProofAuthorizesCredentialCommitment() public {
@@ -437,6 +513,99 @@ contract IdentityApplicationATest is Test {
         assertTrue(application.isVerifiedSupplier(SECOND_CREDENTIAL_COMMITMENT));
         assertTrue(application.usedNullifiers(NULLIFIER_A_EPOCH_ONE));
         assertTrue(application.usedNullifiers(NULLIFIER_B_EPOCH_ONE));
+    }
+
+    function testForwardsCrossChainMessageToConfiguredGateway() public {
+        bytes memory payload = "supplier update";
+        uint256 deadline = CURRENT_TIME + 1 hours;
+        bytes32 expectedMessageId = keccak256("configured-mock-message");
+        uint256 expectedNonce = 73;
+        sourceGateway.setReturnValues(expectedMessageId, expectedNonce);
+
+        vm.prank(SUBMITTER);
+        (bytes32 messageId, uint256 nonce) =
+            application.sendCrossChainMessage(DESTINATION_DOMAIN, DESTINATION_RECEIVER, payload, deadline);
+
+        assertEq(messageId, expectedMessageId);
+        assertEq(nonce, expectedNonce);
+        assertEq(sourceGateway.caller(), address(application));
+        assertEq(sourceGateway.destinationDomain(), DESTINATION_DOMAIN);
+        assertEq(sourceGateway.destinationReceiver(), DESTINATION_RECEIVER);
+        assertEq(sourceGateway.payload(), payload);
+        assertEq(sourceGateway.deadline(), deadline);
+    }
+
+    function testIdentityApplicationCallsRealSourceGateway() public {
+        SourceGateway realSourceGateway = new SourceGateway();
+        IdentityApplicationA realGatewayApplication = new IdentityApplicationA(
+            address(verifier),
+            address(realSourceGateway),
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            MAX_PROOF_AGE,
+            STATE_AUTHORITY,
+            ROOT_N
+        );
+        bytes memory payload = "supplier update";
+        uint256 deadline = CURRENT_TIME + 1 hours;
+        bytes32 payloadHash = keccak256(payload);
+        bytes32 expectedMessageId = realSourceGateway.computeMessageId(
+            address(realGatewayApplication),
+            DESTINATION_DOMAIN,
+            DESTINATION_RECEIVER,
+            1,
+            payloadHash,
+            deadline
+        );
+
+        vm.recordLogs();
+        vm.prank(SUBMITTER);
+        (bytes32 messageId, uint256 nonce) = realGatewayApplication.sendCrossChainMessage(
+            DESTINATION_DOMAIN, DESTINATION_RECEIVER, payload, deadline
+        );
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(messageId, expectedMessageId);
+        assertEq(nonce, 1);
+        assertEq(realSourceGateway.nextNonce(), 2);
+        _assertRealGatewayEvent(
+            logs, realSourceGateway, realGatewayApplication, expectedMessageId, payload, deadline
+        );
+    }
+
+    function _assertRealGatewayEvent(
+        Vm.Log[] memory logs,
+        SourceGateway realSourceGateway,
+        IdentityApplicationA realGatewayApplication,
+        bytes32 expectedMessageId,
+        bytes memory expectedPayload,
+        uint256 expectedDeadline
+    ) internal view {
+        assertEq(logs.length, 1);
+        assertEq(logs[0].emitter, address(realSourceGateway));
+        assertEq(logs[0].topics.length, GATEWAY_EVENT_TOPIC_COUNT);
+        assertEq(logs[0].topics[0], SourceGateway.CrossChainMessage.selector);
+        assertEq(logs[0].topics[1], expectedMessageId);
+        assertEq(logs[0].topics[2], bytes32(uint256(uint160(address(realGatewayApplication)))));
+        assertEq(logs[0].topics[3], bytes32(DESTINATION_DOMAIN));
+
+        (
+            uint8 version,
+            uint256 sourceDomain,
+            address eventSourceGateway,
+            address eventDestinationReceiver,
+            uint256 eventNonce,
+            bytes memory eventPayload,
+            uint256 eventDeadline
+        ) = abi.decode(logs[0].data, (uint8, uint256, address, address, uint256, bytes, uint256));
+
+        assertEq(version, realSourceGateway.MESSAGE_VERSION());
+        assertEq(sourceDomain, block.chainid);
+        assertEq(eventSourceGateway, address(realSourceGateway));
+        assertEq(eventDestinationReceiver, DESTINATION_RECEIVER);
+        assertEq(eventNonce, 1);
+        assertEq(eventPayload, expectedPayload);
+        assertEq(eventDeadline, expectedDeadline);
     }
 
     function _verifySupplier(
