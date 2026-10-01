@@ -177,11 +177,18 @@ contract IdentityApplicationA {
 
     function sendCrossChainMessage(
         uint256 destinationDomain,
+        address destinationGateway,
         address destinationReceiver,
         bytes calldata payload,
         uint256 deadline
     ) external returns (bytes32 messageId, uint256 nonce) {
-        return sourceGateway.sendMessage(destinationDomain, destinationReceiver, payload, deadline);
+        return sourceGateway.sendMessage(
+            destinationDomain,
+            destinationGateway,
+            destinationReceiver,
+            payload,
+            deadline
+        );
     }
 
     function isVerifiedSupplier(uint256 credentialCommitment) external view returns (bool) {

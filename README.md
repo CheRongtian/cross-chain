@@ -19,6 +19,7 @@ The current implementation can:
 - reject both exact proof replay and a newly generated proof for the same credential and authorization context;
 - advance the application policy epoch without deleting previously consumed nullifiers;
 - bind a future Unix deadline into every canonical source message;
+- bind source and destination domains and gateways into a type-tagged message identity;
 - let `IdentityApplicationA` call `SourceGateway` while preserving the gateway as the canonical message and nonce authority.
 
 ## Architecture
@@ -44,9 +45,9 @@ Public policy, state + context ──>│ Groth16 / BN254          │ ──> p
                                                      SourceGateway
                                                            │
                                                            v
-                                                CrossChainMessage event
+                                       Domain-separated CrossChainMessage event
 
-Caller ──> SourceGateway on Chain A ──> CrossChainMessage event
+Caller ──> SourceGateway on Chain A ──> Domain-separated CrossChainMessage event
                                                     │
                                                     └──> Relayer and destination execution are not implemented
 ```
@@ -57,14 +58,16 @@ Caller ──> SourceGateway on Chain A ──> CrossChainMessage event
 
 ### Canonical message ID
 
-A message ID is derived from the following fields in a fixed Solidity ABI encoding order:
+A message ID is derived from a protocol type hash and the following fields in a fixed Solidity ABI encoding order:
 
 ```text
+MESSAGE_TYPEHASH
 version
 sourceDomain
 sourceGateway
 sourceSender
 destinationDomain
+destinationGateway
 destinationReceiver
 nonce
 payloadHash
@@ -74,11 +77,31 @@ deadline
 The hashes are defined as:
 
 ```text
-payloadHash = keccak256(payload)
-messageId   = keccak256(abi.encode(...canonical fields))
+MESSAGE_TYPE     = "CrossChainMessage(uint8 version,uint256 sourceDomain,address sourceGateway,address sourceSender,uint256 destinationDomain,address destinationGateway,address destinationReceiver,uint256 nonce,bytes32 payloadHash,uint256 deadline)"
+MESSAGE_TYPEHASH = keccak256(bytes(MESSAGE_TYPE))
+payloadHash      = keccak256(payload)
+messageId        = keccak256(
+    abi.encode(
+        MESSAGE_TYPEHASH,
+        version,
+        sourceDomain,
+        sourceGateway,
+        sourceSender,
+        destinationDomain,
+        destinationGateway,
+        destinationReceiver,
+        nonce,
+        payloadHash,
+        deadline
+    )
+)
 ```
 
-`deadline` is the latest Unix timestamp at which the message is intended to remain valid and is part of the message identity. Changing only the deadline changes the message ID. Policy epoch, message status, and other runtime lifecycle values are excluded. Shared inputs in `test-vectors/canonical-messages.json` are evaluated with standard Solidity ABI encoding during verification, producing a concrete expected message ID under `zk/build/` and a generated Solidity fixture.
+`destinationGateway` identifies the selected remote cross-chain protocol endpoint. `destinationReceiver` identifies the target application contract behind that endpoint. Both addresses are independently bound to the message ID.
+
+`deadline` is the latest Unix timestamp at which the message is intended to remain valid and is part of the message identity. Changing only the deadline changes the message ID. Policy epoch, message status, and other runtime lifecycle values are excluded. Shared inputs in `test-vectors/canonical-messages.json` cover the base message and one-field source-domain, source-gateway, destination-domain, and destination-gateway variants. Verification evaluates them with standard Solidity ABI encoding, produces concrete expected message IDs under `zk/build/`, and generates a Solidity fixture from the same data.
+
+The Gateway nonce is monotonically increasing within one `SourceGateway` deployment. It is not globally unique across chains or Gateway contracts. Global protocol message identity comes from the complete type-tagged encoding, so the same nonce can appear on different source chains, source gateways, destination chains, or destination gateways without producing the same message ID.
 
 ### SourceGateway
 
@@ -87,6 +110,7 @@ messageId   = keccak256(abi.encode(...canonical fields))
 ```solidity
 sendMessage(
     uint256 destinationDomain,
+    address destinationGateway,
     address destinationReceiver,
     bytes payload,
     uint256 deadline
@@ -98,15 +122,16 @@ Gateway behavior:
 - the canonical wire-format version is `2`;
 - the nonce starts at `1` and increments after each message;
 - the destination domain cannot be `0` or the current chain ID;
+- the destination gateway cannot be the zero address;
 - the destination receiver cannot be the zero address;
 - the deadline must be strictly greater than `block.timestamp`;
 - rejected messages do not consume a nonce;
 - a successful call emits `CrossChainMessage`;
 - the event contains the original payload, so event payloads are public.
 
-The event records the direct Gateway caller as `sourceSender`. When `IdentityApplicationA` calls the Gateway, this value is the application contract address rather than the originating EOA. The Gateway currently accepts calls from arbitrary addresses and contracts; recording a caller does not classify it as a trusted source application.
+The source domain always comes from `block.chainid`, and the source gateway always comes from `address(this)`. Callers cannot supply either value. The event records the direct Gateway caller as `sourceSender`. When `IdentityApplicationA` calls the Gateway, this value is the application contract address rather than the originating EOA. The Gateway currently accepts calls from arbitrary addresses and contracts; recording a caller does not classify it as a trusted source application.
 
-The repository currently implements source-chain message production and event verification. It does not yet provide a relayer, destination gateway, message confirmation, destination execution, or destination-side replay protection.
+Binding `destinationGateway` makes the selected remote endpoint part of the cryptographic message identity. It does not establish that the address is deployed, belongs to the destination domain, or is trusted. The repository currently implements source-chain message production and event verification. It does not provide a remote-gateway registry, relayer, destination gateway implementation, message confirmation, destination execution, or destination-side replay protection.
 
 ## Credentials and Zero-Knowledge Authorization
 
@@ -302,7 +327,7 @@ Revocation and nullifier consumption answer separate questions and are enforced 
 
 ### Application source messaging
 
-`IdentityApplicationA.sendCrossChainMessage` forwards the destination domain, destination receiver, payload, and deadline to its configured `ISourceGateway`. It returns the Gateway-created message ID and nonce and does not maintain a second nonce or message encoding implementation. The Gateway observes `address(IdentityApplicationA)` as the direct `sourceSender`.
+`IdentityApplicationA.sendCrossChainMessage` forwards the destination domain, destination gateway, destination receiver, payload, and deadline to its configured `ISourceGateway`. It returns the Gateway-created message ID and nonce and does not maintain a second nonce or message encoding implementation. The Gateway observes `address(IdentityApplicationA)` as the direct `sourceSender`.
 
 This transport entry point is currently separate from `verifySupplier`. It does not require a proof, check stored supplier authorization, or consume a nullifier. Direct calls to `SourceGateway` also remain available because no trusted-source registry is implemented yet.
 
@@ -323,7 +348,7 @@ Start both chains from the repository root:
 
 The command remains active until interrupted with `Ctrl+C`. Chain output is written to `chain-a.log` and `chain-b.log` in the repository root.
 
-Chain A hosts the generated Groth16 verifier, its credential adapter, `IdentityApplicationA`, and `SourceGateway` during complete verification. Chain B verifies the two-chain environment and supplies the destination domain. No destination message receiver is deployed to Chain B.
+Chain A hosts the generated Groth16 verifier, its credential adapter, `IdentityApplicationA`, and `SourceGateway` during complete verification. Chain B verifies the two-chain environment and supplies the destination domain. The destination gateway and receiver used by source messages are explicit message inputs; no destination protocol endpoint or receiver is deployed to Chain B.
 
 ## Prerequisites
 
@@ -376,7 +401,7 @@ The Python validator uses only the standard library, so the repository does not 
 
 ### Solidity
 
-The Solidity build depends on verifier and proof-fixture source generated from the current Groth16 zkey and proof, plus the canonical message fixture generated from the shared vector. Generate those files first:
+The Solidity build depends on verifier and proof-fixture source generated from the current Groth16 zkey and proof, plus the canonical message fixture generated from the shared vectors. Generate those files first:
 
 ```bash
 bash zk/scripts/verify-circuit.sh
@@ -447,7 +472,7 @@ The script uses strict error handling and performs:
 2. selection of a proof timestamp relative to the current Chain A block;
 3. credential model, fixture, and state-tree configuration validation;
 4. deterministic Root N and Root N+1 construction, nullifier-vector generation, and ZK circuit compilation with positive and negative local proof verification;
-5. Solidity verifier, proof-fixture, and deadline-bound canonical message fixture generation;
+5. Solidity verifier, proof-fixture, and domain-separated canonical message fixture generation;
 6. Solidity formatting, build, and tests against the real generated verifier;
 7. focused canonical-message, credential-verifier, and identity-application tests;
 8. deployment of the generated verifier, credential adapter, source gateway, and identity application to Chain A;
@@ -458,10 +483,12 @@ The script uses strict error handling and performs:
 13. rejection of unauthorized and zero-root credential-state updates;
 14. rotation to Root N+1, revocation of credential A, preservation of consumed-nullifier history, and rejection of A's old-root proof;
 15. authorization and retained active status for credential B under Root N+1;
-16. direct `SourceGateway` message creation with deadline-bound message ID and nonce verification;
-17. real `IdentityApplicationA → SourceGateway` message creation and event decoding;
-18. verification that the Gateway records the application address as `sourceSender`;
-19. rejection of current or expired deadlines without nonce consumption.
+16. canonical type-hash and source-domain, source-gateway, destination-domain, and destination-gateway separation checks;
+17. direct `SourceGateway` message creation with deadline-bound message ID and nonce verification;
+18. real `IdentityApplicationA → SourceGateway` message creation and event decoding, including destination-gateway forwarding;
+19. verification that the Gateway records the application address as `sourceSender`;
+20. rejection of a zero destination gateway without nonce consumption;
+21. rejection of current or expired deadlines without nonce consumption.
 
 If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
 
@@ -475,7 +502,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Chain A Source Messaging
+Domain-separated Chain A Source Messaging
 ```
 
 ### Expected error output
@@ -484,6 +511,7 @@ Complete verification intentionally executes negative cases, so a passing log ca
 
 ```text
 Error: execution reverted: InvalidDestinationDomain
+Error: execution reverted: InvalidDestinationGateway
 Error: execution reverted: InvalidDestinationReceiver
 Error: execution reverted: InvalidDeadline
 Error: Assert Failed.
@@ -577,8 +605,9 @@ Cross-Chain/
 - Nullifiers prevent repeated authorization for the same credential, application, epoch, and action. They do not hide the public credential commitment, prevent correlation through other public signals, or provide global replay protection across distinct contexts.
 - `SourceGateway` records its direct caller as `sourceSender` and currently has no trusted-source application registry or allowlist.
 - `IdentityApplicationA` can call `SourceGateway`, while mandatory ZK-gated message creation and proof-to-message nullifier binding remain unimplemented.
-- The current message binds its source chain, source gateway, destination domain, and destination receiver. Complete remote-gateway domain separation and a remote gateway registry remain unimplemented.
-- The repository does not provide an indexer, finality watcher, reorg handling, relayer, Merkle batching, PBFT validation, destination gateway or execution, Application B, finality proof, or production cross-chain security model.
+- The current message binds its protocol type, source domain, source gateway, source sender, destination domain, destination gateway, destination receiver, nonce, payload hash, and deadline.
+- A committed destination gateway is caller-selected. `SourceGateway` does not validate remote deployment, domain ownership, or trust, and no remote-gateway registry exists.
+- The repository does not provide an indexer, finality watcher, reorg handling, relayer, Merkle batching, PBFT validation, destination gateway implementation or execution, Application B, finality proof, or production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.

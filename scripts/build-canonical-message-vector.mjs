@@ -24,31 +24,107 @@ function solidityAddress(value) {
   return value;
 }
 
+const EXPECTED_MESSAGE_TYPE =
+  "CrossChainMessage(uint8 version,uint256 sourceDomain,address sourceGateway,address sourceSender,uint256 destinationDomain,address destinationGateway,address destinationReceiver,uint256 nonce,bytes32 payloadHash,uint256 deadline)";
+const GENERATED_MARKER = "generated-by-scripts/build-canonical-message-vector.mjs";
+const CANONICAL_FIELDS = [
+  "version",
+  "sourceDomain",
+  "sourceGateway",
+  "sourceSender",
+  "destinationDomain",
+  "destinationGateway",
+  "destinationReceiver",
+  "nonce",
+  "payloadHash",
+  "deadline",
+];
+const REQUIRED_SEPARATION_FIELDS = [
+  "sourceDomain",
+  "sourceGateway",
+  "destinationDomain",
+  "destinationGateway",
+];
+
 const source = JSON.parse(await readFile(SOURCE_PATH, "utf8"));
-const vector = source.vectors?.[0];
+const vectors = source.vectors ?? [];
 
-requireCondition(source.vectorVersion === 2, "unsupported canonical message vector version");
-requireCondition(vector !== undefined, "canonical message vector is missing");
-requireCondition(vector.expectedMessageId === "generated-by-scripts/build-canonical-message-vector.mjs", "unexpected expectedMessageId source");
+requireCondition(source.vectorVersion === 3, "unsupported canonical message vector version");
+requireCondition(source.messageType === EXPECTED_MESSAGE_TYPE, "canonical message type does not match the protocol schema");
+requireCondition(vectors.length === 5, "canonical message vectors must contain one base and four domain variants");
 
-const payloadHash = cast("keccak", vector.payload);
-requireCondition(payloadHash.toLowerCase() === vector.payloadHash.toLowerCase(), "payload hash does not match the vector");
+const messageTypeHash = cast("keccak", source.messageType);
+const generatedVectors = vectors.map((vector) => {
+  requireCondition(vector.expectedMessageId === GENERATED_MARKER, `unexpected expectedMessageId source for ${vector.name}`);
+  solidityAddress(vector.sourceGateway);
+  solidityAddress(vector.sourceSender);
+  solidityAddress(vector.destinationGateway);
+  solidityAddress(vector.destinationReceiver);
 
-const encoded = cast(
-  "abi-encode",
-  "f(uint8,uint256,address,address,uint256,address,uint256,bytes32,uint256)",
-  String(vector.version),
-  String(vector.sourceDomain),
-  vector.sourceGateway,
-  vector.sourceSender,
-  String(vector.destinationDomain),
-  vector.destinationReceiver,
-  String(vector.nonce),
-  payloadHash,
-  String(vector.deadline),
+  const payloadHash = cast("keccak", vector.payload);
+  requireCondition(
+    payloadHash.toLowerCase() === vector.payloadHash.toLowerCase(),
+    `payload hash does not match vector ${vector.name}`,
+  );
+
+  const encoded = cast(
+    "abi-encode",
+    "f(bytes32,uint8,uint256,address,address,uint256,address,address,uint256,bytes32,uint256)",
+    messageTypeHash,
+    String(vector.version),
+    String(vector.sourceDomain),
+    vector.sourceGateway,
+    vector.sourceSender,
+    String(vector.destinationDomain),
+    vector.destinationGateway,
+    vector.destinationReceiver,
+    String(vector.nonce),
+    payloadHash,
+    String(vector.deadline),
+  );
+
+  return { ...vector, payloadHash, expectedMessageId: cast("keccak", encoded) };
+});
+
+const baseVector = generatedVectors[0];
+for (const separationField of REQUIRED_SEPARATION_FIELDS) {
+  const variant = generatedVectors.find((vector) => vector.differenceFromBase === separationField);
+  requireCondition(variant !== undefined, `missing ${separationField} separation vector`);
+
+  const differences = CANONICAL_FIELDS.filter(
+    (field) => String(variant[field]).toLowerCase() !== String(baseVector[field]).toLowerCase(),
+  );
+  requireCondition(
+    differences.length === 1 && differences[0] === separationField,
+    `${variant.name} must differ from the base only by ${separationField}`,
+  );
+}
+
+requireCondition(
+  new Set(generatedVectors.map((vector) => vector.expectedMessageId.toLowerCase())).size === generatedVectors.length,
+  "domain-separated vectors produced duplicate message IDs",
 );
-const expectedMessageId = cast("keccak", encoded);
-const generated = { ...source, vectors: [{ ...vector, expectedMessageId }] };
+
+const generated = { ...source, messageTypeHash, vectors: generatedVectors };
+const solidityVectors = generatedVectors
+  .map(
+    (vector, index) => `        if (index == ${index}) {
+            return Vector({
+                version: ${vector.version},
+                sourceDomain: ${vector.sourceDomain},
+                sourceGateway: ${solidityAddress(vector.sourceGateway)},
+                sourceSender: ${solidityAddress(vector.sourceSender)},
+                destinationDomain: ${vector.destinationDomain},
+                destinationGateway: ${solidityAddress(vector.destinationGateway)},
+                destinationReceiver: ${solidityAddress(vector.destinationReceiver)},
+                nonce: ${vector.nonce},
+                payloadHash: ${vector.payloadHash},
+                deadline: ${vector.deadline},
+                expectedMessageId: ${vector.expectedMessageId}
+            });
+        }`,
+  )
+  .join("\n\n");
 
 await mkdir(path.dirname(BUILD_PATH), { recursive: true });
 await mkdir(path.dirname(SOLIDITY_PATH), { recursive: true });
@@ -59,16 +135,30 @@ await writeFile(
 pragma solidity ^0.8.24;
 
 library CanonicalMessageVector {
-    function version() internal pure returns (uint8) { return ${vector.version}; }
-    function sourceDomain() internal pure returns (uint256) { return ${vector.sourceDomain}; }
-    function sourceGateway() internal pure returns (address) { return ${solidityAddress(vector.sourceGateway)}; }
-    function sourceSender() internal pure returns (address) { return ${solidityAddress(vector.sourceSender)}; }
-    function destinationDomain() internal pure returns (uint256) { return ${vector.destinationDomain}; }
-    function destinationReceiver() internal pure returns (address) { return ${solidityAddress(vector.destinationReceiver)}; }
-    function nonce() internal pure returns (uint256) { return ${vector.nonce}; }
-    function payloadHash() internal pure returns (bytes32) { return ${payloadHash}; }
-    function deadline() internal pure returns (uint256) { return ${vector.deadline}; }
-    function expectedMessageId() internal pure returns (bytes32) { return ${expectedMessageId}; }
+    error InvalidVectorIndex();
+
+    struct Vector {
+        uint8 version;
+        uint256 sourceDomain;
+        address sourceGateway;
+        address sourceSender;
+        uint256 destinationDomain;
+        address destinationGateway;
+        address destinationReceiver;
+        uint256 nonce;
+        bytes32 payloadHash;
+        uint256 deadline;
+        bytes32 expectedMessageId;
+    }
+
+    function messageTypeHash() internal pure returns (bytes32) { return ${messageTypeHash}; }
+    function length() internal pure returns (uint256) { return ${generatedVectors.length}; }
+
+    function at(uint256 index) internal pure returns (Vector memory) {
+${solidityVectors}
+
+        revert InvalidVectorIndex();
+    }
 }
 `,
   "utf8",

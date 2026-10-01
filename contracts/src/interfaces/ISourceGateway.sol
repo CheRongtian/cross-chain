@@ -5,6 +5,7 @@ pragma solidity ^0.8.24;
 interface ISourceGateway {
     function sendMessage(
         uint256 destinationDomain,
+        address destinationGateway,
         address destinationReceiver,
         bytes calldata payload,
         uint256 deadline

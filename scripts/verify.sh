@@ -6,12 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Chain A Source Messaging"
+VERIFICATION_NAME="Domain-separated Chain A Source Messaging"
 
 CHAIN_A_RPC="http://127.0.0.1:4545"
 CHAIN_B_RPC="http://127.0.0.1:9545"
 CHAIN_A_ID="10011"
 CHAIN_B_ID="2001"
+ALTERNATE_DESTINATION_DOMAIN="3001"
 PROOF_TIMESTAMP_OFFSET="3600"
 APPLICATION_MAX_PROOF_AGE="3600"
 SNARK_SCALAR_FIELD="21888242871839275222246405745257275088548364400416034343698204186575808495617"
@@ -19,12 +20,15 @@ APPLICATION_DOMAIN_NAMESPACE="cross-chain:identity-application-domain:v1"
 
 ANVIL_DEV_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 SOURCE_SENDER="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+DESTINATION_GATEWAY="0x000000000000000000000000000000000000d00d"
+ALTERNATE_DESTINATION_GATEWAY="0x000000000000000000000000000000000000d00e"
 DESTINATION_RECEIVER="0x000000000000000000000000000000000000bEEF"
 ZERO_ADDRESS="0x0000000000000000000000000000000000000000"
 PAYLOAD="0x68656c6c6f20636861696e2062"
 EXPECTED_PAYLOAD_TEXT="hello chain b"
 EXPECTED_PAYLOAD_HASH="0x758a9838e83061770f5b75d8544bc7a27cc795a8741c6b50bdf738ee276d23a6"
-EVENT_SIGNATURE="CrossChainMessage(bytes32,uint8,uint256,address,address,uint256,address,uint256,bytes,uint256)"
+MESSAGE_TYPE="CrossChainMessage(uint8 version,uint256 sourceDomain,address sourceGateway,address sourceSender,uint256 destinationDomain,address destinationGateway,address destinationReceiver,uint256 nonce,bytes32 payloadHash,uint256 deadline)"
+EVENT_SIGNATURE="CrossChainMessage(bytes32,uint8,uint256,address,address,uint256,address,address,uint256,bytes,uint256)"
 
 STARTED_CHAINS="false"
 CHAINS_PID=""
@@ -134,8 +138,9 @@ send_message() {
 
     output="$(
         cast send "$SOURCE_GATEWAY" \
-            "sendMessage(uint256,address,bytes,uint256)" \
+            "sendMessage(uint256,address,address,bytes,uint256)" \
             "$CHAIN_B_ID" \
+            "$DESTINATION_GATEWAY" \
             "$DESTINATION_RECEIVER" \
             "$PAYLOAD" \
             "$MESSAGE_DEADLINE" \
@@ -164,8 +169,9 @@ send_application_message() {
 
     output="$(
         cast send "$IDENTITY_APPLICATION_ADDRESS" \
-            "sendCrossChainMessage(uint256,address,bytes,uint256)" \
+            "sendCrossChainMessage(uint256,address,address,bytes,uint256)" \
             "$CHAIN_B_ID" \
+            "$DESTINATION_GATEWAY" \
             "$DESTINATION_RECEIVER" \
             "$PAYLOAD" \
             "$MESSAGE_DEADLINE" \
@@ -224,10 +230,11 @@ verify_message_event() {
     destination_domain_topic="$(cast abi-encode "f(uint256)" "$CHAIN_B_ID")"
     expected_data="$(
         cast abi-encode \
-            "f(uint8,uint256,address,address,uint256,bytes,uint256)" \
+            "f(uint8,uint256,address,address,address,uint256,bytes,uint256)" \
             2 \
             "$CHAIN_A_ID" \
             "$SOURCE_GATEWAY" \
+            "$DESTINATION_GATEWAY" \
             "$DESTINATION_RECEIVER" \
             "$expected_nonce" \
             "$PAYLOAD" \
@@ -325,19 +332,22 @@ printf '  4. Build deterministic active-credential roots and Merkle witnesses\n'
 printf '  5. Build deterministic nullifier vectors and context-separated inputs\n'
 printf '  6. Compile the ZK circuit and verify membership, policy, and nullifier cases\n'
 printf '  7. Export the Solidity verifier and application proof fixtures\n'
-printf '  8. Generate the canonical deadline-bound message vector\n'
+printf '  8. Generate canonical domain-separated message vectors\n'
 printf '  9. Format generated Solidity sources\n'
 printf ' 10. forge build\n'
 printf ' 11. forge test -vv\n'
 printf ' 12. Run focused gateway, verifier, and identity application tests\n'
 printf ' 13. Deploy verifier, adapter, SourceGateway, and IdentityApplicationA\n'
 printf ' 14. Preserve nullifier, policy epoch, and revocation verification\n'
-printf ' 15. Verify direct SourceGateway messages and nonce progression\n'
-printf ' 16. Verify Application A to SourceGateway message creation\n'
-printf ' 17. Decode and validate the Application A CrossChainMessage event\n'
-printf ' 18. Recompute message IDs with deadline binding\n'
-printf ' 19. Verify expired deadline rejection without nonce consumption\n'
-printf ' 20. Verify invalid destination domain and receiver reverts\n'
+printf ' 15. Verify protocol type-tag and source/destination domain separation\n'
+printf ' 16. Verify source/destination gateway separation\n'
+printf ' 17. Verify direct SourceGateway messages and nonce progression\n'
+printf ' 18. Verify Application A destination gateway forwarding\n'
+printf ' 19. Decode and validate the Application A CrossChainMessage event\n'
+printf ' 20. Recompute message IDs with deadline binding\n'
+printf ' 21. Verify zero destination gateway rejection\n'
+printf ' 22. Verify expired deadline rejection without nonce consumption\n'
+printf ' 23. Verify invalid destination domain and receiver reverts\n'
 
 CURRENT_STEP="local chain availability check"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -448,6 +458,27 @@ forge test --match-test testEveryIdentityFieldChangesMessageId -vvv
 CURRENT_STEP="shared golden vector test"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test --match-test testSharedGoldenVectorsMatchCanonicalEncoding -vvv
+printf 'VALID: canonical message domain vectors matched\n'
+
+CURRENT_STEP="source domain separation test"
+printf '\n[%s]\n' "$CURRENT_STEP"
+forge test --match-test testSourceDomainChangesMessageId -vvv
+printf 'VALID: different source domain changed message ID\n'
+
+CURRENT_STEP="destination domain separation test"
+printf '\n[%s]\n' "$CURRENT_STEP"
+forge test --match-test testDestinationDomainChangesMessageId -vvv
+printf 'VALID: different destination domain changed message ID\n'
+
+CURRENT_STEP="source gateway separation test"
+printf '\n[%s]\n' "$CURRENT_STEP"
+forge test --match-test testSameNonceAcrossSourceGatewaysProducesDifferentMessageIds -vvv
+printf 'VALID: different source gateway changed message ID\n'
+
+CURRENT_STEP="destination gateway separation test"
+printf '\n[%s]\n' "$CURRENT_STEP"
+forge test --match-test testDestinationGatewayChangesMessageId -vvv
+printf 'VALID: different destination gateway changed message ID\n'
 
 CURRENT_STEP="event consistency test"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -514,6 +545,10 @@ assert_equal \
     "$(cast call "$SOURCE_GATEWAY" "MESSAGE_VERSION()(uint8)" --rpc-url "$CHAIN_A_RPC")" \
     "2" \
     "message version"
+assert_hex_equal \
+    "$(cast call "$SOURCE_GATEWAY" "MESSAGE_TYPEHASH()(bytes32)" --rpc-url "$CHAIN_A_RPC")" \
+    "$(cast keccak "$MESSAGE_TYPE")" \
+    "message type hash"
 assert_equal \
     "$(cast call "$SOURCE_GATEWAY" "nextNonce()(uint256)" --rpc-url "$CHAIN_A_RPC")" \
     "1" \
@@ -531,9 +566,10 @@ CURRENT_STEP="first message ID prediction"
 printf '\n[%s]\n' "$CURRENT_STEP"
 FIRST_EXPECTED_MESSAGE_ID="$(
     cast call "$SOURCE_GATEWAY" \
-        "computeMessageId(address,uint256,address,uint256,bytes32,uint256)(bytes32)" \
+        "computeMessageId(address,uint256,address,address,uint256,bytes32,uint256)(bytes32)" \
         "$SOURCE_SENDER" \
         "$CHAIN_B_ID" \
+        "$DESTINATION_GATEWAY" \
         "$DESTINATION_RECEIVER" \
         1 \
         "$PAYLOAD_HASH" \
@@ -541,6 +577,44 @@ FIRST_EXPECTED_MESSAGE_ID="$(
         --rpc-url "$CHAIN_A_RPC"
 )"
 printf 'First expected message ID: %s\n' "$FIRST_EXPECTED_MESSAGE_ID"
+
+CURRENT_STEP="destination domain separation verification"
+printf '\n[%s]\n' "$CURRENT_STEP"
+ALTERNATE_DOMAIN_MESSAGE_ID="$(
+    cast call "$SOURCE_GATEWAY" \
+        "computeMessageId(address,uint256,address,address,uint256,bytes32,uint256)(bytes32)" \
+        "$SOURCE_SENDER" \
+        "$ALTERNATE_DESTINATION_DOMAIN" \
+        "$DESTINATION_GATEWAY" \
+        "$DESTINATION_RECEIVER" \
+        1 \
+        "$PAYLOAD_HASH" \
+        "$MESSAGE_DEADLINE" \
+        --rpc-url "$CHAIN_A_RPC"
+)"
+if [[ "$(normalize "$FIRST_EXPECTED_MESSAGE_ID")" == "$(normalize "$ALTERNATE_DOMAIN_MESSAGE_ID")" ]]; then
+    fail "different destination domains produced identical message IDs"
+fi
+printf 'VALID: different destination domain changed message ID\n'
+
+CURRENT_STEP="destination gateway separation verification"
+printf '\n[%s]\n' "$CURRENT_STEP"
+ALTERNATE_GATEWAY_MESSAGE_ID="$(
+    cast call "$SOURCE_GATEWAY" \
+        "computeMessageId(address,uint256,address,address,uint256,bytes32,uint256)(bytes32)" \
+        "$SOURCE_SENDER" \
+        "$CHAIN_B_ID" \
+        "$ALTERNATE_DESTINATION_GATEWAY" \
+        "$DESTINATION_RECEIVER" \
+        1 \
+        "$PAYLOAD_HASH" \
+        "$MESSAGE_DEADLINE" \
+        --rpc-url "$CHAIN_A_RPC"
+)"
+if [[ "$(normalize "$FIRST_EXPECTED_MESSAGE_ID")" == "$(normalize "$ALTERNATE_GATEWAY_MESSAGE_ID")" ]]; then
+    fail "different destination gateways produced identical message IDs"
+fi
+printf 'VALID: destination gateway bound to message ID\n'
 
 CURRENT_STEP="first message send"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -567,9 +641,10 @@ CURRENT_STEP="second message ID prediction"
 printf '\n[%s]\n' "$CURRENT_STEP"
 SECOND_EXPECTED_MESSAGE_ID="$(
     cast call "$SOURCE_GATEWAY" \
-        "computeMessageId(address,uint256,address,uint256,bytes32,uint256)(bytes32)" \
+        "computeMessageId(address,uint256,address,address,uint256,bytes32,uint256)(bytes32)" \
         "$SOURCE_SENDER" \
         "$CHAIN_B_ID" \
+        "$DESTINATION_GATEWAY" \
         "$DESTINATION_RECEIVER" \
         2 \
         "$PAYLOAD_HASH" \
@@ -609,9 +684,10 @@ CURRENT_STEP="Application A message ID prediction"
 printf '\n[%s]\n' "$CURRENT_STEP"
 APPLICATION_EXPECTED_MESSAGE_ID="$(
     cast call "$SOURCE_GATEWAY" \
-        "computeMessageId(address,uint256,address,uint256,bytes32,uint256)(bytes32)" \
+        "computeMessageId(address,uint256,address,address,uint256,bytes32,uint256)(bytes32)" \
         "$IDENTITY_APPLICATION_ADDRESS" \
         "$CHAIN_B_ID" \
+        "$DESTINATION_GATEWAY" \
         "$DESTINATION_RECEIVER" \
         3 \
         "$PAYLOAD_HASH" \
@@ -634,6 +710,7 @@ verify_message_event \
     "$MESSAGE_DEADLINE" \
     "Application A message"
 printf 'VALID: Application A called SourceGateway\n'
+printf 'VALID: Application A forwarded destination gateway\n'
 printf 'VALID: CrossChainMessage sourceSender equals IdentityApplicationA\n'
 printf 'VALID: deadline is bound to the recomputed message ID\n'
 
@@ -648,8 +725,9 @@ CURRENT_STEP="expired Application A message rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
 EXPIRED_MESSAGE_DEADLINE="$(cast block latest --field timestamp --rpc-url "$CHAIN_A_RPC")"
 if cast call "$IDENTITY_APPLICATION_ADDRESS" \
-    "sendCrossChainMessage(uint256,address,bytes,uint256)(bytes32,uint256)" \
+    "sendCrossChainMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
     "$CHAIN_B_ID" \
+    "$DESTINATION_GATEWAY" \
     "$DESTINATION_RECEIVER" \
     "$PAYLOAD" \
     "$EXPIRED_MESSAGE_DEADLINE" \
@@ -664,11 +742,32 @@ assert_equal \
     "4" \
     "nonce after expired deadline rejection"
 
+CURRENT_STEP="zero destination gateway rejection"
+printf '\n[%s]\n' "$CURRENT_STEP"
+if cast call "$SOURCE_GATEWAY" \
+    "sendMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
+    "$CHAIN_B_ID" \
+    "$ZERO_ADDRESS" \
+    "$DESTINATION_RECEIVER" \
+    "$PAYLOAD" \
+    "$MESSAGE_DEADLINE" \
+    --from "$SOURCE_SENDER" \
+    --rpc-url "$CHAIN_A_RPC"; then
+    fail "zero destination gateway call unexpectedly succeeded"
+else
+    printf 'EXPECTED FAILURE: zero destination gateway rejected\n'
+fi
+assert_equal \
+    "$(cast call "$SOURCE_GATEWAY" "nextNonce()(uint256)" --rpc-url "$CHAIN_A_RPC")" \
+    "4" \
+    "nonce after zero destination gateway rejection"
+
 CURRENT_STEP="same-chain destination rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
 if cast call "$SOURCE_GATEWAY" \
-    "sendMessage(uint256,address,bytes,uint256)(bytes32,uint256)" \
+    "sendMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
     "$CHAIN_A_ID" \
+    "$DESTINATION_GATEWAY" \
     "$DESTINATION_RECEIVER" \
     "$PAYLOAD" \
     "$MESSAGE_DEADLINE" \
@@ -682,8 +781,9 @@ fi
 CURRENT_STEP="zero destination receiver rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
 if cast call "$SOURCE_GATEWAY" \
-    "sendMessage(uint256,address,bytes,uint256)(bytes32,uint256)" \
+    "sendMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
     "$CHAIN_B_ID" \
+    "$DESTINATION_GATEWAY" \
     "$ZERO_ADDRESS" \
     "$PAYLOAD" \
     "$MESSAGE_DEADLINE" \

@@ -2,15 +2,17 @@
 pragma solidity ^0.8.24;
 
 import {ISourceGateway} from "./interfaces/ISourceGateway.sol";
-import {MessageCodec} from "./MessageCodec.sol";
+import {CROSS_CHAIN_MESSAGE_TYPEHASH, MessageCodec} from "./MessageCodec.sol";
 
 /// @notice Creates canonical outbound messages on the source chain.
 contract SourceGateway is ISourceGateway {
     uint8 public constant MESSAGE_VERSION = 2;
+    bytes32 public constant MESSAGE_TYPEHASH = CROSS_CHAIN_MESSAGE_TYPEHASH;
 
     uint256 public nextNonce = 1;
 
     error InvalidDestinationDomain();
+    error InvalidDestinationGateway();
     error InvalidDestinationReceiver();
     error InvalidDeadline();
 
@@ -21,6 +23,7 @@ contract SourceGateway is ISourceGateway {
         address sourceGateway,
         address indexed sourceSender,
         uint256 indexed destinationDomain,
+        address destinationGateway,
         address destinationReceiver,
         uint256 nonce,
         bytes payload,
@@ -29,12 +32,16 @@ contract SourceGateway is ISourceGateway {
 
     function sendMessage(
         uint256 destinationDomain,
+        address destinationGateway,
         address destinationReceiver,
         bytes calldata payload,
         uint256 deadline
     ) external returns (bytes32 messageId, uint256 nonce) {
         if (destinationDomain == 0 || destinationDomain == block.chainid) {
             revert InvalidDestinationDomain();
+        }
+        if (destinationGateway == address(0)) {
+            revert InvalidDestinationGateway();
         }
         if (destinationReceiver == address(0)) {
             revert InvalidDestinationReceiver();
@@ -49,6 +56,7 @@ contract SourceGateway is ISourceGateway {
         messageId = computeMessageId(
             msg.sender,
             destinationDomain,
+            destinationGateway,
             destinationReceiver,
             nonce,
             keccak256(payload),
@@ -62,6 +70,7 @@ contract SourceGateway is ISourceGateway {
             address(this),
             msg.sender,
             destinationDomain,
+            destinationGateway,
             destinationReceiver,
             nonce,
             payload,
@@ -72,6 +81,7 @@ contract SourceGateway is ISourceGateway {
     function computeMessageId(
         address sourceSender,
         uint256 destinationDomain,
+        address destinationGateway,
         address destinationReceiver,
         uint256 nonce,
         bytes32 payloadHash,
@@ -84,6 +94,7 @@ contract SourceGateway is ISourceGateway {
                 sourceGateway: address(this),
                 sourceSender: sourceSender,
                 destinationDomain: destinationDomain,
+                destinationGateway: destinationGateway,
                 destinationReceiver: destinationReceiver,
                 nonce: nonce,
                 payloadHash: payloadHash,

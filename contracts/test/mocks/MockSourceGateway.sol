@@ -6,6 +6,7 @@ import {ISourceGateway} from "../../src/interfaces/ISourceGateway.sol";
 contract MockSourceGateway is ISourceGateway {
     address public caller;
     uint256 public destinationDomain;
+    address public destinationGateway;
     address public destinationReceiver;
     bytes public payload;
     uint256 public deadline;
@@ -20,12 +21,14 @@ contract MockSourceGateway is ISourceGateway {
 
     function sendMessage(
         uint256 destinationDomain_,
+        address destinationGateway_,
         address destinationReceiver_,
         bytes calldata payload_,
         uint256 deadline_
     ) external returns (bytes32 messageId, uint256 nonce) {
         caller = msg.sender;
         destinationDomain = destinationDomain_;
+        destinationGateway = destinationGateway_;
         destinationReceiver = destinationReceiver_;
         payload = payload_;
         deadline = deadline_;

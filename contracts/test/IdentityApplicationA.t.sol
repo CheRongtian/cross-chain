@@ -29,6 +29,7 @@ contract IdentityApplicationATest is Test {
     uint256 internal constant GATEWAY_EVENT_TOPIC_COUNT = 4;
     uint256 internal constant DESTINATION_DOMAIN = 2001;
     address internal constant SUBMITTER = address(0xA11CE);
+    address internal constant DESTINATION_GATEWAY = address(0xD00D);
     address internal constant DESTINATION_RECEIVER = address(0xBEEF);
     address internal constant STATE_AUTHORITY = address(0xA11CE5);
     address internal constant UNAUTHORIZED_CALLER = address(0xBAD);
@@ -523,13 +524,19 @@ contract IdentityApplicationATest is Test {
         sourceGateway.setReturnValues(expectedMessageId, expectedNonce);
 
         vm.prank(SUBMITTER);
-        (bytes32 messageId, uint256 nonce) =
-            application.sendCrossChainMessage(DESTINATION_DOMAIN, DESTINATION_RECEIVER, payload, deadline);
+        (bytes32 messageId, uint256 nonce) = application.sendCrossChainMessage(
+            DESTINATION_DOMAIN,
+            DESTINATION_GATEWAY,
+            DESTINATION_RECEIVER,
+            payload,
+            deadline
+        );
 
         assertEq(messageId, expectedMessageId);
         assertEq(nonce, expectedNonce);
         assertEq(sourceGateway.caller(), address(application));
         assertEq(sourceGateway.destinationDomain(), DESTINATION_DOMAIN);
+        assertEq(sourceGateway.destinationGateway(), DESTINATION_GATEWAY);
         assertEq(sourceGateway.destinationReceiver(), DESTINATION_RECEIVER);
         assertEq(sourceGateway.payload(), payload);
         assertEq(sourceGateway.deadline(), deadline);
@@ -552,6 +559,7 @@ contract IdentityApplicationATest is Test {
         bytes32 expectedMessageId = realSourceGateway.computeMessageId(
             address(realGatewayApplication),
             DESTINATION_DOMAIN,
+            DESTINATION_GATEWAY,
             DESTINATION_RECEIVER,
             1,
             payloadHash,
@@ -561,7 +569,11 @@ contract IdentityApplicationATest is Test {
         vm.recordLogs();
         vm.prank(SUBMITTER);
         (bytes32 messageId, uint256 nonce) = realGatewayApplication.sendCrossChainMessage(
-            DESTINATION_DOMAIN, DESTINATION_RECEIVER, payload, deadline
+            DESTINATION_DOMAIN,
+            DESTINATION_GATEWAY,
+            DESTINATION_RECEIVER,
+            payload,
+            deadline
         );
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
@@ -593,15 +605,20 @@ contract IdentityApplicationATest is Test {
             uint8 version,
             uint256 sourceDomain,
             address eventSourceGateway,
+            address eventDestinationGateway,
             address eventDestinationReceiver,
             uint256 eventNonce,
             bytes memory eventPayload,
             uint256 eventDeadline
-        ) = abi.decode(logs[0].data, (uint8, uint256, address, address, uint256, bytes, uint256));
+        ) = abi.decode(
+            logs[0].data,
+            (uint8, uint256, address, address, address, uint256, bytes, uint256)
+        );
 
         assertEq(version, realSourceGateway.MESSAGE_VERSION());
         assertEq(sourceDomain, block.chainid);
         assertEq(eventSourceGateway, address(realSourceGateway));
+        assertEq(eventDestinationGateway, DESTINATION_GATEWAY);
         assertEq(eventDestinationReceiver, DESTINATION_RECEIVER);
         assertEq(eventNonce, 1);
         assertEq(eventPayload, expectedPayload);
