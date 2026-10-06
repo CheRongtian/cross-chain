@@ -21,23 +21,25 @@ library MessageCodec {
         uint256 deadline;
     }
 
-    function computeMessageId(CanonicalMessage memory message) internal pure returns (bytes32) {
-        // Canonical ABI encoding is shared with the off-chain vector generator.
-        // forge-lint: disable-next-line(asm-keccak256)
-        return keccak256(
-            abi.encode(
-                CROSS_CHAIN_MESSAGE_TYPEHASH,
-                message.version,
-                message.sourceDomain,
-                message.sourceGateway,
-                message.sourceSender,
-                message.destinationDomain,
-                message.destinationGateway,
-                message.destinationReceiver,
-                message.nonce,
-                message.payloadHash,
-                message.deadline
-            )
+    function computeMessageId(CanonicalMessage memory message) internal pure returns (bytes32 messageId) {
+        bytes memory encodedMessage = abi.encode(
+            CROSS_CHAIN_MESSAGE_TYPEHASH,
+            message.version,
+            message.sourceDomain,
+            message.sourceGateway,
+            message.sourceSender,
+            message.destinationDomain,
+            message.destinationGateway,
+            message.destinationReceiver,
+            message.nonce,
+            message.payloadHash,
+            message.deadline
         );
+
+        // Hashes the exact ABI byte sequence constructed above.
+        // forge-lint: disable-next-line(inline-assembly)
+        assembly ("memory-safe") {
+            messageId := keccak256(add(encodedMessage, 0x20), mload(encodedMessage))
+        }
     }
 }

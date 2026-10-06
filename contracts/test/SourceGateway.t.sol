@@ -110,7 +110,7 @@ contract SourceGatewayTest is Test {
         assertEq(CanonicalMessageVector.messageTypeHash(), CROSS_CHAIN_MESSAGE_TYPEHASH);
 
         for (uint256 index = 0; index < CanonicalMessageVector.length(); index++) {
-            CanonicalMessageVector.Vector memory vector = CanonicalMessageVector.at(index);
+            CanonicalMessageVector.Vector memory vector = CanonicalMessageVector.vectorAt(index);
             bytes32 actual = MessageCodec.computeMessageId(
                 MessageCodec.CanonicalMessage({
                     version: vector.version,
@@ -217,15 +217,16 @@ contract SourceGatewayTest is Test {
         vm.recordLogs();
 
         vm.prank(SOURCE_SENDER);
-        gateway.sendMessage(
+        (bytes32 returnedMessageId, uint256 returnedNonce) = _callGateway(
             DESTINATION_DOMAIN,
             DESTINATION_GATEWAY,
             DESTINATION_RECEIVER,
-            _payload(),
             DEADLINE
         );
         Vm.Log[] memory logs = vm.getRecordedLogs();
 
+        assertEq(returnedMessageId, expectedMessageId);
+        assertEq(returnedNonce, 1);
         assertEq(logs.length, 1);
         assertEq(logs[0].emitter, address(gateway));
         assertEq(logs[0].topics.length, EVENT_TOPIC_COUNT);
@@ -257,73 +258,58 @@ contract SourceGatewayTest is Test {
 
     function testRejectsZeroDestinationDomainWithoutConsumingNonce() public {
         vm.expectRevert(SourceGateway.InvalidDestinationDomain.selector);
-        gateway.sendMessage(0, DESTINATION_GATEWAY, DESTINATION_RECEIVER, _payload(), DEADLINE);
+        _callGateway(0, DESTINATION_GATEWAY, DESTINATION_RECEIVER, DEADLINE);
 
         assertEq(gateway.nextNonce(), 1);
     }
 
     function testRejectsSameChainDestinationWithoutConsumingNonce() public {
         vm.expectRevert(SourceGateway.InvalidDestinationDomain.selector);
-        gateway.sendMessage(
-            SOURCE_DOMAIN,
-            DESTINATION_GATEWAY,
-            DESTINATION_RECEIVER,
-            _payload(),
-            DEADLINE
-        );
+        _callGateway(SOURCE_DOMAIN, DESTINATION_GATEWAY, DESTINATION_RECEIVER, DEADLINE);
 
         assertEq(gateway.nextNonce(), 1);
     }
 
     function testRejectsZeroDestinationGatewayWithoutConsumingNonce() public {
         vm.expectRevert(SourceGateway.InvalidDestinationGateway.selector);
-        gateway.sendMessage(DESTINATION_DOMAIN, address(0), DESTINATION_RECEIVER, _payload(), DEADLINE);
+        _callGateway(DESTINATION_DOMAIN, address(0), DESTINATION_RECEIVER, DEADLINE);
 
         assertEq(gateway.nextNonce(), 1);
     }
 
     function testRejectsZeroReceiverWithoutConsumingNonce() public {
         vm.expectRevert(SourceGateway.InvalidDestinationReceiver.selector);
-        gateway.sendMessage(DESTINATION_DOMAIN, DESTINATION_GATEWAY, address(0), _payload(), DEADLINE);
+        _callGateway(DESTINATION_DOMAIN, DESTINATION_GATEWAY, address(0), DEADLINE);
 
         assertEq(gateway.nextNonce(), 1);
     }
 
     function testRejectsCurrentDeadlineWithoutConsumingNonce() public {
         vm.expectRevert(SourceGateway.InvalidDeadline.selector);
-        gateway.sendMessage(
-            DESTINATION_DOMAIN,
-            DESTINATION_GATEWAY,
-            DESTINATION_RECEIVER,
-            _payload(),
-            CURRENT_TIME
-        );
+        _callGateway(DESTINATION_DOMAIN, DESTINATION_GATEWAY, DESTINATION_RECEIVER, CURRENT_TIME);
 
         assertEq(gateway.nextNonce(), 1);
     }
 
     function testRejectsExpiredDeadlineWithoutConsumingNonce() public {
         vm.expectRevert(SourceGateway.InvalidDeadline.selector);
-        gateway.sendMessage(
-            DESTINATION_DOMAIN,
-            DESTINATION_GATEWAY,
-            DESTINATION_RECEIVER,
-            _payload(),
-            CURRENT_TIME - 1
-        );
+        _callGateway(DESTINATION_DOMAIN, DESTINATION_GATEWAY, DESTINATION_RECEIVER, CURRENT_TIME - 1);
 
         assertEq(gateway.nextNonce(), 1);
     }
 
     function _sendMessage(uint256 deadline) internal returns (bytes32 messageId, uint256 nonce) {
         vm.prank(SOURCE_SENDER);
-        return gateway.sendMessage(
-            DESTINATION_DOMAIN,
-            DESTINATION_GATEWAY,
-            DESTINATION_RECEIVER,
-            _payload(),
-            deadline
-        );
+        return _callGateway(DESTINATION_DOMAIN, DESTINATION_GATEWAY, DESTINATION_RECEIVER, deadline);
+    }
+
+    function _callGateway(
+        uint256 destinationDomain,
+        address destinationGateway,
+        address destinationReceiver,
+        uint256 deadline
+    ) internal returns (bytes32 messageId, uint256 nonce) {
+        return gateway.sendMessage(destinationDomain, destinationGateway, destinationReceiver, _payload(), deadline);
     }
 
     function _messageId(address sourceSender, uint256 nonce, uint256 deadline) internal view returns (bytes32) {

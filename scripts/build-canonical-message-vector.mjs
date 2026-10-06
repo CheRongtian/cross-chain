@@ -154,7 +154,7 @@ library CanonicalMessageVector {
     function messageTypeHash() internal pure returns (bytes32) { return ${messageTypeHash}; }
     function length() internal pure returns (uint256) { return ${generatedVectors.length}; }
 
-    function at(uint256 index) internal pure returns (Vector memory) {
+    function vectorAt(uint256 index) internal pure returns (Vector memory) {
 ${solidityVectors}
 
         revert InvalidVectorIndex();

@@ -13,7 +13,9 @@ import {MockSourceGateway} from "./mocks/MockSourceGateway.sol";
 contract IdentityApplicationATest is Test {
     uint256 internal constant TRUSTED_ISSUER = 12_345;
     uint256 internal constant REQUIRED_ROLE = 1;
-    uint256 internal constant MAX_PROOF_AGE = 1 hours;
+    uint256 internal constant ONE_HOUR = 1 hours;
+    uint256 internal constant MAX_PROOF_AGE = ONE_HOUR;
+    uint256 internal constant MESSAGE_LIFETIME = ONE_HOUR;
     uint256 internal constant CREDENTIAL_COMMITMENT = 98_765;
     uint256 internal constant SECOND_CREDENTIAL_COMMITMENT = 98_766;
     uint256 internal constant CURRENT_TIME = 2_000_000_000;
@@ -33,12 +35,12 @@ contract IdentityApplicationATest is Test {
     address internal constant DESTINATION_RECEIVER = address(0xBEEF);
     address internal constant STATE_AUTHORITY = address(0xA11CE5);
     address internal constant UNAUTHORIZED_CALLER = address(0xBAD);
+    address internal constant NO_CODE_ADDRESS = address(0xCAFE);
 
     MockCredentialVerifier internal verifier;
     MockSourceGateway internal sourceGateway;
     IdentityApplicationA internal application;
     uint256 internal proofApplicationDomain;
-    uint256 internal proofPolicyEpoch;
 
     function setUp() public {
         vm.warp(CURRENT_TIME);
@@ -55,7 +57,6 @@ contract IdentityApplicationATest is Test {
             ROOT_N
         );
         proofApplicationDomain = application.applicationDomain();
-        proofPolicyEpoch = INITIAL_POLICY_EPOCH;
     }
 
     function testConstructorConfiguration() public view {
@@ -103,7 +104,7 @@ contract IdentityApplicationATest is Test {
     function testRejectsAddressWithoutVerifierCode() public {
         vm.expectRevert(IdentityApplicationA.InvalidCredentialVerifier.selector);
         new IdentityApplicationA(
-            address(0xBEEF),
+            NO_CODE_ADDRESS,
             address(sourceGateway),
             TRUSTED_ISSUER,
             REQUIRED_ROLE,
@@ -130,7 +131,7 @@ contract IdentityApplicationATest is Test {
         vm.expectRevert(IdentityApplicationA.InvalidSourceGateway.selector);
         new IdentityApplicationA(
             address(verifier),
-            address(0xBEEF),
+            NO_CODE_ADDRESS,
             TRUSTED_ISSUER,
             REQUIRED_ROLE,
             MAX_PROOF_AGE,
@@ -305,7 +306,7 @@ contract IdentityApplicationATest is Test {
             CURRENT_TIME,
             ROOT_N,
             proofApplicationDomain + 1,
-            proofPolicyEpoch,
+            INITIAL_POLICY_EPOCH,
             ACTION_VERIFY_SUPPLIER,
             NULLIFIER_A_EPOCH_ONE
         );
@@ -323,7 +324,7 @@ contract IdentityApplicationATest is Test {
             CURRENT_TIME,
             ROOT_N,
             proofApplicationDomain,
-            proofPolicyEpoch + 1,
+            INITIAL_POLICY_EPOCH + 1,
             ACTION_VERIFY_SUPPLIER,
             NULLIFIER_A_EPOCH_TWO
         );
@@ -341,7 +342,7 @@ contract IdentityApplicationATest is Test {
             CURRENT_TIME,
             ROOT_N,
             proofApplicationDomain,
-            proofPolicyEpoch,
+            INITIAL_POLICY_EPOCH,
             ACTION_VERIFY_SUPPLIER + 1,
             NULLIFIER_A_EPOCH_ONE
         );
@@ -360,7 +361,7 @@ contract IdentityApplicationATest is Test {
             CURRENT_TIME,
             ROOT_N,
             proofApplicationDomain,
-            proofPolicyEpoch,
+            INITIAL_POLICY_EPOCH,
             ACTION_VERIFY_SUPPLIER,
             outOfFieldNullifier
         );
@@ -396,9 +397,9 @@ contract IdentityApplicationATest is Test {
     function testNewPolicyEpochAllowsDifferentNullifierAndPreservesHistory() public {
         _verifySupplier(CREDENTIAL_COMMITMENT, TRUSTED_ISSUER, REQUIRED_ROLE, CURRENT_TIME);
 
+        uint256 nextPolicyEpoch = INITIAL_POLICY_EPOCH + 1;
         vm.prank(STATE_AUTHORITY);
         application.advancePolicyEpoch();
-        proofPolicyEpoch += 1;
 
         _verifySupplierWithContext(
             CREDENTIAL_COMMITMENT,
@@ -407,7 +408,7 @@ contract IdentityApplicationATest is Test {
             CURRENT_TIME,
             ROOT_N,
             proofApplicationDomain,
-            proofPolicyEpoch,
+            nextPolicyEpoch,
             ACTION_VERIFY_SUPPLIER,
             NULLIFIER_A_EPOCH_TWO
         );
@@ -518,7 +519,7 @@ contract IdentityApplicationATest is Test {
 
     function testForwardsCrossChainMessageToConfiguredGateway() public {
         bytes memory payload = "supplier update";
-        uint256 deadline = CURRENT_TIME + 1 hours;
+        uint256 deadline = CURRENT_TIME + MESSAGE_LIFETIME;
         bytes32 expectedMessageId = keccak256("configured-mock-message");
         uint256 expectedNonce = 73;
         sourceGateway.setReturnValues(expectedMessageId, expectedNonce);
@@ -554,7 +555,7 @@ contract IdentityApplicationATest is Test {
             ROOT_N
         );
         bytes memory payload = "supplier update";
-        uint256 deadline = CURRENT_TIME + 1 hours;
+        uint256 deadline = CURRENT_TIME + MESSAGE_LIFETIME;
         bytes32 payloadHash = keccak256(payload);
         bytes32 expectedMessageId = realSourceGateway.computeMessageId(
             address(realGatewayApplication),
@@ -638,9 +639,9 @@ contract IdentityApplicationATest is Test {
             proofTimestamp,
             ROOT_N,
             proofApplicationDomain,
-            proofPolicyEpoch,
+            INITIAL_POLICY_EPOCH,
             ACTION_VERIFY_SUPPLIER,
-            _nullifierFor(credentialCommitment, proofPolicyEpoch)
+            _nullifierFor(credentialCommitment, INITIAL_POLICY_EPOCH)
         );
     }
 
@@ -658,9 +659,9 @@ contract IdentityApplicationATest is Test {
             proofTimestamp,
             proofCredentialStateRoot,
             proofApplicationDomain,
-            proofPolicyEpoch,
+            INITIAL_POLICY_EPOCH,
             ACTION_VERIFY_SUPPLIER,
-            _nullifierFor(credentialCommitment, proofPolicyEpoch)
+            _nullifierFor(credentialCommitment, INITIAL_POLICY_EPOCH)
         );
     }
 
@@ -670,8 +671,8 @@ contract IdentityApplicationATest is Test {
         uint256 proofRequiredRole,
         uint256 proofTimestamp,
         uint256 proofCredentialStateRoot,
-        uint256 proofApplicationDomain,
-        uint256 proofPolicyEpoch,
+        uint256 proofApplicationDomainValue,
+        uint256 proofPolicyEpochValue,
         uint256 proofActionContext,
         uint256 proofNullifier
     ) internal {
@@ -681,8 +682,8 @@ contract IdentityApplicationATest is Test {
             requiredRole: proofRequiredRole,
             currentTimestamp: proofTimestamp,
             credentialStateRoot: proofCredentialStateRoot,
-            applicationDomain: proofApplicationDomain,
-            policyEpoch: proofPolicyEpoch,
+            applicationDomain: proofApplicationDomainValue,
+            policyEpoch: proofPolicyEpochValue,
             actionContext: proofActionContext,
             nullifier: proofNullifier
         });

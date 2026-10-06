@@ -21,7 +21,10 @@ contract MockSourceGateway is ISourceGateway {
 
     function sendMessage(
         uint256 destinationDomain_,
+        // This test double records raw forwarding inputs; validation belongs to SourceGateway.
+        // forge-lint: disable-next-line(missing-zero-check)
         address destinationGateway_,
+        // forge-lint: disable-next-line(missing-zero-check)
         address destinationReceiver_,
         bytes calldata payload_,
         uint256 deadline_
