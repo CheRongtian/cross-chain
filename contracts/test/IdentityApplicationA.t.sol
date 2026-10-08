@@ -544,7 +544,7 @@ contract IdentityApplicationATest is Test {
     }
 
     function testIdentityApplicationCallsRealSourceGateway() public {
-        SourceGateway realSourceGateway = new SourceGateway();
+        SourceGateway realSourceGateway = new SourceGateway(address(this));
         IdentityApplicationA realGatewayApplication = new IdentityApplicationA(
             address(verifier),
             address(realSourceGateway),
@@ -554,6 +554,7 @@ contract IdentityApplicationATest is Test {
             STATE_AUTHORITY,
             ROOT_N
         );
+        realSourceGateway.setSourceApplicationAuthorization(address(realGatewayApplication), true);
         bytes memory payload = "supplier update";
         uint256 deadline = CURRENT_TIME + MESSAGE_LIFETIME;
         bytes32 payloadHash = keccak256(payload);
@@ -583,6 +584,63 @@ contract IdentityApplicationATest is Test {
         assertEq(realSourceGateway.nextNonce(), 2);
         _assertRealGatewayEvent(
             logs, realSourceGateway, realGatewayApplication, expectedMessageId, payload, deadline
+        );
+    }
+
+    function testRealSourceGatewayRejectsUnauthorizedIdentityApplication() public {
+        SourceGateway realSourceGateway = new SourceGateway(address(this));
+        IdentityApplicationA realGatewayApplication = new IdentityApplicationA(
+            address(verifier),
+            address(realSourceGateway),
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            MAX_PROOF_AGE,
+            STATE_AUTHORITY,
+            ROOT_N
+        );
+
+        vm.prank(SUBMITTER);
+        vm.expectRevert(SourceGateway.UnauthorizedSourceApplication.selector);
+        _sendRealGatewayMessage(realGatewayApplication);
+
+        assertEq(realSourceGateway.nextNonce(), 1);
+    }
+
+    function testRealSourceGatewayRejectsRevokedIdentityApplicationWithoutConsumingNonce() public {
+        SourceGateway realSourceGateway = new SourceGateway(address(this));
+        IdentityApplicationA realGatewayApplication = new IdentityApplicationA(
+            address(verifier),
+            address(realSourceGateway),
+            TRUSTED_ISSUER,
+            REQUIRED_ROLE,
+            MAX_PROOF_AGE,
+            STATE_AUTHORITY,
+            ROOT_N
+        );
+        realSourceGateway.setSourceApplicationAuthorization(address(realGatewayApplication), true);
+
+        vm.prank(SUBMITTER);
+        (, uint256 acceptedNonce) = _sendRealGatewayMessage(realGatewayApplication);
+        assertEq(acceptedNonce, 1);
+        realSourceGateway.setSourceApplicationAuthorization(address(realGatewayApplication), false);
+
+        vm.prank(SUBMITTER);
+        vm.expectRevert(SourceGateway.UnauthorizedSourceApplication.selector);
+        _sendRealGatewayMessage(realGatewayApplication);
+
+        assertEq(realSourceGateway.nextNonce(), 2);
+    }
+
+    function _sendRealGatewayMessage(IdentityApplicationA realGatewayApplication)
+        internal
+        returns (bytes32 messageId, uint256 nonce)
+    {
+        return realGatewayApplication.sendCrossChainMessage(
+            DESTINATION_DOMAIN,
+            DESTINATION_GATEWAY,
+            DESTINATION_RECEIVER,
+            "supplier update",
+            CURRENT_TIME + MESSAGE_LIFETIME
         );
     }
 

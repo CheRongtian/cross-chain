@@ -20,6 +20,8 @@ The current implementation can:
 - advance the application policy epoch without deleting previously consumed nullifiers;
 - bind a future Unix deadline into every canonical source message;
 - bind source and destination domains and gateways into a type-tagged message identity;
+- restrict canonical message creation to explicitly authorized source applications;
+- let an explicit source-authorization administrator authorize and revoke application contracts;
 - let `IdentityApplicationA` call `SourceGateway` while preserving the gateway as the canonical message and nonce authority.
 
 ## Architecture
@@ -42,14 +44,12 @@ Public policy, state + context ──>│ Groth16 / BN254          │ ──> p
                                                            │       v        v
                                                            │ usedNullifiers commitment status
                                                            v
-                                                     SourceGateway
-                                                           │
-                                                           v
-                                       Domain-separated CrossChainMessage event
-
-Caller ──> SourceGateway on Chain A ──> Domain-separated CrossChainMessage event
-                                                    │
-                                                    └──> Relayer and destination execution are not implemented
+                                      authorized application registry ──> SourceGateway
+                                                           │                    │
+                                                           │                    v
+                                                           │   Domain-separated CrossChainMessage event
+                                                           │                    │
+Unknown EOA or contract ───────────────────────────────> rejected               └──> Relayer and destination execution are not implemented
 ```
 
 `IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
@@ -117,8 +117,20 @@ sendMessage(
 ) returns (bytes32 messageId, uint256 nonce)
 ```
 
+It also exposes the administrator-controlled registry API:
+
+```solidity
+setSourceApplicationAuthorization(address application, bool authorized)
+```
+
 Gateway behavior:
 
+- the constructor requires a non-zero authorization administrator;
+- only the configured administrator can update source-application authorization;
+- authorizing an application requires a non-zero address with deployed contract code;
+- revocation remains available after a contract has lost its code;
+- no-op registry updates are rejected;
+- `sendMessage` accepts only currently authorized direct callers;
 - the canonical wire-format version is `2`;
 - the nonce starts at `1` and increments after each message;
 - the destination domain cannot be `0` or the current chain ID;
@@ -129,7 +141,9 @@ Gateway behavior:
 - a successful call emits `CrossChainMessage`;
 - the event contains the original payload, so event payloads are public.
 
-The source domain always comes from `block.chainid`, and the source gateway always comes from `address(this)`. Callers cannot supply either value. The event records the direct Gateway caller as `sourceSender`. When `IdentityApplicationA` calls the Gateway, this value is the application contract address rather than the originating EOA. The Gateway currently accepts calls from arbitrary addresses and contracts; recording a caller does not classify it as a trusted source application.
+The source domain always comes from `block.chainid`, and the source gateway always comes from `address(this)`. Callers cannot supply either value. The event records the direct Gateway caller as `sourceSender`. When `IdentityApplicationA` calls the Gateway, this value is the application contract address rather than the originating EOA. The application must also be present in `authorizedSourceApplications` at call time.
+
+Authorization is an admission check for future messages. Revoking an application prevents subsequent sends without changing its previous events, message IDs, or consumed nonces. Source-application revocation is independent of credential revocation: one controls whether a contract may originate new messages, while the other controls whether a credential remains active. The registry does not alter the canonical message fields, `MESSAGE_VERSION`, `MESSAGE_TYPEHASH`, or shared message vectors.
 
 Binding `destinationGateway` makes the selected remote endpoint part of the cryptographic message identity. It does not establish that the address is deployed, belongs to the destination domain, or is trusted. The repository currently implements source-chain message production and event verification. It does not provide a remote-gateway registry, relayer, destination gateway implementation, message confirmation, destination execution, or destination-side replay protection.
 
@@ -329,7 +343,9 @@ Revocation and nullifier consumption answer separate questions and are enforced 
 
 `IdentityApplicationA.sendCrossChainMessage` forwards the destination domain, destination gateway, destination receiver, payload, and deadline to its configured `ISourceGateway`. It returns the Gateway-created message ID and nonce and does not maintain a second nonce or message encoding implementation. The Gateway observes `address(IdentityApplicationA)` as the direct `sourceSender`.
 
-This transport entry point is currently separate from `verifySupplier`. It does not require a proof, check stored supplier authorization, or consume a nullifier. Direct calls to `SourceGateway` also remain available because no trusted-source registry is implemented yet.
+After deployment, the source-authorization administrator explicitly authorizes `IdentityApplicationA` in the Gateway registry. The deployment flow performs this transaction only after confirming that the application was created at its predicted address, preserving the application-domain value used by the generated proofs.
+
+This transport entry point remains separate from `verifySupplier`. It does not require a proof, check stored supplier authorization, or consume a nullifier. Gateway authorization establishes which application contract may create a message; it does not authenticate the EOA calling that application or bind a proof nullifier to a message.
 
 ## Local Two-Chain Environment
 
@@ -476,19 +492,22 @@ The script uses strict error handling and performs:
 6. Solidity formatting, build, and tests against the real generated verifier;
 7. focused canonical-message, credential-verifier, and identity-application tests;
 8. deployment of the generated verifier, credential adapter, source gateway, and identity application to Chain A;
-9. valid on-chain proof verification and credential A authorization under Root N;
-10. rejection of future, stale, tampered, alternate-policy, alternate-domain, alternate-epoch, alternate-action, and non-current-root submissions;
-11. rejection of exact and regenerated same-context proof replays;
-12. authorized policy-epoch advancement and acceptance of credential A's new-epoch nullifier;
-13. rejection of unauthorized and zero-root credential-state updates;
-14. rotation to Root N+1, revocation of credential A, preservation of consumed-nullifier history, and rejection of A's old-root proof;
-15. authorization and retained active status for credential B under Root N+1;
-16. canonical type-hash and source-domain, source-gateway, destination-domain, and destination-gateway separation checks;
-17. direct `SourceGateway` message creation with deadline-bound message ID and nonce verification;
-18. real `IdentityApplicationA → SourceGateway` message creation and event decoding, including destination-gateway forwarding;
-19. verification that the Gateway records the application address as `sourceSender`;
-20. rejection of a zero destination gateway without nonce consumption;
-21. rejection of current or expired deadlines without nonce consumption.
+9. explicit authorization of the deployed identity application by the configured Gateway administrator;
+10. valid on-chain proof verification and credential A authorization under Root N;
+11. rejection of future, stale, tampered, alternate-policy, alternate-domain, alternate-epoch, alternate-action, and non-current-root submissions;
+12. rejection of exact and regenerated same-context proof replays;
+13. authorized policy-epoch advancement and acceptance of credential A's new-epoch nullifier;
+14. rejection of unauthorized and zero-root credential-state updates;
+15. rotation to Root N+1, revocation of credential A, preservation of consumed-nullifier history, and rejection of A's old-root proof;
+16. authorization and retained active status for credential B under Root N+1;
+17. canonical type-hash and source-domain, source-gateway, destination-domain, and destination-gateway separation checks;
+18. rejection of registry updates from a non-administrator and rejection of an invalid application address;
+19. rejection of direct EOA sends and sends from an unknown application without nonce consumption;
+20. real `IdentityApplicationA → SourceGateway` message creation and event decoding, including destination-gateway forwarding;
+21. verification that the Gateway records the application address as `sourceSender`;
+22. rejection of invalid destinations and deadlines without nonce consumption;
+23. revocation of the identity application, preservation of its historical message ID, and rejection of its next send without nonce consumption;
+24. reauthorization of the identity application and successful creation of the next canonical message.
 
 If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
 
@@ -502,7 +521,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Domain-separated Chain A Source Messaging
+Authorized Chain A Source Messaging
 ```
 
 ### Expected error output
@@ -514,6 +533,9 @@ Error: execution reverted: InvalidDestinationDomain
 Error: execution reverted: InvalidDestinationGateway
 Error: execution reverted: InvalidDestinationReceiver
 Error: execution reverted: InvalidDeadline
+Error: execution reverted: UnauthorizedAuthorizationAdmin
+Error: execution reverted: InvalidSourceApplication
+Error: execution reverted: UnauthorizedSourceApplication
 Error: Assert Failed.
 Invalid proof
 FutureProofTimestamp
@@ -530,7 +552,7 @@ UnauthorizedCredentialStateAuthority
 StaleProofTimestamp
 ```
 
-These messages demonstrate that the contracts reject invalid destinations and deadlines, the circuit rejects invalid witnesses, a proof cannot be reused with a tampered public input, and the identity application enforces policy, freshness, context-bound replay protection, state-root authority, and revocation. Each expected failure is followed by `Verified rejection`, `EXPECTED FAILURE`, or `Verified expected ... rejection`. Complete verification succeeds only when the script exits with code `0` and the log ends with `VERIFICATION PASSED`.
+These messages demonstrate that the contracts reject unauthorized source applications, invalid destinations and deadlines, the circuit rejects invalid witnesses, a proof cannot be reused with a tampered public input, and the identity application enforces policy, freshness, context-bound replay protection, state-root authority, and revocation. Each expected failure is followed by `Verified rejection`, `EXPECTED FAILURE`, or `Verified expected ... rejection`. Complete verification succeeds only when the script exits with code `0` and the log ends with `VERIFICATION PASSED`.
 
 The on-chain negative cases normally return `false` and are reported as `Verified expected on-chain rejection`. A successful result for any modified proof or public policy value fails the complete verification.
 
@@ -554,6 +576,7 @@ Cross-Chain/
 │       ├── IdentityApplicationA.t.sol
 │       ├── mocks/
 │       │   ├── MockCredentialVerifier.sol
+│       │   ├── MockSourceApplication.sol
 │       │   └── MockSourceGateway.sol
 │       └── SourceGateway.t.sol
 ├── scripts/
@@ -603,7 +626,10 @@ Cross-Chain/
 - Stored authorization does not automatically expire when the proof freshness window passes.
 - Revocation uses membership in a deterministic active-credential root and an explicit Chain A root authority. The authority is responsible for publishing a root and revoked-commitment list that describe the same transition.
 - Nullifiers prevent repeated authorization for the same credential, application, epoch, and action. They do not hide the public credential commitment, prevent correlation through other public signals, or provide global replay protection across distinct contexts.
-- `SourceGateway` records its direct caller as `sourceSender` and currently has no trusted-source application registry or allowlist.
+- `SourceGateway` admits only explicitly authorized application contracts and records the direct application caller as `sourceSender`.
+- Source-application authorization is administered by one immutable address. The local deployment uses an explicit development account; production use requires an appropriate governance and key-management design.
+- Registry authorization does not authenticate the EOA calling an authorized application. Each application remains responsible for its own caller and business-policy checks.
+- Gateway revocation affects future message creation only. It does not invalidate previously emitted messages or alter historical message IDs.
 - `IdentityApplicationA` can call `SourceGateway`, while mandatory ZK-gated message creation and proof-to-message nullifier binding remain unimplemented.
 - The current message binds its protocol type, source domain, source gateway, source sender, destination domain, destination gateway, destination receiver, nonce, payload hash, and deadline.
 - A committed destination gateway is caller-selected. `SourceGateway` does not validate remote deployment, domain ownership, or trust, and no remote-gateway registry exists.

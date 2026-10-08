@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Domain-separated Chain A Source Messaging"
+VERIFICATION_NAME="Authorized Chain A Source Messaging"
 
 CHAIN_A_RPC="http://127.0.0.1:4545"
 CHAIN_B_RPC="http://127.0.0.1:9545"
@@ -20,6 +20,7 @@ APPLICATION_DOMAIN_NAMESPACE="cross-chain:identity-application-domain:v1"
 
 ANVIL_DEV_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 SOURCE_SENDER="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+UNAUTHORIZED_CALLER="0x000000000000000000000000000000000000cafe"
 DESTINATION_GATEWAY="0x000000000000000000000000000000000000d00d"
 ALTERNATE_DESTINATION_GATEWAY="0x000000000000000000000000000000000000d00e"
 DESTINATION_RECEIVER="0x000000000000000000000000000000000000bEEF"
@@ -73,6 +74,30 @@ assert_hex_equal() {
     fi
 
     printf 'Verified %s: %s\n' "$label" "$actual"
+}
+
+expect_call_revert() {
+    local label="$1"
+    local error_signature="$2"
+    local error_name="${error_signature%%(*}"
+    local error_selector
+    local output
+    shift 2
+
+    error_selector="$(cast sig "$error_signature")"
+
+    if output="$(cast call "$@" 2>&1)"; then
+        printf '%s\n' "$output"
+        fail "$label unexpectedly succeeded"
+    fi
+
+    printf '%s\n' "$output"
+    if [[ "$(normalize "$output")" != *"$(normalize "$error_selector")"* ]] \
+        && [[ "$output" != *"$error_name"* ]]; then
+        fail "$label reverted without $error_signature"
+    fi
+
+    printf 'EXPECTED FAILURE: %s (%s)\n' "$label" "$error_name"
 }
 
 probe_chain_id() {
@@ -133,17 +158,16 @@ assert_transaction_success() {
     esac
 }
 
-send_message() {
+send_source_application_authorization() {
+    local application="$1"
+    local authorized="$2"
     local output
 
     output="$(
         cast send "$SOURCE_GATEWAY" \
-            "sendMessage(uint256,address,address,bytes,uint256)" \
-            "$CHAIN_B_ID" \
-            "$DESTINATION_GATEWAY" \
-            "$DESTINATION_RECEIVER" \
-            "$PAYLOAD" \
-            "$MESSAGE_DEADLINE" \
+            "setSourceApplicationAuthorization(address,bool)" \
+            "$application" \
+            "$authorized" \
             --rpc-url "$CHAIN_A_RPC" \
             --private-key "$ANVIL_DEV_KEY" \
             --async
@@ -158,10 +182,31 @@ send_message() {
     )"
 
     if [[ ! "$LAST_TX_HASH" =~ ^0x[[:xdigit:]]{64}$ ]]; then
-        fail "could not extract transaction hash from cast send output"
+        fail "could not extract source application authorization transaction hash"
     fi
 
     printf 'Transaction hash: %s\n' "$LAST_TX_HASH"
+}
+
+deploy_unknown_source_application() {
+    local output
+
+    output="$(
+        forge create "test/mocks/MockSourceApplication.sol:MockSourceApplication" \
+            --rpc-url "$CHAIN_A_RPC" \
+            --private-key "$ANVIL_DEV_KEY" \
+            --broadcast \
+            2>&1
+    )"
+    printf '%s\n' "$output"
+
+    UNKNOWN_SOURCE_APPLICATION="$(
+        printf '%s\n' "$output" \
+            | sed -nE 's/^[[:space:]]*Deployed to:[[:space:]]*(0x[[:xdigit:]]{40}).*$/\1/p' \
+            | tail -n 1
+    )"
+    [[ "$UNKNOWN_SOURCE_APPLICATION" =~ ^0x[[:xdigit:]]{40}$ ]] \
+        || fail "could not extract unknown source application address"
 }
 
 send_application_message() {
@@ -341,13 +386,16 @@ printf ' 13. Deploy verifier, adapter, SourceGateway, and IdentityApplicationA\n
 printf ' 14. Preserve nullifier, policy epoch, and revocation verification\n'
 printf ' 15. Verify protocol type-tag and source/destination domain separation\n'
 printf ' 16. Verify source/destination gateway separation\n'
-printf ' 17. Verify direct SourceGateway messages and nonce progression\n'
-printf ' 18. Verify Application A destination gateway forwarding\n'
-printf ' 19. Decode and validate the Application A CrossChainMessage event\n'
-printf ' 20. Recompute message IDs with deadline binding\n'
-printf ' 21. Verify zero destination gateway rejection\n'
-printf ' 22. Verify expired deadline rejection without nonce consumption\n'
-printf ' 23. Verify invalid destination domain and receiver reverts\n'
+printf ' 17. Verify the authorization admin and Application A registry state\n'
+printf ' 18. Verify unknown EOA and unknown application rejection\n'
+printf ' 19. Verify registry admin protection and invalid targets\n'
+printf ' 20. Verify authorized Application A message creation\n'
+printf ' 21. Decode and validate the Application A CrossChainMessage event\n'
+printf ' 22. Recompute message IDs with domain and deadline binding\n'
+printf ' 23. Verify destination and deadline rejection without nonce consumption\n'
+printf ' 24. Revoke Application A and verify future messages are rejected\n'
+printf ' 25. Verify historical message identity remains unchanged\n'
+printf ' 26. Reauthorize Application A and verify message creation resumes\n'
 
 CURRENT_STEP="local chain availability check"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -502,6 +550,7 @@ CHAIN_A_EXPECTED_ID="$CHAIN_A_ID" \
 VERIFIER_DEPLOYER_KEY="$ANVIL_DEV_KEY" \
 APPLICATION_MAX_PROOF_AGE="$APPLICATION_MAX_PROOF_AGE" \
 CREDENTIAL_STATE_AUTHORITY="$SOURCE_SENDER" \
+SOURCE_AUTHORIZATION_ADMIN="$SOURCE_SENDER" \
 EXPECTED_IDENTITY_APPLICATION_ADDRESS="$PREDICTED_IDENTITY_APPLICATION_ADDRESS" \
 DEPLOYMENT_OUTPUT_FILE="$DEPLOYMENT_ADDRESSES_FILE" \
     bash "$PROJECT_ROOT/scripts/deploy-verifier.sh"
@@ -549,10 +598,27 @@ assert_hex_equal \
     "$(cast call "$SOURCE_GATEWAY" "MESSAGE_TYPEHASH()(bytes32)" --rpc-url "$CHAIN_A_RPC")" \
     "$(cast keccak "$MESSAGE_TYPE")" \
     "message type hash"
+assert_hex_equal \
+    "$(cast call "$SOURCE_GATEWAY" "authorizationAdmin()(address)" --rpc-url "$CHAIN_A_RPC")" \
+    "$SOURCE_SENDER" \
+    "source authorization admin"
+assert_equal \
+    "$(cast call "$SOURCE_GATEWAY" \
+        "authorizedSourceApplications(address)(bool)" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
+        --rpc-url "$CHAIN_A_RPC")" \
+    "true" \
+    "IdentityApplicationA source authorization"
 assert_equal \
     "$(cast call "$SOURCE_GATEWAY" "nextNonce()(uint256)" --rpc-url "$CHAIN_A_RPC")" \
     "1" \
     "initial nonce"
+printf 'VALID: IdentityApplicationA registered as source application\n'
+
+CURRENT_STEP="unknown source application deployment"
+printf '\n[%s]\n' "$CURRENT_STEP"
+deploy_unknown_source_application
+printf 'Unknown source application: %s\n' "$UNKNOWN_SOURCE_APPLICATION"
 
 CURRENT_STEP="payload verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -562,12 +628,72 @@ assert_equal "$PAYLOAD_TEXT" "$EXPECTED_PAYLOAD_TEXT" "payload UTF-8 text"
 PAYLOAD_HASH="$(cast keccak "$PAYLOAD")"
 assert_hex_equal "$PAYLOAD_HASH" "$EXPECTED_PAYLOAD_HASH" "payload hash"
 
+CURRENT_STEP="non-admin source authorization rejection"
+printf '\n[%s]\n' "$CURRENT_STEP"
+expect_call_revert \
+    "non-admin source authorization update rejected" \
+    "UnauthorizedAuthorizationAdmin()" \
+    "$SOURCE_GATEWAY" \
+    "setSourceApplicationAuthorization(address,bool)" \
+    "$UNKNOWN_SOURCE_APPLICATION" \
+    true \
+    --from "$UNAUTHORIZED_CALLER" \
+    --rpc-url "$CHAIN_A_RPC"
+
+CURRENT_STEP="zero source application rejection"
+printf '\n[%s]\n' "$CURRENT_STEP"
+expect_call_revert \
+    "zero source application authorization rejected" \
+    "InvalidSourceApplication()" \
+    "$SOURCE_GATEWAY" \
+    "setSourceApplicationAuthorization(address,bool)" \
+    "$ZERO_ADDRESS" \
+    true \
+    --from "$SOURCE_SENDER" \
+    --rpc-url "$CHAIN_A_RPC"
+
+CURRENT_STEP="unknown direct EOA rejection"
+printf '\n[%s]\n' "$CURRENT_STEP"
+expect_call_revert \
+    "unknown EOA rejected" \
+    "UnauthorizedSourceApplication()" \
+    "$SOURCE_GATEWAY" \
+    "sendMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
+    "$CHAIN_B_ID" \
+    "$DESTINATION_GATEWAY" \
+    "$DESTINATION_RECEIVER" \
+    "$PAYLOAD" \
+    "$MESSAGE_DEADLINE" \
+    --from "$SOURCE_SENDER" \
+    --rpc-url "$CHAIN_A_RPC"
+
+CURRENT_STEP="unknown source application rejection"
+printf '\n[%s]\n' "$CURRENT_STEP"
+expect_call_revert \
+    "unknown application rejected" \
+    "UnauthorizedSourceApplication()" \
+    "$UNKNOWN_SOURCE_APPLICATION" \
+    "sendCrossChainMessage(address,uint256,address,address,bytes,uint256)(bytes32,uint256)" \
+    "$SOURCE_GATEWAY" \
+    "$CHAIN_B_ID" \
+    "$DESTINATION_GATEWAY" \
+    "$DESTINATION_RECEIVER" \
+    "$PAYLOAD" \
+    "$MESSAGE_DEADLINE" \
+    --from "$SOURCE_SENDER" \
+    --rpc-url "$CHAIN_A_RPC"
+assert_equal \
+    "$(cast call "$SOURCE_GATEWAY" "nextNonce()(uint256)" --rpc-url "$CHAIN_A_RPC")" \
+    "1" \
+    "nonce after unauthorized source rejection"
+printf 'VALID: unauthorized sends did not consume nonce\n'
+
 CURRENT_STEP="first message ID prediction"
 printf '\n[%s]\n' "$CURRENT_STEP"
 FIRST_EXPECTED_MESSAGE_ID="$(
     cast call "$SOURCE_GATEWAY" \
         "computeMessageId(address,uint256,address,address,uint256,bytes32,uint256)(bytes32)" \
-        "$SOURCE_SENDER" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
         "$CHAIN_B_ID" \
         "$DESTINATION_GATEWAY" \
         "$DESTINATION_RECEIVER" \
@@ -583,7 +709,7 @@ printf '\n[%s]\n' "$CURRENT_STEP"
 ALTERNATE_DOMAIN_MESSAGE_ID="$(
     cast call "$SOURCE_GATEWAY" \
         "computeMessageId(address,uint256,address,address,uint256,bytes32,uint256)(bytes32)" \
-        "$SOURCE_SENDER" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
         "$ALTERNATE_DESTINATION_DOMAIN" \
         "$DESTINATION_GATEWAY" \
         "$DESTINATION_RECEIVER" \
@@ -602,7 +728,7 @@ printf '\n[%s]\n' "$CURRENT_STEP"
 ALTERNATE_GATEWAY_MESSAGE_ID="$(
     cast call "$SOURCE_GATEWAY" \
         "computeMessageId(address,uint256,address,address,uint256,bytes32,uint256)(bytes32)" \
-        "$SOURCE_SENDER" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
         "$CHAIN_B_ID" \
         "$ALTERNATE_DESTINATION_GATEWAY" \
         "$DESTINATION_RECEIVER" \
@@ -618,7 +744,7 @@ printf 'VALID: destination gateway bound to message ID\n'
 
 CURRENT_STEP="first message send"
 printf '\n[%s]\n' "$CURRENT_STEP"
-send_message
+send_application_message
 FIRST_TX_HASH="$LAST_TX_HASH"
 
 CURRENT_STEP="first message event verification"
@@ -626,7 +752,7 @@ verify_message_event \
     "$FIRST_TX_HASH" \
     "$FIRST_EXPECTED_MESSAGE_ID" \
     1 \
-    "$SOURCE_SENDER" \
+    "$IDENTITY_APPLICATION_ADDRESS" \
     "$MESSAGE_DEADLINE" \
     "first message"
 
@@ -642,7 +768,7 @@ printf '\n[%s]\n' "$CURRENT_STEP"
 SECOND_EXPECTED_MESSAGE_ID="$(
     cast call "$SOURCE_GATEWAY" \
         "computeMessageId(address,uint256,address,address,uint256,bytes32,uint256)(bytes32)" \
-        "$SOURCE_SENDER" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
         "$CHAIN_B_ID" \
         "$DESTINATION_GATEWAY" \
         "$DESTINATION_RECEIVER" \
@@ -661,7 +787,7 @@ printf 'Verified that nonce 1 and nonce 2 produce different message IDs.\n'
 
 CURRENT_STEP="second message send"
 printf '\n[%s]\n' "$CURRENT_STEP"
-send_message
+send_application_message
 SECOND_TX_HASH="$LAST_TX_HASH"
 
 CURRENT_STEP="second message event verification"
@@ -669,7 +795,7 @@ verify_message_event \
     "$SECOND_TX_HASH" \
     "$SECOND_EXPECTED_MESSAGE_ID" \
     2 \
-    "$SOURCE_SENDER" \
+    "$IDENTITY_APPLICATION_ADDRESS" \
     "$MESSAGE_DEADLINE" \
     "second message"
 
@@ -744,8 +870,8 @@ assert_equal \
 
 CURRENT_STEP="zero destination gateway rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
-if cast call "$SOURCE_GATEWAY" \
-    "sendMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
+if cast call "$IDENTITY_APPLICATION_ADDRESS" \
+    "sendCrossChainMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
     "$CHAIN_B_ID" \
     "$ZERO_ADDRESS" \
     "$DESTINATION_RECEIVER" \
@@ -764,8 +890,8 @@ assert_equal \
 
 CURRENT_STEP="same-chain destination rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
-if cast call "$SOURCE_GATEWAY" \
-    "sendMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
+if cast call "$IDENTITY_APPLICATION_ADDRESS" \
+    "sendCrossChainMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
     "$CHAIN_A_ID" \
     "$DESTINATION_GATEWAY" \
     "$DESTINATION_RECEIVER" \
@@ -780,8 +906,8 @@ fi
 
 CURRENT_STEP="zero destination receiver rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
-if cast call "$SOURCE_GATEWAY" \
-    "sendMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
+if cast call "$IDENTITY_APPLICATION_ADDRESS" \
+    "sendCrossChainMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
     "$CHAIN_B_ID" \
     "$DESTINATION_GATEWAY" \
     "$ZERO_ADDRESS" \
@@ -793,5 +919,92 @@ if cast call "$SOURCE_GATEWAY" \
 else
     printf 'Verified rejection of the zero destination receiver.\n'
 fi
+
+CURRENT_STEP="IdentityApplicationA source authorization revocation"
+printf '\n[%s]\n' "$CURRENT_STEP"
+send_source_application_authorization "$IDENTITY_APPLICATION_ADDRESS" false
+assert_transaction_success "$LAST_TX_HASH" "IdentityApplicationA source authorization revocation"
+assert_equal \
+    "$(cast call "$SOURCE_GATEWAY" \
+        "authorizedSourceApplications(address)(bool)" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
+        --rpc-url "$CHAIN_A_RPC")" \
+    "false" \
+    "revoked IdentityApplicationA source authorization"
+
+CURRENT_STEP="historical message identity verification after revocation"
+printf '\n[%s]\n' "$CURRENT_STEP"
+assert_hex_equal \
+    "$(cast call "$SOURCE_GATEWAY" \
+        "computeMessageId(address,uint256,address,address,uint256,bytes32,uint256)(bytes32)" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
+        "$CHAIN_B_ID" \
+        "$DESTINATION_GATEWAY" \
+        "$DESTINATION_RECEIVER" \
+        1 \
+        "$PAYLOAD_HASH" \
+        "$MESSAGE_DEADLINE" \
+        --rpc-url "$CHAIN_A_RPC")" \
+    "$FIRST_EXPECTED_MESSAGE_ID" \
+    "historical message ID after source application revocation"
+
+CURRENT_STEP="revoked IdentityApplicationA message rejection"
+printf '\n[%s]\n' "$CURRENT_STEP"
+expect_call_revert \
+    "revoked Application A rejected" \
+    "UnauthorizedSourceApplication()" \
+    "$IDENTITY_APPLICATION_ADDRESS" \
+    "sendCrossChainMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
+    "$CHAIN_B_ID" \
+    "$DESTINATION_GATEWAY" \
+    "$DESTINATION_RECEIVER" \
+    "$PAYLOAD" \
+    "$MESSAGE_DEADLINE" \
+    --from "$SOURCE_SENDER" \
+    --rpc-url "$CHAIN_A_RPC"
+assert_equal \
+    "$(cast call "$SOURCE_GATEWAY" "nextNonce()(uint256)" --rpc-url "$CHAIN_A_RPC")" \
+    "4" \
+    "nonce after revoked source application rejection"
+printf 'VALID: revoked send did not consume nonce\n'
+
+CURRENT_STEP="IdentityApplicationA source reauthorization"
+printf '\n[%s]\n' "$CURRENT_STEP"
+send_source_application_authorization "$IDENTITY_APPLICATION_ADDRESS" true
+assert_transaction_success "$LAST_TX_HASH" "IdentityApplicationA source reauthorization"
+assert_equal \
+    "$(cast call "$SOURCE_GATEWAY" \
+        "authorizedSourceApplications(address)(bool)" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
+        --rpc-url "$CHAIN_A_RPC")" \
+    "true" \
+    "reauthorized IdentityApplicationA source authorization"
+
+REAUTHORIZED_EXPECTED_MESSAGE_ID="$(
+    cast call "$SOURCE_GATEWAY" \
+        "computeMessageId(address,uint256,address,address,uint256,bytes32,uint256)(bytes32)" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
+        "$CHAIN_B_ID" \
+        "$DESTINATION_GATEWAY" \
+        "$DESTINATION_RECEIVER" \
+        4 \
+        "$PAYLOAD_HASH" \
+        "$MESSAGE_DEADLINE" \
+        --rpc-url "$CHAIN_A_RPC"
+)"
+send_application_message
+REAUTHORIZED_MESSAGE_TX_HASH="$LAST_TX_HASH"
+verify_message_event \
+    "$REAUTHORIZED_MESSAGE_TX_HASH" \
+    "$REAUTHORIZED_EXPECTED_MESSAGE_ID" \
+    4 \
+    "$IDENTITY_APPLICATION_ADDRESS" \
+    "$MESSAGE_DEADLINE" \
+    "reauthorized Application A message"
+assert_equal \
+    "$(cast call "$SOURCE_GATEWAY" "nextNonce()(uint256)" --rpc-url "$CHAIN_A_RPC")" \
+    "5" \
+    "nonce after reauthorized Application A message"
+printf 'VALID: reauthorized Application A message accepted\n'
 
 CURRENT_STEP="complete"

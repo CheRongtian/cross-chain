@@ -9,12 +9,24 @@ contract SourceGateway is ISourceGateway {
     uint8 public constant MESSAGE_VERSION = 2;
     bytes32 public constant MESSAGE_TYPEHASH = CROSS_CHAIN_MESSAGE_TYPEHASH;
 
-    uint256 public nextNonce = 1;
+    // Lower camel case preserves the project-facing getter name.
+    // forge-lint: disable-next-line(screaming-snake-case-immutable)
+    address public immutable authorizationAdmin;
 
+    uint256 public nextNonce = 1;
+    mapping(address application => bool authorized) public authorizedSourceApplications;
+
+    error InvalidAuthorizationAdmin();
+    error UnauthorizedAuthorizationAdmin();
+    error InvalidSourceApplication();
+    error SourceApplicationAuthorizationUnchanged();
+    error UnauthorizedSourceApplication();
     error InvalidDestinationDomain();
     error InvalidDestinationGateway();
     error InvalidDestinationReceiver();
     error InvalidDeadline();
+
+    event SourceApplicationAuthorizationUpdated(address indexed application, bool authorized);
 
     event CrossChainMessage(
         bytes32 indexed messageId,
@@ -30,6 +42,31 @@ contract SourceGateway is ISourceGateway {
         uint256 deadline
     );
 
+    constructor(address authorizationAdmin_) {
+        if (authorizationAdmin_ == address(0)) {
+            revert InvalidAuthorizationAdmin();
+        }
+
+        authorizationAdmin = authorizationAdmin_;
+    }
+
+    function setSourceApplicationAuthorization(address application, bool authorized) external {
+        if (msg.sender != authorizationAdmin) {
+            revert UnauthorizedAuthorizationAdmin();
+        }
+        if (application == address(0) || (authorized && application.code.length == 0)) {
+            revert InvalidSourceApplication();
+        }
+        if (authorizedSourceApplications[application] == authorized) {
+            revert SourceApplicationAuthorizationUnchanged();
+        }
+
+        // The authorization change is emitted immediately below.
+        // forge-lint: disable-next-line(missing-events-access-control)
+        authorizedSourceApplications[application] = authorized;
+        emit SourceApplicationAuthorizationUpdated(application, authorized);
+    }
+
     function sendMessage(
         uint256 destinationDomain,
         address destinationGateway,
@@ -37,6 +74,9 @@ contract SourceGateway is ISourceGateway {
         bytes calldata payload,
         uint256 deadline
     ) external returns (bytes32 messageId, uint256 nonce) {
+        if (!authorizedSourceApplications[msg.sender]) {
+            revert UnauthorizedSourceApplication();
+        }
         if (destinationDomain == 0 || destinationDomain == block.chainid) {
             revert InvalidDestinationDomain();
         }

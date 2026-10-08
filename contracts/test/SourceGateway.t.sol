@@ -7,6 +7,7 @@ import {Vm} from "forge-std/Vm.sol";
 import {CanonicalMessageVector} from "../generated/CanonicalMessageVector.sol";
 import {CROSS_CHAIN_MESSAGE_TYPEHASH, MessageCodec} from "../src/MessageCodec.sol";
 import {SourceGateway} from "../src/SourceGateway.sol";
+import {MockSourceApplication} from "./mocks/MockSourceApplication.sol";
 
 contract SourceGatewayTest is Test {
     uint256 internal constant SOURCE_DOMAIN = 10_011;
@@ -15,18 +16,165 @@ contract SourceGatewayTest is Test {
     uint256 internal constant CURRENT_TIME = 2_000_000_000;
     uint256 internal constant DEADLINE = CURRENT_TIME + 1 hours;
     uint256 internal constant EVENT_TOPIC_COUNT = 4;
-    address internal constant SOURCE_SENDER = address(0xA11CE);
+    uint256 internal constant AUTHORIZATION_EVENT_TOPIC_COUNT = 2;
     address internal constant DESTINATION_GATEWAY = address(0xD00D);
     address internal constant ALTERNATE_DESTINATION_GATEWAY = address(0xD00E);
     address internal constant DESTINATION_RECEIVER = address(0xBEEF);
+    address internal constant UNKNOWN_EOA = address(0xBAD);
     string internal constant PAYLOAD_TEXT = "hello chain b";
 
     SourceGateway internal gateway;
+    MockSourceApplication internal sourceApplication;
+    MockSourceApplication internal secondSourceApplication;
+    MockSourceApplication internal unknownSourceApplication;
 
     function setUp() public {
         vm.chainId(SOURCE_DOMAIN);
         vm.warp(CURRENT_TIME);
-        gateway = new SourceGateway();
+        gateway = new SourceGateway(address(this));
+        sourceApplication = new MockSourceApplication();
+        secondSourceApplication = new MockSourceApplication();
+        unknownSourceApplication = new MockSourceApplication();
+        gateway.setSourceApplicationAuthorization(address(sourceApplication), true);
+    }
+
+    function testAuthorizationAdminConfiguredCorrectly() public view {
+        assertEq(gateway.authorizationAdmin(), address(this));
+    }
+
+    function testRejectsZeroAuthorizationAdmin() public {
+        vm.expectRevert(SourceGateway.InvalidAuthorizationAdmin.selector);
+        new SourceGateway(address(0));
+    }
+
+    function testAdminCanAuthorizeAndRevokeSourceApplication() public {
+        gateway.setSourceApplicationAuthorization(address(secondSourceApplication), true);
+        assertTrue(gateway.authorizedSourceApplications(address(secondSourceApplication)));
+
+        gateway.setSourceApplicationAuthorization(address(secondSourceApplication), false);
+        assertFalse(gateway.authorizedSourceApplications(address(secondSourceApplication)));
+    }
+
+    function testAuthorizationUpdateEmitsEvent() public {
+        vm.recordLogs();
+        gateway.setSourceApplicationAuthorization(address(secondSourceApplication), true);
+        gateway.setSourceApplicationAuthorization(address(secondSourceApplication), false);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(logs.length, 2);
+        assertEq(logs[0].emitter, address(gateway));
+        assertEq(logs[0].topics.length, AUTHORIZATION_EVENT_TOPIC_COUNT);
+        assertEq(logs[0].topics[0], SourceGateway.SourceApplicationAuthorizationUpdated.selector);
+        assertEq(logs[0].topics[1], bytes32(uint256(uint160(address(secondSourceApplication)))));
+        assertTrue(abi.decode(logs[0].data, (bool)));
+        assertEq(logs[1].emitter, address(gateway));
+        assertEq(logs[1].topics.length, AUTHORIZATION_EVENT_TOPIC_COUNT);
+        assertEq(logs[1].topics[0], SourceGateway.SourceApplicationAuthorizationUpdated.selector);
+        assertEq(logs[1].topics[1], bytes32(uint256(uint160(address(secondSourceApplication)))));
+        assertFalse(abi.decode(logs[1].data, (bool)));
+    }
+
+    function testNonAdminCannotAuthorizeSourceApplication() public {
+        vm.prank(UNKNOWN_EOA);
+        vm.expectRevert(SourceGateway.UnauthorizedAuthorizationAdmin.selector);
+        gateway.setSourceApplicationAuthorization(address(secondSourceApplication), true);
+
+        assertFalse(gateway.authorizedSourceApplications(address(secondSourceApplication)));
+    }
+
+    function testNonAdminCannotRevokeSourceApplication() public {
+        vm.prank(UNKNOWN_EOA);
+        vm.expectRevert(SourceGateway.UnauthorizedAuthorizationAdmin.selector);
+        gateway.setSourceApplicationAuthorization(address(sourceApplication), false);
+
+        assertTrue(gateway.authorizedSourceApplications(address(sourceApplication)));
+    }
+
+    function testRejectsZeroSourceApplicationForAuthorizationUpdates() public {
+        vm.expectRevert(SourceGateway.InvalidSourceApplication.selector);
+        gateway.setSourceApplicationAuthorization(address(0), true);
+
+        vm.expectRevert(SourceGateway.InvalidSourceApplication.selector);
+        gateway.setSourceApplicationAuthorization(address(0), false);
+    }
+
+    function testRejectsAuthorizationForAddressWithoutCode() public {
+        vm.expectRevert(SourceGateway.InvalidSourceApplication.selector);
+        gateway.setSourceApplicationAuthorization(UNKNOWN_EOA, true);
+    }
+
+    function testRejectsAuthorizationStateNoOps() public {
+        vm.expectRevert(SourceGateway.SourceApplicationAuthorizationUnchanged.selector);
+        gateway.setSourceApplicationAuthorization(address(sourceApplication), true);
+
+        vm.expectRevert(SourceGateway.SourceApplicationAuthorizationUnchanged.selector);
+        gateway.setSourceApplicationAuthorization(address(unknownSourceApplication), false);
+    }
+
+    function testUnknownEOACannotSendAndDoesNotConsumeNonce() public {
+        vm.recordLogs();
+        vm.prank(UNKNOWN_EOA);
+        vm.expectRevert(SourceGateway.UnauthorizedSourceApplication.selector);
+        _callGatewayDirect();
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(gateway.nextNonce(), 1);
+        assertEq(logs.length, 0);
+    }
+
+    function testUnknownApplicationCannotSendAndDoesNotConsumeNonce() public {
+        vm.recordLogs();
+        vm.expectRevert(SourceGateway.UnauthorizedSourceApplication.selector);
+        _callGatewayFrom(unknownSourceApplication, gateway, DEADLINE);
+
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(gateway.nextNonce(), 1);
+        assertEq(logs.length, 0);
+    }
+
+    function testRevokedApplicationCannotSendAndDoesNotConsumeNonce() public {
+        _sendMessage(DEADLINE);
+        gateway.setSourceApplicationAuthorization(address(sourceApplication), false);
+        uint256 nonceBeforeRejectedSend = gateway.nextNonce();
+
+        vm.expectRevert(SourceGateway.UnauthorizedSourceApplication.selector);
+        _sendMessage(DEADLINE);
+
+        assertEq(gateway.nextNonce(), nonceBeforeRejectedSend);
+    }
+
+    function testReauthorizedApplicationCanSendAgain() public {
+        gateway.setSourceApplicationAuthorization(address(sourceApplication), false);
+        gateway.setSourceApplicationAuthorization(address(sourceApplication), true);
+
+        (, uint256 nonce) = _sendMessage(DEADLINE);
+
+        assertEq(nonce, 1);
+        assertEq(gateway.nextNonce(), 2);
+    }
+
+    function testMultipleAuthorizedApplicationsUseTheirOwnSourceSender() public {
+        gateway.setSourceApplicationAuthorization(address(secondSourceApplication), true);
+
+        (bytes32 firstMessageId, uint256 firstNonce) = _callGatewayFrom(sourceApplication, gateway, DEADLINE);
+        (bytes32 secondMessageId, uint256 secondNonce) =
+            _callGatewayFrom(secondSourceApplication, gateway, DEADLINE);
+
+        assertEq(firstNonce, 1);
+        assertEq(secondNonce, 2);
+        assertEq(firstMessageId, _messageId(address(sourceApplication), 1, DEADLINE));
+        assertEq(secondMessageId, _messageId(address(secondSourceApplication), 2, DEADLINE));
+        assertNotEq(firstMessageId, secondMessageId);
+    }
+
+    function testRevocationDoesNotChangeHistoricalMessageIdentity() public {
+        (bytes32 historicalMessageId,) = _sendMessage(DEADLINE);
+        gateway.setSourceApplicationAuthorization(address(sourceApplication), false);
+
+        assertEq(historicalMessageId, _messageId(address(sourceApplication), 1, DEADLINE));
+        assertEq(gateway.nextNonce(), 2);
+        assertFalse(gateway.authorizedSourceApplications(address(sourceApplication)));
     }
 
     function testInitialNonceIsOne() public view {
@@ -54,7 +202,7 @@ contract SourceGatewayTest is Test {
                 gateway.MESSAGE_VERSION(),
                 SOURCE_DOMAIN,
                 address(gateway),
-                SOURCE_SENDER,
+                address(sourceApplication),
                 DESTINATION_DOMAIN,
                 DESTINATION_GATEWAY,
                 DESTINATION_RECEIVER,
@@ -64,7 +212,7 @@ contract SourceGatewayTest is Test {
             )
         );
 
-        assertEq(_messageId(SOURCE_SENDER, 1, DEADLINE), expected);
+        assertEq(_messageId(address(sourceApplication), 1, DEADLINE), expected);
     }
 
     function testEveryIdentityFieldChangesMessageId() public view {
@@ -103,7 +251,10 @@ contract SourceGatewayTest is Test {
     }
 
     function testIdenticalCanonicalInputsProduceIdenticalMessageId() public view {
-        assertEq(_messageId(SOURCE_SENDER, 1, DEADLINE), _messageId(SOURCE_SENDER, 1, DEADLINE));
+        assertEq(
+            _messageId(address(sourceApplication), 1, DEADLINE),
+            _messageId(address(sourceApplication), 1, DEADLINE)
+        );
     }
 
     function testSharedGoldenVectorsMatchCanonicalEncoding() public pure {
@@ -155,18 +306,19 @@ contract SourceGatewayTest is Test {
     }
 
     function testSameNonceAcrossSourceGatewaysProducesDifferentMessageIds() public {
-        SourceGateway secondGateway = new SourceGateway();
+        SourceGateway secondGateway = new SourceGateway(address(this));
+        secondGateway.setSourceApplicationAuthorization(address(sourceApplication), true);
 
-        vm.prank(SOURCE_SENDER);
-        (bytes32 firstMessageId, uint256 firstNonce) = gateway.sendMessage(
+        (bytes32 firstMessageId, uint256 firstNonce) = sourceApplication.sendCrossChainMessage(
+            gateway,
             DESTINATION_DOMAIN,
             DESTINATION_GATEWAY,
             DESTINATION_RECEIVER,
             _payload(),
             DEADLINE
         );
-        vm.prank(SOURCE_SENDER);
-        (bytes32 secondMessageId, uint256 secondNonce) = secondGateway.sendMessage(
+        (bytes32 secondMessageId, uint256 secondNonce) = sourceApplication.sendCrossChainMessage(
+            secondGateway,
             DESTINATION_DOMAIN,
             DESTINATION_GATEWAY,
             DESTINATION_RECEIVER,
@@ -180,16 +332,9 @@ contract SourceGatewayTest is Test {
     }
 
     function testMessageIdCanBeRecomputed() public {
-        bytes32 expected = _messageId(SOURCE_SENDER, 1, DEADLINE);
+        bytes32 expected = _messageId(address(sourceApplication), 1, DEADLINE);
 
-        vm.prank(SOURCE_SENDER);
-        (bytes32 messageId, uint256 nonce) = gateway.sendMessage(
-            DESTINATION_DOMAIN,
-            DESTINATION_GATEWAY,
-            DESTINATION_RECEIVER,
-            _payload(),
-            DEADLINE
-        );
+        (bytes32 messageId, uint256 nonce) = _sendMessage(DEADLINE);
 
         assertEq(messageId, expected);
         assertEq(nonce, 1);
@@ -209,14 +354,16 @@ contract SourceGatewayTest is Test {
     }
 
     function testDeadlineChangesMessageId() public view {
-        assertNotEq(_messageId(SOURCE_SENDER, 1, DEADLINE), _messageId(SOURCE_SENDER, 1, DEADLINE + 1));
+        assertNotEq(
+            _messageId(address(sourceApplication), 1, DEADLINE),
+            _messageId(address(sourceApplication), 1, DEADLINE + 1)
+        );
     }
 
     function testEmitsCrossChainMessage() public {
-        bytes32 expectedMessageId = _messageId(SOURCE_SENDER, 1, DEADLINE);
+        bytes32 expectedMessageId = _messageId(address(sourceApplication), 1, DEADLINE);
         vm.recordLogs();
 
-        vm.prank(SOURCE_SENDER);
         (bytes32 returnedMessageId, uint256 returnedNonce) = _callGateway(
             DESTINATION_DOMAIN,
             DESTINATION_GATEWAY,
@@ -232,7 +379,7 @@ contract SourceGatewayTest is Test {
         assertEq(logs[0].topics.length, EVENT_TOPIC_COUNT);
         assertEq(logs[0].topics[0], SourceGateway.CrossChainMessage.selector);
         assertEq(logs[0].topics[1], expectedMessageId);
-        assertEq(logs[0].topics[2], bytes32(uint256(uint160(SOURCE_SENDER))));
+        assertEq(logs[0].topics[2], bytes32(uint256(uint160(address(sourceApplication)))));
         assertEq(logs[0].topics[3], bytes32(DESTINATION_DOMAIN));
 
         (
@@ -299,7 +446,6 @@ contract SourceGatewayTest is Test {
     }
 
     function _sendMessage(uint256 deadline) internal returns (bytes32 messageId, uint256 nonce) {
-        vm.prank(SOURCE_SENDER);
         return _callGateway(DESTINATION_DOMAIN, DESTINATION_GATEWAY, DESTINATION_RECEIVER, deadline);
     }
 
@@ -309,7 +455,39 @@ contract SourceGatewayTest is Test {
         address destinationReceiver,
         uint256 deadline
     ) internal returns (bytes32 messageId, uint256 nonce) {
-        return gateway.sendMessage(destinationDomain, destinationGateway, destinationReceiver, _payload(), deadline);
+        return sourceApplication.sendCrossChainMessage(
+            gateway,
+            destinationDomain,
+            destinationGateway,
+            destinationReceiver,
+            _payload(),
+            deadline
+        );
+    }
+
+    function _callGatewayFrom(
+        MockSourceApplication application,
+        SourceGateway targetGateway,
+        uint256 deadline
+    ) internal returns (bytes32 messageId, uint256 nonce) {
+        return application.sendCrossChainMessage(
+            targetGateway,
+            DESTINATION_DOMAIN,
+            DESTINATION_GATEWAY,
+            DESTINATION_RECEIVER,
+            _payload(),
+            deadline
+        );
+    }
+
+    function _callGatewayDirect() internal returns (bytes32 messageId, uint256 nonce) {
+        return gateway.sendMessage(
+            DESTINATION_DOMAIN,
+            DESTINATION_GATEWAY,
+            DESTINATION_RECEIVER,
+            _payload(),
+            DEADLINE
+        );
     }
 
     function _messageId(address sourceSender, uint256 nonce, uint256 deadline) internal view returns (bytes32) {
@@ -329,7 +507,7 @@ contract SourceGatewayTest is Test {
             version: gateway.MESSAGE_VERSION(),
             sourceDomain: SOURCE_DOMAIN,
             sourceGateway: address(gateway),
-            sourceSender: SOURCE_SENDER,
+            sourceSender: address(sourceApplication),
             destinationDomain: DESTINATION_DOMAIN,
             destinationGateway: DESTINATION_GATEWAY,
             destinationReceiver: DESTINATION_RECEIVER,

@@ -19,6 +19,7 @@ VERIFIER_DEPLOYER_KEY="${VERIFIER_DEPLOYER_KEY:-0xac0974bec39a17e36ba4a6b4d238ff
 APPLICATION_MAX_PROOF_AGE="${APPLICATION_MAX_PROOF_AGE:-3600}"
 APPLICATION_SUBMITTER="${APPLICATION_SUBMITTER:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
 CREDENTIAL_STATE_AUTHORITY="${CREDENTIAL_STATE_AUTHORITY:-$APPLICATION_SUBMITTER}"
+SOURCE_AUTHORIZATION_ADMIN="${SOURCE_AUTHORIZATION_ADMIN:-$APPLICATION_SUBMITTER}"
 UNAUTHORIZED_STATE_CALLER="0x000000000000000000000000000000000000bEEF"
 TEMP_DIR=""
 LAST_DEPLOYED_ADDRESS=""
@@ -395,6 +396,32 @@ send_credential_state_update() {
         || fail "could not extract credential state update transaction hash"
 }
 
+send_source_application_authorization() {
+    local application="$1"
+    local authorized="$2"
+    local output
+
+    output="$(
+        cast send "$SOURCE_GATEWAY_ADDRESS" \
+            "setSourceApplicationAuthorization(address,bool)" \
+            "$application" \
+            "$authorized" \
+            --rpc-url "$CHAIN_A_RPC_URL" \
+            --private-key "$VERIFIER_DEPLOYER_KEY" \
+            --async
+    )"
+
+    printf 'cast send output: %s\n' "$output"
+    LAST_TX_HASH="$(
+        printf '%s\n' "$output" \
+            | sed -nE 's/.*(0x[[:xdigit:]]{64}).*/\1/p' \
+            | tail -n 1
+    )"
+
+    [[ "$LAST_TX_HASH" =~ ^0x[[:xdigit:]]{64}$ ]] \
+        || fail "could not extract source application authorization transaction hash"
+}
+
 assert_transaction_success() {
     local transaction_hash="$1"
     local label="$2"
@@ -414,13 +441,14 @@ assert_transaction_success() {
 
 assert_true_result() {
     local result
+    local label="${2:-valid on-chain proof}"
     result="$(normalize "$1")"
 
     case "$result" in
         true|1|0x1|0x01|0x0000000000000000000000000000000000000000000000000000000000000001)
             ;;
         *)
-            fail "valid on-chain proof returned '$1'"
+            fail "$label returned '$1'"
             ;;
     esac
 }
@@ -540,7 +568,8 @@ printf 'Credential verifier adapter: %s\n' "$CREDENTIAL_VERIFIER_ADDRESS"
 printf '\n[deploy source gateway to Chain A]\n'
 deploy_contract \
     "src/SourceGateway.sol:SourceGateway" \
-    "$TEMP_DIR/source-gateway.log"
+    "$TEMP_DIR/source-gateway.log" \
+    --constructor-args "$SOURCE_AUTHORIZATION_ADMIN"
 SOURCE_GATEWAY_ADDRESS="$LAST_DEPLOYED_ADDRESS"
 printf 'Source gateway: %s\n' "$SOURCE_GATEWAY_ADDRESS"
 
@@ -574,6 +603,26 @@ for deployed_address in \
     [[ -n "$DEPLOYED_CODE" ]] && [[ "$DEPLOYED_CODE" != "0x" ]] \
         || fail "no bytecode at deployed address $deployed_address"
 done
+
+DEPLOYED_AUTHORIZATION_ADMIN="$(
+    cast call "$SOURCE_GATEWAY_ADDRESS" \
+        "authorizationAdmin()(address)" \
+        --rpc-url "$CHAIN_A_RPC_URL"
+)"
+[[ "$(normalize "$DEPLOYED_AUTHORIZATION_ADMIN")" == "$(normalize "$SOURCE_AUTHORIZATION_ADMIN")" ]] \
+    || fail "source authorization admin: expected $SOURCE_AUTHORIZATION_ADMIN, got $DEPLOYED_AUTHORIZATION_ADMIN"
+printf 'Verified source authorization admin: %s\n' "$DEPLOYED_AUTHORIZATION_ADMIN"
+
+printf '\n[authorize identity application as source application]\n'
+send_source_application_authorization "$IDENTITY_APPLICATION_ADDRESS" true
+assert_transaction_success "$LAST_TX_HASH" "IdentityApplicationA source authorization"
+assert_true_result "$(
+    cast call "$SOURCE_GATEWAY_ADDRESS" \
+        "authorizedSourceApplications(address)(bool)" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
+        --rpc-url "$CHAIN_A_RPC_URL"
+)" "IdentityApplicationA source authorization"
+printf 'Verified IdentityApplicationA source authorization.\n'
 
 assert_uint_equal \
     "$(cast call "$IDENTITY_APPLICATION_ADDRESS" "credentialStateRoot()(uint256)" --rpc-url "$CHAIN_A_RPC_URL")" \
