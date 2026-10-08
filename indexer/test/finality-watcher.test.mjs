@@ -128,3 +128,61 @@ test("does not evaluate stale finality candidates when reconciliation fails", as
   await assert.rejects(watcher.runFinalityPass(), /canonical reconciliation failed/);
   assert.equal(finalityCalls, 0);
 });
+
+test("a fresh Finality Watcher can continue after a failed database pass", async () => {
+  let durableStatus = "FINALIZING";
+  const publicClient = {
+    async request() {
+      return "0x7b";
+    },
+  };
+  const reconciler = {
+    async reconcile({ headBlock }) {
+      return { detected: false, headBlock };
+    },
+  };
+  const failedWatcher = createFinalityWatcher({
+    config: CONFIG,
+    pool: undefined,
+    publicClient,
+    reconciler,
+    store: {
+      async advanceFinality() {
+        throw new Error("database client interrupted before finality commit");
+      },
+    },
+    logger: { log() {} },
+  });
+
+  await assert.rejects(
+    failedWatcher.runFinalityPass(),
+    /database client interrupted before finality commit/,
+  );
+  assert.equal(durableStatus, "FINALIZING");
+
+  const restartedWatcher = createFinalityWatcher({
+    config: CONFIG,
+    pool: undefined,
+    publicClient,
+    reconciler,
+    store: {
+      async advanceFinality() {
+        assert.equal(durableStatus, "FINALIZING");
+        durableStatus = "FINALIZED";
+        return {
+          headBlock: 123n,
+          candidatesChecked: 1,
+          observedToFinalizing: 0,
+          observedToFinalized: 0,
+          finalizingToFinalized: 1,
+          unchangedFinalizing: 0,
+        };
+      },
+    },
+    logger: { log() {} },
+  });
+  const recovered = await restartedWatcher.runFinalityPass();
+
+  assert.equal(recovered.finalizingToFinalized, 1);
+  assert.equal(durableStatus, "FINALIZED");
+});

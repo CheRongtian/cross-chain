@@ -451,6 +451,214 @@ test("rolls back all writes when a non-duplicate row is invalid", async () => {
   assert.equal((await readCursor(pool, config.databaseSchema, scope)).next_block, "10");
 });
 
+test("retries a complete range after an injected pre-commit cursor failure", async () => {
+  await initializeCursor();
+  const failureFunction = `${schemaIdentifier}."fail_cursor_advance_for_recovery_test"`;
+
+  await pool.query(
+    `DROP TRIGGER IF EXISTS fail_cursor_advance_for_recovery_test ON ${cursorsTable}`,
+  );
+  await pool.query(`DROP FUNCTION IF EXISTS ${failureFunction}()`);
+  await pool.query(
+    `CREATE OR REPLACE FUNCTION ${failureFunction}()
+       RETURNS trigger
+       LANGUAGE plpgsql
+       AS $failure$
+       BEGIN
+         RAISE EXCEPTION 'injected cursor failure before commit';
+       END;
+       $failure$`,
+  );
+  await pool.query(
+    `CREATE TRIGGER fail_cursor_advance_for_recovery_test
+       BEFORE UPDATE OF next_block ON ${cursorsTable}
+       FOR EACH ROW
+       EXECUTE FUNCTION ${failureFunction}()`,
+  );
+
+  try {
+    await assert.rejects(
+      store.persistRange(scope, {
+        fromBlock: 10n,
+        toBlock: 10n,
+        rows: [messageRow()],
+      }),
+      /injected cursor failure before commit/,
+    );
+
+    assert.equal((await readMessages(pool, config.databaseSchema)).length, 0);
+    assert.equal((await readCursor(pool, config.databaseSchema, scope)).next_block, "10");
+    assert.deepEqual(
+      (await readIndexedSourceBlocks(
+        pool,
+        config.databaseSchema,
+        scope,
+      )).map((block) => block.block_number),
+      ["9"],
+    );
+  } finally {
+    await pool.query(
+      `DROP TRIGGER IF EXISTS fail_cursor_advance_for_recovery_test ON ${cursorsTable}`,
+    );
+    await pool.query(`DROP FUNCTION IF EXISTS ${failureFunction}()`);
+  }
+
+  const retry = await store.persistRange(scope, {
+    fromBlock: 10n,
+    toBlock: 10n,
+    rows: [messageRow()],
+  });
+
+  assert.deepEqual(retry, { inserted: 1, duplicates: 0, nextBlock: 11n });
+  assert.equal((await readMessages(pool, config.databaseSchema)).length, 1);
+  assert.equal((await readCursor(pool, config.databaseSchema, scope)).next_block, "11");
+  assert.deepEqual(
+    (await readIndexedSourceBlocks(
+      pool,
+      config.databaseSchema,
+      scope,
+    )).map((block) => block.block_number),
+    ["9", "10"],
+  );
+});
+
+test("a fresh PostgreSQL client resumes persisted terminal lifecycle state", async () => {
+  await initializeCursor();
+  const firstClientPool = createDatabasePool(config);
+
+  try {
+    const firstClientStore = createDatabaseStore(firstClientPool, config.databaseSchema);
+    const firstClientFinalityStore = createFinalityStore(
+      firstClientPool,
+      config.databaseSchema,
+    );
+    const firstClientCanonicalStore = createCanonicalStore(
+      firstClientPool,
+      config.databaseSchema,
+    );
+    const orphanHash = blockHash(11n, 1_000n);
+
+    await firstClientStore.persistRange(scope, {
+      fromBlock: 10n,
+      toBlock: 10n,
+      blocks: canonicalBlockRange(10n, 10n),
+      rows: [messageRow({ sourceLogIndex: "0" })],
+    });
+    await firstClientFinalityStore.advanceFinality(scope, {
+      headBlock: 10n,
+      finalityBlockDepth: 0n,
+    });
+    await firstClientStore.persistRange(scope, {
+      fromBlock: 11n,
+      toBlock: 11n,
+      blocks: [
+        canonicalBlock(11n, {
+          hash: orphanHash,
+          parentHash: blockHash(10n),
+        }),
+      ],
+      rows: [
+        messageRow({
+          messageId: `0x${"55".repeat(32)}`,
+          sourceBlockNumber: "11",
+          sourceBlockHash: orphanHash,
+          sourceTransactionHash: `0x${"45".repeat(32)}`,
+          sourceLogIndex: "0",
+        }),
+      ],
+    });
+    await firstClientCanonicalStore.recoverCanonicalReorg(scope, {
+      commonAncestor: canonicalBlock(10n),
+      forkBlock: 11n,
+    });
+  } finally {
+    await firstClientPool.end();
+  }
+
+  await assert.rejects(
+    readCursor(firstClientPool, config.databaseSchema, scope),
+    /end|closed|pool/i,
+  );
+
+  const recoveredClientPool = createDatabasePool(config);
+  try {
+    const recoveredStore = createDatabaseStore(
+      recoveredClientPool,
+      config.databaseSchema,
+    );
+    const recoveredFinalityStore = createFinalityStore(
+      recoveredClientPool,
+      config.databaseSchema,
+    );
+    const recoveredMessages = await readMessages(
+      recoveredClientPool,
+      config.databaseSchema,
+    );
+    const recoveredCursor = await readCursor(
+      recoveredClientPool,
+      config.databaseSchema,
+      scope,
+    );
+    const recoveredBlocks = await readIndexedSourceBlocks(
+      recoveredClientPool,
+      config.databaseSchema,
+      scope,
+    );
+
+    assert.deepEqual(
+      recoveredMessages.map((row) => row.status),
+      ["FINALIZED", "REORGED"],
+    );
+    assert.equal(recoveredCursor.next_block, "11");
+    assert.deepEqual(
+      recoveredBlocks.map((block) => block.block_number),
+      ["9", "10"],
+    );
+    assert.deepEqual(
+      (await recoveredFinalityStore.listBatchEligibleMessages(scope)).map(
+        (row) => row.message_id,
+      ),
+      [`0x${"11".repeat(32)}`],
+    );
+
+    const terminalPass = await recoveredFinalityStore.advanceFinality(scope, {
+      headBlock: 1_000n,
+      finalityBlockDepth: 0n,
+    });
+    assert.deepEqual(terminalPass, finalityResult(1_000n));
+
+    const replacementHash = blockHash(11n, 2_000n);
+    const resumed = await recoveredStore.persistRange(scope, {
+      fromBlock: 11n,
+      toBlock: 11n,
+      blocks: [
+        canonicalBlock(11n, {
+          hash: replacementHash,
+          parentHash: blockHash(10n),
+        }),
+      ],
+      rows: [
+        messageRow({
+          messageId: `0x${"66".repeat(32)}`,
+          sourceBlockNumber: "11",
+          sourceBlockHash: replacementHash,
+          sourceTransactionHash: `0x${"46".repeat(32)}`,
+          sourceLogIndex: "0",
+        }),
+      ],
+    });
+    assert.deepEqual(resumed, { inserted: 1, duplicates: 0, nextBlock: 12n });
+    assert.deepEqual(
+      (await readMessages(recoveredClientPool, config.databaseSchema)).map(
+        (row) => row.status,
+      ),
+      ["FINALIZED", "REORGED", "OBSERVED"],
+    );
+  } finally {
+    await recoveredClientPool.end();
+  }
+});
+
 test("persists canonical metadata for every scanned block including empty blocks", async () => {
   await initializeCursor();
   const result = await store.persistRange(scope, {

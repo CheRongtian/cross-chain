@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import test from "node:test";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -59,7 +59,7 @@ function assertPersistedEvent(row, event, expectedStatus) {
   assert.ok(row.observed_at instanceof Date);
 }
 
-test("tracks finality and recovers a real SourceGateway branch replacement", async () => {
+test("recovers Indexer, Finality Watcher, PostgreSQL client, and a replaced source branch", async () => {
   const config = loadConfig();
   assert.equal(
     config.finalityBlockDepth,
@@ -94,6 +94,7 @@ test("tracks finality and recovers a real SourceGateway branch replacement", asy
   const walletClient = createWalletClient({ account, chain, transport: http(config.chainRpcUrl) });
   const scope = { chainDomain: config.chainDomain, sourceGateway: config.sourceGateway };
   const schemaIdentifier = `"${config.databaseSchema}"`;
+  const activeWorkers = new Set();
 
   async function runOneShotProcess(mode) {
     const result = await execFileAsync(process.execPath, [INDEXER_MAIN_PATH, mode, "--once"], {
@@ -102,6 +103,70 @@ test("tracks finality and recovers a real SourceGateway branch replacement", asy
     process.stdout.write(result.stdout);
     process.stderr.write(result.stderr);
     return result.stdout;
+  }
+
+  async function runContinuousProcessUntilKilled(mode, durableMarker) {
+    return new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [INDEXER_MAIN_PATH, mode], {
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      activeWorkers.add(child);
+
+      let stdout = "";
+      let stderr = "";
+      let markerSeen = false;
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, 30_000);
+
+      child.stdout.on("data", (chunk) => {
+        const text = chunk.toString();
+        stdout += text;
+        process.stdout.write(text);
+        if (!markerSeen && durableMarker.test(stdout)) {
+          markerSeen = true;
+          child.kill("SIGKILL");
+        }
+      });
+      child.stderr.on("data", (chunk) => {
+        const text = chunk.toString();
+        stderr += text;
+        process.stderr.write(text);
+      });
+      child.once("error", (error) => {
+        clearTimeout(timeout);
+        activeWorkers.delete(child);
+        reject(error);
+      });
+      child.once("close", (code, signal) => {
+        clearTimeout(timeout);
+        activeWorkers.delete(child);
+        if (timedOut) {
+          reject(new Error(`timed out waiting for ${mode} durable marker`));
+          return;
+        }
+        if (!markerSeen) {
+          reject(
+            new Error(
+              `${mode} exited before its durable marker (code ${code}, signal ${signal}): ${stderr}`,
+            ),
+          );
+          return;
+        }
+        if (signal !== "SIGKILL") {
+          reject(
+            new Error(
+              `${mode} was expected to stop through SIGKILL, received code ${code} and signal ${signal}`,
+            ),
+          );
+          return;
+        }
+        resolve(stdout);
+      });
+    });
   }
 
   async function produceMessage(payload) {
@@ -148,7 +213,10 @@ test("tracks finality and recovers a real SourceGateway branch replacement", asy
     activePool = undefined;
 
     const messageA = await produceMessage("0x6d6573736167652061");
-    const firstIndexOutput = await runOneShotProcess("indexer");
+    const firstIndexOutput = await runContinuousProcessUntilKilled(
+      "indexer",
+      /New cursor next block:/,
+    );
 
     activePool = createDatabasePool(config);
     let rows = await readMessages(activePool, config.databaseSchema);
@@ -163,11 +231,42 @@ test("tracks finality and recovers a real SourceGateway branch replacement", asy
 
     console.log("VALID: Message A persisted as OBSERVED");
     console.log(`VALID: Indexer cursor persisted at block ${cursor.next_block}`);
+    console.log("VALID: Indexer was terminated abruptly after its durable range commit");
+
+    const closedPool = activePool;
+    await closedPool.end();
+    activePool = undefined;
+    await assert.rejects(
+      readCursor(closedPool, config.databaseSchema, scope),
+      /end|closed|pool/i,
+    );
+    console.log("EXPECTED FAILURE: closed PostgreSQL client rejected a new operation");
+
+    activePool = createDatabasePool(config);
+    rows = await readMessages(activePool, config.databaseSchema);
+    cursor = await readCursor(activePool, config.databaseSchema, scope);
+    const blocksAfterClientRecovery = await readIndexedSourceBlocks(
+      activePool,
+      config.databaseSchema,
+      scope,
+    );
+    assert.equal(rows.length, 1);
+    assertPersistedEvent(rows[0], messageA, "OBSERVED");
+    assert.ok(BigInt(cursor.next_block) > messageA.sourceBlockNumber);
+    assert.ok(
+      blocksAfterClientRecovery.some(
+        (block) => block.block_number === messageA.sourceBlockNumber.toString(),
+      ),
+    );
+    console.log("VALID: fresh PostgreSQL client recovered message, cursor, and block history");
 
     await activePool.end();
     activePool = undefined;
 
-    const firstFinalityOutput = await runOneShotProcess("finality");
+    const firstFinalityOutput = await runContinuousProcessUntilKilled(
+      "finality",
+      /OBSERVED -> FINALIZING: 1/,
+    );
 
     activePool = createDatabasePool(config);
     rows = await readMessages(activePool, config.databaseSchema);
@@ -183,17 +282,79 @@ test("tracks finality and recovers a real SourceGateway branch replacement", asy
 
     console.log("VALID: Message A moved from OBSERVED to FINALIZING");
     console.log("VALID: FINALIZING messages are not batch eligible");
+    console.log("VALID: Finality Watcher was terminated after persisting FINALIZING");
 
     await activePool.end();
     activePool = undefined;
 
     const messageB = await produceMessage("0x6d6573736167652062");
     const secondIndexOutput = await runOneShotProcess("indexer");
+
+    activePool = createDatabasePool(config);
+    rows = await readMessages(activePool, config.databaseSchema);
+    cursor = await readCursor(activePool, config.databaseSchema, scope);
+    const blocksBeforeRepeatedRestart = await readIndexedSourceBlocks(
+      activePool,
+      config.databaseSchema,
+      scope,
+    );
+    assert.match(secondIndexOutput, /Rows inserted: 1/);
+    assert.equal(rows.length, 2);
+    assertPersistedEvent(rows[0], messageA, "FINALIZING");
+    assertPersistedEvent(rows[1], messageB, "OBSERVED");
+    assert.equal(rows[0].finalizing_at.getTime(), messageAFinalizingAt);
+    assert.equal(rows[1].finalizing_at, null);
+    const cursorAfterOfflineRecovery = cursor.next_block;
+    const canonicalIdentityBeforeRestart = blocksBeforeRepeatedRestart.map((block) => ({
+      number: block.block_number,
+      hash: block.block_hash,
+      parentHash: block.parent_hash,
+    }));
+
+    console.log("VALID: restarted Indexer discovered Message B emitted while offline");
+    console.log("VALID: Message A remained a single persisted occurrence");
+
+    await activePool.end();
+    activePool = undefined;
+
+    const repeatedRestartOutputA = await runOneShotProcess("indexer");
+    const repeatedRestartOutputB = await runOneShotProcess("indexer");
+
+    activePool = createDatabasePool(config);
+    rows = await readMessages(activePool, config.databaseSchema);
+    cursor = await readCursor(activePool, config.databaseSchema, scope);
+    const blocksAfterRepeatedRestart = await readIndexedSourceBlocks(
+      activePool,
+      config.databaseSchema,
+      scope,
+    );
+    assert.match(
+      repeatedRestartOutputA,
+      new RegExp(`Cursor next block: ${cursorAfterOfflineRecovery}`),
+    );
+    assert.match(
+      repeatedRestartOutputB,
+      new RegExp(`Cursor next block: ${cursorAfterOfflineRecovery}`),
+    );
+    assert.equal(rows.length, 2);
+    assert.equal(cursor.next_block, cursorAfterOfflineRecovery);
+    assert.deepEqual(
+      blocksAfterRepeatedRestart.map((block) => ({
+        number: block.block_number,
+        hash: block.block_hash,
+        parentHash: block.parent_hash,
+      })),
+      canonicalIdentityBeforeRestart,
+    );
+    console.log("VALID: repeated Indexer restarts preserved message and block identity");
+
+    await activePool.end();
+    activePool = undefined;
+
     const secondFinalityOutput = await runOneShotProcess("finality");
 
     activePool = createDatabasePool(config);
     rows = await readMessages(activePool, config.databaseSchema);
-    assert.match(secondIndexOutput, /Rows inserted: 1/);
     assert.match(secondFinalityOutput, /OBSERVED -> FINALIZING: 1/);
     assert.match(secondFinalityOutput, /FINALIZING unchanged: 1/);
     assert.equal(rows.length, 2);
@@ -202,7 +363,7 @@ test("tracks finality and recovers a real SourceGateway branch replacement", asy
     assert.equal(rows[0].finalizing_at.getTime(), messageAFinalizingAt);
     const messageBFinalizingAt = rows[1].finalizing_at.getTime();
 
-    console.log("VALID: Message A remained FINALIZING one block below the configured depth");
+    console.log("VALID: restarted Finality Watcher resumed persisted FINALIZING state");
     console.log("VALID: Message B independently entered FINALIZING");
 
     await activePool.end();
@@ -432,6 +593,7 @@ test("tracks finality and recovers a real SourceGateway branch replacement", asy
 
     console.log("VALID: replacement canonical branch re-indexed through its empty block");
     console.log("VALID: Message D persisted as a distinct canonical occurrence");
+    console.log("VALID: new Indexer process resumed from the reorg-rewound cursor");
 
     await activePool.end();
     activePool = undefined;
@@ -473,6 +635,9 @@ test("tracks finality and recovers a real SourceGateway branch replacement", asy
     console.log("VALID: replacement Message D progressed to FINALIZED");
     console.log("VALID: old REORGED Message C remained terminal");
   } finally {
+    for (const worker of activeWorkers) {
+      worker.kill("SIGKILL");
+    }
     if (activePool !== undefined) {
       await activePool.end();
     }

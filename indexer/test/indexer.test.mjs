@@ -163,6 +163,145 @@ test("reloads a cursor rewound by canonical reconciliation", async () => {
   assert.deepEqual(scanned, [[5n, 6n]]);
 });
 
+test("a failed range leaves the durable cursor for a fresh Indexer instance to retry", async () => {
+  let durableCursor = 1n;
+  const scannedRanges = [];
+  const publicClient = {
+    async request() {
+      return "0x2";
+    },
+    async getBlock({ blockNumber }) {
+      return {
+        number: blockNumber,
+        hash: blockHash(blockNumber + 1n),
+        parentHash: blockHash(blockNumber),
+      };
+    },
+    async getLogs({ fromBlock, toBlock }) {
+      scannedRanges.push([fromBlock, toBlock]);
+      return [];
+    },
+  };
+  const reconciler = {
+    async reconcile({ headBlock }) {
+      return { detected: false, headBlock };
+    },
+  };
+
+  const failedIndexer = createIndexer({
+    config: CONFIG,
+    pool: undefined,
+    publicClient,
+    store: {
+      async loadOrInitializeCursor() {
+        return durableCursor;
+      },
+      async persistRange() {
+        throw new Error("database connection lost before commit");
+      },
+    },
+    reconciler,
+    logger: { log() {} },
+  });
+
+  await assert.rejects(
+    failedIndexer.catchUpOnce(),
+    /database connection lost before commit/,
+  );
+  assert.equal(durableCursor, 1n);
+
+  const restartedIndexer = createIndexer({
+    config: CONFIG,
+    pool: undefined,
+    publicClient,
+    store: {
+      async loadOrInitializeCursor() {
+        return durableCursor;
+      },
+      async persistRange(_scope, range) {
+        durableCursor = range.toBlock + 1n;
+        return { inserted: 0, duplicates: 0, nextBlock: durableCursor };
+      },
+    },
+    reconciler,
+    logger: { log() {} },
+  });
+  const recovered = await restartedIndexer.catchUpOnce();
+
+  assert.equal(recovered.initialNextBlock, 1n);
+  assert.equal(recovered.nextBlock, 3n);
+  assert.equal(durableCursor, 3n);
+  assert.deepEqual(scannedRanges, [[1n, 2n], [1n, 2n]]);
+});
+
+test("new Indexer instances reuse a committed cursor across repeated restarts", async () => {
+  let durableCursor = 1n;
+  const committedRanges = [];
+  const publicClient = {
+    async request() {
+      return "0x3";
+    },
+    async getBlock({ blockNumber }) {
+      return {
+        number: blockNumber,
+        hash: blockHash(blockNumber + 1n),
+        parentHash: blockHash(blockNumber),
+      };
+    },
+    async getLogs() {
+      return [];
+    },
+  };
+  const store = {
+    async loadOrInitializeCursor() {
+      return durableCursor;
+    },
+    async persistRange(_scope, range) {
+      committedRanges.push([range.fromBlock, range.toBlock]);
+      durableCursor = range.toBlock + 1n;
+      return { inserted: 0, duplicates: 0, nextBlock: durableCursor };
+    },
+  };
+  const reconciler = {
+    async reconcile({ headBlock }) {
+      return { detected: false, headBlock };
+    },
+  };
+
+  const first = await createIndexer({
+    config: CONFIG,
+    pool: undefined,
+    publicClient,
+    store,
+    reconciler,
+    logger: { log() {} },
+  }).catchUpOnce();
+  const second = await createIndexer({
+    config: CONFIG,
+    pool: undefined,
+    publicClient,
+    store,
+    reconciler,
+    logger: { log() {} },
+  }).catchUpOnce();
+  const third = await createIndexer({
+    config: CONFIG,
+    pool: undefined,
+    publicClient,
+    store,
+    reconciler,
+    logger: { log() {} },
+  }).catchUpOnce();
+
+  assert.equal(first.initialNextBlock, 1n);
+  assert.equal(first.nextBlock, 4n);
+  assert.equal(second.initialNextBlock, 4n);
+  assert.equal(second.scannedRanges, 0);
+  assert.equal(third.initialNextBlock, 4n);
+  assert.equal(third.scannedRanges, 0);
+  assert.deepEqual(committedRanges, [[1n, 2n], [3n, 3n]]);
+});
+
 test("validates RPC chain identity and SourceGateway bytecode", async () => {
   await validateChainSource(
     {

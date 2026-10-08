@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Source Reorg Detection and Recovery"
+VERIFICATION_NAME="Crash Recovery"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -399,14 +399,17 @@ printf '  9. Deploy and verify the complete current Chain A protocol\n'
 printf ' 10. Preserve credential policy, replay, epoch, and revocation checks\n'
 printf ' 11. Preserve canonical message domain separation and authorization checks\n'
 printf ' 12. Produce and persist a real Chain A message as OBSERVED\n'
-printf ' 13. Advance real messages through FINALIZING at a fixed watcher head\n'
-printf ' 14. Verify exact-depth FINALIZED transitions and batch eligibility\n'
-printf ' 15. Re-scan a FINALIZED event and preserve lifecycle metadata\n'
-printf ' 16. Restart one-shot indexing from the persisted next-block cursor\n'
-printf ' 17. Persist canonical metadata for event-bearing and empty source blocks\n'
-printf ' 18. Replace a real Anvil branch and recover from its common ancestor\n'
-printf ' 19. Preserve the old occurrence as REORGED and re-index the replacement branch\n'
-printf ' 20. Finalize the replacement occurrence while REORGED remains terminal\n'
+printf ' 13. Abruptly stop the Indexer after its durable range commit\n'
+printf ' 14. Recreate the PostgreSQL client and recover persisted state\n'
+printf ' 15. Recover a message emitted while the Indexer was offline\n'
+printf ' 16. Verify repeated Indexer restarts remain idempotent\n'
+printf ' 17. Abruptly stop and restart the Finality Watcher from FINALIZING\n'
+printf ' 18. Verify exact-depth FINALIZED transitions and unique batch eligibility\n'
+printf ' 19. Re-scan a FINALIZED event and preserve lifecycle metadata\n'
+printf ' 20. Persist canonical metadata for event-bearing and empty source blocks\n'
+printf ' 21. Replace a real Anvil branch and recover from its common ancestor\n'
+printf ' 22. Preserve the old occurrence as terminal REORGED\n'
+printf ' 23. Restart indexing from the reorg-rewound cursor and finalize the replacement\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -435,7 +438,7 @@ DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DB_SCHEMA" \
     node "$INDEXER_DIR/src/migrate.mjs"
 
-CURRENT_STEP="Chain A Indexer unit tests"
+CURRENT_STEP="Chain A Indexer unit and recovery tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$INDEXER_DIR/test/config.test.mjs" \
@@ -447,7 +450,7 @@ node --test \
     "$INDEXER_DIR/test/indexer.test.mjs" \
     "$INDEXER_DIR/test/finality-watcher.test.mjs"
 
-CURRENT_STEP="Chain A Indexer database tests"
+CURRENT_STEP="Chain A Indexer database and recovery tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
@@ -1070,7 +1073,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real Chain A indexing, finality, and source reorg recovery integration"
+CURRENT_STEP="real crash, restart, finality, and source reorg recovery integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \
