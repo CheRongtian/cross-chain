@@ -7,6 +7,7 @@ import {
   toUint256,
   validateCanonicalMessage,
 } from "./canonical-message.mjs";
+import { normalizeSourceEventIdentity } from "./source-event-identity.mjs";
 
 export const CROSS_CHAIN_MESSAGE_EVENT = parseAbiItem(
   "event CrossChainMessage(bytes32 indexed messageId, uint8 version, uint256 sourceDomain, address sourceGateway, address indexed sourceSender, uint256 indexed destinationDomain, address destinationGateway, address destinationReceiver, uint256 nonce, bytes payload, uint256 deadline)",
@@ -87,12 +88,13 @@ export function decodeCrossChainMessageLog(log, { expectedGateway, expectedSourc
 
 export function sourceEventToDatabaseRow(event) {
   const payload = normalizePayload(event.payload);
+  const identity = normalizeSourceEventIdentity(event);
 
   return {
     messageId: normalizeBytes32(event.messageId, "message ID"),
     version: Number(toUint256(event.version, "message version")),
-    sourceDomain: toUint256(event.sourceDomain, "source domain").toString(),
-    sourceGateway: normalizeAddress(event.sourceGateway, "source gateway"),
+    sourceDomain: identity.sourceDomain,
+    sourceGateway: identity.sourceGateway,
     sourceSender: normalizeAddress(event.sourceSender, "source sender"),
     destinationDomain: toUint256(event.destinationDomain, "destination domain").toString(),
     destinationGateway: normalizeAddress(event.destinationGateway, "destination gateway"),
@@ -102,8 +104,8 @@ export function sourceEventToDatabaseRow(event) {
     payloadHash: normalizeBytes32(event.payloadHash, "payload hash"),
     deadline: toUint256(event.deadline, "deadline").toString(),
     sourceBlockNumber: toUint256(event.sourceBlockNumber, "source block number").toString(),
-    sourceBlockHash: normalizeBytes32(event.sourceBlockHash, "source block hash"),
-    sourceTransactionHash: normalizeBytes32(event.sourceTransactionHash, "source transaction hash"),
-    sourceLogIndex: toUint256(event.sourceLogIndex, "source log index").toString(),
+    sourceBlockHash: identity.sourceBlockHash,
+    sourceTransactionHash: identity.sourceTransactionHash,
+    sourceLogIndex: identity.sourceLogIndex,
   };
 }

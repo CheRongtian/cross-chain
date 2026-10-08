@@ -16,7 +16,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { normalizeAddress, normalizePayload } from "../src/canonical-message.mjs";
 import { loadConfig } from "../src/config.mjs";
 import {
-  applyMigration,
+  applyMigrations,
   createDatabasePool,
   readCursor,
   readMessages,
@@ -57,7 +57,7 @@ function assertPersistedEvent(row, event) {
   assert.ok(row.observed_at instanceof Date);
 }
 
-test("persists real SourceGateway events and resumes from the stored cursor", async () => {
+test("persists real SourceGateway events idempotently and resumes from the stored cursor", async () => {
   const config = loadConfig();
   const identityApplication = normalizeAddress(
     requireEnvironment("IDENTITY_APPLICATION_ADDRESS"),
@@ -86,6 +86,7 @@ test("persists real SourceGateway events and resumes from the stored cursor", as
   const publicClient = createPublicClient({ chain, transport: http(config.chainRpcUrl) });
   const walletClient = createWalletClient({ account, chain, transport: http(config.chainRpcUrl) });
   const scope = { chainDomain: config.chainDomain, sourceGateway: config.sourceGateway };
+  const schemaIdentifier = `"${config.databaseSchema}"`;
 
   async function runOneShotProcess() {
     const result = await execFileAsync(process.execPath, [INDEXER_MAIN_PATH, "--once"], {
@@ -117,48 +118,113 @@ test("persists real SourceGateway events and resumes from the stored cursor", as
     });
   }
 
+  async function rewindTestCursor(pool, nextBlock) {
+    const result = await pool.query(
+      `UPDATE ${schemaIdentifier}."indexer_cursors"
+          SET next_block = $3, updated_at = CURRENT_TIMESTAMP
+        WHERE chain_domain = $1 AND source_gateway = $2`,
+      [config.chainDomain.toString(), config.sourceGateway, nextBlock.toString()],
+    );
+    assert.equal(result.rowCount, 1, "test cursor rewind must update exactly one row");
+  }
+
   let activePool = createDatabasePool(config);
   try {
-    await applyMigration(activePool, config.databaseSchema);
+    await applyMigrations(activePool, config.databaseSchema);
     await resetIndexerTables(activePool, config.databaseSchema);
     await activePool.end();
     activePool = undefined;
 
     const messageA = await produceMessage("0x6d6573736167652061");
-    await runOneShotProcess();
+    const firstRunOutput = await runOneShotProcess();
 
     activePool = createDatabasePool(config);
     const rowsAfterFirstRun = await readMessages(activePool, config.databaseSchema);
     const cursorAfterFirstRun = await readCursor(activePool, config.databaseSchema, scope);
 
+    assert.match(firstRunOutput, /Rows inserted: 1/);
+    assert.match(firstRunOutput, /Duplicates skipped: 0/);
     assert.equal(rowsAfterFirstRun.length, 1);
     assertPersistedEvent(rowsAfterFirstRun[0], messageA);
     assert.ok(BigInt(cursorAfterFirstRun.next_block) > messageA.sourceBlockNumber);
-    const persistedRestartCursor = BigInt(cursorAfterFirstRun.next_block);
+    const firstObservedAt = rowsAfterFirstRun[0].observed_at.getTime();
 
     console.log("VALID: Message A persisted as OBSERVED");
     console.log("VALID: canonical message ID and source event metadata persisted");
-    console.log(`VALID: Indexer cursor persisted at block ${persistedRestartCursor}`);
+    console.log(`VALID: Indexer cursor persisted at block ${cursorAfterFirstRun.next_block}`);
+
+    console.log("Re-scanning the same source block");
+    await rewindTestCursor(activePool, messageA.sourceBlockNumber);
+    await activePool.end();
+    activePool = undefined;
+
+    const duplicateRunOutput = await runOneShotProcess();
+
+    activePool = createDatabasePool(config);
+    const rowsAfterDuplicateRun = await readMessages(activePool, config.databaseSchema);
+    const cursorAfterDuplicateRun = await readCursor(activePool, config.databaseSchema, scope);
+
+    assert.match(duplicateRunOutput, /Rows inserted: 0/);
+    assert.match(duplicateRunOutput, /Duplicates skipped: 1/);
+    assert.equal(rowsAfterDuplicateRun.length, 1);
+    assertPersistedEvent(rowsAfterDuplicateRun[0], messageA);
+    assert.equal(rowsAfterDuplicateRun[0].observed_at.getTime(), firstObservedAt);
+    assert.ok(BigInt(cursorAfterDuplicateRun.next_block) > messageA.sourceBlockNumber);
+
+    console.log("VALID: same source event encountered again");
+    console.log("VALID: row count remained one");
+    console.log("VALID: duplicate event preserved observed_at and status");
+    console.log("VALID: cursor advanced after duplicate-only range");
 
     await activePool.end();
     activePool = undefined;
 
+    console.log("Producing a later source event");
     const messageB = await produceMessage("0x6d6573736167652062");
 
-    const secondRunOutput = await runOneShotProcess();
+    activePool = createDatabasePool(config);
+    await rewindTestCursor(activePool, messageA.sourceBlockNumber);
+    await activePool.end();
+    activePool = undefined;
+
+    const mixedRunOutput = await runOneShotProcess();
+
+    activePool = createDatabasePool(config);
+    const rowsAfterMixedRun = await readMessages(activePool, config.databaseSchema);
+    const cursorAfterMixedRun = await readCursor(activePool, config.databaseSchema, scope);
+
+    assert.match(mixedRunOutput, /Rows inserted: 1/);
+    assert.match(mixedRunOutput, /Duplicates skipped: 1/);
+    assert.equal(rowsAfterMixedRun.length, 2);
+    assertPersistedEvent(rowsAfterMixedRun[0], messageA);
+    assertPersistedEvent(rowsAfterMixedRun[1], messageB);
+    assert.equal(rowsAfterMixedRun[0].observed_at.getTime(), firstObservedAt);
+    assert.ok(BigInt(cursorAfterMixedRun.next_block) > messageB.sourceBlockNumber);
+    const persistedRestartCursor = BigInt(cursorAfterMixedRun.next_block);
+
+    console.log("VALID: old event treated as duplicate");
+    console.log("VALID: new event inserted");
+    console.log("VALID: one record per source event");
+
+    await activePool.end();
+    activePool = undefined;
+
+    const messageC = await produceMessage("0x6d6573736167652063");
+    const restartRunOutput = await runOneShotProcess();
 
     activePool = createDatabasePool(config);
     const rowsAfterRestart = await readMessages(activePool, config.databaseSchema);
     const cursorAfterRestart = await readCursor(activePool, config.databaseSchema, scope);
 
-    assert.match(secondRunOutput, new RegExp(`Cursor next block: ${persistedRestartCursor}`));
-    assert.equal(rowsAfterRestart.length, 2);
+    assert.match(restartRunOutput, new RegExp(`Cursor next block: ${persistedRestartCursor}`));
+    assert.equal(rowsAfterRestart.length, 3);
     assertPersistedEvent(rowsAfterRestart[0], messageA);
     assertPersistedEvent(rowsAfterRestart[1], messageB);
-    assert.ok(BigInt(cursorAfterRestart.next_block) > messageB.sourceBlockNumber);
+    assertPersistedEvent(rowsAfterRestart[2], messageC);
+    assert.ok(BigInt(cursorAfterRestart.next_block) > messageC.sourceBlockNumber);
 
     console.log("VALID: Indexer resumed from the persisted cursor");
-    console.log("VALID: Message B persisted as OBSERVED after restart");
+    console.log("VALID: later message persisted as OBSERVED after restart");
     console.log(`VALID: cursor advanced to block ${cursorAfterRestart.next_block}`);
   } finally {
     if (activePool !== undefined) {

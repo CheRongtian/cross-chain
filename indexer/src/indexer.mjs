@@ -94,7 +94,8 @@ export function createIndexer({
       const snapshotHead = await publicClient.getBlockNumber();
       let nextBlock = await store.loadOrInitializeCursor(scope, config.sourceGatewayStartBlock);
       const initialNextBlock = nextBlock;
-      let persistedRows = 0;
+      let insertedRows = 0;
+      let duplicateRows = 0;
       let scannedRanges = 0;
 
       logger.log(`Indexer chain domain: ${config.chainDomain}`);
@@ -132,13 +133,22 @@ export function createIndexer({
           rows,
         });
         nextBlock = committed.nextBlock;
-        persistedRows += committed.persistedRows;
+        insertedRows += committed.inserted;
+        duplicateRows += committed.duplicates;
         scannedRanges += 1;
-        logger.log(`Rows persisted: ${committed.persistedRows}`);
+        logger.log(`Rows inserted: ${committed.inserted}`);
+        logger.log(`Duplicates skipped: ${committed.duplicates}`);
         logger.log(`New cursor next block: ${nextBlock}`);
       }
 
-      return { initialNextBlock, nextBlock, persistedRows, scannedRanges, snapshotHead };
+      return {
+        initialNextBlock,
+        nextBlock,
+        insertedRows,
+        duplicateRows,
+        scannedRanges,
+        snapshotHead,
+      };
     },
 
     async runContinuous({ signal } = {}) {

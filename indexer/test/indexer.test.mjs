@@ -64,7 +64,7 @@ test("one-shot indexing scans only to its startup snapshot head", async () => {
     async persistRange(_scope, range) {
       committedRanges.push([range.fromBlock, range.toBlock]);
       cursor = range.toBlock + 1n;
-      return { persistedRows: range.rows.length, nextBlock: cursor };
+      return { inserted: range.rows.length, duplicates: 0, nextBlock: cursor };
     },
   };
   const logger = { log() {} };
@@ -85,6 +85,8 @@ test("one-shot indexing scans only to its startup snapshot head", async () => {
   assert.deepEqual(committedRanges, queriedRanges);
   assert.equal(result.snapshotHead, 5n);
   assert.equal(result.nextBlock, 6n);
+  assert.equal(result.insertedRows, 0);
+  assert.equal(result.duplicateRows, 0);
 });
 
 test("validates RPC chain identity and SourceGateway bytecode", async () => {

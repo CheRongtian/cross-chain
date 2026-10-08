@@ -1,5 +1,5 @@
 import { loadConfig } from "./config.mjs";
-import { applyMigration, createDatabasePool } from "./db.mjs";
+import { applyMigrations, createDatabasePool } from "./db.mjs";
 import { createChainClient, createIndexer, validateChainSource } from "./indexer.mjs";
 
 const argumentsList = process.argv.slice(2);
@@ -17,7 +17,7 @@ process.once("SIGINT", () => controller.abort());
 process.once("SIGTERM", () => controller.abort());
 
 try {
-  await applyMigration(pool, config.databaseSchema);
+  await applyMigrations(pool, config.databaseSchema);
   await validateChainSource(publicClient, config);
   const indexer = createIndexer({ config, pool, publicClient });
 

@@ -7,7 +7,15 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Persistent Chain A Event Indexing"
+VERIFICATION_NAME="Idempotent Chain A Event Ingestion"
+
+ENV_FILE="$PROJECT_ROOT/.env"
+if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "$ENV_FILE"
+    set +a
+fi
 
 CHAIN_A_RPC="http://127.0.0.1:4545"
 CHAIN_B_RPC="http://127.0.0.1:9545"
@@ -389,8 +397,9 @@ printf '  9. Deploy and verify the complete current Chain A protocol\n'
 printf ' 10. Preserve credential policy, replay, epoch, and revocation checks\n'
 printf ' 11. Preserve canonical message domain separation and authorization checks\n'
 printf ' 12. Produce and persist a real Chain A message as OBSERVED\n'
-printf ' 13. Restart one-shot indexing from the persisted next-block cursor\n'
-printf ' 14. Persist a later message and verify cursor advancement\n'
+printf ' 13. Re-scan the same real source event and verify one-row idempotency\n'
+printf ' 14. Scan a mixed duplicate-and-new range and verify cursor advancement\n'
+printf ' 15. Restart one-shot indexing from the persisted next-block cursor\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -399,11 +408,11 @@ NODE_MAJOR_VERSION="$(node -p 'Number(process.versions.node.split(".")[0])')"
 [[ "$NODE_MAJOR_VERSION" =~ ^[0-9]+$ ]] || fail "could not determine the Node.js major version"
 (( NODE_MAJOR_VERSION >= 22 )) || fail "Node.js 22 or later is required; found $(node --version)"
 [[ -n "$DATABASE_URL" ]] \
-    || fail "PostgreSQL is required for persistent Chain A indexing. Set DATABASE_URL to a disposable or local test database."
+    || fail "PostgreSQL is required for persistent Chain A indexing. Configure DATABASE_URL in the repository-root .env file."
 [[ -f "$INDEXER_DIR/node_modules/viem/package.json" ]] \
-    || fail "Indexer dependencies are missing. Run 'cd indexer && npm install' before verification."
+    || fail "Indexer dependencies are missing. Run 'cd indexer && npm ci' before verification."
 [[ -f "$INDEXER_DIR/node_modules/pg/package.json" ]] \
-    || fail "Indexer dependencies are missing. Run 'cd indexer && npm install' before verification."
+    || fail "Indexer dependencies are missing. Run 'cd indexer && npm ci' before verification."
 printf 'Verified Node.js version: %s\n' "$(node --version)"
 printf 'Verified Indexer dependency directories.\n'
 
@@ -413,7 +422,7 @@ DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DB_SCHEMA" \
     node "$INDEXER_DIR/src/check-database.mjs"
 
-CURRENT_STEP="Chain A Indexer migration"
+CURRENT_STEP="Chain A Indexer migrations"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DB_SCHEMA" \
@@ -424,6 +433,7 @@ printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$INDEXER_DIR/test/config.test.mjs" \
     "$INDEXER_DIR/test/canonical-message.test.mjs" \
+    "$INDEXER_DIR/test/source-event-identity.test.mjs" \
     "$INDEXER_DIR/test/indexer.test.mjs"
 
 CURRENT_STEP="Chain A Indexer database tests"
@@ -1049,7 +1059,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real Chain A to PostgreSQL Indexer integration"
+CURRENT_STEP="real idempotent Chain A to PostgreSQL Indexer integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

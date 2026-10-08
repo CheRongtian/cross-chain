@@ -11,7 +11,7 @@
     "migrate": "node src/migrate.mjs",
     "start": "node src/main.mjs",
     "catch-up": "node src/main.mjs --once",
-    "test": "node --test test/config.test.mjs test/canonical-message.test.mjs test/indexer.test.mjs",
+    "test": "node --test test/config.test.mjs test/canonical-message.test.mjs test/source-event-identity.test.mjs test/indexer.test.mjs",
     "test:database": "node --test test/database.test.mjs",
     "test:integration": "node --test test/integration.test.mjs"
   },

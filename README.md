@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, and persistent source-event indexing. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, an identity application that can create canonical outbound messages through the gateway, and a PostgreSQL-backed Indexer for those source events.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, and persistent idempotent source-event indexing. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, an identity application that can create canonical outbound messages through the gateway, and a PostgreSQL-backed Indexer for those source events.
 
 The current implementation can:
 
@@ -25,6 +25,8 @@ The current implementation can:
 - let `IdentityApplicationA` call `SourceGateway` while preserving the gateway as the canonical message and nonce authority;
 - scan one configured Chain A `SourceGateway` in bounded block ranges;
 - recompute and validate canonical message IDs before persistence;
+- identify each concrete source-log occurrence by its chain, gateway, block hash, transaction hash, and log index;
+- enforce one PostgreSQL row per exact source event across retries, rescans, and clean process restarts;
 - persist complete messages and source-event provenance in PostgreSQL with an initial `OBSERVED` status;
 - resume normal indexing from a persistent next-block cursor after a clean stop and restart.
 
@@ -361,6 +363,20 @@ The Node.js Indexer consumes only `CrossChainMessage` logs emitted by the config
 
 Before persistence, each event is decoded using the current `SourceGateway` event ABI. The Indexer computes `keccak256(payload)`, reconstructs the canonical ABI-encoded message, and requires the resulting message ID to equal the indexed event value. A mismatch fails the current range. Addresses and hashes are stored as lowercase hexadecimal text, the complete payload is stored as `BYTEA`, and protocol integers use `NUMERIC(78,0)` with JavaScript `BigInt` or decimal strings.
 
+The protocol `messageId` identifies the canonical cross-chain message. The source-event identity identifies one concrete Ethereum log occurrence and consists of:
+
+```text
+source domain
+source gateway
+source block hash
+source transaction hash
+source log index
+```
+
+PostgreSQL enforces uniqueness over those five fields. Ingestion uses conflict-aware insertion, so reading the same exact log again does not create another `source_messages` row. After a uniqueness conflict, the Indexer reads the existing row through the same transaction and verifies every immutable message and provenance field against the newly decoded event. Consistent duplicates are counted and skipped. An inconsistent duplicate fails and rolls back the complete scanned range.
+
+The block hash is part of the identity so the same transaction and log index under another block hash remains a distinct source occurrence. The current Indexer records both occurrences if it observes them; it does not determine which one belongs to the canonical chain or reconcile source reorgs.
+
 ### Persistent message data
 
 The `source_messages` table stores:
@@ -378,9 +394,9 @@ The `source_messages` table stores:
 
 The `indexer_cursors` table scopes each cursor by Chain A domain and source Gateway. Its `next_block` value is the first block not yet committed by the Indexer. A new cursor starts at `SOURCE_GATEWAY_START_BLOCK`; an existing cursor takes precedence over the configured start block.
 
-For each range, all message inserts and the cursor update execute in one PostgreSQL transaction through one `pg` client. A failed validation or query rolls back the complete range. Logs are sorted by block number and log index before insertion, and multiple messages in one block are committed together with the range cursor.
+For each range, all message inserts, duplicate consistency checks, and the cursor update execute in one PostgreSQL transaction through one `pg` client. A failed validation or query rolls back the complete range. Logs are sorted by block number and log index before insertion, and multiple messages in one block are committed together with the range cursor. A matching duplicate does not change its first `observed_at` value or current lifecycle status, and a range containing only matching duplicates still advances the cursor. Cursor updates are monotonic during normal ingestion.
 
-One-shot mode reads the chain head once at startup, scans only through that fixed snapshot, and exits. Continuous mode repeatedly catches up to a new snapshot and waits for `INDEXER_POLL_INTERVAL_MS` between polls. A clean restart uses the stored cursor and continues without rescanning from genesis. Deterministic duplicate-event handling, concurrent Indexer coordination, full crash recovery, finality tracking, and reorg rollback are not implemented.
+One-shot mode reads the chain head once at startup, scans only through that fixed snapshot, and exits. Continuous mode repeatedly catches up to a new snapshot and waits for `INDEXER_POLL_INTERVAL_MS` between polls. A clean restart uses the stored cursor and continues without rescanning from genesis. If a retry or deliberate rescan encounters an already stored event, database uniqueness prevents a duplicate row. The runtime assumes one active Indexer; cursor coordination across concurrent instances, full crash recovery, finality tracking, and reorg rollback are not implemented.
 
 ### Runtime configuration
 
@@ -488,6 +504,8 @@ The Indexer pins `viem` to `2.56.9` and `pg` to `8.23.1`. Its dependency tree is
 
 PostgreSQL installation and database creation remain external prerequisites. Project scripts check connectivity and apply the project migration, but they do not install or start PostgreSQL and do not create a database.
 
+The unified verification script automatically loads local configuration from the repository-root `.env` file. Copy the structure from `.env.example`, set the local PostgreSQL password in `.env`, and keep the example file free of real credentials. The local `.env` file is excluded from source control and its values are not printed by the verification script.
+
 The Python validator uses only the standard library, so the repository does not need a `requirements.txt` file.
 
 ## Build and Test
@@ -575,14 +593,13 @@ The real Chain A integration, including message production and clean restart con
 Run the unified verification script from the repository root:
 
 ```bash
-export DATABASE_URL='postgresql://<user>:<password>@127.0.0.1/<database>'
 ./scripts/verify.sh
 ```
 
 The script uses strict error handling and performs:
 
 1. Node.js and Indexer dependency checks without automatic installation;
-2. PostgreSQL connectivity, migration, unit tests, and database transaction tests;
+2. PostgreSQL connectivity, ordered migrations, unit tests, and database transaction tests;
 3. local-chain availability and chain ID checks;
 4. selection of a proof timestamp relative to the current Chain A block;
 5. credential model, fixture, and state-tree configuration validation;
@@ -599,9 +616,10 @@ The script uses strict error handling and performs:
 16. creation of a fresh message after the configured Indexer start block;
 17. one-shot indexing through a fixed startup chain-head snapshot;
 18. canonical message recomputation and complete `OBSERVED` row verification;
-19. persistence of the scoped `next_block` cursor;
-20. clean Indexer stop, later message creation, and restart from the stored cursor;
-21. persistence of the later message and verification that the cursor advances again.
+19. persistence of the scoped `next_block` cursor and deterministic source-event uniqueness;
+20. a deliberate real-block rescan that preserves one row, `observed_at`, status, and cursor progress;
+21. a mixed range in which an old event is skipped and a later event is inserted;
+22. clean Indexer stop, another message creation, and normal restart from the stored cursor.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -617,7 +635,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Persistent Chain A Event Indexing
+Idempotent Chain A Event Ingestion
 ```
 
 ### Expected error output
@@ -656,6 +674,7 @@ The on-chain negative cases normally return `false` and are reported as `Verifie
 
 ```text
 Cross-Chain/
+├── .env.example
 ├── contracts/
 │   ├── foundry.toml
 │   ├── src/
@@ -677,7 +696,8 @@ Cross-Chain/
 │       └── SourceGateway.t.sol
 ├── indexer/
 │   ├── migrations/
-│   │   └── 001_chain_a_indexer.sql
+│   │   ├── 001_chain_a_indexer.sql
+│   │   └── 002_idempotent_event_ingestion.sql
 │   ├── src/
 │   │   ├── canonical-message.mjs
 │   │   ├── check-database.mjs
@@ -686,13 +706,15 @@ Cross-Chain/
 │   │   ├── indexer.mjs
 │   │   ├── main.mjs
 │   │   ├── migrate.mjs
+│   │   ├── source-event-identity.mjs
 │   │   └── source-gateway-event.mjs
 │   ├── test/
 │   │   ├── canonical-message.test.mjs
 │   │   ├── config.test.mjs
 │   │   ├── database.test.mjs
 │   │   ├── indexer.test.mjs
-│   │   └── integration.test.mjs
+│   │   ├── integration.test.mjs
+│   │   └── source-event-identity.test.mjs
 │   ├── package.json
 │   └── package-lock.json
 ├── scripts/
@@ -749,8 +771,9 @@ Cross-Chain/
 - `IdentityApplicationA` can call `SourceGateway`, while mandatory ZK-gated message creation and proof-to-message nullifier binding remain unimplemented.
 - The Indexer validates and persists source events, but it does not establish that a particular message was produced atomically with a ZK proof.
 - `OBSERVED` records the current Chain A view at ingestion time. It provides no finality, confirmation-depth, validator-approval, or delivery guarantee.
-- Persistent block cursors support normal clean restart continuation. Deterministic duplicate-event uniqueness, multi-instance coordination, and full crash recovery remain unimplemented.
-- Source block hashes are stored as provenance, while reorg detection, orphan rollback, and common-ancestor recovery remain unimplemented.
+- Persistent block cursors support normal clean restart continuation. Database-enforced source-event uniqueness makes exact-log retries and rescans idempotent without overwriting first-observation data or lifecycle status.
+- The runtime assumes one active Indexer. Multi-instance cursor coordination, distributed locking, and full crash recovery remain unimplemented.
+- Source block hashes are part of event identity and stored as provenance, while canonical-occurrence selection, reorg detection, orphan rollback, and common-ancestor recovery remain unimplemented.
 - The current message binds its protocol type, source domain, source gateway, source sender, destination domain, destination gateway, destination receiver, nonce, payload hash, and deadline.
 - A committed destination gateway is caller-selected. `SourceGateway` does not validate remote deployment, domain ownership, or trust, and no remote-gateway registry exists.
 - The repository does not provide a finality watcher, reorg handling, relayer, Merkle batching, PBFT validation, destination gateway implementation or execution, Application B, finality proof, or production cross-chain security model.
