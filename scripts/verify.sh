@@ -5,8 +5,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
+INDEXER_DIR="$PROJECT_ROOT/indexer"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Authorized Chain A Source Messaging"
+VERIFICATION_NAME="Persistent Chain A Event Indexing"
 
 CHAIN_A_RPC="http://127.0.0.1:4545"
 CHAIN_B_RPC="http://127.0.0.1:9545"
@@ -30,6 +31,12 @@ EXPECTED_PAYLOAD_TEXT="hello chain b"
 EXPECTED_PAYLOAD_HASH="0x758a9838e83061770f5b75d8544bc7a27cc795a8741c6b50bdf738ee276d23a6"
 MESSAGE_TYPE="CrossChainMessage(uint8 version,uint256 sourceDomain,address sourceGateway,address sourceSender,uint256 destinationDomain,address destinationGateway,address destinationReceiver,uint256 nonce,bytes32 payloadHash,uint256 deadline)"
 EVENT_SIGNATURE="CrossChainMessage(bytes32,uint8,uint256,address,address,uint256,address,address,uint256,bytes,uint256)"
+
+DATABASE_URL="${DATABASE_URL:-}"
+INDEXER_DB_SCHEMA="${INDEXER_DB_SCHEMA:-cross_chain_indexer_verification}"
+INDEXER_DATABASE_TEST_SCHEMA="cross_chain_indexer_database_verification"
+INDEXER_BLOCK_RANGE="${INDEXER_BLOCK_RANGE:-2}"
+INDEXER_POLL_INTERVAL_MS="${INDEXER_POLL_INTERVAL_MS:-100}"
 
 STARTED_CHAINS="false"
 CHAINS_PID=""
@@ -370,32 +377,60 @@ else
 fi
 
 printf '\nVerification steps:\n'
-printf '  1. Check or start Chain A and Chain B\n'
-printf '  2. Verify chain IDs and select the proof timestamp\n'
-printf '  3. Validate the credential model, fixtures, and state encoding\n'
-printf '  4. Build deterministic active-credential roots and Merkle witnesses\n'
-printf '  5. Build deterministic nullifier vectors and context-separated inputs\n'
-printf '  6. Compile the ZK circuit and verify membership, policy, and nullifier cases\n'
-printf '  7. Export the Solidity verifier and application proof fixtures\n'
-printf '  8. Generate canonical domain-separated message vectors\n'
-printf '  9. Format generated Solidity sources\n'
-printf ' 10. forge build\n'
-printf ' 11. forge test -vv\n'
-printf ' 12. Run focused gateway, verifier, and identity application tests\n'
-printf ' 13. Deploy verifier, adapter, SourceGateway, and IdentityApplicationA\n'
-printf ' 14. Preserve nullifier, policy epoch, and revocation verification\n'
-printf ' 15. Verify protocol type-tag and source/destination domain separation\n'
-printf ' 16. Verify source/destination gateway separation\n'
-printf ' 17. Verify the authorization admin and Application A registry state\n'
-printf ' 18. Verify unknown EOA and unknown application rejection\n'
-printf ' 19. Verify registry admin protection and invalid targets\n'
-printf ' 20. Verify authorized Application A message creation\n'
-printf ' 21. Decode and validate the Application A CrossChainMessage event\n'
-printf ' 22. Recompute message IDs with domain and deadline binding\n'
-printf ' 23. Verify destination and deadline rejection without nonce consumption\n'
-printf ' 24. Revoke Application A and verify future messages are rejected\n'
-printf ' 25. Verify historical message identity remains unchanged\n'
-printf ' 26. Reauthorize Application A and verify message creation resumes\n'
+printf '  1. Check Node.js, Indexer dependencies, and PostgreSQL connectivity\n'
+printf '  2. Apply the Indexer migration and run unit/database tests\n'
+printf '  3. Check or start Chain A and Chain B\n'
+printf '  4. Verify chain IDs and select the proof timestamp\n'
+printf '  5. Validate the credential model, fixtures, and state encoding\n'
+printf '  6. Build and verify the ZK circuit, proofs, and nullifier cases\n'
+printf '  7. Generate the Solidity verifier and canonical message fixtures\n'
+printf '  8. Build and test the Solidity contracts\n'
+printf '  9. Deploy and verify the complete current Chain A protocol\n'
+printf ' 10. Preserve credential policy, replay, epoch, and revocation checks\n'
+printf ' 11. Preserve canonical message domain separation and authorization checks\n'
+printf ' 12. Produce and persist a real Chain A message as OBSERVED\n'
+printf ' 13. Restart one-shot indexing from the persisted next-block cursor\n'
+printf ' 14. Persist a later message and verify cursor advancement\n'
+
+CURRENT_STEP="Indexer prerequisite verification"
+printf '\n[%s]\n' "$CURRENT_STEP"
+command -v node >/dev/null 2>&1 || fail "Node.js 22 or later is required for the Chain A Indexer"
+NODE_MAJOR_VERSION="$(node -p 'Number(process.versions.node.split(".")[0])')"
+[[ "$NODE_MAJOR_VERSION" =~ ^[0-9]+$ ]] || fail "could not determine the Node.js major version"
+(( NODE_MAJOR_VERSION >= 22 )) || fail "Node.js 22 or later is required; found $(node --version)"
+[[ -n "$DATABASE_URL" ]] \
+    || fail "PostgreSQL is required for persistent Chain A indexing. Set DATABASE_URL to a disposable or local test database."
+[[ -f "$INDEXER_DIR/node_modules/viem/package.json" ]] \
+    || fail "Indexer dependencies are missing. Run 'cd indexer && npm install' before verification."
+[[ -f "$INDEXER_DIR/node_modules/pg/package.json" ]] \
+    || fail "Indexer dependencies are missing. Run 'cd indexer && npm install' before verification."
+printf 'Verified Node.js version: %s\n' "$(node --version)"
+printf 'Verified Indexer dependency directories.\n'
+
+CURRENT_STEP="PostgreSQL connectivity verification"
+printf '\n[%s]\n' "$CURRENT_STEP"
+DATABASE_URL="$DATABASE_URL" \
+INDEXER_DB_SCHEMA="$INDEXER_DB_SCHEMA" \
+    node "$INDEXER_DIR/src/check-database.mjs"
+
+CURRENT_STEP="Chain A Indexer migration"
+printf '\n[%s]\n' "$CURRENT_STEP"
+DATABASE_URL="$DATABASE_URL" \
+INDEXER_DB_SCHEMA="$INDEXER_DB_SCHEMA" \
+    node "$INDEXER_DIR/src/migrate.mjs"
+
+CURRENT_STEP="Chain A Indexer unit tests"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test \
+    "$INDEXER_DIR/test/config.test.mjs" \
+    "$INDEXER_DIR/test/canonical-message.test.mjs" \
+    "$INDEXER_DIR/test/indexer.test.mjs"
+
+CURRENT_STEP="Chain A Indexer database tests"
+printf '\n[%s]\n' "$CURRENT_STEP"
+DATABASE_URL="$DATABASE_URL" \
+INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
+    node --test "$INDEXER_DIR/test/database.test.mjs"
 
 CURRENT_STEP="local chain availability check"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1006,5 +1041,29 @@ assert_equal \
     "5" \
     "nonce after reauthorized Application A message"
 printf 'VALID: reauthorized Application A message accepted\n'
+
+CURRENT_STEP="persistent Chain A Indexer integration preparation"
+printf '\n[%s]\n' "$CURRENT_STEP"
+INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC")"
+[[ "$INDEXER_START_BLOCK" =~ ^[0-9]+$ ]] || fail "latest Chain A block number must be an unsigned integer"
+INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
+printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
+
+CURRENT_STEP="real Chain A to PostgreSQL Indexer integration"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
+CHAIN_A_DOMAIN="$CHAIN_A_ID" \
+SOURCE_GATEWAY_ADDRESS="$SOURCE_GATEWAY" \
+SOURCE_GATEWAY_START_BLOCK="$INDEXER_START_BLOCK" \
+DATABASE_URL="$DATABASE_URL" \
+INDEXER_BLOCK_RANGE="$INDEXER_BLOCK_RANGE" \
+INDEXER_POLL_INTERVAL_MS="$INDEXER_POLL_INTERVAL_MS" \
+INDEXER_DB_SCHEMA="$INDEXER_DB_SCHEMA" \
+IDENTITY_APPLICATION_ADDRESS="$IDENTITY_APPLICATION_ADDRESS" \
+INDEXER_INTEGRATION_PRIVATE_KEY="$ANVIL_DEV_KEY" \
+INDEXER_INTEGRATION_DESTINATION_DOMAIN="$CHAIN_B_ID" \
+INDEXER_INTEGRATION_DESTINATION_GATEWAY="$DESTINATION_GATEWAY" \
+INDEXER_INTEGRATION_DESTINATION_RECEIVER="$DESTINATION_RECEIVER" \
+    node --test "$INDEXER_DIR/test/integration.test.mjs"
 
 CURRENT_STEP="complete"

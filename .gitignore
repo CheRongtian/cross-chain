@@ -7,6 +7,8 @@ contracts/out/
 contracts/broadcast/
 contracts/generated/
 zk/node_modules/
+indexer/node_modules/
+indexer/.env
 zk/build/
 zk/generated/
 *.wtns

@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging and zero-knowledge credential authorization with revocation and replay protection. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, and an identity application that can create canonical outbound messages through the gateway.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, and persistent source-event indexing. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, an identity application that can create canonical outbound messages through the gateway, and a PostgreSQL-backed Indexer for those source events.
 
 The current implementation can:
 
@@ -22,7 +22,11 @@ The current implementation can:
 - bind source and destination domains and gateways into a type-tagged message identity;
 - restrict canonical message creation to explicitly authorized source applications;
 - let an explicit source-authorization administrator authorize and revoke application contracts;
-- let `IdentityApplicationA` call `SourceGateway` while preserving the gateway as the canonical message and nonce authority.
+- let `IdentityApplicationA` call `SourceGateway` while preserving the gateway as the canonical message and nonce authority;
+- scan one configured Chain A `SourceGateway` in bounded block ranges;
+- recompute and validate canonical message IDs before persistence;
+- persist complete messages and source-event provenance in PostgreSQL with an initial `OBSERVED` status;
+- resume normal indexing from a persistent next-block cursor after a clean stop and restart.
 
 ## Architecture
 
@@ -49,10 +53,14 @@ Public policy, state + context ──>│ Groth16 / BN254          │ ──> p
                                                            │                    v
                                                            │   Domain-separated CrossChainMessage event
                                                            │                    │
-Unknown EOA or contract ───────────────────────────────> rejected               └──> Relayer and destination execution are not implemented
+Unknown EOA or contract ───────────────────────────────> rejected               v
+                                                                     Chain A Indexer
+                                                                               │
+                                                                               v
+                                                                    PostgreSQL / OBSERVED
 ```
 
-`IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
+`IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The Indexer persists emitted source events; it does not add proof-to-message binding. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
 
 ## Cross-Chain Messages
 
@@ -347,6 +355,65 @@ After deployment, the source-authorization administrator explicitly authorizes `
 
 This transport entry point remains separate from `verifySupplier`. It does not require a proof, check stored supplier authorization, or consume a nullifier. Gateway authorization establishes which application contract may create a message; it does not authenticate the EOA calling that application or bind a proof nullifier to a message.
 
+## Chain A Indexer
+
+The Node.js Indexer consumes only `CrossChainMessage` logs emitted by the configured `SOURCE_GATEWAY_ADDRESS`. At startup it verifies the RPC chain ID against `CHAIN_A_DOMAIN` and confirms that the configured Gateway address contains contract bytecode. It then reads a persistent cursor from PostgreSQL and queries logs with bounded `fromBlock` and `toBlock` ranges.
+
+Before persistence, each event is decoded using the current `SourceGateway` event ABI. The Indexer computes `keccak256(payload)`, reconstructs the canonical ABI-encoded message, and requires the resulting message ID to equal the indexed event value. A mismatch fails the current range. Addresses and hashes are stored as lowercase hexadecimal text, the complete payload is stored as `BYTEA`, and protocol integers use `NUMERIC(78,0)` with JavaScript `BigInt` or decimal strings.
+
+### Persistent message data
+
+The `source_messages` table stores:
+
+- every canonical message field;
+- the complete payload and its hash;
+- source block number and block hash;
+- source transaction hash and log index;
+- the PostgreSQL observation timestamp;
+- the initial status `OBSERVED`.
+
+`OBSERVED` means that the Indexer saw and persisted a source event from the current Chain A view. It does not mean that the block is finalized, reorg-safe, approved by validators, batched, or ready for destination delivery. Block hashes are retained as event provenance for future reconciliation, while the current Indexer does not detect or repair reorgs.
+
+### Cursor and restart behavior
+
+The `indexer_cursors` table scopes each cursor by Chain A domain and source Gateway. Its `next_block` value is the first block not yet committed by the Indexer. A new cursor starts at `SOURCE_GATEWAY_START_BLOCK`; an existing cursor takes precedence over the configured start block.
+
+For each range, all message inserts and the cursor update execute in one PostgreSQL transaction through one `pg` client. A failed validation or query rolls back the complete range. Logs are sorted by block number and log index before insertion, and multiple messages in one block are committed together with the range cursor.
+
+One-shot mode reads the chain head once at startup, scans only through that fixed snapshot, and exits. Continuous mode repeatedly catches up to a new snapshot and waits for `INDEXER_POLL_INTERVAL_MS` between polls. A clean restart uses the stored cursor and continues without rescanning from genesis. Deterministic duplicate-event handling, concurrent Indexer coordination, full crash recovery, finality tracking, and reorg rollback are not implemented.
+
+### Runtime configuration
+
+| Variable | Meaning |
+| --- | --- |
+| `CHAIN_A_RPC_URL` | Chain A HTTP JSON-RPC endpoint |
+| `CHAIN_A_DOMAIN` | Expected Chain A chain ID |
+| `SOURCE_GATEWAY_ADDRESS` | Only Gateway whose events are indexed |
+| `SOURCE_GATEWAY_START_BLOCK` | First block for a new cursor |
+| `DATABASE_URL` | PostgreSQL connection string |
+| `INDEXER_BLOCK_RANGE` | Maximum blocks queried per range; defaults to `2000` |
+| `INDEXER_POLL_INTERVAL_MS` | Continuous-mode polling delay; defaults to `1000` |
+| `INDEXER_DB_SCHEMA` | PostgreSQL schema; defaults to `cross_chain_indexer` |
+
+Apply the migration and run a one-shot catch-up from `indexer/`:
+
+```bash
+export CHAIN_A_RPC_URL='http://127.0.0.1:4545'
+export CHAIN_A_DOMAIN='10011'
+export SOURCE_GATEWAY_ADDRESS='<deployed-source-gateway>'
+export SOURCE_GATEWAY_START_BLOCK='<source-gateway-deployment-block>'
+export DATABASE_URL='postgresql://<user>:<password>@127.0.0.1/<database>'
+
+npm run migrate
+npm run catch-up
+```
+
+Run the continuous service with the same configuration:
+
+```bash
+npm start
+```
+
 ## Local Two-Chain Environment
 
 `scripts/start-chains.sh` starts two Anvil chains:
@@ -373,9 +440,10 @@ Install these tools before using the repository:
 - Bash;
 - Foundry, including `forge`, `cast`, and `anvil`;
 - Circom 2;
-- Node.js 20 or later;
+- Node.js 22 or later;
 - npm;
-- Python 3.
+- Python 3;
+- PostgreSQL with a disposable or local project database.
 
 Check the local environment:
 
@@ -388,6 +456,7 @@ circom --version
 node --version
 npm --version
 python3 --version
+psql --version
 ```
 
 Foundry and Circom are system tools and are not installed by the verification scripts:
@@ -395,7 +464,7 @@ Foundry and Circom are system tools and are not installed by the verification sc
 - [Foundry installation](https://getfoundry.sh/introduction/installation/)
 - [Circom 2 installation](https://docs.circom.io/getting-started/installation/)
 
-The JavaScript dependencies are pinned in `zk/package.json` and `zk/package-lock.json`:
+The ZK JavaScript dependencies are pinned in `zk/package.json` and `zk/package-lock.json`:
 
 | Dependency | Version |
 | --- | --- |
@@ -409,7 +478,15 @@ Install repository dependencies:
 cd zk
 npm ci
 cd ..
+
+cd indexer
+npm ci
+cd ..
 ```
+
+The Indexer pins `viem` to `2.56.9` and `pg` to `8.23.1`. Its dependency tree is recorded in `indexer/package-lock.json`, so clean installations should use `npm ci`.
+
+PostgreSQL installation and database creation remain external prerequisites. Project scripts check connectivity and apply the project migration, but they do not install or start PostgreSQL and do not create a database.
 
 The Python validator uses only the standard library, so the repository does not need a `requirements.txt` file.
 
@@ -474,40 +551,59 @@ The script:
 
 Generated circuits, witnesses, proofs, public signals, ptau files, and zkey files are written under `zk/build/`. Generated Solidity cryptographic source is written under `contracts/generated/`. Both locations are excluded from source control.
 
+### Chain A Indexer
+
+Run the Indexer unit suite after installing its packages:
+
+```bash
+cd indexer
+npm test
+```
+
+Run the PostgreSQL tests against a disposable or local project database:
+
+```bash
+export DATABASE_URL='postgresql://<user>:<password>@127.0.0.1/<database>'
+export INDEXER_DB_SCHEMA='cross_chain_indexer_database_test'
+npm run test:database
+```
+
+The real Chain A integration, including message production and clean restart continuation, runs through the unified repository verification flow because it needs the deployed protocol contracts and both local chains.
+
 ## Complete Verification
 
 Run the unified verification script from the repository root:
 
 ```bash
+export DATABASE_URL='postgresql://<user>:<password>@127.0.0.1/<database>'
 ./scripts/verify.sh
 ```
 
 The script uses strict error handling and performs:
 
-1. local-chain availability and chain ID checks;
-2. selection of a proof timestamp relative to the current Chain A block;
-3. credential model, fixture, and state-tree configuration validation;
-4. deterministic Root N and Root N+1 construction, nullifier-vector generation, and ZK circuit compilation with positive and negative local proof verification;
-5. Solidity verifier, proof-fixture, and domain-separated canonical message fixture generation;
-6. Solidity formatting, build, and tests against the real generated verifier;
-7. focused canonical-message, credential-verifier, and identity-application tests;
-8. deployment of the generated verifier, credential adapter, source gateway, and identity application to Chain A;
-9. explicit authorization of the deployed identity application by the configured Gateway administrator;
-10. valid on-chain proof verification and credential A authorization under Root N;
-11. rejection of future, stale, tampered, alternate-policy, alternate-domain, alternate-epoch, alternate-action, and non-current-root submissions;
-12. rejection of exact and regenerated same-context proof replays;
-13. authorized policy-epoch advancement and acceptance of credential A's new-epoch nullifier;
-14. rejection of unauthorized and zero-root credential-state updates;
-15. rotation to Root N+1, revocation of credential A, preservation of consumed-nullifier history, and rejection of A's old-root proof;
-16. authorization and retained active status for credential B under Root N+1;
-17. canonical type-hash and source-domain, source-gateway, destination-domain, and destination-gateway separation checks;
-18. rejection of registry updates from a non-administrator and rejection of an invalid application address;
-19. rejection of direct EOA sends and sends from an unknown application without nonce consumption;
-20. real `IdentityApplicationA → SourceGateway` message creation and event decoding, including destination-gateway forwarding;
-21. verification that the Gateway records the application address as `sourceSender`;
-22. rejection of invalid destinations and deadlines without nonce consumption;
-23. revocation of the identity application, preservation of its historical message ID, and rejection of its next send without nonce consumption;
-24. reauthorization of the identity application and successful creation of the next canonical message.
+1. Node.js and Indexer dependency checks without automatic installation;
+2. PostgreSQL connectivity, migration, unit tests, and database transaction tests;
+3. local-chain availability and chain ID checks;
+4. selection of a proof timestamp relative to the current Chain A block;
+5. credential model, fixture, and state-tree configuration validation;
+6. deterministic active-state construction, nullifier generation, and ZK circuit verification;
+7. Solidity verifier, proof-fixture, and canonical message fixture generation;
+8. Solidity formatting, build, and tests against the real generated verifier;
+9. focused canonical-message, credential-verifier, and identity-application tests;
+10. deployment of the generated verifier, credential adapter, source gateway, and identity application to Chain A;
+11. explicit authorization of the deployed identity application by the configured Gateway administrator;
+12. valid and rejected credential-proof, policy, nullifier, epoch, and revocation cases;
+13. canonical type-hash and source/destination domain and gateway separation checks;
+14. registry administration, unknown caller, destination, deadline, revocation, nonce, and reauthorization cases;
+15. real `IdentityApplicationA → SourceGateway` message creation and event decoding;
+16. creation of a fresh message after the configured Indexer start block;
+17. one-shot indexing through a fixed startup chain-head snapshot;
+18. canonical message recomputation and complete `OBSERVED` row verification;
+19. persistence of the scoped `next_block` cursor;
+20. clean Indexer stop, later message creation, and restart from the stored cursor;
+21. persistence of the later message and verification that the cursor advances again.
+
+`DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
 If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
 
@@ -521,7 +617,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Authorized Chain A Source Messaging
+Persistent Chain A Event Indexing
 ```
 
 ### Expected error output
@@ -579,6 +675,26 @@ Cross-Chain/
 │       │   ├── MockSourceApplication.sol
 │       │   └── MockSourceGateway.sol
 │       └── SourceGateway.t.sol
+├── indexer/
+│   ├── migrations/
+│   │   └── 001_chain_a_indexer.sql
+│   ├── src/
+│   │   ├── canonical-message.mjs
+│   │   ├── check-database.mjs
+│   │   ├── config.mjs
+│   │   ├── db.mjs
+│   │   ├── indexer.mjs
+│   │   ├── main.mjs
+│   │   ├── migrate.mjs
+│   │   └── source-gateway-event.mjs
+│   ├── test/
+│   │   ├── canonical-message.test.mjs
+│   │   ├── config.test.mjs
+│   │   ├── database.test.mjs
+│   │   ├── indexer.test.mjs
+│   │   └── integration.test.mjs
+│   ├── package.json
+│   └── package-lock.json
 ├── scripts/
 │   ├── build-canonical-message-vector.mjs
 │   ├── deploy-verifier.sh
@@ -631,9 +747,13 @@ Cross-Chain/
 - Registry authorization does not authenticate the EOA calling an authorized application. Each application remains responsible for its own caller and business-policy checks.
 - Gateway revocation affects future message creation only. It does not invalidate previously emitted messages or alter historical message IDs.
 - `IdentityApplicationA` can call `SourceGateway`, while mandatory ZK-gated message creation and proof-to-message nullifier binding remain unimplemented.
+- The Indexer validates and persists source events, but it does not establish that a particular message was produced atomically with a ZK proof.
+- `OBSERVED` records the current Chain A view at ingestion time. It provides no finality, confirmation-depth, validator-approval, or delivery guarantee.
+- Persistent block cursors support normal clean restart continuation. Deterministic duplicate-event uniqueness, multi-instance coordination, and full crash recovery remain unimplemented.
+- Source block hashes are stored as provenance, while reorg detection, orphan rollback, and common-ancestor recovery remain unimplemented.
 - The current message binds its protocol type, source domain, source gateway, source sender, destination domain, destination gateway, destination receiver, nonce, payload hash, and deadline.
 - A committed destination gateway is caller-selected. `SourceGateway` does not validate remote deployment, domain ownership, or trust, and no remote-gateway registry exists.
-- The repository does not provide an indexer, finality watcher, reorg handling, relayer, Merkle batching, PBFT validation, destination gateway implementation or execution, Application B, finality proof, or production cross-chain security model.
+- The repository does not provide a finality watcher, reorg handling, relayer, Merkle batching, PBFT validation, destination gateway implementation or execution, Application B, finality proof, or production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.
