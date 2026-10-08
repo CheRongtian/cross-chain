@@ -18,7 +18,9 @@ import { loadConfig } from "../src/config.mjs";
 import {
   applyMigrations,
   createDatabasePool,
+  createFinalityStore,
   readCursor,
+  readIndexedSourceBlocks,
   readMessages,
   resetIndexerTables,
 } from "../src/db.mjs";
@@ -36,7 +38,7 @@ function requireEnvironment(name) {
   return value;
 }
 
-function assertPersistedEvent(row, event) {
+function assertPersistedEvent(row, event, expectedStatus) {
   assert.equal(row.message_id, event.messageId);
   assert.equal(row.version, Number(event.version));
   assert.equal(row.source_domain, event.sourceDomain.toString());
@@ -53,12 +55,17 @@ function assertPersistedEvent(row, event) {
   assert.equal(row.source_block_hash, event.sourceBlockHash);
   assert.equal(row.source_tx_hash, event.sourceTransactionHash);
   assert.equal(row.source_log_index, event.sourceLogIndex.toString());
-  assert.equal(row.status, "OBSERVED");
+  assert.equal(row.status, expectedStatus);
   assert.ok(row.observed_at instanceof Date);
 }
 
-test("persists real SourceGateway events idempotently and resumes from the stored cursor", async () => {
+test("tracks finality and recovers a real SourceGateway branch replacement", async () => {
   const config = loadConfig();
+  assert.equal(
+    config.finalityBlockDepth,
+    2n,
+    "the real finality integration test requires FINALITY_BLOCK_DEPTH=2",
+  );
   const identityApplication = normalizeAddress(
     requireEnvironment("IDENTITY_APPLICATION_ADDRESS"),
     "IdentityApplicationA address",
@@ -88,8 +95,8 @@ test("persists real SourceGateway events idempotently and resumes from the store
   const scope = { chainDomain: config.chainDomain, sourceGateway: config.sourceGateway };
   const schemaIdentifier = `"${config.databaseSchema}"`;
 
-  async function runOneShotProcess() {
-    const result = await execFileAsync(process.execPath, [INDEXER_MAIN_PATH, "--once"], {
+  async function runOneShotProcess(mode) {
+    const result = await execFileAsync(process.execPath, [INDEXER_MAIN_PATH, mode, "--once"], {
       env: process.env,
     });
     process.stdout.write(result.stdout);
@@ -118,6 +125,11 @@ test("persists real SourceGateway events idempotently and resumes from the store
     });
   }
 
+  async function mineBlock() {
+    await publicClient.request({ method: "evm_mine" });
+    return BigInt(await publicClient.request({ method: "eth_blockNumber" }));
+  }
+
   async function rewindTestCursor(pool, nextBlock) {
     const result = await pool.query(
       `UPDATE ${schemaIdentifier}."indexer_cursors"
@@ -136,96 +148,330 @@ test("persists real SourceGateway events idempotently and resumes from the store
     activePool = undefined;
 
     const messageA = await produceMessage("0x6d6573736167652061");
-    const firstRunOutput = await runOneShotProcess();
+    const firstIndexOutput = await runOneShotProcess("indexer");
 
     activePool = createDatabasePool(config);
-    const rowsAfterFirstRun = await readMessages(activePool, config.databaseSchema);
-    const cursorAfterFirstRun = await readCursor(activePool, config.databaseSchema, scope);
+    let rows = await readMessages(activePool, config.databaseSchema);
+    let cursor = await readCursor(activePool, config.databaseSchema, scope);
 
-    assert.match(firstRunOutput, /Rows inserted: 1/);
-    assert.match(firstRunOutput, /Duplicates skipped: 0/);
-    assert.equal(rowsAfterFirstRun.length, 1);
-    assertPersistedEvent(rowsAfterFirstRun[0], messageA);
-    assert.ok(BigInt(cursorAfterFirstRun.next_block) > messageA.sourceBlockNumber);
-    const firstObservedAt = rowsAfterFirstRun[0].observed_at.getTime();
+    assert.match(firstIndexOutput, /Rows inserted: 1/);
+    assert.match(firstIndexOutput, /Duplicates skipped: 0/);
+    assert.equal(rows.length, 1);
+    assertPersistedEvent(rows[0], messageA, "OBSERVED");
+    assert.ok(BigInt(cursor.next_block) > messageA.sourceBlockNumber);
+    const firstObservedAt = rows[0].observed_at.getTime();
 
     console.log("VALID: Message A persisted as OBSERVED");
-    console.log("VALID: canonical message ID and source event metadata persisted");
-    console.log(`VALID: Indexer cursor persisted at block ${cursorAfterFirstRun.next_block}`);
+    console.log(`VALID: Indexer cursor persisted at block ${cursor.next_block}`);
 
-    console.log("Re-scanning the same source block");
-    await rewindTestCursor(activePool, messageA.sourceBlockNumber);
     await activePool.end();
     activePool = undefined;
 
-    const duplicateRunOutput = await runOneShotProcess();
+    const firstFinalityOutput = await runOneShotProcess("finality");
 
     activePool = createDatabasePool(config);
-    const rowsAfterDuplicateRun = await readMessages(activePool, config.databaseSchema);
-    const cursorAfterDuplicateRun = await readCursor(activePool, config.databaseSchema, scope);
+    rows = await readMessages(activePool, config.databaseSchema);
+    assert.match(firstFinalityOutput, /OBSERVED -> FINALIZING: 1/);
+    assertPersistedEvent(rows[0], messageA, "FINALIZING");
+    assert.ok(rows[0].finalizing_at instanceof Date);
+    assert.equal(rows[0].finalized_at, null);
+    assert.equal(
+      (await createFinalityStore(activePool, config.databaseSchema).listBatchEligibleMessages(scope)).length,
+      0,
+    );
+    const messageAFinalizingAt = rows[0].finalizing_at.getTime();
 
-    assert.match(duplicateRunOutput, /Rows inserted: 0/);
-    assert.match(duplicateRunOutput, /Duplicates skipped: 1/);
-    assert.equal(rowsAfterDuplicateRun.length, 1);
-    assertPersistedEvent(rowsAfterDuplicateRun[0], messageA);
-    assert.equal(rowsAfterDuplicateRun[0].observed_at.getTime(), firstObservedAt);
-    assert.ok(BigInt(cursorAfterDuplicateRun.next_block) > messageA.sourceBlockNumber);
-
-    console.log("VALID: same source event encountered again");
-    console.log("VALID: row count remained one");
-    console.log("VALID: duplicate event preserved observed_at and status");
-    console.log("VALID: cursor advanced after duplicate-only range");
+    console.log("VALID: Message A moved from OBSERVED to FINALIZING");
+    console.log("VALID: FINALIZING messages are not batch eligible");
 
     await activePool.end();
     activePool = undefined;
 
-    console.log("Producing a later source event");
     const messageB = await produceMessage("0x6d6573736167652062");
+    const secondIndexOutput = await runOneShotProcess("indexer");
+    const secondFinalityOutput = await runOneShotProcess("finality");
 
     activePool = createDatabasePool(config);
+    rows = await readMessages(activePool, config.databaseSchema);
+    assert.match(secondIndexOutput, /Rows inserted: 1/);
+    assert.match(secondFinalityOutput, /OBSERVED -> FINALIZING: 1/);
+    assert.match(secondFinalityOutput, /FINALIZING unchanged: 1/);
+    assert.equal(rows.length, 2);
+    assertPersistedEvent(rows[0], messageA, "FINALIZING");
+    assertPersistedEvent(rows[1], messageB, "FINALIZING");
+    assert.equal(rows[0].finalizing_at.getTime(), messageAFinalizingAt);
+    const messageBFinalizingAt = rows[1].finalizing_at.getTime();
+
+    console.log("VALID: Message A remained FINALIZING one block below the configured depth");
+    console.log("VALID: Message B independently entered FINALIZING");
+
+    await activePool.end();
+    activePool = undefined;
+
+    const exactBoundaryHead = await mineBlock();
+    assert.equal(exactBoundaryHead, messageA.sourceBlockNumber + config.finalityBlockDepth);
+    const boundaryFinalityOutput = await runOneShotProcess("finality");
+
+    activePool = createDatabasePool(config);
+    rows = await readMessages(activePool, config.databaseSchema);
+    const finalityStore = createFinalityStore(activePool, config.databaseSchema);
+    let batchEligible = await finalityStore.listBatchEligibleMessages(scope);
+    assert.match(boundaryFinalityOutput, /FINALIZING -> FINALIZED: 1/);
+    assert.match(boundaryFinalityOutput, /FINALIZING unchanged: 1/);
+    assertPersistedEvent(rows[0], messageA, "FINALIZED");
+    assertPersistedEvent(rows[1], messageB, "FINALIZING");
+    assert.ok(rows[0].finalized_at instanceof Date);
+    assert.equal(rows[0].finalized_at_head, exactBoundaryHead.toString());
+    assert.deepEqual(batchEligible.map((row) => row.message_id), [messageA.messageId]);
+    const messageAFinalizedAt = rows[0].finalized_at.getTime();
+
+    console.log("VALID: Message A finalized at the exact configured depth boundary");
+    console.log("VALID: only Message A is batch eligible");
+
+    await activePool.end();
+    activePool = undefined;
+
+    const stableFinalityOutput = await runOneShotProcess("finality");
+
+    activePool = createDatabasePool(config);
+    rows = await readMessages(activePool, config.databaseSchema);
+    assert.match(stableFinalityOutput, /Candidates checked: 1/);
+    assert.match(stableFinalityOutput, /FINALIZING unchanged: 1/);
+    assert.equal(rows[0].status, "FINALIZED");
+    assert.equal(rows[0].finalized_at.getTime(), messageAFinalizedAt);
+    assert.equal(rows[0].finalized_at_head, exactBoundaryHead.toString());
+    assert.equal(rows[1].status, "FINALIZING");
+    assert.equal(rows[1].finalizing_at.getTime(), messageBFinalizingAt);
+
+    console.log("VALID: FINALIZED state and metadata remained stable on another watcher pass");
+
     await rewindTestCursor(activePool, messageA.sourceBlockNumber);
     await activePool.end();
     activePool = undefined;
 
-    const mixedRunOutput = await runOneShotProcess();
+    const rescanOutput = await runOneShotProcess("indexer");
 
     activePool = createDatabasePool(config);
-    const rowsAfterMixedRun = await readMessages(activePool, config.databaseSchema);
-    const cursorAfterMixedRun = await readCursor(activePool, config.databaseSchema, scope);
+    rows = await readMessages(activePool, config.databaseSchema);
+    cursor = await readCursor(activePool, config.databaseSchema, scope);
+    assert.match(rescanOutput, /Rows inserted: 0/);
+    assert.match(rescanOutput, /Duplicates skipped: 2/);
+    assert.equal(rows.length, 2);
+    assertPersistedEvent(rows[0], messageA, "FINALIZED");
+    assertPersistedEvent(rows[1], messageB, "FINALIZING");
+    assert.equal(rows[0].observed_at.getTime(), firstObservedAt);
+    assert.equal(rows[0].finalized_at.getTime(), messageAFinalizedAt);
+    assert.equal(rows[0].finalized_at_head, exactBoundaryHead.toString());
+    assert.equal(rows[1].finalizing_at.getTime(), messageBFinalizingAt);
+    assert.ok(BigInt(cursor.next_block) > exactBoundaryHead);
 
-    assert.match(mixedRunOutput, /Rows inserted: 1/);
-    assert.match(mixedRunOutput, /Duplicates skipped: 1/);
-    assert.equal(rowsAfterMixedRun.length, 2);
-    assertPersistedEvent(rowsAfterMixedRun[0], messageA);
-    assertPersistedEvent(rowsAfterMixedRun[1], messageB);
-    assert.equal(rowsAfterMixedRun[0].observed_at.getTime(), firstObservedAt);
-    assert.ok(BigInt(cursorAfterMixedRun.next_block) > messageB.sourceBlockNumber);
-    const persistedRestartCursor = BigInt(cursorAfterMixedRun.next_block);
-
-    console.log("VALID: old event treated as duplicate");
-    console.log("VALID: new event inserted");
-    console.log("VALID: one record per source event");
+    console.log("VALID: rescan preserved the FINALIZED row and finality metadata");
+    console.log("VALID: duplicate source events did not create additional rows");
 
     await activePool.end();
     activePool = undefined;
 
-    const messageC = await produceMessage("0x6d6573736167652063");
-    const restartRunOutput = await runOneShotProcess();
+    const messageBBoundaryHead = await mineBlock();
+    assert.equal(messageBBoundaryHead, messageB.sourceBlockNumber + config.finalityBlockDepth);
+    const secondBoundaryOutput = await runOneShotProcess("finality");
 
     activePool = createDatabasePool(config);
-    const rowsAfterRestart = await readMessages(activePool, config.databaseSchema);
-    const cursorAfterRestart = await readCursor(activePool, config.databaseSchema, scope);
+    rows = await readMessages(activePool, config.databaseSchema);
+    batchEligible = await createFinalityStore(
+      activePool,
+      config.databaseSchema,
+    ).listBatchEligibleMessages(scope);
+    assert.match(secondBoundaryOutput, /FINALIZING -> FINALIZED: 1/);
+    assert.deepEqual(rows.map((row) => row.status), ["FINALIZED", "FINALIZED"]);
+    assert.deepEqual(batchEligible.map((row) => row.message_id), [
+      messageA.messageId,
+      messageB.messageId,
+    ]);
 
-    assert.match(restartRunOutput, new RegExp(`Cursor next block: ${persistedRestartCursor}`));
-    assert.equal(rowsAfterRestart.length, 3);
-    assertPersistedEvent(rowsAfterRestart[0], messageA);
-    assertPersistedEvent(rowsAfterRestart[1], messageB);
-    assertPersistedEvent(rowsAfterRestart[2], messageC);
-    assert.ok(BigInt(cursorAfterRestart.next_block) > messageC.sourceBlockNumber);
+    console.log("VALID: Message B finalized independently at its exact depth boundary");
+    console.log("VALID: both finalized messages are batch eligible in source order");
+
+    await activePool.end();
+    activePool = undefined;
+
+    const persistedRestartCursor = BigInt(cursor.next_block);
+    const commonAncestor = BigInt(await publicClient.request({ method: "eth_blockNumber" }));
+    const commonAncestorBlock = await publicClient.getBlock({ blockNumber: commonAncestor });
+    const snapshotId = await publicClient.request({ method: "evm_snapshot" });
+    assert.match(snapshotId, /^0x[0-9a-fA-F]+$/);
+
+    console.log(`Creating old source branch after common ancestor ${commonAncestor}`);
+    const messageC = await produceMessage("0x6d6573736167652063");
+    const restartOutput = await runOneShotProcess("indexer");
+
+    const oldBranchFinalityOutput = await runOneShotProcess("finality");
+
+    activePool = createDatabasePool(config);
+    rows = await readMessages(activePool, config.databaseSchema);
+    cursor = await readCursor(activePool, config.databaseSchema, scope);
+    assert.match(restartOutput, new RegExp(`Cursor next block: ${persistedRestartCursor}`));
+    assert.match(oldBranchFinalityOutput, /OBSERVED -> FINALIZING: 1/);
+    assert.equal(rows.length, 3);
+    assertPersistedEvent(rows[0], messageA, "FINALIZED");
+    assertPersistedEvent(rows[1], messageB, "FINALIZED");
+    assertPersistedEvent(rows[2], messageC, "FINALIZING");
+    assert.ok(BigInt(cursor.next_block) > messageC.sourceBlockNumber);
+    const oldMessageFinalizingAt = rows[2].finalizing_at.getTime();
 
     console.log("VALID: Indexer resumed from the persisted cursor");
-    console.log("VALID: later message persisted as OBSERVED after restart");
-    console.log(`VALID: cursor advanced to block ${cursorAfterRestart.next_block}`);
+    console.log("VALID: old-branch Message C entered FINALIZING");
+
+    await activePool.end();
+    activePool = undefined;
+
+    const oldEmptyBlock = await mineBlock();
+    const oldEmptyBlockOutput = await runOneShotProcess("indexer");
+
+    activePool = createDatabasePool(config);
+    let indexedBlocks = await readIndexedSourceBlocks(
+      activePool,
+      config.databaseSchema,
+      scope,
+    );
+    cursor = await readCursor(activePool, config.databaseSchema, scope);
+    assert.match(oldEmptyBlockOutput, /CrossChainMessage logs found: 0/);
+    assert.equal(indexedBlocks.at(-1).block_number, oldEmptyBlock.toString());
+    assert.equal(BigInt(cursor.next_block), oldEmptyBlock + 1n);
+    const oldMessageBlockHash = messageC.sourceBlockHash;
+    const oldEmptyBlockHash = indexedBlocks.at(-1).block_hash;
+
+    console.log("VALID: old-branch empty block metadata persisted");
+
+    await activePool.end();
+    activePool = undefined;
+
+    const reverted = await publicClient.request({
+      method: "evm_revert",
+      params: [snapshotId],
+    });
+    assert.equal(reverted, true);
+    assert.equal(
+      BigInt(await publicClient.request({ method: "eth_blockNumber" })),
+      commonAncestor,
+    );
+
+    console.log("Reverted Chain A to the stable snapshot");
+    const messageD = await produceMessage("0x6d6573736167652064");
+    const replacementEmptyBlock = await mineBlock();
+    assert.equal(messageD.sourceBlockNumber, messageC.sourceBlockNumber);
+    assert.equal(replacementEmptyBlock, oldEmptyBlock);
+    assert.notEqual(messageD.sourceBlockHash, oldMessageBlockHash);
+
+    console.log("Running Finality Watcher before Indexer on the replacement branch");
+    const watcherRecoveryOutput = await runOneShotProcess("finality");
+
+    activePool = createDatabasePool(config);
+    rows = await readMessages(activePool, config.databaseSchema);
+    cursor = await readCursor(activePool, config.databaseSchema, scope);
+    indexedBlocks = await readIndexedSourceBlocks(
+      activePool,
+      config.databaseSchema,
+      scope,
+    );
+    const oldOccurrence = rows.find(
+      (row) => row.source_block_hash === oldMessageBlockHash,
+    );
+    assert.match(watcherRecoveryOutput, /Source reorg detected/);
+    assert.match(watcherRecoveryOutput, new RegExp(`Common ancestor: ${commonAncestor}`));
+    assert.match(watcherRecoveryOutput, /Unfinalized messages marked REORGED: 1/);
+    assert.match(watcherRecoveryOutput, /Candidates checked: 0/);
+    assert.ok(oldOccurrence);
+    assertPersistedEvent(oldOccurrence, messageC, "REORGED");
+    assert.ok(oldOccurrence.reorged_at instanceof Date);
+    assert.equal(oldOccurrence.finalizing_at.getTime(), oldMessageFinalizingAt);
+    assert.equal(oldOccurrence.finalized_at, null);
+    assert.equal(BigInt(cursor.next_block), commonAncestor + 1n);
+    assert.equal(indexedBlocks.at(-1).block_number, commonAncestor.toString());
+    assert.equal(indexedBlocks.at(-1).block_hash, commonAncestorBlock.hash.toLowerCase());
+    assert.ok(indexedBlocks.every((block) => block.block_hash !== oldEmptyBlockHash));
+    assert.equal(
+      (await createFinalityStore(
+        activePool,
+        config.databaseSchema,
+      ).listBatchEligibleMessages(scope)).some(
+        (row) => row.source_block_hash === oldMessageBlockHash,
+      ),
+      false,
+    );
+
+    console.log("VALID: Finality Watcher found the common ancestor before promotion");
+    console.log("VALID: old Message C is preserved as REORGED and not batch eligible");
+    console.log("VALID: cursor rewound and old canonical block tracking was removed");
+
+    await activePool.end();
+    activePool = undefined;
+
+    const replacementIndexOutput = await runOneShotProcess("indexer");
+
+    activePool = createDatabasePool(config);
+    rows = await readMessages(activePool, config.databaseSchema);
+    cursor = await readCursor(activePool, config.databaseSchema, scope);
+    indexedBlocks = await readIndexedSourceBlocks(
+      activePool,
+      config.databaseSchema,
+      scope,
+    );
+    const replacementOccurrence = rows.find(
+      (row) => row.source_block_hash === messageD.sourceBlockHash,
+    );
+    assert.match(
+      replacementIndexOutput,
+      new RegExp(`Cursor next block: ${commonAncestor + 1n}`),
+    );
+    assert.ok(replacementOccurrence);
+    assertPersistedEvent(replacementOccurrence, messageD, "OBSERVED");
+    assert.equal(rows.length, 4);
+    assert.equal(BigInt(cursor.next_block), replacementEmptyBlock + 1n);
+    assert.equal(indexedBlocks.at(-1).block_number, replacementEmptyBlock.toString());
+    assert.notEqual(indexedBlocks.at(-1).block_hash, oldEmptyBlockHash);
+
+    console.log("VALID: replacement canonical branch re-indexed through its empty block");
+    console.log("VALID: Message D persisted as a distinct canonical occurrence");
+
+    await activePool.end();
+    activePool = undefined;
+
+    const replacementFinalizingOutput = await runOneShotProcess("finality");
+    assert.match(replacementFinalizingOutput, /OBSERVED -> FINALIZING: 1/);
+    const replacementBoundaryHead = await mineBlock();
+    assert.equal(
+      replacementBoundaryHead,
+      messageD.sourceBlockNumber + config.finalityBlockDepth,
+    );
+    const replacementFinalizedOutput = await runOneShotProcess("finality");
+
+    activePool = createDatabasePool(config);
+    rows = await readMessages(activePool, config.databaseSchema);
+    batchEligible = await createFinalityStore(
+      activePool,
+      config.databaseSchema,
+    ).listBatchEligibleMessages(scope);
+    const oldAfterFinality = rows.find(
+      (row) => row.source_block_hash === oldMessageBlockHash,
+    );
+    const replacementAfterFinality = rows.find(
+      (row) => row.source_block_hash === messageD.sourceBlockHash,
+    );
+    assert.match(replacementFinalizedOutput, /FINALIZING -> FINALIZED: 1/);
+    assert.equal(oldAfterFinality.status, "REORGED");
+    assert.equal(oldAfterFinality.reorged_at.getTime(), oldOccurrence.reorged_at.getTime());
+    assertPersistedEvent(replacementAfterFinality, messageD, "FINALIZED");
+    assert.equal(
+      batchEligible.some((row) => row.source_block_hash === oldMessageBlockHash),
+      false,
+    );
+    assert.equal(
+      batchEligible.some((row) => row.source_block_hash === messageD.sourceBlockHash),
+      true,
+    );
+
+    console.log("VALID: replacement Message D progressed to FINALIZED");
+    console.log("VALID: old REORGED Message C remained terminal");
   } finally {
     if (activePool !== undefined) {
       await activePool.end();

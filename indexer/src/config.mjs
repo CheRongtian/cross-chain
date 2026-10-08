@@ -2,6 +2,7 @@ import { normalizeAddress, toUint256 } from "./canonical-message.mjs";
 
 const DEFAULT_BLOCK_RANGE = "2000";
 const DEFAULT_POLL_INTERVAL_MS = "1000";
+const DEFAULT_FINALITY_POLL_INTERVAL_MS = "1000";
 const DEFAULT_DATABASE_SCHEMA = "cross_chain_indexer";
 
 function requireNonEmpty(value, name) {
@@ -38,6 +39,14 @@ function parsePositiveInteger(value, name) {
     throw new Error(`${name} must be a positive safe integer`);
   }
   return result;
+}
+
+function parseNonNegativeBigInt(value, name) {
+  const normalized = requireNonEmpty(value, name);
+  if (!/^[0-9]+$/.test(normalized)) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+  return toUint256(normalized, name);
 }
 
 export function validateSchemaName(value) {
@@ -81,6 +90,14 @@ export function loadConfig(environment = process.env) {
     pollIntervalMs: parsePositiveInteger(
       environment.INDEXER_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS,
       "INDEXER_POLL_INTERVAL_MS",
+    ),
+    finalityBlockDepth: parseNonNegativeBigInt(
+      environment.FINALITY_BLOCK_DEPTH,
+      "FINALITY_BLOCK_DEPTH",
+    ),
+    finalityPollIntervalMs: parsePositiveInteger(
+      environment.FINALITY_POLL_INTERVAL_MS ?? DEFAULT_FINALITY_POLL_INTERVAL_MS,
+      "FINALITY_POLL_INTERVAL_MS",
     ),
   };
 }

@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Idempotent Chain A Event Ingestion"
+VERIFICATION_NAME="Source Reorg Detection and Recovery"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -45,6 +45,8 @@ INDEXER_DB_SCHEMA="${INDEXER_DB_SCHEMA:-cross_chain_indexer_verification}"
 INDEXER_DATABASE_TEST_SCHEMA="cross_chain_indexer_database_verification"
 INDEXER_BLOCK_RANGE="${INDEXER_BLOCK_RANGE:-2}"
 INDEXER_POLL_INTERVAL_MS="${INDEXER_POLL_INTERVAL_MS:-100}"
+FINALITY_BLOCK_DEPTH="${FINALITY_BLOCK_DEPTH:-2}"
+FINALITY_POLL_INTERVAL_MS="${FINALITY_POLL_INTERVAL_MS:-100}"
 
 STARTED_CHAINS="false"
 CHAINS_PID=""
@@ -386,7 +388,7 @@ fi
 
 printf '\nVerification steps:\n'
 printf '  1. Check Node.js, Indexer dependencies, and PostgreSQL connectivity\n'
-printf '  2. Apply the Indexer migration and run unit/database tests\n'
+printf '  2. Apply the Indexer migrations and run unit/database tests\n'
 printf '  3. Check or start Chain A and Chain B\n'
 printf '  4. Verify chain IDs and select the proof timestamp\n'
 printf '  5. Validate the credential model, fixtures, and state encoding\n'
@@ -397,9 +399,14 @@ printf '  9. Deploy and verify the complete current Chain A protocol\n'
 printf ' 10. Preserve credential policy, replay, epoch, and revocation checks\n'
 printf ' 11. Preserve canonical message domain separation and authorization checks\n'
 printf ' 12. Produce and persist a real Chain A message as OBSERVED\n'
-printf ' 13. Re-scan the same real source event and verify one-row idempotency\n'
-printf ' 14. Scan a mixed duplicate-and-new range and verify cursor advancement\n'
-printf ' 15. Restart one-shot indexing from the persisted next-block cursor\n'
+printf ' 13. Advance real messages through FINALIZING at a fixed watcher head\n'
+printf ' 14. Verify exact-depth FINALIZED transitions and batch eligibility\n'
+printf ' 15. Re-scan a FINALIZED event and preserve lifecycle metadata\n'
+printf ' 16. Restart one-shot indexing from the persisted next-block cursor\n'
+printf ' 17. Persist canonical metadata for event-bearing and empty source blocks\n'
+printf ' 18. Replace a real Anvil branch and recover from its common ancestor\n'
+printf ' 19. Preserve the old occurrence as REORGED and re-index the replacement branch\n'
+printf ' 20. Finalize the replacement occurrence while REORGED remains terminal\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -434,7 +441,11 @@ node --test \
     "$INDEXER_DIR/test/config.test.mjs" \
     "$INDEXER_DIR/test/canonical-message.test.mjs" \
     "$INDEXER_DIR/test/source-event-identity.test.mjs" \
-    "$INDEXER_DIR/test/indexer.test.mjs"
+    "$INDEXER_DIR/test/canonical-block.test.mjs" \
+    "$INDEXER_DIR/test/reorg-detector.test.mjs" \
+    "$INDEXER_DIR/test/finality-policy.test.mjs" \
+    "$INDEXER_DIR/test/indexer.test.mjs" \
+    "$INDEXER_DIR/test/finality-watcher.test.mjs"
 
 CURRENT_STEP="Chain A Indexer database tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1059,7 +1070,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real idempotent Chain A to PostgreSQL Indexer integration"
+CURRENT_STEP="real Chain A indexing, finality, and source reorg recovery integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \
@@ -1068,6 +1079,8 @@ SOURCE_GATEWAY_START_BLOCK="$INDEXER_START_BLOCK" \
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_BLOCK_RANGE="$INDEXER_BLOCK_RANGE" \
 INDEXER_POLL_INTERVAL_MS="$INDEXER_POLL_INTERVAL_MS" \
+FINALITY_BLOCK_DEPTH="$FINALITY_BLOCK_DEPTH" \
+FINALITY_POLL_INTERVAL_MS="$FINALITY_POLL_INTERVAL_MS" \
 INDEXER_DB_SCHEMA="$INDEXER_DB_SCHEMA" \
 IDENTITY_APPLICATION_ADDRESS="$IDENTITY_APPLICATION_ADDRESS" \
 INDEXER_INTEGRATION_PRIVATE_KEY="$ANVIL_DEV_KEY" \

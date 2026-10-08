@@ -1,6 +1,8 @@
 import { createPublicClient, http } from "viem";
 
+import { fetchCanonicalBlockRange } from "./canonical-block.mjs";
 import { createDatabaseStore } from "./db.mjs";
+import { createCanonicalReconciler } from "./reorg-detector.mjs";
 import {
   CROSS_CHAIN_MESSAGE_EVENT,
   decodeCrossChainMessageLog,
@@ -54,6 +56,10 @@ export function createChainClient(config) {
   return createPublicClient({ transport: http(config.chainRpcUrl) });
 }
 
+export async function readChainHead(publicClient) {
+  return BigInt(await publicClient.request({ method: "eth_blockNumber" }));
+}
+
 export async function validateChainSource(publicClient, config) {
   const actualChainId = BigInt(await publicClient.request({ method: "eth_chainId" }));
   if (actualChainId !== config.chainDomain) {
@@ -85,15 +91,24 @@ export function createIndexer({
   pool,
   publicClient = createChainClient(config),
   store = createDatabaseStore(pool, config.databaseSchema),
+  reconciler,
   logger = console,
 }) {
   const scope = { chainDomain: config.chainDomain, sourceGateway: config.sourceGateway };
+  const canonicalReconciler = reconciler ?? createCanonicalReconciler({
+    config,
+    pool,
+    publicClient,
+    logger,
+  });
 
   return {
     async catchUpOnce() {
-      const snapshotHead = await publicClient.getBlockNumber();
+      const snapshotHead = await readChainHead(publicClient);
       let nextBlock = await store.loadOrInitializeCursor(scope, config.sourceGatewayStartBlock);
       const initialNextBlock = nextBlock;
+      const reconciliation = await canonicalReconciler.reconcile({ headBlock: snapshotHead });
+      nextBlock = await store.loadOrInitializeCursor(scope, config.sourceGatewayStartBlock);
       let insertedRows = 0;
       let duplicateRows = 0;
       let scannedRanges = 0;
@@ -110,6 +125,11 @@ export function createIndexer({
         }
 
         logger.log(`Scanning blocks ${range.fromBlock}-${range.toBlock}`);
+        const blocks = await fetchCanonicalBlockRange(
+          publicClient,
+          range.fromBlock,
+          range.toBlock,
+        );
         const logs = await publicClient.getLogs({
           address: config.sourceGateway,
           event: CROSS_CHAIN_MESSAGE_EVENT,
@@ -130,6 +150,7 @@ export function createIndexer({
         const committed = await store.persistRange(scope, {
           fromBlock: range.fromBlock,
           toBlock: range.toBlock,
+          blocks,
           rows,
         });
         nextBlock = committed.nextBlock;
@@ -148,6 +169,7 @@ export function createIndexer({
         duplicateRows,
         scannedRanges,
         snapshotHead,
+        reconciliation,
       };
     },
 

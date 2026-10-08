@@ -12,6 +12,8 @@ const VALID_ENVIRONMENT = {
   INDEXER_BLOCK_RANGE: "500",
   INDEXER_POLL_INTERVAL_MS: "250",
   INDEXER_DB_SCHEMA: "indexer_test",
+  FINALITY_BLOCK_DEPTH: "12",
+  FINALITY_POLL_INTERVAL_MS: "300",
 };
 
 test("loads and normalizes valid Indexer configuration", () => {
@@ -24,6 +26,8 @@ test("loads and normalizes valid Indexer configuration", () => {
   assert.equal(config.blockRange, 500n);
   assert.equal(config.pollIntervalMs, 250);
   assert.equal(config.databaseSchema, "indexer_test");
+  assert.equal(config.finalityBlockDepth, 12n);
+  assert.equal(config.finalityPollIntervalMs, 300);
 });
 
 test("loads database-only configuration without chain settings", () => {
@@ -43,12 +47,32 @@ for (const [name, value, message] of [
   ["SOURCE_GATEWAY_START_BLOCK", "-1", /invalid SourceGateway start block/],
   ["INDEXER_BLOCK_RANGE", "0", /INDEXER_BLOCK_RANGE must be a positive safe integer/],
   ["INDEXER_POLL_INTERVAL_MS", "0", /INDEXER_POLL_INTERVAL_MS must be a positive safe integer/],
+  ["FINALITY_POLL_INTERVAL_MS", "0", /FINALITY_POLL_INTERVAL_MS must be a positive safe integer/],
   ["INDEXER_DB_SCHEMA", "invalid-schema", /must be a PostgreSQL identifier/],
 ]) {
   test(`rejects invalid ${name}`, () => {
     assert.throws(() => loadConfig({ ...VALID_ENVIRONMENT, [name]: value }), message);
   });
 }
+
+test("accepts zero source finality depth", () => {
+  assert.equal(loadConfig({ ...VALID_ENVIRONMENT, FINALITY_BLOCK_DEPTH: "0" }).finalityBlockDepth, 0n);
+});
+
+for (const invalidDepth of ["", "-1", "1.5", "NaN", (1n << 256n).toString()]) {
+  test(`rejects invalid FINALITY_BLOCK_DEPTH value ${JSON.stringify(invalidDepth)}`, () => {
+    assert.throws(
+      () => loadConfig({ ...VALID_ENVIRONMENT, FINALITY_BLOCK_DEPTH: invalidDepth }),
+      /FINALITY_BLOCK_DEPTH/,
+    );
+  });
+}
+
+test("requires FINALITY_BLOCK_DEPTH", () => {
+  const environment = { ...VALID_ENVIRONMENT };
+  delete environment.FINALITY_BLOCK_DEPTH;
+  assert.throws(() => loadConfig(environment), /FINALITY_BLOCK_DEPTH is required/);
+});
 
 test("requires a PostgreSQL connection string", () => {
   assert.throws(

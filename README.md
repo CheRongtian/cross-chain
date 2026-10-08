@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, and persistent idempotent source-event indexing. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, an identity application that can create canonical outbound messages through the gateway, and a PostgreSQL-backed Indexer for those source events.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent idempotent source-event indexing, configurable source-block finality tracking, and source-chain reorganization recovery. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, an identity application that can create canonical outbound messages through the gateway, a PostgreSQL-backed Indexer, and an independent Finality Watcher.
 
 The current implementation can:
 
@@ -27,7 +27,14 @@ The current implementation can:
 - recompute and validate canonical message IDs before persistence;
 - identify each concrete source-log occurrence by its chain, gateway, block hash, transaction hash, and log index;
 - enforce one PostgreSQL row per exact source event across retries, rescans, and clean process restarts;
+- persist canonical metadata for every scanned source block, including blocks without matching events;
 - persist complete messages and source-event provenance in PostgreSQL with an initial `OBSERVED` status;
+- advance each message through `OBSERVED → FINALIZING → FINALIZED` using a configurable source-block depth;
+- detect a source-chain divergence before indexing or finality advancement and recover from the common ancestor;
+- preserve orphaned unfinalized occurrences as terminal `REORGED` audit records while re-indexing the replacement branch;
+- fail closed without database mutation when a detected fork reaches a `FINALIZED` occurrence;
+- treat only `FINALIZED` messages as eligible for a future batching component;
+- preserve finality state and timestamps across duplicate event ingestion;
 - resume normal indexing from a persistent next-block cursor after a clean stop and restart.
 
 ## Architecture
@@ -59,10 +66,22 @@ Unknown EOA or contract ──────────────────�
                                                                      Chain A Indexer
                                                                                │
                                                                                v
-                                                                    PostgreSQL / OBSERVED
+                                                       PostgreSQL / canonical block history
+                                                               │              │
+                                                               v              v
+                                                        OBSERVED          reorg check
+                                                               │              │
+                                                               v              v
+                                                        FINALIZING        REORGED
+                                                               │
+                                                               v
+                                                         FINALIZED
+                                                               │
+                                                               v
+                                                future batching (not implemented)
 ```
 
-`IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The Indexer persists emitted source events; it does not add proof-to-message binding. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
+`IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The Indexer persists emitted source events, and the Finality Watcher advances their database lifecycle; neither component adds proof-to-message binding. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
 
 ## Cross-Chain Messages
 
@@ -357,9 +376,9 @@ After deployment, the source-authorization administrator explicitly authorizes `
 
 This transport entry point remains separate from `verifySupplier`. It does not require a proof, check stored supplier authorization, or consume a nullifier. Gateway authorization establishes which application contract may create a message; it does not authenticate the EOA calling that application or bind a proof nullifier to a message.
 
-## Chain A Indexer
+## Chain A Indexer and Finality Watcher
 
-The Node.js Indexer consumes only `CrossChainMessage` logs emitted by the configured `SOURCE_GATEWAY_ADDRESS`. At startup it verifies the RPC chain ID against `CHAIN_A_DOMAIN` and confirms that the configured Gateway address contains contract bytecode. It then reads a persistent cursor from PostgreSQL and queries logs with bounded `fromBlock` and `toBlock` ranges.
+The Node.js Indexer consumes only `CrossChainMessage` logs emitted by the configured `SOURCE_GATEWAY_ADDRESS`. At startup it verifies the RPC chain ID against `CHAIN_A_DOMAIN` and confirms that the configured Gateway address contains contract bytecode. It reads one fixed Chain A head, reconciles persisted canonical history against that head, then queries logs with bounded `fromBlock` and `toBlock` ranges. One-shot indexing never extends beyond the head captured at startup.
 
 Before persistence, each event is decoded using the current `SourceGateway` event ABI. The Indexer computes `keccak256(payload)`, reconstructs the canonical ABI-encoded message, and requires the resulting message ID to equal the indexed event value. A mismatch fails the current range. Addresses and hashes are stored as lowercase hexadecimal text, the complete payload is stored as `BYTEA`, and protocol integers use `NUMERIC(78,0)` with JavaScript `BigInt` or decimal strings.
 
@@ -375,7 +394,7 @@ source log index
 
 PostgreSQL enforces uniqueness over those five fields. Ingestion uses conflict-aware insertion, so reading the same exact log again does not create another `source_messages` row. After a uniqueness conflict, the Indexer reads the existing row through the same transaction and verifies every immutable message and provenance field against the newly decoded event. Consistent duplicates are counted and skipped. An inconsistent duplicate fails and rolls back the complete scanned range.
 
-The block hash is part of the identity so the same transaction and log index under another block hash remains a distinct source occurrence. The current Indexer records both occurrences if it observes them; it does not determine which one belongs to the canonical chain or reconcile source reorgs.
+The block hash is part of the identity, so the same transaction and log index under another block hash remains a distinct source occurrence. If a replacement branch emits the same protocol message, both occurrences remain available for audit: the orphaned row is `REORGED`, while the replacement occurrence begins as a new `OBSERVED` row with its own block hash. `REORGED` describes only that exact source-event occurrence; it does not revoke a credential or protocol message ID and does not represent destination execution.
 
 ### Persistent message data
 
@@ -386,17 +405,62 @@ The `source_messages` table stores:
 - source block number and block hash;
 - source transaction hash and log index;
 - the PostgreSQL observation timestamp;
-- the initial status `OBSERVED`.
+- the lifecycle status;
+- the time a message first entered `FINALIZING`;
+- the finalization time and the fixed head used for the successful finality decision;
+- the time an unfinalized occurrence was classified as `REORGED`.
 
-`OBSERVED` means that the Indexer saw and persisted a source event from the current Chain A view. It does not mean that the block is finalized, reorg-safe, approved by validators, batched, or ready for destination delivery. Block hashes are retained as event provenance for future reconciliation, while the current Indexer does not detect or repair reorgs.
+The `indexed_source_blocks` table stores the number, hash, and parent hash of every scanned block under the configured source domain and Gateway scope. Eventless blocks are recorded as part of the same continuous ancestry. A scanned range commits its complete block metadata, messages, duplicate checks, and next-block cursor in one PostgreSQL transaction.
+
+### Finality lifecycle
+
+The independent Finality Watcher reads the Chain A head exactly once per pass and reconciles canonical block history before evaluating any message. It then evaluates every `OBSERVED` or `FINALIZING` message scoped to the configured chain domain and source Gateway inside one PostgreSQL transaction. Every candidate in the pass is evaluated against the same fixed head.
+
+The configured policy is:
+
+```text
+headBlock >= sourceBlock + FINALITY_BLOCK_DEPTH
+```
+
+The depth counts successor blocks. At depth `2`, a source message in block `N` becomes final at head `N + 2`. Equality is sufficient. A depth of `0` immediately finalizes a message when its source block is at or below the watcher head and provides no confirmation-depth protection.
+
+The lifecycle states are:
+
+- `OBSERVED` records durable ingestion before the watcher evaluates the event;
+- `FINALIZING` records that the event has been evaluated and still lacks the configured depth;
+- `FINALIZED` records that the fixed watcher head satisfied the configured depth;
+- `REORGED` preserves an orphaned `OBSERVED` or `FINALIZING` occurrence as an audit record.
+
+An already-deep `OBSERVED` message moves directly to `FINALIZED`; its `finalizing_at` remains `NULL` because it never entered `FINALIZING`. `FINALIZED` and `REORGED` are terminal. Later watcher passes and exact-event rescans preserve their status and timestamps. Only `FINALIZED` rows are exposed as eligible input for future batching; `OBSERVED`, `FINALIZING`, and `REORGED` are excluded. This repository does not yet implement the batcher.
+
+This remains an operator-configured source confirmation policy and does not provide absolute consensus finality or a cryptographic finality proof.
+
+### Canonical history and source reorganization recovery
+
+Before either the Indexer scans a new range or the Finality Watcher advances lifecycle state, the reconciler compares the newest persisted canonical block that is visible at the fixed RPC head with the block returned by Chain A. A matching hash takes the fast path. A hash mismatch or head regression walks persisted blocks backward and compares them with the current chain until it finds the common ancestor.
+
+Recovery from a fork is atomic under the configured source scope:
+
+1. lock the source cursor and the persisted common ancestor;
+2. lock message occurrences from the fork block onward;
+3. abort if any affected occurrence is already `FINALIZED`;
+4. mark affected `OBSERVED` and `FINALIZING` occurrences as `REORGED` while preserving their message data, provenance, observation time, and any `finalizing_at` timestamp;
+5. delete canonical block records from the fork block onward;
+6. rewind the cursor to the fork block so normal indexing can persist the replacement branch.
+
+If a fork reaches `FINALIZED`, the recovery transaction rolls back completely. Message rows, canonical block records, and the cursor remain unchanged so an operator can investigate the finality-policy violation. If no common ancestor exists in retained history, recovery also stops for manual intervention.
+
+When the canonical block table is empty while a cursor or message rows already exist, the reconciler fetches the historical block range through the last committed block and verifies every existing message block hash before storing the history. A mismatch or a stored range beyond the current head fails closed because safe automatic reconstruction is unavailable.
 
 ### Cursor and restart behavior
 
 The `indexer_cursors` table scopes each cursor by Chain A domain and source Gateway. Its `next_block` value is the first block not yet committed by the Indexer. A new cursor starts at `SOURCE_GATEWAY_START_BLOCK`; an existing cursor takes precedence over the configured start block.
 
-For each range, all message inserts, duplicate consistency checks, and the cursor update execute in one PostgreSQL transaction through one `pg` client. A failed validation or query rolls back the complete range. Logs are sorted by block number and log index before insertion, and multiple messages in one block are committed together with the range cursor. A matching duplicate does not change its first `observed_at` value or current lifecycle status, and a range containing only matching duplicates still advances the cursor. Cursor updates are monotonic during normal ingestion.
+For each range, canonical block inserts, message inserts, duplicate consistency checks, and the cursor update execute in one PostgreSQL transaction through one `pg` client. A failed validation or query rolls back the complete range. Logs are sorted by block number and log index before insertion, and multiple messages in one block are committed together with the range cursor. A matching duplicate does not change its first `observed_at` value or current lifecycle status, and a range containing only matching duplicates still advances the cursor. Cursor updates are monotonic during normal ingestion and move backward only during atomic fork recovery.
 
-One-shot mode reads the chain head once at startup, scans only through that fixed snapshot, and exits. Continuous mode repeatedly catches up to a new snapshot and waits for `INDEXER_POLL_INTERVAL_MS` between polls. A clean restart uses the stored cursor and continues without rescanning from genesis. If a retry or deliberate rescan encounters an already stored event, database uniqueness prevents a duplicate row. The runtime assumes one active Indexer; cursor coordination across concurrent instances, full crash recovery, finality tracking, and reorg rollback are not implemented.
+Indexer one-shot mode reads the chain head once at startup, scans only through that fixed snapshot, and exits. Continuous mode repeatedly catches up to a new snapshot and waits for `INDEXER_POLL_INTERVAL_MS` between polls. A clean restart uses the stored cursor and continues without rescanning from genesis. If a retry or deliberate rescan encounters an already stored event, database uniqueness prevents a duplicate row.
+
+The Finality Watcher runs independently from the Indexer. Its one-shot mode performs one fixed-head reconciliation and finality pass, while continuous mode repeats passes with `FINALITY_POLL_INTERVAL_MS` between them. The runtime assumes one active Indexer and one active Finality Watcher. Multi-instance coordination and full process-level crash recovery remain unimplemented.
 
 ### Runtime configuration
 
@@ -409,9 +473,11 @@ One-shot mode reads the chain head once at startup, scans only through that fixe
 | `DATABASE_URL` | PostgreSQL connection string |
 | `INDEXER_BLOCK_RANGE` | Maximum blocks queried per range; defaults to `2000` |
 | `INDEXER_POLL_INTERVAL_MS` | Continuous-mode polling delay; defaults to `1000` |
+| `FINALITY_BLOCK_DEPTH` | Required non-negative source confirmation depth; `0` allows immediate finalization |
+| `FINALITY_POLL_INTERVAL_MS` | Continuous Finality Watcher polling delay; defaults to `1000` |
 | `INDEXER_DB_SCHEMA` | PostgreSQL schema; defaults to `cross_chain_indexer` |
 
-Apply the migration and run a one-shot catch-up from `indexer/`:
+Apply the migrations and run a one-shot catch-up from `indexer/`:
 
 ```bash
 export CHAIN_A_RPC_URL='http://127.0.0.1:4545'
@@ -419,6 +485,8 @@ export CHAIN_A_DOMAIN='10011'
 export SOURCE_GATEWAY_ADDRESS='<deployed-source-gateway>'
 export SOURCE_GATEWAY_START_BLOCK='<source-gateway-deployment-block>'
 export DATABASE_URL='postgresql://<user>:<password>@127.0.0.1/<database>'
+export FINALITY_BLOCK_DEPTH='2'
+export FINALITY_POLL_INTERVAL_MS='1000'
 
 npm run migrate
 npm run catch-up
@@ -428,6 +496,13 @@ Run the continuous service with the same configuration:
 
 ```bash
 npm start
+```
+
+Run one Finality Watcher pass or the continuous watcher with the same configuration:
+
+```bash
+npm run finality:once
+npm run finality
 ```
 
 ## Local Two-Chain Environment
@@ -569,7 +644,7 @@ The script:
 
 Generated circuits, witnesses, proofs, public signals, ptau files, and zkey files are written under `zk/build/`. Generated Solidity cryptographic source is written under `contracts/generated/`. Both locations are excluded from source control.
 
-### Chain A Indexer
+### Chain A Indexer and Finality Watcher
 
 Run the Indexer unit suite after installing its packages:
 
@@ -586,7 +661,7 @@ export INDEXER_DB_SCHEMA='cross_chain_indexer_database_test'
 npm run test:database
 ```
 
-The real Chain A integration, including message production and clean restart continuation, runs through the unified repository verification flow because it needs the deployed protocol contracts and both local chains.
+The real Chain A integration runs through the unified repository verification flow because it needs the deployed protocol contracts and both local chains. It covers fixed-snapshot indexing, clean restart continuation, exact-event rescans, real `OBSERVED → FINALIZING → FINALIZED` transitions, eventless block tracking, and snapshot/revert replacement of an unfinalized branch.
 
 ## Complete Verification
 
@@ -616,10 +691,18 @@ The script uses strict error handling and performs:
 16. creation of a fresh message after the configured Indexer start block;
 17. one-shot indexing through a fixed startup chain-head snapshot;
 18. canonical message recomputation and complete `OBSERVED` row verification;
-19. persistence of the scoped `next_block` cursor and deterministic source-event uniqueness;
-20. a deliberate real-block rescan that preserves one row, `observed_at`, status, and cursor progress;
-21. a mixed range in which an old event is skipped and a later event is inserted;
-22. clean Indexer stop, another message creation, and normal restart from the stored cursor.
+19. transition to `FINALIZING` while the configured source-block depth is unmet;
+20. exact-boundary transition to `FINALIZED` using one fixed watcher head;
+21. exclusion of `OBSERVED`, `FINALIZING`, and `REORGED` rows from future batch eligibility;
+22. terminal `FINALIZED` stability across another watcher pass;
+23. deliberate real-block rescan that preserves one row and all lifecycle metadata;
+24. independent finalization of a later message at its own depth boundary;
+25. clean Indexer stop, another message creation, and normal restart from the stored cursor;
+26. canonical metadata persistence for event-bearing and eventless source blocks;
+27. real Anvil snapshot/revert branch replacement;
+28. common-ancestor discovery by the Finality Watcher before lifecycle advancement;
+29. atomic `REORGED` classification, canonical-history deletion, and cursor rewind;
+30. replacement-branch re-indexing and independent finalization while the orphaned occurrence remains terminal.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -635,7 +718,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Idempotent Chain A Event Ingestion
+Source Reorg Detection and Recovery
 ```
 
 ### Expected error output
@@ -697,23 +780,33 @@ Cross-Chain/
 ├── indexer/
 │   ├── migrations/
 │   │   ├── 001_chain_a_indexer.sql
-│   │   └── 002_idempotent_event_ingestion.sql
+│   │   ├── 002_idempotent_event_ingestion.sql
+│   │   ├── 003_finality_watcher.sql
+│   │   └── 004_source_reorg_detection.sql
 │   ├── src/
+│   │   ├── canonical-block.mjs
 │   │   ├── canonical-message.mjs
 │   │   ├── check-database.mjs
 │   │   ├── config.mjs
 │   │   ├── db.mjs
+│   │   ├── finality-policy.mjs
+│   │   ├── finality-watcher.mjs
 │   │   ├── indexer.mjs
 │   │   ├── main.mjs
 │   │   ├── migrate.mjs
+│   │   ├── reorg-detector.mjs
 │   │   ├── source-event-identity.mjs
 │   │   └── source-gateway-event.mjs
 │   ├── test/
+│   │   ├── canonical-block.test.mjs
 │   │   ├── canonical-message.test.mjs
 │   │   ├── config.test.mjs
 │   │   ├── database.test.mjs
+│   │   ├── finality-policy.test.mjs
+│   │   ├── finality-watcher.test.mjs
 │   │   ├── indexer.test.mjs
 │   │   ├── integration.test.mjs
+│   │   ├── reorg-detector.test.mjs
 │   │   └── source-event-identity.test.mjs
 │   ├── package.json
 │   └── package-lock.json
@@ -770,13 +863,15 @@ Cross-Chain/
 - Gateway revocation affects future message creation only. It does not invalidate previously emitted messages or alter historical message IDs.
 - `IdentityApplicationA` can call `SourceGateway`, while mandatory ZK-gated message creation and proof-to-message nullifier binding remain unimplemented.
 - The Indexer validates and persists source events, but it does not establish that a particular message was produced atomically with a ZK proof.
-- `OBSERVED` records the current Chain A view at ingestion time. It provides no finality, confirmation-depth, validator-approval, or delivery guarantee.
+- `OBSERVED` records the current Chain A view at ingestion time. `FINALIZED` means only that the configured source-block depth was reached at the recorded watcher head; it provides no validator-approval or delivery guarantee.
+- Canonical block hashes and parent hashes are tracked for every scanned block, including blocks without source events. The Indexer and Finality Watcher reconcile this history before their respective work.
+- An unfinalized orphan is retained as terminal `REORGED` data and is never batch eligible. A replacement occurrence has its own block-hash identity and lifecycle.
+- A fork that reaches a `FINALIZED` occurrence fails closed and requires operator investigation; configured block depth therefore remains a policy choice with real reorganization risk.
 - Persistent block cursors support normal clean restart continuation. Database-enforced source-event uniqueness makes exact-log retries and rescans idempotent without overwriting first-observation data or lifecycle status.
-- The runtime assumes one active Indexer. Multi-instance cursor coordination, distributed locking, and full crash recovery remain unimplemented.
-- Source block hashes are part of event identity and stored as provenance, while canonical-occurrence selection, reorg detection, orphan rollback, and common-ancestor recovery remain unimplemented.
+- The runtime assumes one active Indexer and one active Finality Watcher. Multi-instance coordination, distributed locking, and full crash recovery remain unimplemented.
 - The current message binds its protocol type, source domain, source gateway, source sender, destination domain, destination gateway, destination receiver, nonce, payload hash, and deadline.
 - A committed destination gateway is caller-selected. `SourceGateway` does not validate remote deployment, domain ownership, or trust, and no remote-gateway registry exists.
-- The repository does not provide a finality watcher, reorg handling, relayer, Merkle batching, PBFT validation, destination gateway implementation or execution, Application B, finality proof, or production cross-chain security model.
+- The repository does not provide a batcher, Merkle batch construction, relaying, PBFT validation, destination gateway implementation or execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.
