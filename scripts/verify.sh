@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Merkle Message Commitment"
+VERIFICATION_NAME="Batch Lifecycle"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -417,6 +417,12 @@ printf ' 27. Verify batch integrity, deterministic Merkle leaves, nodes, roots, 
 printf ' 28. Commit the real FINALIZED batch into a deterministic Message Root\n'
 printf ' 29. Verify real inclusion proofs and reject tampered message, root, and proof cases\n'
 printf ' 30. Rebuild the same root and proofs while preserving source state\n'
+printf ' 31. Persist one BUILDING batch per source scope and assign finalized occurrences once\n'
+printf ' 32. Atomically seal canonical membership, batch ID, count, and Message Root\n'
+printf ' 33. Verify immutable sealed snapshots, rollback, and concurrent retries\n'
+printf ' 34. Restore SEALED and CONSENSUS_PENDING snapshots in fresh processes\n'
+printf ' 35. Reject COMMITTED transitions without future PBFT quorum authorization\n'
+printf ' 36. Finalize a later real message into the next epoch and preserve old proofs\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -445,7 +451,7 @@ DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DB_SCHEMA" \
     node "$INDEXER_DIR/src/migrate.mjs"
 
-CURRENT_STEP="Chain A Indexer, recovery, batch, and Merkle commitment unit tests"
+CURRENT_STEP="Chain A Indexer, recovery, batch, Merkle, and lifecycle unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$INDEXER_DIR/test/config.test.mjs" \
@@ -457,13 +463,16 @@ node --test \
     "$INDEXER_DIR/test/indexer.test.mjs" \
     "$INDEXER_DIR/test/finality-watcher.test.mjs" \
     "$INDEXER_DIR/test/message-batch.test.mjs" \
-    "$INDEXER_DIR/test/message-merkle.test.mjs"
+    "$INDEXER_DIR/test/message-merkle.test.mjs" \
+    "$INDEXER_DIR/test/batch-lifecycle-policy.test.mjs"
 
-CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, and Merkle tests"
+CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, and lifecycle tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
-    node --test "$INDEXER_DIR/test/database.test.mjs"
+    node --test \
+        "$INDEXER_DIR/test/database.test.mjs" \
+        "$INDEXER_DIR/test/batch-lifecycle.database.test.mjs"
 
 CURRENT_STEP="local chain availability check"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1082,7 +1091,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source recovery, finality, reorg, batch, and Merkle integration"
+CURRENT_STEP="real source recovery, finality, reorg, batch, Merkle, and lifecycle integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

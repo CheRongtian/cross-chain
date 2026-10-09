@@ -43,11 +43,11 @@ function quoteIdentifier(value) {
   return `"${validateSchemaName(value)}"`;
 }
 
-function tableName(schema, table) {
+export function tableName(schema, table) {
   return `${quoteIdentifier(schema)}.${quoteIdentifier(table)}`;
 }
 
-function normalizeSourceScope(scope) {
+export function normalizeSourceScope(scope) {
   return {
     chainDomain: toUint256(scope.chainDomain, "source scope chain domain").toString(),
     sourceGateway: normalizeAddress(scope.sourceGateway, "source scope gateway"),
@@ -941,6 +941,8 @@ export async function readTableColumns(pool, schema, table) {
 export async function resetIndexerTables(pool, schema) {
   await pool.query(
     `TRUNCATE TABLE
+        ${tableName(schema, "message_batch_members")},
+        ${tableName(schema, "message_batches")},
         ${tableName(schema, "source_messages")},
         ${tableName(schema, "indexer_cursors")},
         ${tableName(schema, "indexed_source_blocks")}

@@ -23,9 +23,11 @@ import {
   readIndexedSourceBlocks,
   readMessages,
   resetIndexerTables,
+  tableName,
 } from "../src/db.mjs";
 import { createMessageBatcher } from "../src/message-batch.mjs";
 import { buildMessageMerkleTree, verifyMessageMerkleProof } from "../src/message-merkle.mjs";
+import { createBatchLifecycle } from "../src/batch-lifecycle.mjs";
 import { decodeCrossChainMessageLog } from "../src/source-gateway-event.mjs";
 
 const IDENTITY_APPLICATION_ABI = parseAbi([
@@ -33,6 +35,7 @@ const IDENTITY_APPLICATION_ABI = parseAbi([
 ]);
 const execFileAsync = promisify(execFile);
 const INDEXER_MAIN_PATH = fileURLToPath(new URL("../src/main.mjs", import.meta.url));
+const LIFECYCLE_READER_PATH = fileURLToPath(new URL("./helpers/read-batch-lifecycle.mjs", import.meta.url));
 
 function requireEnvironment(name) {
   const value = process.env[name];
@@ -61,7 +64,7 @@ function assertPersistedEvent(row, event, expectedStatus) {
   assert.ok(row.observed_at instanceof Date);
 }
 
-test("recovers source workers and deterministically batches real finalized messages", async () => {
+test("recovers source workers and seals durable batches from real finalized messages", async () => {
   const config = loadConfig();
   assert.equal(
     config.finalityBlockDepth,
@@ -710,6 +713,48 @@ test("recovers source workers and deterministically batches real finalized messa
     } finally {
       await freshBatchPool.end();
     }
+
+    const lifecycle = createBatchLifecycle({ config, pool: activePool });
+    const collected = await lifecycle.collectEligible({ initialEpoch: batchEpoch });
+    const lifecycleId = collected.snapshot.record.batchRecordId;
+    assert.equal(collected.snapshot.record.status, "BUILDING");
+    assert.equal(collected.snapshot.record.batchId, null);
+    assert.equal(collected.assignedCount, 3);
+    assert.deepEqual(collected.snapshot.members.map((member) => member.messageId).sort(), [...batch.messageIds].sort());
+    const sealed = await lifecycle.sealBatch({
+      batchRecordId: lifecycleId,
+      expectedBatchId: batch.batchId,
+      expectedMessageRoot: tree.messageRoot,
+    });
+    assert.equal(sealed.record.status, "SEALED");
+    assert.deepEqual(sealed.batch, batch);
+    assert.deepEqual(sealed.tree, tree);
+    assert.deepEqual(sealed.members.map((member) => member.position), [0n, 1n, 2n]);
+    assert.deepEqual(await lifecycle.sealBatch({ batchRecordId: lifecycleId }), sealed);
+    await assert.rejects(activePool.query(
+      `UPDATE ${tableName(config.databaseSchema, "message_batch_members")}
+          SET canonical_position = 99 WHERE batch_record_id = $1`,
+      [lifecycleId],
+    ), /membership is immutable/);
+
+    function transportValue(value) {
+      return JSON.parse(JSON.stringify(value, (_key, item) => typeof item === "bigint" ? item.toString() : item));
+    }
+    const sealedProcessRead = await execFileAsync(process.execPath, [LIFECYCLE_READER_PATH, lifecycleId], { env: process.env });
+    process.stderr.write(sealedProcessRead.stderr);
+    assert.deepEqual(JSON.parse(sealedProcessRead.stdout), transportValue(sealed));
+    const pending = await lifecycle.markConsensusPending({ batchRecordId: lifecycleId });
+    assert.equal(pending.record.status, "CONSENSUS_PENDING");
+    assert.equal(pending.record.committedAt, null);
+    assert.deepEqual(await lifecycle.markConsensusPending({ batchRecordId: lifecycleId }), pending);
+    const pendingProcessRead = await execFileAsync(process.execPath, [LIFECYCLE_READER_PATH, lifecycleId], { env: process.env });
+    process.stderr.write(pendingProcessRead.stderr);
+    assert.deepEqual(JSON.parse(pendingProcessRead.stdout), transportValue(pending));
+    await assert.rejects(activePool.query(
+      `UPDATE ${tableName(config.databaseSchema, "message_batches")}
+          SET status = 'COMMITTED', committed_at = CURRENT_TIMESTAMP WHERE batch_record_id = $1`,
+      [lifecycleId],
+    ), /PBFT quorum authorization/);
     assert.deepEqual(await readMessages(activePool, config.databaseSchema), sourceStateBeforeBatching);
     assert.deepEqual(await readCursor(activePool, config.databaseSchema, scope), cursorBeforeBatching);
     assert.deepEqual(
@@ -727,6 +772,44 @@ test("recovers source workers and deterministically batches real finalized messa
     console.log("VALID: tampered message, wrong root, wrong proof, and REORGED occurrence rejected");
     console.log("VALID: Merkle computation preserved all source lifecycle and canonical block data");
     console.log(`Deterministic Message Root: ${tree.messageRoot}`);
+    console.log("VALID: real finalized A/B/D persisted as BUILDING and atomically SEALED");
+    console.log("VALID: sealed batch and root matched the deterministic builders");
+    console.log("VALID: fresh processes recovered SEALED and CONSENSUS_PENDING snapshots");
+    console.log("VALID: sealed membership mutation and unauthorized COMMITTED transition rejected");
+
+    const messageE = await produceMessage("0x6d6573736167652065");
+    await runOneShotProcess("indexer");
+    await runOneShotProcess("finality");
+    for (let successor = 0n; successor < config.finalityBlockDepth; successor += 1n) {
+      await mineBlock();
+    }
+    await runOneShotProcess("finality");
+    const afterNewMessage = await readMessages(activePool, config.databaseSchema);
+    assert.equal(afterNewMessage.length, sourceStateBeforeBatching.length + 1);
+    assert.deepEqual(afterNewMessage.slice(0, sourceStateBeforeBatching.length), sourceStateBeforeBatching);
+    const eRow = afterNewMessage.find((row) => row.message_id === messageE.messageId);
+    assert.ok(eRow);
+    assertPersistedEvent(eRow, messageE, "FINALIZED");
+    const beforeRolloverBlocks = await readIndexedSourceBlocks(activePool, config.databaseSchema, scope);
+    const beforeRolloverCursor = await readCursor(activePool, config.databaseSchema, scope);
+    const rollover = await lifecycle.collectEligible();
+    assert.equal(rollover.assignedCount, 1);
+    assert.equal(rollover.snapshot.record.epoch, batchEpoch + 1n);
+    assert.equal(rollover.snapshot.record.status, "BUILDING");
+    assert.equal(rollover.snapshot.record.batchId, null);
+    assert.equal(rollover.snapshot.record.messageRoot, null);
+    assert.deepEqual(rollover.snapshot.members.map((member) => member.messageId), [messageE.messageId]);
+    const oldAfterRollover = await lifecycle.readBatch({ batchRecordId: lifecycleId });
+    assert.deepEqual(oldAfterRollover, pending);
+    assert.deepEqual(oldAfterRollover.tree.proofs, tree.proofs);
+    for (let index = 0; index < batch.messages.length; index += 1) {
+      assert.equal(verifyMessageMerkleProof({ batch: oldAfterRollover.batch, message: batch.messages[index], proof: oldAfterRollover.tree.proofs[index], messageRoot: oldAfterRollover.tree.messageRoot }), true);
+    }
+    assert.deepEqual(await readMessages(activePool, config.databaseSchema), afterNewMessage);
+    assert.deepEqual(await readIndexedSourceBlocks(activePool, config.databaseSchema, scope), beforeRolloverBlocks);
+    assert.deepEqual(await readCursor(activePool, config.databaseSchema, scope), beforeRolloverCursor);
+    console.log("VALID: real Message E finalized after sealing and entered the next BUILDING epoch");
+    console.log("VALID: old membership, batch ID, root, and proofs remained unchanged after rollover");
   } finally {
     for (const worker of activeWorkers) {
       worker.kill("SIGKILL");

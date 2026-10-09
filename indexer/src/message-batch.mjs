@@ -181,7 +181,7 @@ export function validateMessageBatch(batch) {
   return canonical;
 }
 
-function databaseRowToBatchMessage(row) {
+export function databaseRowToBatchMessage(row) {
   if (!Buffer.isBuffer(row.payload) && !(row.payload instanceof Uint8Array)) {
     throw new Error("stored batch message payload must be bytes");
   }
