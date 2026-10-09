@@ -29,6 +29,7 @@ import { createMessageBatcher } from "../src/message-batch.mjs";
 import { buildMessageMerkleTree, verifyMessageMerkleProof } from "../src/message-merkle.mjs";
 import { createBatchLifecycle } from "../src/batch-lifecycle.mjs";
 import { decodeCrossChainMessageLog } from "../src/source-gateway-event.mjs";
+import { verifyFourIndependentValidators } from "../../validator/test/helpers/four-process.mjs";
 
 const IDENTITY_APPLICATION_ABI = parseAbi([
   "function sendCrossChainMessage(uint256 destinationDomain, address destinationGateway, address destinationReceiver, bytes payload, uint256 deadline) returns (bytes32 messageId, uint256 nonce)",
@@ -843,6 +844,8 @@ test("recovers source workers and seals durable batches from real finalized mess
     assert.deepEqual(await readCursor(activePool, config.databaseSchema, scope), beforeRolloverCursor);
     console.log("VALID: real Message E finalized after sealing and entered the next BUILDING epoch");
     console.log("VALID: old membership, batch ID, root, and proofs remained unchanged after rollover");
+    await verifyFourIndependentValidators({ sourceConfig: config, sourcePool: activePool,
+      snapshot: oldAfterRollover, pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE") });
   } finally {
     for (const worker of activeWorkers) {
       worker.kill("SIGKILL");

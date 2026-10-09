@@ -1,0 +1,14 @@
+{
+  "name": "cross-chain-validator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "migrate": "node src/migrate.mjs",
+    "test": "node --test test/config.test.mjs test/handshake.test.mjs test/source-validation.test.mjs test/server.test.mjs",
+    "test:database": "node --test test/database.test.mjs"
+  },
+  "dependencies": { "pg": "8.23.1", "viem": "2.56.9" }
+}

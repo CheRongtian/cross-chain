@@ -9,6 +9,7 @@ contracts/broadcast/
 contracts/generated/
 zk/node_modules/
 indexer/node_modules/
+validator/node_modules/
 indexer/.env
 zk/build/
 zk/generated/

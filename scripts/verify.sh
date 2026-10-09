@@ -6,8 +6,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
+VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Shared Merkle Compatibility"
+VERIFICATION_NAME="Independent Validator Foundation"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -51,6 +52,7 @@ FINALITY_POLL_INTERVAL_MS="${FINALITY_POLL_INTERVAL_MS:-100}"
 STARTED_CHAINS="false"
 CHAINS_PID=""
 TEMP_DIR=""
+VALIDATOR_PID_FILE=""
 CURRENT_STEP="initialization"
 LAST_TX_HASH=""
 
@@ -320,9 +322,35 @@ verify_message_event() {
 
 cleanup() {
     local exit_code=$?
+    local validator_pid
+    local validator_attempt
+    local validators_alive
 
     trap - EXIT INT TERM
     set +e
+
+    if [[ -n "$VALIDATOR_PID_FILE" ]] && [[ -f "$VALIDATOR_PID_FILE" ]]; then
+        while IFS= read -r validator_pid; do
+            if [[ "$validator_pid" =~ ^[1-9][0-9]*$ ]]; then
+                kill "$validator_pid" 2>/dev/null || true
+            fi
+        done < "$VALIDATOR_PID_FILE"
+        for validator_attempt in {1..50}; do
+            validators_alive="false"
+            while IFS= read -r validator_pid; do
+                if [[ "$validator_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$validator_pid" 2>/dev/null; then
+                    validators_alive="true"
+                fi
+            done < "$VALIDATOR_PID_FILE"
+            [[ "$validators_alive" == "true" ]] || break
+            sleep 0.1
+        done
+        while IFS= read -r validator_pid; do
+            if [[ "$validator_pid" =~ ^[1-9][0-9]*$ ]]; then
+                kill -KILL "$validator_pid" 2>/dev/null || true
+            fi
+        done < "$VALIDATOR_PID_FILE"
+    fi
 
     if [[ "$STARTED_CHAINS" == "true" ]] && [[ -n "$CHAINS_PID" ]]; then
         printf '\nStopping the local chains started by this verification...\n'
@@ -333,7 +361,8 @@ cleanup() {
     if [[ -n "$TEMP_DIR" ]] && [[ -d "$TEMP_DIR" ]]; then
         rm -f -- \
             "$TEMP_DIR/deploy-output.log" \
-            "$TEMP_DIR/deployment-addresses.env"
+            "$TEMP_DIR/deployment-addresses.env" \
+            "$TEMP_DIR/validator-pids"
         rmdir "$TEMP_DIR" 2>/dev/null || true
     fi
 
@@ -427,6 +456,12 @@ printf ' 37. Detect committed Merkle fixture drift without rewriting expected va
 printf ' 38. Match off-chain and Solidity domains, leaves, nodes, roots, and proofs to one shared fixture\n'
 printf ' 39. Reject shared cross-runtime proof mutations and encoding mismatches\n'
 printf ' 40. Verify fresh-process SEALED A/B/D proofs in the Solidity test-local EVM\n'
+printf ' 41. Test validator identities, handshake domains, HTTP inputs, and independent source validation\n'
+printf ' 42. Apply validator-owned migrations and verify four isolated identity-bound stores\n'
+printf ' 43. Start four independent validator processes and authenticate all directed peer pairs\n'
+printf ' 44. Verify each validator rechecks real Chain A blocks, receipts, logs, and fixed-head finality\n'
+printf ' 45. Reject corrupt real candidates and wrong chain, Gateway, or validator identity\n'
+printf ' 46. Restart V4, preserve independent local observations, and leave batches CONSENSUS_PENDING\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -440,6 +475,8 @@ NODE_MAJOR_VERSION="$(node -p 'Number(process.versions.node.split(".")[0])')"
     || fail "Indexer dependencies are missing. Run 'cd indexer && npm ci' before verification."
 [[ -f "$INDEXER_DIR/node_modules/pg/package.json" ]] \
     || fail "Indexer dependencies are missing. Run 'cd indexer && npm ci' before verification."
+[[ -f "$VALIDATOR_DIR/node_modules/viem/package.json" ]] && [[ -f "$VALIDATOR_DIR/node_modules/pg/package.json" ]] \
+    || fail "Validator dependencies are missing. Prepare the validator package dependencies before verification; this script does not install them."
 printf 'Verified Node.js version: %s\n' "$(node --version)"
 printf 'Verified Indexer dependency directories.\n'
 
@@ -482,6 +519,20 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
     node --test \
         "$INDEXER_DIR/test/database.test.mjs" \
         "$INDEXER_DIR/test/batch-lifecycle.database.test.mjs"
+
+CURRENT_STEP="independent validator unit tests"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test \
+    "$VALIDATOR_DIR/test/config.test.mjs" \
+    "$VALIDATOR_DIR/test/handshake.test.mjs" \
+    "$VALIDATOR_DIR/test/source-validation.test.mjs" \
+    "$VALIDATOR_DIR/test/server.test.mjs"
+
+CURRENT_STEP="isolated validator database migrations and persistence tests"
+printf '\n[%s]\n' "$CURRENT_STEP"
+DATABASE_URL="${VALIDATOR_VERIFICATION_DATABASE_URL:-$DATABASE_URL}" \
+VALIDATOR_DATABASE_TEST_SCHEMA="cross_chain_validator_database_verification" \
+    node --test "$VALIDATOR_DIR/test/database.test.mjs"
 
 CURRENT_STEP="local chain availability check"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -635,6 +686,8 @@ printf '\n[%s]\n' "$CURRENT_STEP"
 TEMP_PARENT="${TMPDIR:-/tmp}"
 TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-verification.XXXXXX")"
 DEPLOYMENT_ADDRESSES_FILE="$TEMP_DIR/deployment-addresses.env"
+VALIDATOR_PID_FILE="$TEMP_DIR/validator-pids"
+: > "$VALIDATOR_PID_FILE"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_EXPECTED_ID="$CHAIN_A_ID" \
 VERIFIER_DEPLOYER_KEY="$ANVIL_DEV_KEY" \
@@ -1104,7 +1157,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source recovery, finality, reorg, batch, Merkle, lifecycle, and Solidity compatibility integration"
+CURRENT_STEP="real source recovery, lifecycle, Solidity compatibility, and four independent validators integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \
@@ -1121,6 +1174,7 @@ INDEXER_INTEGRATION_PRIVATE_KEY="$ANVIL_DEV_KEY" \
 INDEXER_INTEGRATION_DESTINATION_DOMAIN="$CHAIN_B_ID" \
 INDEXER_INTEGRATION_DESTINATION_GATEWAY="$DESTINATION_GATEWAY" \
 INDEXER_INTEGRATION_DESTINATION_RECEIVER="$DESTINATION_RECEIVER" \
+VALIDATOR_VERIFICATION_PID_FILE="$VALIDATOR_PID_FILE" \
     node --test "$INDEXER_DIR/test/integration.test.mjs"
 
 CURRENT_STEP="complete"

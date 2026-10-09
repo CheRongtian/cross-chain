@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent idempotent source-event indexing, configurable source-block finality tracking, source-chain reorganization recovery, restart-safe single-node workers, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and a persistent batch lifecycle. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, an identity application that can create canonical outbound messages through the gateway, a PostgreSQL-backed Indexer, an independent Finality Watcher, a batch builder for finalized source messages, durable sealed Message Roots with reproducible inclusion proofs, and a pure Solidity Merkle primitive constrained by shared golden vectors.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, a persistent batch lifecycle, and four independent validator processes. It provides a source-chain gateway, a two-chain local environment, user-held credential proofs, an identity application, a PostgreSQL-backed Indexer and Finality Watcher, durable sealed Message Roots, and validators that independently recheck Chain A and retain isolated local observations. PBFT consensus and destination execution are not implemented.
 
 The current implementation can:
 
@@ -51,7 +51,12 @@ The current implementation can:
 - preserve finality state and timestamps across duplicate event ingestion;
 - recover the Indexer from a persisted next-block cursor after graceful or abrupt process loss;
 - preserve `OBSERVED`, `FINALIZING`, `FINALIZED`, and `REORGED` lifecycle data across worker restarts;
-- recreate a failed or closed PostgreSQL client and continue from durable database state.
+- recreate a failed or closed PostgreSQL client and continue from durable database state;
+- run four independent validator processes with distinct secp256k1 identities and isolated state;
+- authenticate configured peer identities with source-bound challenge-response signatures;
+- independently verify canonical source blocks, receipts, raw event logs, and fixed-head finality;
+- reconstruct each candidate's batch ID and Message Root using the existing protocol implementations;
+- preserve validator-local validation observations across fresh-process restarts without granting commit authority.
 
 ## Architecture
 
@@ -104,6 +109,10 @@ Unknown EOA or contract ──────────────────�
                                                                │
                                                                v
                                                      CONSENSUS_PENDING
+                                                               │
+                                                               v
+                                              V1 / V2 / V3 / V4 independent processes
+                                              own key + state + Chain A RPC checks
 ```
 
 `IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The Indexer persists emitted source events, and the Finality Watcher advances their database lifecycle; neither component adds proof-to-message binding. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
@@ -113,6 +122,8 @@ The Indexer and Finality Watcher are disposable worker processes. Their durable 
 The batch lifecycle assigns finalized source occurrences to durable batch records. Sealing reuses the deterministic batch and Merkle builders to persist an immutable snapshot, and reading it reconstructs its inclusion proofs. Batch operations preserve source lifecycle state. `COMMITTED` is reserved for future PBFT quorum authorization; consensus and destination delivery are outside the current implementation.
 
 The same commitment primitive is implemented in JavaScript and Solidity. Shared committed vectors constrain both runtimes, and complete verification passes a reconstructed real sealed batch into Foundry's local EVM. This compatibility path does not deploy a destination endpoint or execute a message on Chain B.
+
+Each validator reads the immutable source candidate and independently rechecks Chain A. Its local `VALID` or `INVALID` result is an observation, with no PBFT vote, quorum, or authorization to change the source batch lifecycle. Four local `VALID` results leave the batch `CONSENSUS_PENDING`.
 
 ## Cross-Chain Messages
 
@@ -701,6 +712,78 @@ Fresh clients and processes recover the same sealed or pending snapshot without 
 
 Batch membership uniqueness provides durable assignment ownership. It does not establish exactly-once consensus, relaying, destination execution, or delivery.
 
+## Independent Validators
+
+The `validator/` subsystem runs one validator per Node.js process. The configured static set contains exactly four unique secp256k1-derived Ethereum addresses and four distinct HTTP endpoints. V1–V4 are verification aliases, not cryptographic identities. Each process has its own key, memory, endpoint, PostgreSQL namespace, and source RPC client. The production configuration supports separate database servers as well as isolated schemas on one server.
+
+There is no primary, proposal, consensus view, validator-set epoch, vote, quorum calculation, or quorum certificate. The foundation produces local validation observations only. Even four successful independent validations cannot authorize `CONSENSUS_PENDING → COMMITTED`.
+
+### Identity and persistence
+
+Private keys enter through `VALIDATOR_PRIVATE_KEY`. They are never included in public identity responses, validation observations, or PostgreSQL records. Verification constructs development-only keys at runtime and injects them into child-process environments without printing them. These keys must not be used for production validators.
+
+Validator migrations are owned by `validator/migrations/`; Indexer migrations and source tables remain unchanged. The validator process requires its local migration to have been applied explicitly before startup. Startup binds or checks one persistent identity, verifies source connectivity and Chain A context, and only then opens the HTTP endpoint. A failed prerequisite exits nonzero.
+
+The local schema contains:
+
+- `validator_metadata`: one immutable validator address, source domain/Gateway, finality policy, and protocol version;
+- `validated_batch_bindings`: one immutable batch ID, epoch, root, count, and ordered public source-occurrence references;
+- `validation_observations`: immutable `VALID`/`INVALID` observations keyed by batch ID and source-head hash, with exact head number and an operational timestamp.
+
+Opening an existing namespace with another key, Gateway, domain, or finality policy fails closed. Same-snapshot validation at the same head is idempotent. A different head adds an observation without deleting history. A changed root, epoch, or occurrence membership for an existing batch ID, or contradictory results at the same head, cannot overwrite prior state. No operational timestamp or local observation enters a message ID, batch ID, Merkle hash, or future consensus signature.
+
+An integrity-checked candidate that fails canonical-block or depth validation can produce a local `INVALID` observation. A malformed or corrupt snapshot cannot establish a batch binding; its request is rejected without recording its untrusted cryptographic assertions. Unavailable RPC data cannot produce `VALID` or overwrite an earlier observation. Validator operations never repair or rewrite source history.
+
+### Independent source validation
+
+`POST /validate-batch` accepts only a canonical `batchId` reference. The process loads the candidate from its configured source database through the existing lifecycle reconstruction and accepts only `SEALED` or `CONSENSUS_PENDING`. It independently performs:
+
+1. RPC chain-ID and configured SourceGateway-bytecode checks;
+2. one fixed latest Chain A head number/hash for the complete pass;
+3. canonical block-hash comparison for every member;
+4. successful transaction receipt and exact block/transaction/log occurrence checks;
+5. raw topics/data decoding through the existing SourceGateway event decoder, with complete canonical message comparison;
+6. exact successor-depth finality through the existing `isFinalizedByDepth` policy using that fixed head;
+7. deterministic batch reconstruction and Message Root recomputation through the existing production builders;
+8. a check that the fixed head's block hash still matches before persisting the local observation.
+
+`FINALIZED` in PostgreSQL is an eligibility input, not independent source truth. A source block above the fixed head, insufficient depth, missing or changed log, wrong context, or canonical mismatch fails closed. A fork affecting finalized members is not repaired by validators. Source-layer reconciliation and operator investigation retain that responsibility. Proof verification and outbound message creation also remain separate application operations; the validator layer adds no atomic ZK-to-message binding.
+
+### Peer transport and HTTP API
+
+The transport uses Node's built-in HTTP implementation. Requests have a bounded JSON body and strict fields. Public endpoints expose no secrets:
+
+| Endpoint | Responsibility |
+| --- | --- |
+| `GET /health` | Alive/PID information and readiness after local identity, source DB, and RPC prerequisite checks |
+| `GET /identity` | Public validator identity and source policy context |
+| `GET /observations` | This validator's own persisted validation history |
+| `POST /handshake` | Sign a known peer's fresh bytes32 challenge in the identity-handshake domain |
+| `POST /connect-peer` | Authenticate one configured peer using an independently generated challenge |
+| `POST /validate-batch` | Independently validate a referenced source batch |
+
+Handshake hashing is `keccak256(abi.encode(HANDSHAKE_DOMAIN, sourceDomain, sourceGateway, validatorAddress, challenge))`, with the type string `ValidatorIdentityHandshake(uint256 sourceDomain,address sourceGateway,address validator,bytes32 challenge)`. The response uses Ethereum personal-message signing of that raw digest. The requester recovers the signer and checks the expected static peer identity, source context, and challenge. Changed challenges, identities, context, signatures, and replay against a new challenge fail. No persistent handshake anti-replay ledger is needed; freshness belongs to the requester.
+
+This handshake proves peer key control. It is not a PBFT vote, encrypted transport, or authenticated consensus session. A validation request triggers independent reads and cannot upload a trusted tree/root or grant commit authority.
+
+### Configuration
+
+`validator/.env.example` documents one process's operator configuration. Real keys and database passwords belong only in an ignored `.env` or process environment. Required values include `VALIDATOR_PRIVATE_KEY`, listen host/port, `VALIDATOR_DATABASE_URL`/`VALIDATOR_DB_SCHEMA`, `SOURCE_DATABASE_URL`/`SOURCE_DB_SCHEMA`, Chain A RPC/domain, deployed SourceGateway, finality depth, and `VALIDATOR_PEERS` as four `{ address, url }` entries including self. The self endpoint must match the listen configuration; duplicate addresses/endpoints and malformed or incomplete sets fail early.
+
+Source and local state may use the same PostgreSQL server, but must use distinct schemas or databases. A validator never shares writable local state with another validator. Schema identifiers are validated and queries carrying network references are parameterized. Source access reuses the lifecycle's read/locking operations and performs no source-row writes; it does not apply Indexer migrations.
+
+Complete verification continues to load the root `.env`. Its development validators use the existing `DATABASE_URL` with four isolated schemas by default. `VALIDATOR_VERIFICATION_DATABASE_URL` optionally selects another already-prepared local database. No additional password or permanent validator-key configuration is required for this development verification flow.
+
+### Verification and recovery
+
+Unit tests cover configuration, independent identities, domain-separated handshakes, bounded HTTP inputs, exact large-integer finality, fixed-head source checks, raw-log mutations, and malformed snapshots. Database tests use four distinct namespaces and cover identity binding, isolation, rerunnable migration, immutable observations, conflicting snapshot rejection, and recovery through fresh pools.
+
+The existing real integration preserves A/B/D finalization, C reorganization, sealed Solidity proofs, and E rollover, then starts V1–V4 as four real processes. Test-only RPC forwarding observers record each process's actual Chain A requests without changing their responses. Every validator must independently fetch receipts, use one latest-head snapshot per pass, reconstruct the pending batch, and persist its own observation. All directed peer pairs authenticate.
+
+The flow stops V4 and verifies that V1/V2/V3 remain alive with unchanged state, rejects a different key opening V4's store, and starts a fresh V4 process that recovers its observation and validates idempotently. Corrupt root/block and injected `REORGED` cases use isolated copies of real source data, never the original source tables. Separate negative profiles cover insufficient RPC depth, wrong chain, and missing Gateway bytecode. The complete original source rows, cursor, canonical blocks, batch statuses, and membership are compared before and after validator operations.
+
+The integration helper tracks only its own child processes and handles failure and interruption cleanup. The root script also maintains an owned PID registry for fallback cleanup; it never targets unrelated validator processes. These recovery tests establish local persistence and process isolation, not PBFT fault tolerance or consensus liveness.
+
 ## Local Two-Chain Environment
 
 `scripts/start-chains.sh` starts two Anvil chains:
@@ -769,15 +852,19 @@ cd ..
 cd indexer
 npm ci
 cd ..
+
+cd validator
+npm ci
+cd ..
 ```
 
-The Indexer pins `viem` to `2.56.9` and `pg` to `8.23.1`. Its dependency tree is recorded in `indexer/package-lock.json`, so clean installations should use `npm ci`.
+The Indexer and validator packages both pin `viem` to `2.56.9` and `pg` to `8.23.1`, with lockfiles for clean installations. The validator adds no HTTP framework or new cryptographic dependency. Package preparation is an external prerequisite; verification never installs dependencies.
 
 PostgreSQL installation and database creation remain external prerequisites. Project scripts check connectivity and apply the project migration, but they do not install or start PostgreSQL and do not create a database.
 
 The unified verification script automatically loads local configuration from the repository-root `.env` file. Copy the structure from `.env.example`, set the local PostgreSQL password in `.env`, and keep the example file free of real credentials. The local `.env` file is excluded from source control and its values are not printed by the verification script.
 
-The Python validator uses only the standard library, so the repository does not need a `requirements.txt` file.
+The Python credential-model checker uses only the standard library, so the repository does not need a `requirements.txt` file.
 
 ## Build and Test
 
@@ -923,11 +1010,20 @@ The script uses strict error handling and performs:
 50. byte-for-byte Merkle golden fixture drift checks without overwriting fixed expected outputs;
 51. Node and Solidity comparisons against the same committed domains, leaves, internal nodes, roots, and proofs;
 52. shared-fixture negative cases, trusted leaf-count checks, and hash/encoding drift probes;
-53. real fresh-process sealed A/B/D proofs verified in Foundry's local Solidity EVM.
+53. real fresh-process sealed A/B/D proofs verified in Foundry's local Solidity EVM;
+54. validator identity, configuration, handshake, HTTP, and independent source-validation unit tests;
+55. validator-owned migrations and four isolated identity-bound state-store tests;
+56. four real validator processes, distinct public identities/PIDs, and all directed peer handshakes;
+57. each validator's recorded real RPC receipt/block requests and fixed-head finality checks;
+58. immutable local observations and same-head idempotent validation of the real pending A/B/D batch;
+59. wrong-reference/root/block, `REORGED` injection, insufficient depth, wrong chain/Gateway, and wrong-key rejection;
+60. fresh V4 recovery with V1/V2/V3 unaffected and complete original source-state preservation.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
 If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
+
+The validator integration applies its own migrations explicitly, chooses temporary local ports, injects runtime development keys, and cleans up its own validator processes and RPC observers. It retains no quorum result and leaves the batch pending. Test-owned validator namespaces are reset for a complete run; restart recovery is checked within that run. No production validator store is reset.
 
 All stdout and stderr are displayed in the terminal and written to:
 
@@ -939,7 +1035,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Shared Merkle Compatibility
+Independent Validator Foundation
 ```
 
 ### Expected error output
@@ -1057,6 +1153,30 @@ Cross-Chain/
 │   ├── canonical-messages.json
 │   ├── merkle-golden-vectors.json
 │   └── nullifiers.json
+├── validator/
+│   ├── .env.example
+│   ├── migrations/
+│   │   └── 001_validator_foundation.sql
+│   ├── src/
+│   │   ├── config.mjs
+│   │   ├── db.mjs
+│   │   ├── handshake.mjs
+│   │   ├── identity.mjs
+│   │   ├── main.mjs
+│   │   ├── migrate.mjs
+│   │   ├── server.mjs
+│   │   └── source-validation.mjs
+│   ├── test/
+│   │   ├── config.test.mjs
+│   │   ├── database.test.mjs
+│   │   ├── handshake.test.mjs
+│   │   ├── server.test.mjs
+│   │   ├── source-validation.test.mjs
+│   │   └── helpers/
+│   │       ├── fixtures.mjs
+│   │       └── four-process.mjs
+│   ├── package.json
+│   └── package-lock.json
 ├── zk/
 │   ├── circuits/
 │   │   └── CredentialAuthorization.circom
@@ -1118,6 +1238,9 @@ Cross-Chain/
 - PostgreSQL remains operational persistence. Batch and Merkle construction do not independently establish canonical-chain consensus or validator authority.
 - Persistent batch assignment, sealing, and epoch advancement preserve source lifecycle state. `CONSENSUS_PENDING` is the current authorization boundary; future PBFT quorum verification must authorize `COMMITTED`.
 - The Solidity Merkle primitive requires independently trusted expected context, including member count, and does not replace canonical message-field validation or authenticate a relayer. Shared golden vectors lock compatibility and grant no destination permissions.
+- Four independent validator processes may share one source RPC provider; independent checking does not eliminate that provider's trust assumptions or produce a cryptographic source-finality proof.
+- Validator-local observations are separate from source persistence and are never consensus votes. One validator or four local `VALID` results cannot commit a batch.
+- Peer handshake signatures prove configured identity control in a distinct domain and cannot serve as future PREPARE/COMMIT signatures. Source mismatches fail closed and do not trigger source DB repairs.
 - The repository does not provide destination gateway integration, QC verification, exactly-once downstream batch consumption, relaying, PBFT validation, destination execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
