@@ -13,7 +13,7 @@
     "catch-up": "node src/main.mjs --once",
     "finality": "node src/main.mjs finality",
     "finality:once": "node src/main.mjs finality --once",
-    "test": "node --test test/config.test.mjs test/canonical-message.test.mjs test/source-event-identity.test.mjs test/canonical-block.test.mjs test/reorg-detector.test.mjs test/finality-policy.test.mjs test/indexer.test.mjs test/finality-watcher.test.mjs test/message-batch.test.mjs",
+    "test": "node --test test/config.test.mjs test/canonical-message.test.mjs test/source-event-identity.test.mjs test/canonical-block.test.mjs test/reorg-detector.test.mjs test/finality-policy.test.mjs test/indexer.test.mjs test/finality-watcher.test.mjs test/message-batch.test.mjs test/message-merkle.test.mjs",
     "test:database": "node --test test/database.test.mjs",
     "test:integration": "node --test test/integration.test.mjs"
   },

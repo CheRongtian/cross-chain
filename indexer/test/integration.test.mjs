@@ -25,6 +25,7 @@ import {
   resetIndexerTables,
 } from "../src/db.mjs";
 import { createMessageBatcher } from "../src/message-batch.mjs";
+import { buildMessageMerkleTree, verifyMessageMerkleProof } from "../src/message-merkle.mjs";
 import { decodeCrossChainMessageLog } from "../src/source-gateway-event.mjs";
 
 const IDENTITY_APPLICATION_ABI = parseAbi([
@@ -658,6 +659,37 @@ test("recovers source workers and deterministically batches real finalized messa
       false,
     );
     assert.deepEqual(await batcher.buildBatch({ epoch: batchEpoch }), batch);
+    const tree = buildMessageMerkleTree(batch);
+    assert.equal(tree.leafCount, 3);
+    assert.deepEqual(buildMessageMerkleTree(batch), tree);
+    for (let index = 0; index < batch.messages.length; index += 1) {
+      assert.equal(verifyMessageMerkleProof({
+        batch,
+        message: batch.messages[index],
+        proof: tree.proofs[index],
+        messageRoot: tree.messageRoot,
+      }), true);
+    }
+    assert.equal(tree.proofs.some((proof) => proof.messageId === messageC.messageId), false);
+    const validProofInput = {
+      batch,
+      message: batch.messages[0],
+      proof: tree.proofs[0],
+      messageRoot: tree.messageRoot,
+    };
+    assert.equal(verifyMessageMerkleProof({
+      ...validProofInput,
+      message: { ...batch.messages[0], nonce: batch.messages[0].nonce + 1n },
+    }), false);
+    assert.equal(verifyMessageMerkleProof({
+      ...validProofInput,
+      messageRoot: `0x${"ff".repeat(32)}`,
+    }), false);
+    assert.equal(verifyMessageMerkleProof({ ...validProofInput, proof: tree.proofs[1] }), false);
+    assert.equal(verifyMessageMerkleProof({
+      ...validProofInput,
+      message: { ...messageC, status: "REORGED" },
+    }), false);
 
     const freshBatchPool = createDatabasePool(config);
     try {
@@ -665,6 +697,16 @@ test("recovers source workers and deterministically batches real finalized messa
         epoch: batchEpoch,
       });
       assert.deepEqual(rebuilt, batch);
+      const rebuiltTree = buildMessageMerkleTree(rebuilt);
+      assert.deepEqual(rebuiltTree, tree);
+      for (let index = 0; index < rebuilt.messages.length; index += 1) {
+        assert.equal(verifyMessageMerkleProof({
+          batch: rebuilt,
+          message: rebuilt.messages[index],
+          proof: rebuiltTree.proofs[index],
+          messageRoot: rebuiltTree.messageRoot,
+        }), true);
+      }
     } finally {
       await freshBatchPool.end();
     }
@@ -680,6 +722,11 @@ test("recovers source workers and deterministically batches real finalized messa
     console.log("VALID: deterministic batching preserved all source lifecycle metadata");
     console.log(`Deterministic batch epoch: ${batch.epoch}`);
     console.log(`Deterministic batch ID: ${batch.batchId}`);
+    console.log("VALID: real finalized Message A, B, and D inclusion proofs verified");
+    console.log("VALID: fresh batch and Merkle builders reproduced the root and every proof");
+    console.log("VALID: tampered message, wrong root, wrong proof, and REORGED occurrence rejected");
+    console.log("VALID: Merkle computation preserved all source lifecycle and canonical block data");
+    console.log(`Deterministic Message Root: ${tree.messageRoot}`);
   } finally {
     for (const worker of activeWorkers) {
       worker.kill("SIGKILL");

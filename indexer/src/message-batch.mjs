@@ -2,6 +2,7 @@ import { encodeAbiParameters, keccak256, parseAbiParameters, stringToHex } from 
 
 import {
   normalizeAddress,
+  normalizeBytes32,
   normalizePayload,
   toUint256,
   validateCanonicalMessage,
@@ -31,7 +32,7 @@ function requiredUint256(value, label) {
   return toUint256(value, label);
 }
 
-function normalizeBatchMessage(message, scope) {
+export function normalizeBatchMessage(message, scope) {
   if (message === null || typeof message !== "object") {
     throw new Error("invalid batch message");
   }
@@ -147,6 +148,37 @@ export function buildMessageBatch({ sourceDomain, sourceGateway, epoch, messages
     messageIds: Object.freeze(orderedMessageIds),
     batchId: keccak256(encoded).toLowerCase(),
   });
+}
+
+export function validateMessageBatch(batch) {
+  if (batch === null || typeof batch !== "object") {
+    throw new Error("invalid message batch");
+  }
+  if (requiredUint256(batch.version, "batch version") !== MESSAGE_BATCH_VERSION) {
+    throw new Error("unsupported batch version");
+  }
+  const suppliedBatchId = normalizeBytes32(batch.batchId, "batch ID");
+  if (!Array.isArray(batch.messageIds)) {
+    throw new Error("batch message IDs must be an array");
+  }
+  const canonical = buildMessageBatch(batch);
+  if (canonical === undefined) {
+    throw new Error("empty message batch is invalid");
+  }
+  if (batch.messageIds.length !== canonical.messageIds.length) {
+    throw new Error("batch message membership length mismatch");
+  }
+  for (let index = 0; index < canonical.messages.length; index += 1) {
+    const declaredId = normalizeBytes32(batch.messageIds[index], "batch message ID");
+    const inputId = normalizeBytes32(batch.messages[index].messageId, "message ID");
+    if (declaredId !== canonical.messageIds[index] || inputId !== canonical.messageIds[index]) {
+      throw new Error("batch message membership or canonical order mismatch");
+    }
+  }
+  if (suppliedBatchId !== canonical.batchId) {
+    throw new Error("batch ID does not match canonical batch");
+  }
+  return canonical;
 }
 
 function databaseRowToBatchMessage(row) {

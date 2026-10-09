@@ -8,6 +8,7 @@ import {
   buildMessageBatch,
   MESSAGE_BATCH_TYPE,
   MESSAGE_BATCH_TYPEHASH,
+  validateMessageBatch,
 } from "../src/message-batch.mjs";
 
 const SOURCE_GATEWAY = "0x0000000000000000000000000000000000001001";
@@ -248,4 +249,56 @@ test("large block, log, domain, nonce, and epoch values remain exact", () => {
   assert.equal(actual.messages[0].sourceBlockNumber, large);
   assert.equal(actual.messages[1].sourceLogIndex, large + 1n);
   assert.equal(actual.messages[0].nonce, large);
+});
+
+test("batch integrity validation reconstructs an unchanged canonical batch", () => {
+  const batch = build([
+    finalizedMessage(),
+    finalizedMessage({ nonce: 2n, sourceBlockNumber: 11n }),
+  ]);
+  assert.deepEqual(validateMessageBatch(batch), batch);
+  assert.deepEqual(validateMessageBatch({
+    ...batch,
+    version: "1",
+    epoch: "7",
+    id: "operational metadata",
+  }), batch);
+});
+
+test("batch integrity validation rejects stale IDs, changed membership, and reordered input", () => {
+  const batch = build([
+    finalizedMessage(),
+    finalizedMessage({ nonce: 2n, sourceBlockNumber: 11n }),
+  ]);
+  assert.throws(() => validateMessageBatch({ ...batch, batchId: hash(999n) }), /batch ID does not match/);
+  assert.throws(() => validateMessageBatch({ ...batch, epoch: 8n }), /batch ID does not match/);
+  assert.throws(() => validateMessageBatch({
+    ...batch,
+    messages: [...batch.messages].reverse(),
+    messageIds: [...batch.messageIds].reverse(),
+  }), /canonical order mismatch/);
+  assert.throws(() => validateMessageBatch({
+    ...batch,
+    messageIds: [batch.messageIds[0]],
+  }), /membership length mismatch/);
+  assert.throws(() => validateMessageBatch({
+    ...batch,
+    messages: [batch.messages[0], { ...batch.messages[1], nonce: 99n }],
+  }), /canonical message ID mismatch/);
+  assert.throws(() => validateMessageBatch({
+    ...batch,
+    messages: [batch.messages[0], batch.messages[0]],
+    messageIds: [batch.messageIds[0], batch.messageIds[0]],
+  }), /duplicate source occurrence/);
+});
+
+test("batch integrity validation rejects empty and malformed batches", () => {
+  const batch = build([finalizedMessage()]);
+  for (const invalid of [null, undefined, { ...batch, batchId: "0x00" }, { ...batch, version: null }]) {
+    assert.throws(() => validateMessageBatch(invalid));
+  }
+  assert.throws(() => validateMessageBatch({ ...batch, version: 2n }), /unsupported batch version/);
+  assert.throws(() => validateMessageBatch({ ...batch, messageIds: undefined }), /must be an array/);
+  assert.throws(() => validateMessageBatch({ ...batch, messages: [], messageIds: [] }), /empty message batch/);
+  assert.throws(() => validateMessageBatch({ ...batch, messageIds: ["0x00"] }), /invalid batch message ID/);
 });

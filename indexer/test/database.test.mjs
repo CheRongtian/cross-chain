@@ -22,6 +22,7 @@ import {
 } from "../src/db.mjs";
 import { computeCanonicalMessageId, computePayloadHash } from "../src/canonical-message.mjs";
 import { createMessageBatcher } from "../src/message-batch.mjs";
+import { buildMessageMerkleTree, verifyMessageMerkleProof } from "../src/message-merkle.mjs";
 
 assert.ok(process.env.DATABASE_URL, "DATABASE_URL is required for PostgreSQL tests");
 
@@ -1241,6 +1242,16 @@ test("deterministic batching uses only FINALIZED rows and preserves lifecycle da
   assert.deepEqual(batch.messageIds, [first.messageId, second.messageId]);
   assert.deepEqual(batch.messages.map((message) => message.sourceLogIndex), [0n, 1n]);
   assert.deepEqual(repeated, batch);
+  const tree = buildMessageMerkleTree(batch);
+  assert.deepEqual(buildMessageMerkleTree(repeated), tree);
+  for (let index = 0; index < batch.messages.length; index += 1) {
+    assert.equal(verifyMessageMerkleProof({
+      batch,
+      message: batch.messages[index],
+      proof: tree.proofs[index],
+      messageRoot: tree.messageRoot,
+    }), true);
+  }
   assert.deepEqual(await readMessages(pool, config.databaseSchema), before);
   assert.deepEqual(await readCursor(pool, config.databaseSchema, scope), cursorBefore);
   assert.deepEqual(await readIndexedSourceBlocks(pool, config.databaseSchema, scope), blocksBefore);
@@ -1252,6 +1263,7 @@ test("deterministic batching uses only FINALIZED rows and preserves lifecycle da
       pool: freshPool,
     }).buildBatch({ epoch: LARGE_INTEGER.toString() });
     assert.deepEqual(rebuilt, batch);
+    assert.deepEqual(buildMessageMerkleTree(rebuilt), tree);
   } finally {
     await freshPool.end();
   }
@@ -1264,7 +1276,12 @@ test("deterministic batching uses only FINALIZED rows and preserves lifecycle da
   });
   assert.deepEqual(rescan, { inserted: 0, duplicates: 2, nextBlock: 11n });
   assert.deepEqual(await batcher.buildBatch({ epoch: LARGE_INTEGER }), batch);
+  assert.deepEqual(buildMessageMerkleTree(await batcher.buildBatch({ epoch: LARGE_INTEGER })), tree);
   assert.deepEqual(await readMessages(pool, config.databaseSchema), before);
+  assert.deepEqual(
+    (await finalityStore.listBatchEligibleMessages(scope)).map((row) => row.message_id),
+    [first.messageId, second.messageId],
+  );
 });
 
 test("the production batcher rejects a persisted row with an inconsistent message ID", async () => {

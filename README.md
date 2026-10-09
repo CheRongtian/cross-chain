@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent idempotent source-event indexing, configurable source-block finality tracking, source-chain reorganization recovery, restart-safe single-node workers, and deterministic message batching. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, an identity application that can create canonical outbound messages through the gateway, a PostgreSQL-backed Indexer, an independent Finality Watcher, and a batch builder for finalized source messages.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent idempotent source-event indexing, configurable source-block finality tracking, source-chain reorganization recovery, restart-safe single-node workers, deterministic message batching, and off-chain Merkle message commitments. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, an identity application that can create canonical outbound messages through the gateway, a PostgreSQL-backed Indexer, an independent Finality Watcher, a batch builder for finalized source messages, and deterministic Message Roots with inclusion proofs.
 
 The current implementation can:
 
@@ -37,6 +37,10 @@ The current implementation can:
 - deterministically order batch membership by canonical source block and log position;
 - bind an explicit batch epoch, source scope, and ordered canonical message IDs into an ABI-encoded batch identifier;
 - reconstruct the same batch from the same eligible message set and context across repeated reads and fresh builder instances;
+- validate batch integrity before constructing a deterministic ordered Merkle tree;
+- bind each Merkle leaf to its batch ID, canonical message position, and canonical message ID;
+- reproduce the same Message Root and per-message inclusion proofs from the same valid batch;
+- verify inclusion proofs off-chain and reject changed messages, contexts, positions, roots, and paths;
 - preserve finality state and timestamps across duplicate event ingestion;
 - recover the Indexer from a persisted next-block cursor after graceful or abrupt process loss;
 - preserve `OBSERVED`, `FINALIZING`, `FINALIZED`, and `REORGED` lifecycle data across worker restarts;
@@ -84,13 +88,19 @@ Unknown EOA or contract ──────────────────�
                                                                │
                                                                v
                                                     deterministic Message Batch
+                                                               │
+                                                               v
+                                                        ordered Merkle Tree
+                                                               │
+                                                               v
+                                                 Message Root + inclusion proofs
 ```
 
 `IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The Indexer persists emitted source events, and the Finality Watcher advances their database lifecycle; neither component adds proof-to-message binding. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
 
 The Indexer and Finality Watcher are disposable worker processes. Their durable operational progress lives in PostgreSQL, and every new process reconciles that state with Chain A before continuing.
 
-The batch builder reads finalized source occurrences from PostgreSQL and preserves their canonical protocol fields and source provenance in a deterministic order. Batch construction has no effect on source lifecycle state. Merkle batch commitments, consensus, and destination delivery are outside the current implementation.
+The batch builder reads finalized source occurrences from PostgreSQL and preserves their canonical protocol fields and source provenance in a deterministic order. The Merkle builder consumes this validated batch and derives an ordered tree, Message Root, and inclusion proofs. Batch and Merkle computation preserve source lifecycle state. Consensus and destination delivery are outside the current implementation.
 
 ## Cross-Chain Messages
 
@@ -568,7 +578,46 @@ Given the same eligible source occurrences and context, reverse or shuffled inpu
 
 Batch construction reads source data and returns an immutable value. It does not persist a batch record, reserve or consume finalized rows, rotate epochs, or change finality state. If the finalized set grows, a new construction may produce different membership and a different batch ID even when the caller reuses an epoch. Exactly-once downstream consumption requires additional lifecycle design.
 
-PostgreSQL provides durable operational state; Chain A remains the source history authority. Constructing a batch grants no Chain B authorization, validator approval, quorum certificate, or delivery guarantee. The implementation stops at Message Batch and supplies no message-batch Merkle tree, root, leaf encoding, inclusion proof, batch sealing, PBFT, or relayer.
+PostgreSQL provides durable operational state; Chain A remains the source history authority. Constructing a batch grants no Chain B authorization, validator approval, quorum certificate, or delivery guarantee. The batch feeds the off-chain Merkle commitment described below. Batch sealing, consensus, and relaying remain outside the current implementation.
+
+## Merkle Message Commitment
+
+`buildMessageMerkleTree(batch)` accepts a deterministic Message Batch. Before hashing, `validateMessageBatch` reconstructs it with the existing batch builder and checks its version, source context, epoch, message IDs, membership, canonical order, and batch ID. A stale ID, reordered batch, changed message, duplicate occurrence, non-finalized member, or empty batch raises an error. The Merkle layer performs no independent database selection and keeps the existing batch ID and ordering semantics.
+
+Leaf and internal-node domains follow the repository's typed ABI/Keccak convention:
+
+```text
+LEAF_DOMAIN = keccak256(bytes(
+    "MessageMerkleLeaf(bytes32 batchId,uint256 index,bytes32 messageId)"
+))
+NODE_DOMAIN = keccak256(bytes(
+    "MessageMerkleNode(bytes32 leftChild,bytes32 rightChild)"
+))
+leaf = keccak256(abi.encode(LEAF_DOMAIN, batchId, uint256(index), messageId))
+node = keccak256(abi.encode(NODE_DOMAIN, leftChild, rightChild))
+```
+
+Leaves follow the batch's canonical message order. The leaf binds its message to a particular batch and zero-based position; the batch ID already binds the source scope, epoch, and ordered protocol message IDs. Internal nodes preserve left/right order. Children and sibling hashes are never sorted. At every layer with an odd number of nodes, the last node is duplicated as its own right sibling. A single-message batch has its leaf hash as the Message Root and an empty proof path. There is no valid empty-batch root.
+
+The immutable tree result contains `batchId`, `leafCount`, `messageRoot`, ordered `leaves`, and one entry in `proofs` for each message. Each proof contains:
+
+| Field | Meaning |
+| --- | --- |
+| `batchId` | Expected deterministic batch identity |
+| `messageId` | Canonical protocol message at this position |
+| `index` | Non-negative safe JavaScript integer within batch bounds |
+| `leafCount` | Exact message count of the expected batch |
+| `siblings` | Canonical bytes32 sibling hashes, from the leaf upward |
+
+Proof direction follows the index at each layer: even positions are left children and odd positions are right children, then the position becomes `floor(index / 2)`. The expected leaf count fixes the number of layers and the locations where self-duplication is required. Array indices and counts use safe JavaScript integer semantics; domains, epochs, nonces, block numbers, and other protocol uint256 values retain `BigInt` semantics. The leaf's index is explicitly converted to uint256 for ABI encoding.
+
+`verifyMessageMerkleProof({ batch, message, proof, messageRoot })` receives the expected batch and root from the caller. It revalidates the batch, recomputes the supplied complete message's canonical ID, and compares its canonical fields, `FINALIZED` status, and source provenance with the member at the claimed position. It then checks the proof's batch ID, message ID, index, leaf count, exact path length, bytes32 siblings, positional left/right direction, and required odd-node duplication. The recomputed root must equal the expected Message Root. Invalid inputs return `false`.
+
+Keeping an old message ID while changing a nonce, payload, deadline, or another protocol field fails normal verification. A proof for a different message or epoch also fails, as do wrong roots, wrong positions, tampered siblings, malformed hashes, truncated paths, and extra path elements. Source occurrences marked `REORGED` cannot enter the validated batch or satisfy its member validation.
+
+Repeated construction, a fresh batch or Merkle builder, and permutations canonicalized by the batch builder reproduce identical leaves, roots, and proofs. These values contain no database row IDs, observation/finalization timestamps, process identifiers, or private credential attributes. Merkle computation does not write source records, eligibility, canonical block history, or batch lifecycle state.
+
+The Message Root commits to ordered batch membership. Its expected batch and root still require an appropriate trust source; a valid proof by itself grants no Chain B authorization, Byzantine consensus, quorum certificate, or delivery guarantee. Current verification is off-chain only. Solidity Merkle verification, shared Solidity/off-chain golden vectors, persistent batch lifecycle, sealing, PBFT, relaying, and destination execution remain unimplemented.
 
 ## Local Two-Chain Environment
 
@@ -709,7 +758,7 @@ The script:
 
 Generated circuits, witnesses, proofs, public signals, ptau files, and zkey files are written under `zk/build/`. Generated Solidity cryptographic source is written under `contracts/generated/`. Both locations are excluded from source control.
 
-### Chain A Indexer, Finality Watcher, and Message Batches
+### Chain A Indexer, Finality Watcher, Message Batches, and Merkle Commitments
 
 Run the Indexer unit suite after installing its packages:
 
@@ -726,9 +775,9 @@ export INDEXER_DB_SCHEMA='cross_chain_indexer_database_test'
 npm run test:database
 ```
 
-The unit suite also covers batch ABI encoding, canonical ordering under input permutations, explicit epochs, membership changes, duplicate rejection, malformed messages, invalid lifecycle states, and large protocol integers. PostgreSQL tests connect the existing finalized-only query to the production batcher, check insertion-order independence and duplicate rescans, and verify that construction preserves all source lifecycle metadata.
+The unit suite also covers batch ABI encoding, canonical ordering under input permutations, explicit epochs, membership changes, duplicate rejection, malformed messages, invalid lifecycle states, and large protocol integers. Merkle tests cover batch integrity, distinct hash domains, ordered pairs, single-leaf and odd-node behavior, deterministic roots and proofs, successful inclusion, and rejected message/context/root/path changes. PostgreSQL tests connect the existing finalized-only query to the production batcher, construct a stable tree and verify its proofs, check insertion-order independence and duplicate rescans, and verify that computation preserves all source lifecycle metadata and canonical block records.
 
-The real Chain A integration runs through the unified repository verification flow because it needs the deployed protocol contracts and both local chains. It covers fixed-snapshot indexing, abrupt worker termination after durable commits, offline message catch-up, PostgreSQL pool recreation, repeated restarts, exact-event rescans, real `OBSERVED → FINALIZING → FINALIZED` transitions, eventless block tracking, and snapshot/revert replacement of an unfinalized branch followed by a fresh Indexer process. It then constructs a batch from the canonical finalized occurrences, excludes the reorged occurrence, and rebuilds the same batch with a fresh builder and PostgreSQL pool.
+The real Chain A integration runs through the unified repository verification flow because it needs the deployed protocol contracts and both local chains. It covers fixed-snapshot indexing, abrupt worker termination after durable commits, offline message catch-up, PostgreSQL pool recreation, repeated restarts, exact-event rescans, real `OBSERVED → FINALIZING → FINALIZED` transitions, eventless block tracking, and snapshot/revert replacement of an unfinalized branch followed by a fresh Indexer process. It then constructs a batch from finalized A/B/D, excludes the reorged C occurrence, builds the Message Root, and verifies all three inclusion proofs. Fresh builders reproduce the batch, root, and proofs; changed messages and wrong roots/proofs fail while all source state remains unchanged.
 
 ## Complete Verification
 
@@ -776,7 +825,12 @@ The script uses strict error handling and performs:
 34. deterministic batch unit tests for encoding, epochs, permutations, membership changes, and fail-closed inputs;
 35. database-backed batch construction with only `FINALIZED` membership, duplicate-ingestion stability, and unchanged lifecycle metadata;
 36. a real finalized-message batch containing Message A, B, and D while excluding old `REORGED` Message C;
-37. repeated construction and fresh-builder reconstruction with identical ordered membership and batch ID.
+37. repeated construction and fresh-builder reconstruction with identical ordered membership and batch ID;
+38. batch integrity validation and deterministic Merkle leaves, ordered nodes, roots, and proofs;
+39. single-leaf, odd-layer duplication, safe-index, and malformed-input cases;
+40. real finalized A/B/D inclusion proofs against one Message Root;
+41. rejection of changed real messages, wrong roots, wrong proofs, and old `REORGED` C;
+42. fresh-builder reconstruction of identical roots and proofs with all source state preserved.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -792,7 +846,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Deterministic Message Batching
+Merkle Message Commitment
 ```
 
 ### Expected error output
@@ -869,6 +923,7 @@ Cross-Chain/
 │   │   ├── indexer.mjs
 │   │   ├── main.mjs
 │   │   ├── message-batch.mjs
+│   │   ├── message-merkle.mjs
 │   │   ├── migrate.mjs
 │   │   ├── reorg-detector.mjs
 │   │   ├── source-event-identity.mjs
@@ -883,6 +938,7 @@ Cross-Chain/
 │   │   ├── indexer.test.mjs
 │   │   ├── integration.test.mjs
 │   │   ├── message-batch.test.mjs
+│   │   ├── message-merkle.test.mjs
 │   │   ├── reorg-detector.test.mjs
 │   │   └── source-event-identity.test.mjs
 │   ├── package.json
@@ -950,10 +1006,11 @@ Cross-Chain/
 - The current message binds its protocol type, source domain, source gateway, source sender, destination domain, destination gateway, destination receiver, nonce, payload hash, and deadline.
 - A committed destination gateway is caller-selected. `SourceGateway` does not validate remote deployment, domain ownership, or trust, and no remote-gateway registry exists.
 - The batcher consumes only the existing `FINALIZED` eligibility boundary. `REORGED` occurrences remain terminal and are excluded from every batch.
-- A deterministic batch ID binds its source scope, epoch, and ordered canonical message IDs. It provides no Merkle inclusion proof, consensus result, quorum certificate, Chain B authorization, or cross-chain acceptance.
-- Batch construction preserves source lifecycle state and exposes only the existing public message data and provenance. It introduces no private credential attributes.
-- PostgreSQL remains operational persistence. Batch construction does not independently establish canonical-chain consensus or validator authority.
-- The repository does not provide persistent batch lifecycle, batch sealing, automatic epoch rotation, exactly-once batch consumption, Merkle batch construction, relaying, PBFT validation, destination gateway implementation or execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
+- A deterministic batch ID binds its source scope, epoch, and ordered canonical message IDs. The Merkle Message Root and proofs additionally bind message membership to canonical batch positions through distinct leaf and internal-node hash domains.
+- Off-chain inclusion verification requires the caller's expected batch and root. A valid proof establishes membership within that commitment and supplies no consensus result, quorum certificate, Chain B authorization, or cross-chain acceptance.
+- Batch and Merkle computation preserve source lifecycle state and use only existing public message data and provenance. They introduce no private credential attributes.
+- PostgreSQL remains operational persistence. Batch and Merkle construction do not independently establish canonical-chain consensus or validator authority.
+- The repository does not provide Solidity/Destination Gateway Merkle verification, shared Solidity/off-chain Merkle golden vectors, persistent batch lifecycle, batch sealing, automatic epoch rotation, exactly-once batch consumption, relaying, PBFT validation, destination gateway implementation or execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.
