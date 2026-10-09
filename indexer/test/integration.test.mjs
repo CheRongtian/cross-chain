@@ -24,6 +24,7 @@ import {
   readMessages,
   resetIndexerTables,
 } from "../src/db.mjs";
+import { createMessageBatcher } from "../src/message-batch.mjs";
 import { decodeCrossChainMessageLog } from "../src/source-gateway-event.mjs";
 
 const IDENTITY_APPLICATION_ABI = parseAbi([
@@ -59,7 +60,7 @@ function assertPersistedEvent(row, event, expectedStatus) {
   assert.ok(row.observed_at instanceof Date);
 }
 
-test("recovers Indexer, Finality Watcher, PostgreSQL client, and a replaced source branch", async () => {
+test("recovers source workers and deterministically batches real finalized messages", async () => {
   const config = loadConfig();
   assert.equal(
     config.finalityBlockDepth,
@@ -634,6 +635,51 @@ test("recovers Indexer, Finality Watcher, PostgreSQL client, and a replaced sour
 
     console.log("VALID: replacement Message D progressed to FINALIZED");
     console.log("VALID: old REORGED Message C remained terminal");
+
+    const sourceStateBeforeBatching = await readMessages(activePool, config.databaseSchema);
+    const cursorBeforeBatching = await readCursor(activePool, config.databaseSchema, scope);
+    const blocksBeforeBatching = await readIndexedSourceBlocks(
+      activePool,
+      config.databaseSchema,
+      scope,
+    );
+    const batchEpoch = 23n;
+    const batcher = createMessageBatcher({ config, pool: activePool });
+    const batch = await batcher.buildBatch({ epoch: batchEpoch });
+    assert.ok(batch, "finalized source messages must produce a batch");
+    assert.deepEqual(batch.messageIds, [messageA.messageId, messageB.messageId, messageD.messageId]);
+    assert.deepEqual(
+      batch.messages.map((message) => message.sourceBlockNumber),
+      [messageA.sourceBlockNumber, messageB.sourceBlockNumber, messageD.sourceBlockNumber],
+    );
+    assert.ok(batch.messages.every((message) => message.status === "FINALIZED"));
+    assert.equal(
+      batch.messages.some((message) => message.sourceBlockHash === oldMessageBlockHash),
+      false,
+    );
+    assert.deepEqual(await batcher.buildBatch({ epoch: batchEpoch }), batch);
+
+    const freshBatchPool = createDatabasePool(config);
+    try {
+      const rebuilt = await createMessageBatcher({ config, pool: freshBatchPool }).buildBatch({
+        epoch: batchEpoch,
+      });
+      assert.deepEqual(rebuilt, batch);
+    } finally {
+      await freshBatchPool.end();
+    }
+    assert.deepEqual(await readMessages(activePool, config.databaseSchema), sourceStateBeforeBatching);
+    assert.deepEqual(await readCursor(activePool, config.databaseSchema, scope), cursorBeforeBatching);
+    assert.deepEqual(
+      await readIndexedSourceBlocks(activePool, config.databaseSchema, scope),
+      blocksBeforeBatching,
+    );
+    console.log("VALID: real finalized Message A, B, and D entered the ordered batch");
+    console.log("VALID: old REORGED Message C was excluded from batch membership");
+    console.log("VALID: repeated construction and a fresh builder produced the same batch ID");
+    console.log("VALID: deterministic batching preserved all source lifecycle metadata");
+    console.log(`Deterministic batch epoch: ${batch.epoch}`);
+    console.log(`Deterministic batch ID: ${batch.batchId}`);
   } finally {
     for (const worker of activeWorkers) {
       worker.kill("SIGKILL");

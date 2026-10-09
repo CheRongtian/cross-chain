@@ -878,7 +878,12 @@ export function createFinalityStore(pool, schema) {
           WHERE source_domain = $1
             AND source_gateway = $2
             AND status = 'FINALIZED'
-          ORDER BY source_block_number ASC, source_log_index ASC, id ASC`,
+          ORDER BY
+            source_block_number ASC,
+            source_log_index ASC,
+            source_block_hash COLLATE "C" ASC,
+            source_tx_hash COLLATE "C" ASC,
+            message_id COLLATE "C" ASC`,
         [normalizedScope.chainDomain, normalizedScope.sourceGateway],
       );
       return result.rows;

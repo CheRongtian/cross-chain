@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Crash Recovery"
+VERIFICATION_NAME="Deterministic Message Batching"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -410,6 +410,9 @@ printf ' 20. Persist canonical metadata for event-bearing and empty source block
 printf ' 21. Replace a real Anvil branch and recover from its common ancestor\n'
 printf ' 22. Preserve the old occurrence as terminal REORGED\n'
 printf ' 23. Restart indexing from the reorg-rewound cursor and finalize the replacement\n'
+printf ' 24. Verify batch encoding, permutations, explicit epochs, and invalid inputs\n'
+printf ' 25. Build a deterministic batch from real FINALIZED occurrences only\n'
+printf ' 26. Rebuild the same batch with a fresh builder and preserve source lifecycle data\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -438,7 +441,7 @@ DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DB_SCHEMA" \
     node "$INDEXER_DIR/src/migrate.mjs"
 
-CURRENT_STEP="Chain A Indexer unit and recovery tests"
+CURRENT_STEP="Chain A Indexer, recovery, and deterministic batch unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$INDEXER_DIR/test/config.test.mjs" \
@@ -448,9 +451,10 @@ node --test \
     "$INDEXER_DIR/test/reorg-detector.test.mjs" \
     "$INDEXER_DIR/test/finality-policy.test.mjs" \
     "$INDEXER_DIR/test/indexer.test.mjs" \
-    "$INDEXER_DIR/test/finality-watcher.test.mjs"
+    "$INDEXER_DIR/test/finality-watcher.test.mjs" \
+    "$INDEXER_DIR/test/message-batch.test.mjs"
 
-CURRENT_STEP="Chain A Indexer database and recovery tests"
+CURRENT_STEP="Chain A Indexer database, recovery, and batch eligibility tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
@@ -1073,7 +1077,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real crash, restart, finality, and source reorg recovery integration"
+CURRENT_STEP="real source recovery, finality, reorg, and deterministic batch integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

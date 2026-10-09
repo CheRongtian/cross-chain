@@ -20,6 +20,8 @@ import {
   readTableColumns,
   resetIndexerTables,
 } from "../src/db.mjs";
+import { computeCanonicalMessageId, computePayloadHash } from "../src/canonical-message.mjs";
+import { createMessageBatcher } from "../src/message-batch.mjs";
 
 assert.ok(process.env.DATABASE_URL, "DATABASE_URL is required for PostgreSQL tests");
 
@@ -91,6 +93,14 @@ function messageRow(overrides = {}) {
     ...overrides,
   };
   row.sourceBlockHash = overrides.sourceBlockHash ?? blockHash(row.sourceBlockNumber);
+  return row;
+}
+
+function batchMessageRow(overrides = {}) {
+  const row = messageRow(overrides);
+  const payload = `0x${row.payload.toString("hex")}`;
+  row.payloadHash = computePayloadHash(payload);
+  row.messageId = computeCanonicalMessageId({ ...row, payload });
   return row;
 }
 
@@ -1149,4 +1159,130 @@ test("duplicate re-ingestion preserves FINALIZED state and metadata", async () =
     finalizedBeforeRescan.finalized_at.getTime(),
   );
   assert.equal(messages[0].finalized_at_head, finalizedBeforeRescan.finalized_at_head);
+});
+
+test("the production batcher returns no batch when no FINALIZED rows exist", async () => {
+  await initializeCursor();
+  await store.persistRange(scope, {
+    fromBlock: 10n,
+    toBlock: 10n,
+    rows: [batchMessageRow()],
+  });
+  const batcher = createMessageBatcher({
+    config: { ...config, ...scope },
+    pool,
+  });
+  const before = await readMessages(pool, config.databaseSchema);
+
+  assert.equal(await batcher.buildBatch({ epoch: 1n }), undefined);
+  assert.deepEqual(await readMessages(pool, config.databaseSchema), before);
+});
+
+test("deterministic batching uses only FINALIZED rows and preserves lifecycle data", async () => {
+  await initializeCursor();
+  const first = batchMessageRow({ nonce: "1", sourceLogIndex: "0" });
+  const second = batchMessageRow({ nonce: "2", sourceLogIndex: "1" });
+  const finalizing = batchMessageRow({
+    nonce: "3",
+    sourceBlockNumber: "11",
+    sourceLogIndex: "0",
+  });
+  await store.persistRange(scope, {
+    fromBlock: 10n,
+    toBlock: 11n,
+    rows: [second, finalizing, first],
+  });
+  await finalityStore.advanceFinality(scope, {
+    headBlock: 12n,
+    finalityBlockDepth: 2n,
+  });
+
+  const oldHash = blockHash(12n, 1_000n);
+  const orphan = batchMessageRow({
+    nonce: "4",
+    sourceBlockNumber: "12",
+    sourceBlockHash: oldHash,
+    sourceLogIndex: "0",
+  });
+  await store.persistRange(scope, {
+    fromBlock: 12n,
+    toBlock: 12n,
+    blocks: [canonicalBlock(12n, { hash: oldHash })],
+    rows: [orphan],
+  });
+  await canonicalStore.recoverCanonicalReorg(scope, {
+    commonAncestor: canonicalBlock(11n),
+    forkBlock: 12n,
+  });
+  const observed = batchMessageRow({
+    nonce: "5",
+    sourceBlockNumber: "12",
+    sourceLogIndex: "0",
+  });
+  await store.persistRange(scope, {
+    fromBlock: 12n,
+    toBlock: 12n,
+    rows: [observed],
+  });
+
+  const before = await readMessages(pool, config.databaseSchema);
+  const cursorBefore = await readCursor(pool, config.databaseSchema, scope);
+  const blocksBefore = await readIndexedSourceBlocks(pool, config.databaseSchema, scope);
+  assert.deepEqual(before.map((row) => row.status), [
+    "FINALIZED", "FINALIZING", "FINALIZED", "REORGED", "OBSERVED",
+  ]);
+  assert.deepEqual(
+    (await finalityStore.listBatchEligibleMessages(scope)).map((row) => row.message_id),
+    [first.messageId, second.messageId],
+  );
+  const batcher = createMessageBatcher({ config: { ...config, ...scope }, pool });
+  const batch = await batcher.buildBatch({ epoch: LARGE_INTEGER });
+  const repeated = await batcher.buildBatch({ epoch: LARGE_INTEGER });
+  assert.deepEqual(batch.messageIds, [first.messageId, second.messageId]);
+  assert.deepEqual(batch.messages.map((message) => message.sourceLogIndex), [0n, 1n]);
+  assert.deepEqual(repeated, batch);
+  assert.deepEqual(await readMessages(pool, config.databaseSchema), before);
+  assert.deepEqual(await readCursor(pool, config.databaseSchema, scope), cursorBefore);
+  assert.deepEqual(await readIndexedSourceBlocks(pool, config.databaseSchema, scope), blocksBefore);
+
+  const freshPool = createDatabasePool(config);
+  try {
+    const rebuilt = await createMessageBatcher({
+      config: { ...config, ...scope },
+      pool: freshPool,
+    }).buildBatch({ epoch: LARGE_INTEGER.toString() });
+    assert.deepEqual(rebuilt, batch);
+  } finally {
+    await freshPool.end();
+  }
+
+  await rewindCursor(10n);
+  const rescan = await store.persistRange(scope, {
+    fromBlock: 10n,
+    toBlock: 10n,
+    rows: [first, second],
+  });
+  assert.deepEqual(rescan, { inserted: 0, duplicates: 2, nextBlock: 11n });
+  assert.deepEqual(await batcher.buildBatch({ epoch: LARGE_INTEGER }), batch);
+  assert.deepEqual(await readMessages(pool, config.databaseSchema), before);
+});
+
+test("the production batcher rejects a persisted row with an inconsistent message ID", async () => {
+  await initializeCursor();
+  await store.persistRange(scope, {
+    fromBlock: 10n,
+    toBlock: 10n,
+    rows: [batchMessageRow()],
+  });
+  await finalityStore.advanceFinality(scope, { headBlock: 10n, finalityBlockDepth: 0n });
+  await pool.query(
+    `UPDATE ${schemaIdentifier}."source_messages" SET message_id = $1`,
+    [`0x${"ff".repeat(32)}`],
+  );
+  const before = await readMessages(pool, config.databaseSchema);
+  await assert.rejects(
+    createMessageBatcher({ config: { ...config, ...scope }, pool }).buildBatch({ epoch: 1n }),
+    /canonical message ID mismatch/,
+  );
+  assert.deepEqual(await readMessages(pool, config.databaseSchema), before);
 });

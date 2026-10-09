@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent idempotent source-event indexing, configurable source-block finality tracking, source-chain reorganization recovery, and restart-safe single-node workers. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, an identity application that can create canonical outbound messages through the gateway, a PostgreSQL-backed Indexer, and an independent Finality Watcher.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent idempotent source-event indexing, configurable source-block finality tracking, source-chain reorganization recovery, restart-safe single-node workers, and deterministic message batching. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, an identity application that can create canonical outbound messages through the gateway, a PostgreSQL-backed Indexer, an independent Finality Watcher, and a batch builder for finalized source messages.
 
 The current implementation can:
 
@@ -33,7 +33,10 @@ The current implementation can:
 - detect a source-chain divergence before indexing or finality advancement and recover from the common ancestor;
 - preserve orphaned unfinalized occurrences as terminal `REORGED` audit records while re-indexing the replacement branch;
 - fail closed without database mutation when a detected fork reaches a `FINALIZED` occurrence;
-- treat only `FINALIZED` messages as eligible for a future batching component;
+- consume only `FINALIZED` source occurrences through the existing batching eligibility query;
+- deterministically order batch membership by canonical source block and log position;
+- bind an explicit batch epoch, source scope, and ordered canonical message IDs into an ABI-encoded batch identifier;
+- reconstruct the same batch from the same eligible message set and context across repeated reads and fresh builder instances;
 - preserve finality state and timestamps across duplicate event ingestion;
 - recover the Indexer from a persisted next-block cursor after graceful or abrupt process loss;
 - preserve `OBSERVED`, `FINALIZING`, `FINALIZED`, and `REORGED` lifecycle data across worker restarts;
@@ -80,12 +83,14 @@ Unknown EOA or contract ──────────────────�
                                                          FINALIZED
                                                                │
                                                                v
-                                                future batching (not implemented)
+                                                    deterministic Message Batch
 ```
 
 `IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The Indexer persists emitted source events, and the Finality Watcher advances their database lifecycle; neither component adds proof-to-message binding. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
 
 The Indexer and Finality Watcher are disposable worker processes. Their durable operational progress lives in PostgreSQL, and every new process reconciles that state with Chain A before continuing.
+
+The batch builder reads finalized source occurrences from PostgreSQL and preserves their canonical protocol fields and source provenance in a deterministic order. Batch construction has no effect on source lifecycle state. Merkle batch commitments, consensus, and destination delivery are outside the current implementation.
 
 ## Cross-Chain Messages
 
@@ -435,7 +440,7 @@ The lifecycle states are:
 - `FINALIZED` records that the fixed watcher head satisfied the configured depth;
 - `REORGED` preserves an orphaned `OBSERVED` or `FINALIZING` occurrence as an audit record.
 
-An already-deep `OBSERVED` message moves directly to `FINALIZED`; its `finalizing_at` remains `NULL` because it never entered `FINALIZING`. `FINALIZED` and `REORGED` are terminal. Later watcher passes and exact-event rescans preserve their status and timestamps. Only `FINALIZED` rows are exposed as eligible input for future batching; `OBSERVED`, `FINALIZING`, and `REORGED` are excluded. This repository does not yet implement the batcher.
+An already-deep `OBSERVED` message moves directly to `FINALIZED`; its `finalizing_at` remains `NULL` because it never entered `FINALIZING`. `FINALIZED` and `REORGED` are terminal. Later watcher passes and exact-event rescans preserve their status and timestamps. Only `FINALIZED` rows are eligible for deterministic batch construction; `OBSERVED`, `FINALIZING`, and `REORGED` are excluded. Constructing a batch preserves all source lifecycle status and metadata.
 
 This remains an operator-configured source confirmation policy and does not provide absolute consensus finality or a cryptographic finality proof.
 
@@ -520,6 +525,50 @@ Run one Finality Watcher pass or the continuous watcher with the same configurat
 npm run finality:once
 npm run finality
 ```
+
+## Deterministic Message Batching
+
+`createMessageBatcher({ config, pool })` reads all currently `FINALIZED` source occurrences in the configured `chainDomain` and `sourceGateway` scope through the existing `listBatchEligibleMessages` query. Its `buildBatch({ epoch })` operation requires an explicit uint256 epoch and returns `undefined` when no finalized messages are available. The batch epoch is caller-selected; it is independent of the identity application's policy epoch and any future validator-set epoch.
+
+The batch representation contains:
+
+| Field | Meaning |
+| --- | --- |
+| `version` | Fixed batch wire-format version `1` |
+| `sourceDomain`, `sourceGateway` | One source-chain and Gateway scope |
+| `epoch` | Explicit deterministic batch context |
+| `messages` | Ordered canonical messages, complete payloads, and source-event provenance |
+| `messageIds` | Canonical protocol message IDs in the same order |
+| `batchId` | Keccak hash of the domain-separated Solidity ABI encoding |
+
+The builder itself sorts by `sourceBlockNumber`, then `sourceLogIndex`, then normalized `sourceBlockHash`, `sourceTransactionHash`, and `messageId`, all ascending. The eligibility query uses the same field order and bytewise hexadecimal tie-breakers. Block numbers and log indices remain `BigInt`; database primary keys, timestamps, insertion order, and JavaScript object property order have no role in the protocol result.
+
+Every input must be `FINALIZED`, belong to the batch's source scope, and carry a valid canonical message ID matching its complete protocol data and payload. The builder rejects duplicate message IDs, duplicate source occurrence identities, conflicting hashes at one source height, and conflicting global log positions. Direct calls to the pure `buildMessageBatch` function apply the same validation as the database-backed operation.
+
+Batch encoding follows the same Solidity ABI and Ethereum Keccak conventions as canonical messages:
+
+```text
+MESSAGE_BATCH_TYPE = "MessageBatch(uint8 version,uint256 sourceDomain,address sourceGateway,uint256 epoch,bytes32[] messageIds)"
+MESSAGE_BATCH_TYPEHASH = keccak256(bytes(MESSAGE_BATCH_TYPE))
+batchId = keccak256(
+    abi.encode(
+        MESSAGE_BATCH_TYPEHASH,
+        uint8(1),
+        sourceDomain,
+        sourceGateway,
+        epoch,
+        orderedMessageIds
+    )
+)
+```
+
+The array is ABI-encoded as a `bytes32[]` with its length and ordered contents. Protocol message IDs retain their existing canonical definition. The batch ID binds the batch version, source scope, epoch, and ordered message IDs; source block and transaction provenance are retained in `messages` for ordering and audit.
+
+Given the same eligible source occurrences and context, reverse or shuffled input, repeated construction, and a fresh builder return the same batch. Changing the epoch or ordered message membership changes the batch ID. Database errors and malformed inputs propagate to the caller. The result includes no database IDs or observation/finalization timestamps.
+
+Batch construction reads source data and returns an immutable value. It does not persist a batch record, reserve or consume finalized rows, rotate epochs, or change finality state. If the finalized set grows, a new construction may produce different membership and a different batch ID even when the caller reuses an epoch. Exactly-once downstream consumption requires additional lifecycle design.
+
+PostgreSQL provides durable operational state; Chain A remains the source history authority. Constructing a batch grants no Chain B authorization, validator approval, quorum certificate, or delivery guarantee. The implementation stops at Message Batch and supplies no message-batch Merkle tree, root, leaf encoding, inclusion proof, batch sealing, PBFT, or relayer.
 
 ## Local Two-Chain Environment
 
@@ -660,7 +709,7 @@ The script:
 
 Generated circuits, witnesses, proofs, public signals, ptau files, and zkey files are written under `zk/build/`. Generated Solidity cryptographic source is written under `contracts/generated/`. Both locations are excluded from source control.
 
-### Chain A Indexer and Finality Watcher
+### Chain A Indexer, Finality Watcher, and Message Batches
 
 Run the Indexer unit suite after installing its packages:
 
@@ -677,7 +726,9 @@ export INDEXER_DB_SCHEMA='cross_chain_indexer_database_test'
 npm run test:database
 ```
 
-The real Chain A integration runs through the unified repository verification flow because it needs the deployed protocol contracts and both local chains. It covers fixed-snapshot indexing, abrupt worker termination after durable commits, offline message catch-up, PostgreSQL pool recreation, repeated restarts, exact-event rescans, real `OBSERVED → FINALIZING → FINALIZED` transitions, eventless block tracking, and snapshot/revert replacement of an unfinalized branch followed by a fresh Indexer process.
+The unit suite also covers batch ABI encoding, canonical ordering under input permutations, explicit epochs, membership changes, duplicate rejection, malformed messages, invalid lifecycle states, and large protocol integers. PostgreSQL tests connect the existing finalized-only query to the production batcher, check insertion-order independence and duplicate rescans, and verify that construction preserves all source lifecycle metadata.
+
+The real Chain A integration runs through the unified repository verification flow because it needs the deployed protocol contracts and both local chains. It covers fixed-snapshot indexing, abrupt worker termination after durable commits, offline message catch-up, PostgreSQL pool recreation, repeated restarts, exact-event rescans, real `OBSERVED → FINALIZING → FINALIZED` transitions, eventless block tracking, and snapshot/revert replacement of an unfinalized branch followed by a fresh Indexer process. It then constructs a batch from the canonical finalized occurrences, excludes the reorged occurrence, and rebuilds the same batch with a fresh builder and PostgreSQL pool.
 
 ## Complete Verification
 
@@ -721,7 +772,11 @@ The script uses strict error handling and performs:
 30. common-ancestor discovery by the Finality Watcher before lifecycle advancement;
 31. atomic `REORGED` classification, canonical-history deletion, and cursor rewind;
 32. new Indexer process recovery from the rewound cursor;
-33. replacement-branch finalization while the orphaned occurrence remains terminal and ineligible.
+33. replacement-branch finalization while the orphaned occurrence remains terminal and ineligible;
+34. deterministic batch unit tests for encoding, epochs, permutations, membership changes, and fail-closed inputs;
+35. database-backed batch construction with only `FINALIZED` membership, duplicate-ingestion stability, and unchanged lifecycle metadata;
+36. a real finalized-message batch containing Message A, B, and D while excluding old `REORGED` Message C;
+37. repeated construction and fresh-builder reconstruction with identical ordered membership and batch ID.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -737,7 +792,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Crash Recovery
+Deterministic Message Batching
 ```
 
 ### Expected error output
@@ -813,6 +868,7 @@ Cross-Chain/
 │   │   ├── finality-watcher.mjs
 │   │   ├── indexer.mjs
 │   │   ├── main.mjs
+│   │   ├── message-batch.mjs
 │   │   ├── migrate.mjs
 │   │   ├── reorg-detector.mjs
 │   │   ├── source-event-identity.mjs
@@ -826,6 +882,7 @@ Cross-Chain/
 │   │   ├── finality-watcher.test.mjs
 │   │   ├── indexer.test.mjs
 │   │   ├── integration.test.mjs
+│   │   ├── message-batch.test.mjs
 │   │   ├── reorg-detector.test.mjs
 │   │   └── source-event-identity.test.mjs
 │   ├── package.json
@@ -892,7 +949,11 @@ Cross-Chain/
 - The runtime assumes one active Indexer and one active Finality Watcher. Multi-instance coordination, distributed locking, active-active failover, and zero-downtime orchestration remain unimplemented.
 - The current message binds its protocol type, source domain, source gateway, source sender, destination domain, destination gateway, destination receiver, nonce, payload hash, and deadline.
 - A committed destination gateway is caller-selected. `SourceGateway` does not validate remote deployment, domain ownership, or trust, and no remote-gateway registry exists.
-- The repository does not provide a batcher, Merkle batch construction, relaying, PBFT validation, destination gateway implementation or execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
+- The batcher consumes only the existing `FINALIZED` eligibility boundary. `REORGED` occurrences remain terminal and are excluded from every batch.
+- A deterministic batch ID binds its source scope, epoch, and ordered canonical message IDs. It provides no Merkle inclusion proof, consensus result, quorum certificate, Chain B authorization, or cross-chain acceptance.
+- Batch construction preserves source lifecycle state and exposes only the existing public message data and provenance. It introduces no private credential attributes.
+- PostgreSQL remains operational persistence. Batch construction does not independently establish canonical-chain consensus or validator authority.
+- The repository does not provide persistent batch lifecycle, batch sealing, automatic epoch rotation, exactly-once batch consumption, Merkle batch construction, relaying, PBFT validation, destination gateway implementation or execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.
