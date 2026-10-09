@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, a persistent batch lifecycle, and four independent validator processes. It provides a source-chain gateway, a two-chain local environment, user-held credential proofs, an identity application, a PostgreSQL-backed Indexer and Finality Watcher, durable sealed Message Roots, and validators that independently recheck Chain A and retain isolated local observations. PBFT consensus and destination execution are not implemented.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, a persistent batch lifecycle, and four independent validator processes with signed PBFT PRE-PREPARE proposals. It provides a source-chain gateway, a two-chain local environment, user-held credential proofs, an identity application, a PostgreSQL-backed Indexer and Finality Watcher, durable sealed Message Roots, and validators that independently recheck Chain A and retain isolated local observations and proposal safety locks. Complete PBFT consensus and destination execution are not implemented.
 
 The current implementation can:
 
@@ -56,7 +56,11 @@ The current implementation can:
 - authenticate configured peer identities with source-bound challenge-response signatures;
 - independently verify canonical source blocks, receipts, raw event logs, and fixed-head finality;
 - reconstruct each candidate's batch ID and Message Root using the existing protocol implementations;
-- preserve validator-local validation observations across fresh-process restarts without granting commit authority.
+- preserve validator-local validation observations across fresh-process restarts without granting commit authority;
+- select a deterministic primary from a canonically ordered static committee for each exact batch epoch;
+- sign domain-separated PRE-PREPARE proposals only after independent validation of a pending batch;
+- independently authenticate and validate proposals on backups, retain one immutable proposal per epoch, and recover it after process loss;
+- retry partial proposal delivery without changing the primary, replacing accepted state, or forming a quorum.
 
 ## Architecture
 
@@ -113,6 +117,18 @@ Unknown EOA or contract ──────────────────�
                                                                v
                                               V1 / V2 / V3 / V4 independent processes
                                               own key + state + Chain A RPC checks
+                                                               │
+                                                               v
+                                              deterministic primary per batch epoch
+                                                               │
+                                                               v
+                                                     signed PRE-PREPARE
+                                                               │
+                                                               v
+                                              independent backup source validation
+                                                               │
+                                                               v
+                                              validator-local accepted proposal locks
 ```
 
 `IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The Indexer persists emitted source events, and the Finality Watcher advances their database lifecycle; neither component adds proof-to-message binding. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
@@ -716,7 +732,7 @@ Batch membership uniqueness provides durable assignment ownership. It does not e
 
 The `validator/` subsystem runs one validator per Node.js process. The configured static set contains exactly four unique secp256k1-derived Ethereum addresses and four distinct HTTP endpoints. V1–V4 are verification aliases, not cryptographic identities. Each process has its own key, memory, endpoint, PostgreSQL namespace, and source RPC client. The production configuration supports separate database servers as well as isolated schemas on one server.
 
-There is no primary, proposal, consensus view, validator-set epoch, vote, quorum calculation, or quorum certificate. The foundation produces local validation observations only. Even four successful independent validations cannot authorize `CONSENSUS_PENDING → COMMITTED`.
+The committee coordinates signed PRE-PREPARE proposals through one deterministic primary per batch epoch. Local `VALID` observations and accepted PRE-PREPARE records are distinct from PREPARE votes. There is no PREPARE or COMMIT phase, consensus view, validator-set epoch, quorum calculation, or quorum certificate. Even four accepted proposals cannot authorize `CONSENSUS_PENDING → COMMITTED`.
 
 ### Identity and persistence
 
@@ -728,9 +744,12 @@ The local schema contains:
 
 - `validator_metadata`: one immutable validator address, source domain/Gateway, finality policy, and protocol version;
 - `validated_batch_bindings`: one immutable batch ID, epoch, root, count, and ordered public source-occurrence references;
-- `validation_observations`: immutable `VALID`/`INVALID` observations keyed by batch ID and source-head hash, with exact head number and an operational timestamp.
+- `validation_observations`: immutable `VALID`/`INVALID` observations keyed by batch ID and source-head hash, with exact head number and an operational timestamp;
+- `validator_committee`: an immutable canonical array of four configured public identities;
+- `pbft_pre_prepares`: one immutable accepted proposal per local validator and batch epoch, including batch ID, root, digest, primary signature, `ISSUED`/`ACCEPTED` direction, and acceptance time;
+- `pre_prepare_rejections`: separate minimal public rejection evidence and stable reason categories, with no authority to reserve an accepted slot.
 
-Opening an existing namespace with another key, Gateway, domain, or finality policy fails closed. Same-snapshot validation at the same head is idempotent. A different head adds an observation without deleting history. A changed root, epoch, or occurrence membership for an existing batch ID, or contradictory results at the same head, cannot overwrite prior state. No operational timestamp or local observation enters a message ID, batch ID, Merkle hash, or future consensus signature.
+Opening an existing namespace with another key, Gateway, domain, finality policy, or committee membership fails closed. Peer order and endpoint changes do not change the canonical identity array. Same-snapshot validation at the same head is idempotent. A different head adds an observation without deleting history. A changed root, epoch, or occurrence membership for an existing batch ID, or contradictory results at the same head, cannot overwrite prior state. No operational timestamp or local observation enters a message ID, batch ID, Merkle hash, or proposal signature. Ordered, rerunnable validator migrations preserve existing identity and observations; `002_pre_prepare.sql` adds proposal storage without rewriting the original migration.
 
 An integrity-checked candidate that fails canonical-block or depth validation can produce a local `INVALID` observation. A malformed or corrupt snapshot cannot establish a batch binding; its request is rejected without recording its untrusted cryptographic assertions. Unavailable RPC data cannot produce `VALID` or overwrite an earlier observation. Validator operations never repair or rewrite source history.
 
@@ -761,10 +780,60 @@ The transport uses Node's built-in HTTP implementation. Requests have a bounded 
 | `POST /handshake` | Sign a known peer's fresh bytes32 challenge in the identity-handshake domain |
 | `POST /connect-peer` | Authenticate one configured peer using an independently generated challenge |
 | `POST /validate-batch` | Independently validate a referenced source batch |
+| `POST /pbft/primary` | Compute the canonical committee and primary for a decimal-string batch epoch |
+| `POST /pbft/propose` | Validate a `batchId`, require this node to be primary, persist and broadcast its proposal |
+| `POST /pbft/pre-prepare` | Authenticate an envelope, independently validate its first acceptance, and persist a local safety lock |
+| `GET /pbft/pre-prepares` | Read this validator's durable issued/accepted proposals |
 
 Handshake hashing is `keccak256(abi.encode(HANDSHAKE_DOMAIN, sourceDomain, sourceGateway, validatorAddress, challenge))`, with the type string `ValidatorIdentityHandshake(uint256 sourceDomain,address sourceGateway,address validator,bytes32 challenge)`. The response uses Ethereum personal-message signing of that raw digest. The requester recovers the signer and checks the expected static peer identity, source context, and challenge. Changed challenges, identities, context, signatures, and replay against a new challenge fail. No persistent handshake anti-replay ledger is needed; freshness belongs to the requester.
 
 This handshake proves peer key control. It is not a PBFT vote, encrypted transport, or authenticated consensus session. A validation request triggers independent reads and cannot upload a trusted tree/root or grant commit authority.
+
+### Deterministic primary and PRE-PREPARE
+
+The static committee is sorted by unsigned address bytes, represented as equal-length lowercase hexadecimal addresses. Every validator computes `primaryIndex = epoch % 4n` using exact `BigInt` arithmetic, then selects that canonical position. Configuration insertion order, process startup, discovery, and reachability have no influence. The batch epoch is the sole proposal sequencing context. No independent sequence counter, view number, or validator-set epoch is introduced. An offline primary prevents proposal initiation; another validator is never promoted automatically.
+
+The wire envelope contains only:
+
+```text
+messageType = "PRE_PREPARE"
+protocolVersion = "1"
+sourceDomain                    decimal uint256 string
+sourceGateway                   Ethereum address
+epoch                           decimal uint256 string
+batchId                         bytes32
+messageRoot                     bytes32
+primaryIdentity                 Ethereum address
+proposalDigest                  bytes32
+signature                       65-byte Ethereum signature
+```
+
+Integers are transported as canonical decimal strings, never JSON numbers. The authoritative digest is:
+
+```text
+PRE_PREPARE_DOMAIN = keccak256(UTF8(
+  "PBFTPrePrepare(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,bytes32 batchId,bytes32 messageRoot,address primaryIdentity)"
+))
+
+proposalDigest = keccak256(abi.encode(
+  PRE_PREPARE_DOMAIN, uint8(protocolVersion), uint256(sourceDomain), sourceGateway,
+  uint256(epoch), batchId, messageRoot, primaryIdentity
+))
+```
+
+The domain identifies the PRE-PREPARE message type and is distinct from handshake, canonical source-message, batch, and Merkle domains. The primary signs the raw 32-byte digest with the existing Ethereum personal-message signing model. The resulting EIP-191 signature is recovered against the same raw digest. JSON formatting/property order, signature bytes, timestamps, endpoints, PIDs, and database record IDs are excluded from the digest.
+
+`POST /pbft/propose` accepts only `{ "batchId": "0x..." }`. The node reads and independently verifies the candidate through the existing source-validation service, requires `CONSENSUS_PENDING`, computes the primary, and refuses to sign when it is a backup or source validation fails. Proposal fields come from that same validated snapshot. The ordinary `/validate-batch` endpoint continues to support both `SEALED` and `CONSENSUS_PENDING`; a `SEALED` snapshot cannot enter the proposal path.
+
+A receiving node checks strict fields, version/type, source context, recomputed digest, configured committee membership, recovered signer, and deterministic primary. First acceptance then independently rechecks canonical Chain A blocks, successful receipts, raw event logs, fixed-head finality, local batch epoch, reconstructed batch ID, and Merkle root. A valid primary signature cannot authorize a wrong root, corrupt source state, or an ineligible lifecycle. The primary coordinates proposals and has no source-truth authority. PostgreSQL remains operational evidence, not authoritative cross-chain truth.
+
+The primary persists its `ISSUED` accepted record before sending to the other three configured peers. Each delivery performs the existing peer handshake and a bounded HTTP PRE-PREPARE request, with a five-second timeout for each call. Delivery failures are reported individually; there is no endless retry, alternate-primary selection, or quorum interpretation. Responses are unsigned `ACCEPTED`/`REJECTED` operational results, never approval votes. Invalid bodies receive HTTP 400; well-formed rejected proposals receive 422; internal database failures return 503 and are not swallowed.
+
+The database safety key is `(local_validator_identity, epoch)`. Transactions, a unique constraint, and immutable-row guards prevent concurrent or sequential proposals from replacing the accepted digest. A completely identical delivery returns the original record without another row. A newly authenticated signature for the same digest also preserves the original stored signature. A different authenticated digest for an already-locked epoch returns `CONFLICTING_PRE_PREPARE` before acceptance. Rejection auditing never consumes that slot. Initial acceptance always requires source validation; an authenticated duplicate returns durable prior acceptance without claiming a new source-validation observation.
+
+Before persistence, a restart can validate and construct the same digest again. After persistence, the primary revalidates the pending candidate and reuses its stored envelope for rebroadcast. Partial delivery retries are idempotent for existing backups and produce first acceptance on previously offline backups. A fresh backup process reads the same safety lock, accepts duplicates idempotently, and still rejects conflicts. Source corruption or an unavailable RPC prevents a new proposal; validators do not repair source history or advance the batch lifecycle.
+
+Accepted PRE-PREPARE is not a PREPARE vote, quorum, `COMMITTED` state, or quorum certificate. The source batch stays `CONSENSUS_PENDING`. PREPARE, COMMIT, quorum certificates, Byzantine fault completion, partition recovery, view change, validator rotation, relaying, destination gateways, and destination execution are unsupported.
 
 ### Configuration
 
@@ -781,6 +850,10 @@ Unit tests cover configuration, independent identities, domain-separated handsha
 The existing real integration preserves A/B/D finalization, C reorganization, sealed Solidity proofs, and E rollover, then starts V1–V4 as four real processes. Test-only RPC forwarding observers record each process's actual Chain A requests without changing their responses. Every validator must independently fetch receipts, use one latest-head snapshot per pass, reconstruct the pending batch, and persist its own observation. All directed peer pairs authenticate.
 
 The flow stops V4 and verifies that V1/V2/V3 remain alive with unchanged state, rejects a different key opening V4's store, and starts a fresh V4 process that recovers its observation and validates idempotently. Corrupt root/block and injected `REORGED` cases use isolated copies of real source data, never the original source tables. Separate negative profiles cover insufficient RPC depth, wrong chain, and missing Gateway bytecode. The complete original source rows, cursor, canonical blocks, batch statuses, and membership are compared before and after validator operations.
+
+PRE-PREPARE unit tests add canonical committee permutations, exact uint256 rotation, field/digest/signature mutations, lifecycle/context checks, source corruption, and persistence/broadcast crash boundaries. Database tests cover issued/accepted recovery, rerunnable migration, committee binding, concurrent duplicates/conflicts, immutable locks, and rejection isolation.
+
+The same four-process flow uses a different peer ordering on each node and verifies that all select the same actual primary. It rejects non-primary proposals, malformed signatures, unknown references, wrong epochs, and primary-signed wrong roots before the canonical proposal. A deliberately stopped backup makes the first broadcast partial at a known boundary. The primary then restarts, the backup returns, and the same stored proposal is rebroadcast. Concurrent duplicate delivery, a fresh backup restart, and correctly signed conflicts preserve each node's original record. Fresh isolated source profiles exercise `SEALED`, corrupt roots/blocks, `REORGED` members, and insufficient depth without masking failures behind existing locks. Final assertions compare the original source tables and reject an unauthorized `COMMITTED` transition. These checks do not assert Byzantine consensus completion.
 
 The integration helper tracks only its own child processes and handles failure and interruption cleanup. The root script also maintains an owned PID registry for fallback cleanup; it never targets unrelated validator processes. These recovery tests establish local persistence and process isolation, not PBFT fault tolerance or consensus liveness.
 
@@ -1017,7 +1090,13 @@ The script uses strict error handling and performs:
 57. each validator's recorded real RPC receipt/block requests and fixed-head finality checks;
 58. immutable local observations and same-head idempotent validation of the real pending A/B/D batch;
 59. wrong-reference/root/block, `REORGED` injection, insufficient depth, wrong chain/Gateway, and wrong-key rejection;
-60. fresh V4 recovery with V1/V2/V3 unaffected and complete original source-state preservation.
+60. fresh V4 recovery with V1/V2/V3 unaffected and complete original source-state preservation;
+61. canonical committee ordering, exact deterministic primary rotation, and domain-separated proposal signatures;
+62. durable issued/accepted epoch slots, concurrent duplicates/conflicts, rejection isolation, and migration retries;
+63. a real primary-signed A/B/D PRE-PREPARE with independent backup RPC reconstruction;
+64. wrong-primary/signature/epoch/reference/root/lifecycle/source rejection and unchanged source state;
+65. controlled partial broadcast, fresh primary/backup recovery, and idempotent retry of the stored proposal;
+66. four matching isolated PRE-PREPARE records with the batch still pending and no PREPARE, COMMIT, or quorum.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -1035,7 +1114,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Independent Validator Foundation
+Deterministic PBFT PRE-PREPARE
 ```
 
 ### Expected error output
@@ -1156,20 +1235,25 @@ Cross-Chain/
 ├── validator/
 │   ├── .env.example
 │   ├── migrations/
-│   │   └── 001_validator_foundation.sql
+│   │   ├── 001_validator_foundation.sql
+│   │   └── 002_pre_prepare.sql
 │   ├── src/
+│   │   ├── committee.mjs
 │   │   ├── config.mjs
 │   │   ├── db.mjs
 │   │   ├── handshake.mjs
 │   │   ├── identity.mjs
 │   │   ├── main.mjs
 │   │   ├── migrate.mjs
+│   │   ├── pre-prepare.mjs
+│   │   ├── pre-prepare-service.mjs
 │   │   ├── server.mjs
 │   │   └── source-validation.mjs
 │   ├── test/
 │   │   ├── config.test.mjs
 │   │   ├── database.test.mjs
 │   │   ├── handshake.test.mjs
+│   │   ├── pre-prepare.test.mjs
 │   │   ├── server.test.mjs
 │   │   ├── source-validation.test.mjs
 │   │   └── helpers/
@@ -1241,7 +1325,8 @@ Cross-Chain/
 - Four independent validator processes may share one source RPC provider; independent checking does not eliminate that provider's trust assumptions or produce a cryptographic source-finality proof.
 - Validator-local observations are separate from source persistence and are never consensus votes. One validator or four local `VALID` results cannot commit a batch.
 - Peer handshake signatures prove configured identity control in a distinct domain and cannot serve as future PREPARE/COMMIT signatures. Source mismatches fail closed and do not trigger source DB repairs.
-- The repository does not provide destination gateway integration, QC verification, exactly-once downstream batch consumption, relaying, PBFT validation, destination execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
+- Signed PRE-PREPARE proposals use a separate canonical domain and authenticate the deterministic primary, but signature validity cannot replace independent source validation. One accepted digest per local identity/epoch is durable across restart; accepted proposals do not authorize `COMMITTED`.
+- The repository does not provide PREPARE or COMMIT phases, quorum calculation/certificates, Byzantine fault completion, partition recovery, view change, validator rotation, destination gateway integration, QC verification, exactly-once downstream batch consumption, relaying, destination execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.

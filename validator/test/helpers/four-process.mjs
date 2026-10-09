@@ -10,6 +10,8 @@ import { validatorAccount } from "../../src/identity.mjs";
 import { verifyHandshakeResponse } from "../../src/handshake.mjs";
 import { tableName } from "../../../indexer/src/db.mjs";
 import { developmentKeys } from "./fixtures.mjs";
+import { deterministicPrimary } from "../../src/committee.mjs";
+import { prePrepareDigest } from "../../src/pre-prepare.mjs";
 
 const MAIN = fileURLToPath(new URL("../../src/main.mjs", import.meta.url));
 const SOURCE_TABLES = ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batches", "message_batch_members"];
@@ -109,7 +111,9 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     const pool = createValidatorPool(config); pools.push(pool);
     await applyValidatorMigrations(pool, config.databaseSchema);
     await pool.query(`TRUNCATE TABLE ${tableName(config.databaseSchema, "validation_observations")},
-      ${tableName(config.databaseSchema, "validated_batch_bindings")}, ${tableName(config.databaseSchema, "validator_metadata")}`);
+      ${tableName(config.databaseSchema, "validated_batch_bindings")}, ${tableName(config.databaseSchema, "validator_metadata")},
+      ${tableName(config.databaseSchema, "validator_committee")}, ${tableName(config.databaseSchema, "pbft_pre_prepares")},
+      ${tableName(config.databaseSchema, "pre_prepare_rejections")}`);
     return { config, pool, store: createValidatorStore({ pool, config }) };
   }
   async function start(environment, { expectFailure = false } = {}) {
@@ -151,7 +155,8 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     const peers = keys.map((key, index) => ({ address: validatorAccount(key).address.toLowerCase(), url: `http://127.0.0.1:${reservations[index].port}` }));
     const environments = peers.map((peer, index) => ({
       VALIDATOR_PRIVATE_KEY: keys[index], VALIDATOR_LISTEN_HOST: "127.0.0.1", VALIDATOR_LISTEN_PORT: String(reservations[index].port),
-      VALIDATOR_PEERS: JSON.stringify(peers), VALIDATOR_DATABASE_URL: localUrl, VALIDATOR_DB_SCHEMA: `${prefix}_v${index + 1}`,
+      VALIDATOR_PEERS: JSON.stringify([...peers.slice(index), ...peers.slice(0, index)].reverse()),
+      VALIDATOR_DATABASE_URL: localUrl, VALIDATOR_DB_SCHEMA: `${prefix}_v${index + 1}`,
       SOURCE_DATABASE_URL: sourceConfig.databaseUrl, SOURCE_DB_SCHEMA: sourceConfig.databaseSchema,
       CHAIN_A_DOMAIN: sourceConfig.chainDomain.toString(), SOURCE_GATEWAY_ADDRESS: sourceConfig.sourceGateway,
       CHAIN_A_RPC_URL: proxies[index].url, FINALITY_BLOCK_DEPTH: sourceConfig.finalityBlockDepth.toString(),
@@ -276,7 +281,144 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     for (let index = 0; index < 4; index++) assert.deepEqual(await states[index].store.readObservations(), observations[index]);
     assert.deepEqual(await sourceState(sourcePool, sourceConfig.databaseSchema), originalSourceState);
     console.log("VALID: fresh V4 process recovered its own identity and observation; wrong-key recovery rejected");
+
+    const epoch = snapshot.record.epoch.toString();
+    const primaryAddress = deterministicPrimary(peers, epoch);
+    const primaryIndex = peers.findIndex((peer) => peer.address === primaryAddress);
+    const backups = peers.map((_, index) => index).filter((index) => index !== primaryIndex);
+    for (let index = 0; index < 4; index++) {
+      const selection = await request(peers[index].url, "/pbft/primary", { epoch });
+      assert.equal(selection.status, 200);
+      assert.equal(selection.body.primaryIdentity, primaryAddress);
+      console.log(`VALID: V${index + 1} independently selected primary ${primaryAddress} for epoch ${epoch}`);
+    }
+    const proposal = { messageType: "PRE_PREPARE", protocolVersion: "1", sourceDomain: sourceConfig.chainDomain.toString(),
+      sourceGateway: sourceConfig.sourceGateway, epoch, batchId: snapshot.record.batchId,
+      messageRoot: snapshot.record.messageRoot, primaryIdentity: primaryAddress };
+    async function signedProposal(fields, signerIndex = primaryIndex) {
+      const proposalDigest = prePrepareDigest(fields);
+      const signature = await validatorAccount(keys[signerIndex]).signMessage({ message: { raw: proposalDigest } });
+      return { ...fields, proposalDigest, signature };
+    }
+    async function expectProposalRejection(index, envelope, reason) {
+      const response = await request(peers[index].url, "/pbft/pre-prepare", envelope);
+      assert.equal(response.status, 422); assert.equal(response.body.result, "REJECTED");
+      assert.equal(response.body.reason, reason);
+      console.log(`VALID: V${index + 1} rejected PRE-PREPARE (${reason})`);
+    }
+    const canonical = await signedProposal(proposal);
+    const wrongRoot = await signedProposal({ ...proposal, messageRoot: `0x${"ee".repeat(32)}` });
+    const nonPrimary = backups[0];
+    const callsBeforeWrongRoot = proxies[nonPrimary].calls.length;
+    await expectProposalRejection(nonPrimary, wrongRoot, "WRONG_ROOT");
+    assert.ok(proxies[nonPrimary].calls.slice(callsBeforeWrongRoot).some((call) => call.method === "eth_getTransactionReceipt"),
+      "a correctly signed wrong root must reach independent source reconstruction before rejection");
+    const wrongPrimary = await signedProposal({ ...proposal, primaryIdentity: peers[nonPrimary].address }, nonPrimary);
+    await expectProposalRejection(backups[1], wrongPrimary, "WRONG_PRIMARY");
+    await expectProposalRejection(nonPrimary, { ...canonical, signature: `0x${"00".repeat(65)}` }, "INVALID_SIGNATURE");
+    await expectProposalRejection(nonPrimary, await signedProposal({ ...proposal, batchId: `0x${"ff".repeat(32)}` }), "UNKNOWN_BATCH");
+    const nextEpoch = (BigInt(epoch) + 1n).toString();
+    const nextPrimary = deterministicPrimary(peers, nextEpoch);
+    await expectProposalRejection(nonPrimary, await signedProposal({ ...proposal, epoch: nextEpoch, primaryIdentity: nextPrimary },
+      peers.findIndex((peer) => peer.address === nextPrimary)), "WRONG_EPOCH");
+    const refused = await request(peers[nonPrimary].url, "/pbft/propose", { batchId: proposal.batchId });
+    assert.equal(refused.status, 422); assert.equal(refused.body.reason, "WRONG_PRIMARY");
+    for (const state of states) assert.deepEqual(await state.store.readPrePrepares(), []);
+
+    // Explicitly stop one backup before the first broadcast; connection refusal is deterministic.
+    const offlineIndex = backups[2];
+    await stop(validators[offlineIndex]);
+    const rpcStarts = proxies.map((proxy) => proxy.calls.length);
+    const issued = await request(peers[primaryIndex].url, "/pbft/propose", { batchId: proposal.batchId });
+    assert.equal(issued.status, 200); assert.equal(issued.body.result, "ACCEPTED");
+    assert.equal(issued.body.record.direction, "ISSUED");
+    assert.deepEqual(issued.body.record.envelope, canonical);
+    assert.equal(issued.body.deliveries.length, 3);
+    assert.equal(issued.body.deliveries.find((entry) => entry.peerAddress === peers[offlineIndex].address).delivery, "FAILED");
+    for (let index = 0; index < 4; index++) {
+      const proposals = await states[index].store.readPrePrepares();
+      assert.equal(proposals.length, index === offlineIndex ? 0 : 1);
+      if (index === offlineIndex) continue;
+      assert.equal(proposals[0].envelope.proposalDigest, canonical.proposalDigest);
+      const calls = proxies[index].calls.slice(rpcStarts[index]);
+      assert.equal(calls.filter((call) => call.method === "eth_getBlockByNumber" && call.params[0] === "latest").length, 1);
+      assert.equal(calls.filter((call) => call.method === "eth_getTransactionReceipt").length,
+        new Set(snapshot.batch.messages.map((member) => member.sourceTransactionHash)).size);
+    }
+    const savedPrimary = await states[primaryIndex].store.readPrePrepare(epoch);
+    const savedBackup = await states[backups[0]].store.readPrePrepare(epoch);
+    const primaryPid = validators[primaryIndex].child.pid;
+    await stop(validators[primaryIndex]);
+    validators[primaryIndex] = await start(environments[primaryIndex]);
+    assert.notEqual(validators[primaryIndex].child.pid, primaryPid);
+    assert.deepEqual(await states[primaryIndex].store.readPrePrepare(epoch), savedPrimary);
+    validators[offlineIndex] = await start(environments[offlineIndex]);
+    const retry = await request(peers[primaryIndex].url, "/pbft/propose", { batchId: proposal.batchId });
+    assert.equal(retry.status, 200); assert.deepEqual(retry.body.record, savedPrimary);
+    assert.ok(retry.body.deliveries.every((entry) => entry.delivery === "DELIVERED" && entry.result === "ACCEPTED"));
+    assert.deepEqual(await states[backups[0]].store.readPrePrepare(epoch), savedBackup);
+    const acceptedBeforeDuplicates = await Promise.all(states.map((state) => state.store.readPrePrepares()));
+    for (const index of backups) {
+      const duplicates = await Promise.all(Array.from({ length: 3 }, () => request(peers[index].url, "/pbft/pre-prepare", canonical)));
+      for (const response of duplicates) { assert.equal(response.status, 200); assert.equal(response.body.result, "ACCEPTED"); }
+      assert.deepEqual(await states[index].store.readPrePrepares(), acceptedBeforeDuplicates[index]);
+      await expectProposalRejection(index, wrongRoot, "CONFLICTING_PRE_PREPARE");
+    }
+    const restartIndex = backups[0];
+    const backupPid = validators[restartIndex].child.pid;
+    await stop(validators[restartIndex]);
+    validators[restartIndex] = await start(environments[restartIndex]);
+    assert.notEqual(validators[restartIndex].child.pid, backupPid);
+    const recovered = await request(peers[restartIndex].url, "/pbft/pre-prepares");
+    assert.equal(recovered.status, 200); assert.deepEqual(recovered.body.proposals, acceptedBeforeDuplicates[restartIndex]);
+    assert.equal((await request(peers[restartIndex].url, "/pbft/pre-prepare", canonical)).status, 200);
+    await expectProposalRejection(restartIndex, wrongRoot, "CONFLICTING_PRE_PREPARE");
+    console.log("VALID: primary persistence, partial broadcast retry, concurrent duplicates, and fresh primary/backup recovery preserved one digest");
+
+    // Fresh isolated receivers have no accepted slot that could mask invalid source/lifecycle cases.
+    await stop(validators[3]);
+    for (const mutation of ["sealed", "block", "reorged", "root"]) {
+      await cloneCandidateFixture(sourcePool, sourceConfig.databaseSchema, fixtureSchema);
+      if (mutation === "sealed") {
+        await sourcePool.query(`UPDATE ${tableName(fixtureSchema, "message_batches")} SET status = 'SEALED', consensus_pending_at = NULL WHERE batch_id = $1`, [proposal.batchId]);
+      } else if (mutation === "block") {
+        await sourcePool.query(`UPDATE ${tableName(fixtureSchema, "source_messages")} SET source_block_hash = $2 WHERE id = $1`,
+          [snapshot.members[0].sourceMessageId, `0x${"ee".repeat(32)}`]);
+      } else if (mutation === "root") {
+        await sourcePool.query(`UPDATE ${tableName(fixtureSchema, "message_batches")} SET message_root = $2 WHERE batch_id = $1`, [proposal.batchId, `0x${"ee".repeat(32)}`]);
+      } else {
+        const orphan = originalSourceState.source_messages.find((row) => row.status === "REORGED");
+        assert.ok(orphan);
+        await sourcePool.query(`UPDATE ${tableName(fixtureSchema, "message_batch_members")}
+          SET source_message_id = $2, message_id = $3 WHERE batch_record_id = $1 AND canonical_position = 2`,
+        [snapshot.record.batchRecordId, orphan.id, orphan.message_id]);
+      }
+      const env = { ...environments[3], SOURCE_DB_SCHEMA: fixtureSchema, VALIDATOR_DB_SCHEMA: `${prefix}_pre_${mutation}` };
+      const state = await initializeState(env);
+      const child = await start(env);
+      await expectProposalRejection(3, canonical, mutation === "sealed" ? "INVALID_LIFECYCLE" : "INVALID_SOURCE_STATE");
+      assert.deepEqual(await state.store.readPrePrepares(), []);
+      await stop(child);
+    }
+    const preDepth = { ...environments[3], VALIDATOR_DB_SCHEMA: `${prefix}_pre_depth`,
+      FINALITY_BLOCK_DEPTH: (BigInt(observations[3][0].source_head_number) + 1n).toString() };
+    const depthState = await initializeState(preDepth);
+    const depthChild = await start(preDepth);
+    await expectProposalRejection(3, canonical, "INVALID_SOURCE_STATE");
+    assert.deepEqual(await depthState.store.readPrePrepares(), []);
+    await stop(depthChild);
+    validators[3] = await start(environments[3]);
+    for (let index = 0; index < 4; index++) {
+      assert.deepEqual(await states[index].store.readPrePrepares(), acceptedBeforeDuplicates[index]);
+      assert.deepEqual(await states[index].store.readObservations(), observations[index]);
+      assert.equal((await request(peers[index].url, "/health")).status, 200);
+    }
+    await assert.rejects(sourcePool.query(`UPDATE ${tableName(sourceConfig.databaseSchema, "message_batches")}
+      SET status = 'COMMITTED', committed_at = CURRENT_TIMESTAMP WHERE batch_record_id = $1`,
+    [snapshot.record.batchRecordId]), /PBFT quorum authorization/);
     console.log("VALID: validator operations preserved source rows, cursor, blocks, membership, roots, and CONSENSUS_PENDING");
+    assert.deepEqual(await sourceState(sourcePool, sourceConfig.databaseSchema), originalSourceState);
+    console.log("VALID: four independent PRE-PREPARE safety records match; no PREPARE, quorum, COMMIT, or QC was created");
   } finally {
     controller.abort();
     const cleanup = await Promise.allSettled([

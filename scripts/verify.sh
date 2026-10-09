@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Independent Validator Foundation"
+VERIFICATION_NAME="Deterministic PBFT PRE-PREPARE"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -462,6 +462,13 @@ printf ' 43. Start four independent validator processes and authenticate all dir
 printf ' 44. Verify each validator rechecks real Chain A blocks, receipts, logs, and fixed-head finality\n'
 printf ' 45. Reject corrupt real candidates and wrong chain, Gateway, or validator identity\n'
 printf ' 46. Restart V4, preserve independent local observations, and leave batches CONSENSUS_PENDING\n'
+printf ' 47. Verify canonical committee ordering and exact deterministic primary selection\n'
+printf ' 48. Encode, sign, and authenticate domain-separated PRE-PREPARE proposals\n'
+printf ' 49. Verify durable epoch locks, concurrent delivery, rejection isolation, and migration retries\n'
+printf ' 50. Propose the real pending A/B/D batch and independently revalidate it on backups\n'
+printf ' 51. Reject wrong primary, signature, epoch, reference, root, lifecycle, and source state\n'
+printf ' 52. Recover primary/backup safety locks and retry a controlled partial broadcast\n'
+printf ' 53. Preserve all source state and CONSENSUS_PENDING without PREPARE, COMMIT, or quorum\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -520,13 +527,14 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
         "$INDEXER_DIR/test/database.test.mjs" \
         "$INDEXER_DIR/test/batch-lifecycle.database.test.mjs"
 
-CURRENT_STEP="independent validator unit tests"
+CURRENT_STEP="independent validator and PRE-PREPARE unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$VALIDATOR_DIR/test/config.test.mjs" \
     "$VALIDATOR_DIR/test/handshake.test.mjs" \
     "$VALIDATOR_DIR/test/source-validation.test.mjs" \
-    "$VALIDATOR_DIR/test/server.test.mjs"
+    "$VALIDATOR_DIR/test/server.test.mjs" \
+    "$VALIDATOR_DIR/test/pre-prepare.test.mjs"
 
 CURRENT_STEP="isolated validator database migrations and persistence tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1157,7 +1165,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source recovery, lifecycle, Solidity compatibility, and four independent validators integration"
+CURRENT_STEP="real source recovery, lifecycle, Solidity compatibility, four validators, and PRE-PREPARE integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

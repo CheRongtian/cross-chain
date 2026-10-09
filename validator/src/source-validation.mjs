@@ -110,10 +110,14 @@ export async function validateMembersAgainstChain({ config, publicClient, snapsh
 export function createBatchValidationService({ config, sourcePool, store,
   publicClient = createChainClient(config), reader = createSourceBatchReader({ config, pool: sourcePool }), logger = console }) {
   return {
-    async validate(batchId) {
+    async validatePending(batchId) {
+      return this.validate(batchId, { requirePending: true, withSnapshot: true });
+    },
+    async validate(batchId, { requirePending = false, withSnapshot = false } = {}) {
       const id = normalizeBytes32(batchId, "batch ID");
       let head;
       let snapshot;
+      let reconstructed;
       let integrityChecked = false;
       try {
         await validateSourceContext(publicClient, config);
@@ -121,9 +125,10 @@ export function createBatchValidationService({ config, sourcePool, store,
         check(typeof block.number === "bigint", "RPC_HEAD", "Chain A head has no exact block number");
         head = { number: block.number, hash: normalizeBytes32(block.hash, "source head hash") };
         snapshot = await reader.read(id);
+        if (requirePending) check(snapshot.record?.status === "CONSENSUS_PENDING", "BATCH_STATUS", "PRE-PREPARE requires CONSENSUS_PENDING");
         validateCandidateSnapshot(snapshot, config, id);
         integrityChecked = true;
-        await validateMembersAgainstChain({ config, publicClient, snapshot, head });
+        reconstructed = await validateMembersAgainstChain({ config, publicClient, snapshot, head });
       } catch (error) {
         const reason = error instanceof SourceValidationError ? error.code : "INVALID_SOURCE_OR_SNAPSHOT";
         let message = error.message;
@@ -140,6 +145,7 @@ export function createBatchValidationService({ config, sourcePool, store,
       }
       const observation = await store.recordObservation({ snapshot, head, result: "VALID" });
       return { validatorAddress: config.validatorAddress, batchId: id, result: "VALID",
+        ...(withSnapshot ? { snapshot: { ...snapshot, batch: reconstructed.batch, tree: reconstructed.tree } } : {}),
         batchEpoch: snapshot.record.epoch.toString(), messageRoot: snapshot.record.messageRoot,
         sourceHeadNumber: head.number.toString(), sourceHeadHash: head.hash,
         observedAt: observation.validated_at.toISOString() };

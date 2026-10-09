@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { normalizeAddress, normalizeBytes32 } from "../../indexer/src/canonical-message.mjs";
 import { connectPeer, signHandshake } from "./handshake.mjs";
 import { publicIdentity } from "./identity.mjs";
+import { PRE_PREPARE_ENVELOPE_FIELDS } from "./pre-prepare.mjs";
 
 export const MAX_REQUEST_BYTES = 4096;
 class InputError extends Error {}
@@ -26,7 +27,7 @@ async function readBody(request, keys) {
   return body;
 }
 
-export function createValidatorServer({ config, service, store, authenticatePeer = connectPeer, checkReady = async () => {}, logger = console }) {
+export function createValidatorServer({ config, service, store, prePrepare, authenticatePeer = connectPeer, checkReady = async () => {}, logger = console }) {
   let ready = true;
   const server = createServer(async (request, response) => {
     function send(status, body) {
@@ -44,6 +45,23 @@ export function createValidatorServer({ config, service, store, authenticatePeer
       if (request.method === "GET" && request.url === "/identity") return send(200, publicIdentity(config));
       if (!ready) return send(503, { error: "validator is stopping" });
       if (request.method === "GET" && request.url === "/observations") return send(200, { observations: await store.readObservations() });
+      if (request.method === "GET" && request.url === "/pbft/pre-prepares") return send(200, { proposals: await store.readPrePrepares() });
+      if (request.method === "POST" && request.url === "/pbft/primary") {
+        const body = await readBody(request, ["epoch"]);
+        let result;
+        try { result = prePrepare.primary(body.epoch); } catch { throw new InputError("invalid batch epoch"); }
+        return send(200, result);
+      }
+      if (request.method === "POST" && request.url === "/pbft/propose") {
+        const body = await readBody(request, ["batchId"]);
+        const result = await prePrepare.propose(body.batchId);
+        return send(result.result === "ACCEPTED" ? 200 : 422, result);
+      }
+      if (request.method === "POST" && request.url === "/pbft/pre-prepare") {
+        const body = await readBody(request, PRE_PREPARE_ENVELOPE_FIELDS);
+        const result = await prePrepare.receive(body);
+        return send(result.result === "ACCEPTED" ? 200 : 422, result);
+      }
       if (request.method === "POST" && request.url === "/handshake") {
         const body = await readBody(request, ["requesterAddress", "challenge"]);
         let requester;
