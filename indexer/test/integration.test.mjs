@@ -36,6 +36,7 @@ const IDENTITY_APPLICATION_ABI = parseAbi([
 const execFileAsync = promisify(execFile);
 const INDEXER_MAIN_PATH = fileURLToPath(new URL("../src/main.mjs", import.meta.url));
 const LIFECYCLE_READER_PATH = fileURLToPath(new URL("./helpers/read-batch-lifecycle.mjs", import.meta.url));
+const CONTRACTS_DIRECTORY = fileURLToPath(new URL("../../contracts/", import.meta.url));
 
 function requireEnvironment(name) {
   const value = process.env[name];
@@ -743,6 +744,38 @@ test("recovers source workers and seals durable batches from real finalized mess
     const sealedProcessRead = await execFileAsync(process.execPath, [LIFECYCLE_READER_PATH, lifecycleId], { env: process.env });
     process.stderr.write(sealedProcessRead.stderr);
     assert.deepEqual(JSON.parse(sealedProcessRead.stdout), transportValue(sealed));
+    // Pass only public reconstructed snapshot data to a test-local EVM. No chain deployment.
+    const restoredSealed = JSON.parse(sealedProcessRead.stdout);
+    assert.equal(restoredSealed.record.status, "SEALED");
+    assert.equal(restoredSealed.record.messageCount, String(restoredSealed.tree.leafCount));
+    const solidityInput = JSON.stringify({
+      status: restoredSealed.record.status,
+      batchId: restoredSealed.record.batchId,
+      messageRoot: restoredSealed.record.messageRoot,
+      leafCount: restoredSealed.tree.leafCount,
+      messageIds: restoredSealed.batch.messageIds,
+      leaves: restoredSealed.tree.leaves,
+      proofs: restoredSealed.tree.proofs,
+    });
+    let solidityResult;
+    try {
+      solidityResult = await execFileAsync("forge", [
+        // Forge filters complete ABI signatures, including the literal parentheses.
+        "test", "--match-contract", "MessageMerkleTest", "--match-test", "^testRealSealedSnapshot\\(\\)$", "-vv",
+      ], {
+        cwd: CONTRACTS_DIRECTORY,
+        env: { ...process.env, MERKLE_SEALED_SNAPSHOT_JSON: solidityInput, NO_COLOR: "1" },
+      });
+    } catch (error) {
+      process.stdout.write(error.stdout ?? "");
+      process.stderr.write(error.stderr ?? "");
+      throw error;
+    }
+    process.stdout.write(solidityResult.stdout);
+    process.stderr.write(solidityResult.stderr);
+    const plainSolidityOutput = solidityResult.stdout.replace(/\u001b\[[0-9;]*m/g, "");
+    assert.match(plainSolidityOutput, /\[PASS\]\s+testRealSealedSnapshot\(/, "real sealed Solidity test must execute and pass, not skip");
+    console.log("VALID: fresh-process SEALED A/B/D leaves and proofs accepted by the Solidity Merkle primitive");
     const pending = await lifecycle.markConsensusPending({ batchRecordId: lifecycleId });
     assert.equal(pending.record.status, "CONSENSUS_PENDING");
     assert.equal(pending.record.committedAt, null);

@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent idempotent source-event indexing, configurable source-block finality tracking, source-chain reorganization recovery, restart-safe single-node workers, deterministic message batching, off-chain Merkle message commitments, and a persistent batch lifecycle. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, an identity application that can create canonical outbound messages through the gateway, a PostgreSQL-backed Indexer, an independent Finality Watcher, a batch builder for finalized source messages, and durable sealed Message Roots with reproducible inclusion proofs.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent idempotent source-event indexing, configurable source-block finality tracking, source-chain reorganization recovery, restart-safe single-node workers, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and a persistent batch lifecycle. It provides a source-chain gateway, a two-chain local environment, a user-held credential model, credential proofs that can be verified locally or on Chain A, an identity application that can create canonical outbound messages through the gateway, a PostgreSQL-backed Indexer, an independent Finality Watcher, a batch builder for finalized source messages, durable sealed Message Roots with reproducible inclusion proofs, and a pure Solidity Merkle primitive constrained by shared golden vectors.
 
 The current implementation can:
 
@@ -41,6 +41,8 @@ The current implementation can:
 - bind each Merkle leaf to its batch ID, canonical message position, and canonical message ID;
 - reproduce the same Message Root and per-message inclusion proofs from the same valid batch;
 - verify inclusion proofs off-chain and reject changed messages, contexts, positions, roots, and paths;
+- compute the same Merkle leaves and ordered nodes in an EVM-compatible Solidity library;
+- lock domains, encodings, roots, and proof paths against one fixed shared golden fixture;
 - assign finalized source occurrences to one durable lifecycle batch each;
 - persist a single `BUILDING` batch per source scope and derive subsequent epochs from durable history;
 - atomically seal canonical membership, batch identity, message count, and Message Root;
@@ -109,6 +111,8 @@ Unknown EOA or contract ──────────────────�
 The Indexer and Finality Watcher are disposable worker processes. Their durable operational progress lives in PostgreSQL, and every new process reconciles that state with Chain A before continuing.
 
 The batch lifecycle assigns finalized source occurrences to durable batch records. Sealing reuses the deterministic batch and Merkle builders to persist an immutable snapshot, and reading it reconstructs its inclusion proofs. Batch operations preserve source lifecycle state. `COMMITTED` is reserved for future PBFT quorum authorization; consensus and destination delivery are outside the current implementation.
+
+The same commitment primitive is implemented in JavaScript and Solidity. Shared committed vectors constrain both runtimes, and complete verification passes a reconstructed real sealed batch into Foundry's local EVM. This compatibility path does not deploy a destination endpoint or execute a message on Chain B.
 
 ## Cross-Chain Messages
 
@@ -625,7 +629,36 @@ Keeping an old message ID while changing a nonce, payload, deadline, or another 
 
 Repeated construction, a fresh batch or Merkle builder, and permutations canonicalized by the batch builder reproduce identical leaves, roots, and proofs. These values contain no database row IDs, observation/finalization timestamps, process identifiers, or private credential attributes. Merkle computation does not write source records, eligibility, canonical block history, or batch lifecycle state.
 
-The Message Root commits to ordered batch membership. Its expected batch and root still require an appropriate trust source; a valid proof by itself grants no Chain B authorization, Byzantine consensus, quorum certificate, or delivery guarantee. Current verification is off-chain only. Solidity Merkle verification, shared Solidity/off-chain golden vectors, PBFT, relaying, and destination execution remain unimplemented.
+The Message Root commits to ordered batch membership. Its expected batch, root, and member count still require an appropriate trust source; a valid proof by itself grants no Chain B authorization, Byzantine consensus, quorum certificate, or delivery guarantee. The commitment primitive supports off-chain and Solidity verification. PBFT, relaying, and destination execution remain unimplemented.
+
+## Shared Merkle Compatibility
+
+`contracts/src/MessageMerkle.sol` is a pure internal library with `computeLeaf`, `hashNode`, and `verifyProof`. It uses the same Ethereum Keccak-256 domains and `abi.encode` preimages as the off-chain implementation. It preserves left/right order, derives exact depth from the leaf count, rejects empty trees and out-of-range indices, and enforces self-duplication whenever traversal reaches an unpaired final node. A single leaf is its root and requires an empty sibling path. Invalid proofs return `false`.
+
+`verifyProof(expectedBatchId, expectedMessageId, expectedLeafCount, expectedRoot, proof)` accepts a proof with the existing `batchId`, `messageId`, `index`, `leafCount`, and `siblings` fields. The expected context must be supplied independently from a trusted snapshot. Solidity receives canonical message IDs; the existing `MessageCodec` remains responsible for message-field hashing. The off-chain verifier additionally validates complete messages, source provenance, finalized membership, and the expected deterministic batch.
+
+The trusted count matters independently of root/path verification. For example, the first leaf's proof in a three-leaf tree can also describe a four-leaf path with the same root, because that path does not traverse the duplicated final leaf. The library compares claimed `leafCount` with `expectedLeafCount` before traversing. Passing an untrusted proof's own count as the expected count would lose this check. The primitive does not authenticate any expected context or validate a PBFT certificate.
+
+`test-vectors/merkle-golden-vectors.json` is the sole canonical source of shared Merkle inputs and expected outputs. Node and Foundry tests read it directly; no second hand-maintained Solidity fixture exists. Its schema records:
+
+- a fixture schema version and descriptive protocol identifier, with no new cryptographic hash input;
+- fixed leaf/node type strings and domain hashes;
+- fixed public canonical-message inputs and a source context with an exact large uint256 epoch;
+- batches with 1, 2, 3, 4, and 5 messages, including nontrivial high-bit-set identifiers;
+- complete deterministic batches, ordered message IDs, leaf preimages and hashes, every tree level, roots, and every inclusion proof;
+- a standalone high-index encoding probe and a distinct NIST SHA3-256 result to detect hash-function or width drift.
+
+Protocol uint256 values are decimal strings, hexadecimal values are lowercase and `0x`-prefixed, and bytes32 values contain exactly 64 hexadecimal digits. Existing safe-integer proof indices and leaf counts remain JSON integers. Fixture serialization explicitly sorts keys and preserves array order; JSON serialization never enters a protocol hash.
+
+`indexer/scripts/generate-merkle-golden-vectors.mjs` consumes the fixed inputs through the existing batch and Merkle builders. It uses no database, RPC, clock, or randomness. The developer mode emits candidate fixture contents to stdout; it never writes the canonical file. Unified verification uses `--check` to compare the regenerated bytes with the fixed file and fails on any difference. It cannot silently replace expected values after protocol drift.
+
+Both runtimes compare domains, leaves, internal nodes, roots, and proof paths with the same fixed expected bytes. Tests cover all member positions, single-leaf and multi-level odd duplication, incorrect context/count/index/root/siblings, reordered or truncated/extended paths, and proofs from other members or vectors. They also reject a fabricated odd sibling even when supplied with a root matching the fabricated path.
+
+The encoding tests lock exact preimages and a uint256 index exceeding uint32. For these specific all-32-byte fields, `abi.encodePacked` produces the same bytes as `abi.encode`; a test claiming they must differ would be incorrect. Narrowed or shortened index encodings do differ and are rejected by the fixed values. Ordered nodes include descending pairs so sorted-pair hashing changes expected results. Ethereum Keccak-256 is distinct from the fixture's NIST SHA3-256 comparison value.
+
+The real lifecycle integration reads a sealed A/B/D snapshot in a fresh process and supplies only its public identifiers, trusted count/root, leaves, and proofs to `MessageMerkleTest.testRealSealedSnapshot` through a test-only environment input. Foundry verifies every member in its local EVM without deploying a test harness to either chain. The ordinary Solidity suite skips this input-dependent test; the real integration invokes it with data and requires an actual passing result, never a skip. Dynamic integration data does not overwrite the shared golden fixture.
+
+Golden vectors establish compatibility regression boundaries. They provide no consensus, quorum certificate, trusted relayer, destination registry, replay protection, or execution authorization. No private credential data enters this fixture, and `CONSENSUS_PENDING` remains distinct from `COMMITTED`.
 
 ## Batch Lifecycle
 
@@ -664,7 +697,7 @@ Sealing runs the existing canonical builder over the assigned source occurrences
 
 Database guards reject sealed member insertion, deletion, reassignment, reordering, commitment changes, epoch changes, record deletion, illegal transitions, and rewritten transition timestamps. Every sealed read reconstructs canonical membership and checks count, contiguous positions, canonical order, batch ID, and Message Root. Inconsistent persisted data fails closed. Inclusion proofs are regenerated deterministically from authoritative source data rather than saved as an independent proof format.
 
-Fresh clients and processes recover the same sealed or pending snapshot without local state. Subsequent collection creates the next epoch and assigns only unclaimed finalized occurrences; old roots and proofs remain unchanged. The integration flow seals A/B/D, restores the snapshot in fresh processes, marks it pending, then produces and finalizes Message E and assigns only E to the next epoch. Unit and isolated database tests cover retry behavior, invalid transitions, immutable snapshots, partial-seal rollback, and competing clients synchronized at explicit lock barriers.
+Fresh clients and processes recover the same sealed or pending snapshot without local state. Subsequent collection creates the next epoch and assigns only unclaimed finalized occurrences; old roots and proofs remain unchanged. The integration flow seals A/B/D, restores the snapshot in fresh processes, checks its proofs with the Solidity primitive, marks it pending, then produces and finalizes Message E and assigns only E to the next epoch. Unit and isolated database tests cover retry behavior, invalid transitions, immutable snapshots, partial-seal rollback, and competing clients synchronized at explicit lock barriers.
 
 Batch membership uniqueness provides durable assignment ownership. It does not establish exactly-once consensus, relaying, destination execution, or delivery.
 
@@ -826,7 +859,7 @@ npm run test:database
 
 The unit suite also covers batch ABI encoding, canonical ordering under input permutations, explicit epochs, membership changes, duplicate rejection, malformed messages, invalid lifecycle states, and large protocol integers. Merkle tests cover batch integrity, distinct hash domains, ordered pairs, single-leaf and odd-node behavior, deterministic roots and proofs, successful inclusion, and rejected message/context/root/path changes. PostgreSQL tests connect the existing finalized-only query to the production batcher, construct a stable tree and verify its proofs, check insertion-order independence and duplicate rescans, and verify that computation preserves all source lifecycle metadata and canonical block records.
 
-The real Chain A integration runs through the unified repository verification flow because it needs the deployed protocol contracts and both local chains. It covers fixed-snapshot indexing, abrupt worker termination after durable commits, offline message catch-up, PostgreSQL pool recreation, repeated restarts, exact-event rescans, real `OBSERVED → FINALIZING → FINALIZED` transitions, eventless block tracking, and snapshot/revert replacement of an unfinalized branch followed by a fresh Indexer process. It then constructs and seals a batch from finalized A/B/D, excludes the reorged C occurrence, builds the Message Root, and verifies all three inclusion proofs. Fresh processes restore sealed and pending snapshots. A later real Message E is finalized and assigned to the next epoch while old membership, roots, and proofs remain unchanged. Changed messages and wrong roots/proofs fail, and batch operations preserve source lifecycle state.
+The real Chain A integration runs through the unified repository verification flow because it needs the deployed protocol contracts and both local chains. It covers fixed-snapshot indexing, abrupt worker termination after durable commits, offline message catch-up, PostgreSQL pool recreation, repeated restarts, exact-event rescans, real `OBSERVED → FINALIZING → FINALIZED` transitions, eventless block tracking, and snapshot/revert replacement of an unfinalized branch followed by a fresh Indexer process. It then constructs and seals a batch from finalized A/B/D, excludes the reorged C occurrence, builds the Message Root, and verifies all three inclusion proofs off-chain and through the Solidity library in Foundry's local EVM. Fresh processes restore sealed and pending snapshots. A later real Message E is finalized and assigned to the next epoch while old membership, roots, and proofs remain unchanged. Changed messages and wrong roots/proofs fail, and batch operations preserve source lifecycle state.
 
 ## Complete Verification
 
@@ -886,7 +919,11 @@ The script uses strict error handling and performs:
 46. competing creation, collection, and sealing clients synchronized at explicit database lock barriers;
 47. fresh-process recovery of identical sealed and consensus-pending snapshots;
 48. rejection of premature `COMMITTED` transitions through ordinary SQL and APIs;
-49. finalization of a new real Message E, assignment to the next epoch, and unchanged old inclusion proofs.
+49. finalization of a new real Message E, assignment to the next epoch, and unchanged old inclusion proofs;
+50. byte-for-byte Merkle golden fixture drift checks without overwriting fixed expected outputs;
+51. Node and Solidity comparisons against the same committed domains, leaves, internal nodes, roots, and proofs;
+52. shared-fixture negative cases, trusted leaf-count checks, and hash/encoding drift probes;
+53. real fresh-process sealed A/B/D proofs verified in Foundry's local Solidity EVM.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -902,7 +939,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Batch Lifecycle
+Shared Merkle Compatibility
 ```
 
 ### Expected error output
@@ -953,10 +990,12 @@ Cross-Chain/
 │   │   ├── CredentialVerifier.sol
 │   │   ├── IdentityApplicationA.sol
 │   │   ├── MessageCodec.sol
+│   │   ├── MessageMerkle.sol
 │   │   └── SourceGateway.sol
 │   └── test/
 │       ├── CredentialVerifier.t.sol
 │       ├── IdentityApplicationA.t.sol
+│       ├── MessageMerkle.t.sol
 │       ├── mocks/
 │       │   ├── MockCredentialVerifier.sol
 │       │   ├── MockSourceApplication.sol
@@ -969,6 +1008,8 @@ Cross-Chain/
 │   │   ├── 003_finality_watcher.sql
 │   │   ├── 004_source_reorg_detection.sql
 │   │   └── 005_batch_lifecycle.sql
+│   ├── scripts/
+│   │   └── generate-merkle-golden-vectors.mjs
 │   ├── src/
 │   │   ├── batch-lifecycle-policy.mjs
 │   │   ├── batch-lifecycle.mjs
@@ -1002,6 +1043,7 @@ Cross-Chain/
 │   │   ├── integration.test.mjs
 │   │   ├── message-batch.test.mjs
 │   │   ├── message-merkle.test.mjs
+│   │   ├── message-merkle-golden.test.mjs
 │   │   ├── reorg-detector.test.mjs
 │   │   └── source-event-identity.test.mjs
 │   ├── package.json
@@ -1013,6 +1055,7 @@ Cross-Chain/
 │   └── verify.sh
 ├── test-vectors/
 │   ├── canonical-messages.json
+│   ├── merkle-golden-vectors.json
 │   └── nullifiers.json
 ├── zk/
 │   ├── circuits/
@@ -1074,7 +1117,8 @@ Cross-Chain/
 - Batch and Merkle computation preserve source lifecycle state and use only existing public message data and provenance. They introduce no private credential attributes.
 - PostgreSQL remains operational persistence. Batch and Merkle construction do not independently establish canonical-chain consensus or validator authority.
 - Persistent batch assignment, sealing, and epoch advancement preserve source lifecycle state. `CONSENSUS_PENDING` is the current authorization boundary; future PBFT quorum verification must authorize `COMMITTED`.
-- The repository does not provide Solidity/Destination Gateway Merkle verification, shared Solidity/off-chain Merkle golden vectors, exactly-once downstream batch consumption, relaying, PBFT validation, destination gateway implementation or execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
+- The Solidity Merkle primitive requires independently trusted expected context, including member count, and does not replace canonical message-field validation or authenticate a relayer. Shared golden vectors lock compatibility and grant no destination permissions.
+- The repository does not provide destination gateway integration, QC verification, exactly-once downstream batch consumption, relaying, PBFT validation, destination execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.

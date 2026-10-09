@@ -7,7 +7,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Batch Lifecycle"
+VERIFICATION_NAME="Shared Merkle Compatibility"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -423,6 +423,10 @@ printf ' 33. Verify immutable sealed snapshots, rollback, and concurrent retries
 printf ' 34. Restore SEALED and CONSENSUS_PENDING snapshots in fresh processes\n'
 printf ' 35. Reject COMMITTED transitions without future PBFT quorum authorization\n'
 printf ' 36. Finalize a later real message into the next epoch and preserve old proofs\n'
+printf ' 37. Detect committed Merkle fixture drift without rewriting expected values\n'
+printf ' 38. Match off-chain and Solidity domains, leaves, nodes, roots, and proofs to one shared fixture\n'
+printf ' 39. Reject shared cross-runtime proof mutations and encoding mismatches\n'
+printf ' 40. Verify fresh-process SEALED A/B/D proofs in the Solidity test-local EVM\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -451,7 +455,11 @@ DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DB_SCHEMA" \
     node "$INDEXER_DIR/src/migrate.mjs"
 
-CURRENT_STEP="Chain A Indexer, recovery, batch, Merkle, and lifecycle unit tests"
+CURRENT_STEP="committed Merkle golden fixture drift check"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node "$INDEXER_DIR/scripts/generate-merkle-golden-vectors.mjs" --check
+
+CURRENT_STEP="Chain A Indexer, recovery, batch, Merkle, golden compatibility, and lifecycle unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$INDEXER_DIR/test/config.test.mjs" \
@@ -464,6 +472,7 @@ node --test \
     "$INDEXER_DIR/test/finality-watcher.test.mjs" \
     "$INDEXER_DIR/test/message-batch.test.mjs" \
     "$INDEXER_DIR/test/message-merkle.test.mjs" \
+    "$INDEXER_DIR/test/message-merkle-golden.test.mjs" \
     "$INDEXER_DIR/test/batch-lifecycle-policy.test.mjs"
 
 CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, and lifecycle tests"
@@ -568,9 +577,13 @@ CURRENT_STEP="forge build"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge build
 
-CURRENT_STEP="forge test -vv"
+CURRENT_STEP="forge test -vv including shared Merkle golden compatibility"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test -vv
+
+printf 'VALID: Solidity Merkle domains, leaves, and internal nodes match shared golden vectors\n'
+printf 'VALID: off-chain and Solidity roots and proofs match the same shared golden vectors\n'
+printf 'VALID: cross-runtime negative cases and trusted leaf-count checks verified\n'
 
 CURRENT_STEP="canonical gateway encoding test"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1091,7 +1104,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source recovery, finality, reorg, batch, Merkle, and lifecycle integration"
+CURRENT_STEP="real source recovery, finality, reorg, batch, Merkle, lifecycle, and Solidity compatibility integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \
