@@ -394,20 +394,28 @@ export function createValidatorStore({ pool, config }) {
     },
 
     async readPrepareVote(epoch, voterIdentity) {
-      await checkState(pool);
-      return prepareResult(pool, epoch, voterIdentity);
+      return transaction(async (client) => {
+        await checkState(client, "FOR SHARE");
+        return prepareResult(client, epoch, voterIdentity);
+      });
     },
 
     async readPrepareState(epoch) {
-      await checkState(pool);
-      return prepareResult(pool, epoch);
+      return transaction(async (client) => {
+        await checkState(client, "FOR SHARE");
+        return prepareResult(client, epoch);
+      });
     },
 
     async readPrepareStates() {
-      await checkState(pool);
-      const epochs = (await pool.query(`SELECT epoch FROM ${prepares}
-        WHERE local_validator_identity = $1 ORDER BY epoch`, [config.validatorAddress])).rows;
-      return Promise.all(epochs.map((row) => prepareResult(pool, row.epoch)));
+      return transaction(async (client) => {
+        await checkState(client, "FOR SHARE");
+        const epochs = (await client.query(`SELECT epoch FROM ${prepares}
+          WHERE local_validator_identity = $1 ORDER BY epoch`, [config.validatorAddress])).rows;
+        const states = [];
+        for (const row of epochs) states.push(await prepareResult(client, row.epoch));
+        return states;
+      });
     },
 
     async savePrepareVote(input) {

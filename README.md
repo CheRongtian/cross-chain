@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. The committee is static. Fault-scenario orchestration, view changes, rotation, relaying, and destination execution remain unimplemented.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. The static committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. View changes, rotation, relaying, and destination execution remain unimplemented.
 
 The current implementation can:
 
@@ -69,6 +69,8 @@ The current implementation can:
 - construct and independently verify a QC carrying three or four distinct matching COMMIT signatures;
 - atomically persist an immutable QC and commit the corresponding pending batch;
 - verify persisted certificates when reading `COMMITTED` batches and recover the same result after restart.
+- continue the same consensus instance through explicit durable-message retries after connectivity returns;
+- exercise deterministic process and transport faults while preserving quorum identity, immutable vote locks, and source history.
 
 ## Architecture
 
@@ -979,7 +981,23 @@ The first valid global QC remains immutable. Repeated submission of the same cer
 
 Every `COMMITTED` snapshot read reconstructs the immutable batch and Merkle tree, loads its stored QC evidence, and repeats independent certificate verification against the expected committee. Missing evidence, corrupted signatures, or context drift fails closed. PostgreSQL remains operational persistence and supplies no cryptographic authority by itself. Source messages, finality records, canonical blocks, cursor, membership, and existing proofs remain unchanged; later messages continue into subsequent batch epochs.
 
-This implementation supplies COMMIT/QC authorization for a static committee. Fault-scenario orchestration, Byzantine/partition recovery, view changes, committee rotation, delivery queues, relaying, destination QC verification, and destination execution remain unsupported.
+This implementation supplies COMMIT/QC authorization for a static committee. The verification infrastructure exercises the failure model below. View changes, committee rotation, delivery queues, relaying, destination QC verification, and destination execution remain unsupported.
+
+### Consensus safety and failure model
+
+The committee has `n = 4`, fault bound `f = 1`, and PREPARE/COMMIT quorum `3`. Voter identities come from recovered signatures and configured committee membership. One or two signers cannot produce a valid QC. A conflicting vote adds no support to the accepted proposal and cannot cancel three matching honest votes. The primary coordinates proposal delivery; its signature alone supplies no authority over source truth or commitment.
+
+With an honest, available deterministic primary and one unavailable non-primary validator, the remaining three processes can validate the same real batch, reach `PREPARED`, exchange COMMITs, produce a three-signature QC, and commit. Verification selects the unavailable backup dynamically from the batch epoch, stops its OS process, checks its endpoint and PID, and requires the QC signer set to contain exactly the three live identities. The restarted backup verifies the global committed QC through the existing certificate path. It does not claim PREPARE or COMMIT votes that it never cast, and no new catch-up protocol is introduced.
+
+With an honest primary and one adversarial backup, three honest validators can commit the canonical root. A test-only adversarial builder uses a committee development key to sign deterministic conflicting contents. Valid signatures on a wrong-primary PRE-PREPARE, wrong-root PREPARE, or wrong-root COMMIT must still be rejected. A single adversarial signature, duplicate evidence, or canonical signatures reused for a conflicting statement cannot form a conflicting QC. Durable queries require at most one committed root per source scope and epoch and no conflicting persisted certificate. These scenarios do not establish progress when the primary itself is Byzantine or unresponsive.
+
+During a bidirectional 2|2 partition, all four processes remain alive, but each side can observe only its own two PREPARE voters. Neither side reaches `PREPARED`, can legitimately cast COMMIT, or can form a QC; the batch stays pending. The test activates the partition only after all nodes have accepted PRE-PREPARE and before any PREPARE vote exists. Removing the gate changes delivery policy only. Explicit retries rebroadcast the exact saved envelopes and continue the same epoch, batch ID, root, proposal digest, committee, and deterministic primary. The database, vote locks, and process identities are not reset. Progress resumes under restored connectivity with the primary still available.
+
+An unavailable primary prevents a fresh proposal. Backups retain the same primary calculation, reject attempts to propose or impersonate it, and produce no quorum or certificate. Safety is preserved while liveness pauses. The current implementation has no automatic primary replacement, `VIEW_CHANGE`, `NEW_VIEW`, or view timeout. The same primary may return and resume ordinary operation; progress with a replacement primary requires a future view-change mechanism.
+
+Fault injection belongs exclusively to verification helpers. Each directed peer edge has a test proxy, so sender identity for a block rule comes from the configured edge rather than message fields. Rules block delivery without changing protocol bytes, signatures, or digests. There is no production Byzantine mode, partition administrator API, fault database table, or fault input to protocol hashing. Explicit process-stop boundaries, completed requests, durable checkpoints, and controlled retries determine the scenarios; random drops and timing-based success assumptions are unnecessary.
+
+Every scenario uses an independent source schema with the existing migrations and a fresh set of validator namespaces. The real Indexer rescans canonical Chain A events, the real Finality Watcher establishes eligibility, and the production lifecycle creates a new pending A/B/D batch. Validators independently fetch the real source receipts and blocks. The original committed batch, QC, `REORGED` C occurrence, next-epoch Message E, cursor, and canonical history remain unchanged. Source writes within each fault instance are restricted to the authorized QC/status transition.
 
 ### Configuration
 
@@ -1001,6 +1019,8 @@ PRE-PREPARE unit tests add canonical committee permutations, exact uint256 rotat
 
 PREPARE unit tests cover its independent domain and canonical encoding, signer recovery, exact accepted-proposal matching, pre-PREPARE arrival, self-vote persistence before broadcast, durable double-vote prevention, unique-voter counting, duplicate/conflicting votes, and the one/two/three/four-vote thresholds. Database tests add concurrent duplicate delivery, concurrent second/third voters, atomic `PREPARED` creation, immutable vote/quorum rows, rejection isolation, migration reruns, and fresh-pool recovery.
 
+PREPARE state reads hold the validator metadata row with a shared lock for the transaction, matching the exclusive lock used by vote writers. Votes and the associated `PREPARED` evidence therefore describe one consistent state. A deterministic database test pauses a read after loading two votes, starts a third-vote writer at its lock boundary, and verifies that the read sees the old complete state before the writer creates the new complete state.
+
 The same four-process flow uses a different peer ordering on each node and verifies that all select the same actual primary. It rejects non-primary proposals, malformed signatures, unknown references, wrong epochs, and primary-signed wrong roots before the canonical proposal. A deliberately stopped backup makes the first broadcast partial at a known boundary. The primary then restarts, the backup returns, and the same stored proposal is rebroadcast. Concurrent duplicate delivery, a fresh backup restart, and correctly signed conflicts preserve each node's original record. Fresh isolated source profiles exercise `SEALED`, corrupt roots/blocks, `REORGED` members, and insufficient depth without masking failures behind existing locks. Final assertions compare the original source tables and reject an unauthorized `COMMITTED` transition. These checks do not assert Byzantine consensus completion.
 
 After all four processes hold the canonical PRE-PREPARE, the integration stops one receiver, casts and persists the first PREPARE, restarts the voter and receiver, and rebroadcasts the same vote. Two unique voters leave every node unprepared despite repeated delivery. The third distinct vote atomically produces four independent local `PREPARED` records. A valid wrong-root vote and a later conflicting vote from the fourth validator are excluded without removing the existing three-vote state. The canonical fourth vote is retained without rewriting the earlier quorum evidence. A fresh validator process recovers its accepted proposal, four votes, self-vote lock, and `PREPARED` record. Source tables remain byte-for-byte equivalent and an unauthorized `COMMITTED` transition still fails.
@@ -1009,7 +1029,9 @@ COMMIT/QC unit tests cover the independent domains, exact uint256 encoding, comm
 
 The same four processes then cast real COMMIT votes. Early casts before `PREPARED` fail. A bounded partial broadcast is retried after restarting the sender and receiver. Two voters leave the real A/B/D batch pending; the third creates independently verified local QCs. A restart before global submission reconstructs the same QC. Invalid certificates and an injected source transaction failure preserve pending state with no certificate rows. Concurrent submissions commit once. A fourth COMMIT, duplicate delivery, conflicting vote, equivalent signer subset, and another restart preserve the first global certificate. A fresh source-reader process reconstructs the committed snapshot and independently verifies its stored QC. Source history and the next-epoch Message E batch remain unchanged.
 
-The integration helper tracks only its own child processes and handles failure and interruption cleanup. The root script also maintains an owned PID registry for fallback cleanup; it never targets unrelated validator processes. These recovery tests establish local persistence and process isolation, not PBFT fault tolerance or consensus liveness.
+The normal integration is followed by isolated real-process crash, adversarial-backup, partition/heal, and primary-failure scenarios. Transport unit tests cover directional blocking, both partition directions, same-group delivery, healing, unchanged signed wire bytes, and stale-signature exclusion. The fault integration queries persisted signer sets, QC evidence, batch status, and distinct committed roots rather than treating delivery acknowledgements as consensus.
+
+Normal and fault integrations share one process helper for startup, stop, restart, endpoint queries, signal handling, and the owned PID registry. Cleanup closes the created validators, transport/RPC proxies, port reservations, and pools on success, failure, or interruption. The root script retains fallback cleanup and never targets unrelated user processes. The claimed safety/liveness boundaries are limited to the explicit static-committee scenarios described above.
 
 ## Local Two-Chain Environment
 
@@ -1267,12 +1289,23 @@ The script uses strict error handling and performs:
 80. immutable first certificate after a fourth vote and another valid signer subset;
 81. fresh validator and source-reader recovery of COMMIT locks, quorum, and verified committed snapshots;
 82. unchanged source history, membership, root, proofs, and next-epoch Message E after commitment.
+83. deterministic directional peer proxies, symmetric cross-group blocking, and byte-preserving healing;
+84. an explicit database read/write barrier preventing mixed PREPARE and PREPARED snapshots;
+85. independently migrated and reindexed real A/B/D batches for each fault instance;
+86. one dynamically selected non-primary process offline while exactly three live identities form QC and commit;
+87. offline backup restart and independent committed-certificate verification without fabricated history;
+88. cryptographically valid Byzantine conflicting messages and forged QCs excluded from honest quorum weight;
+89. durable proof of at most one committed root per source scope/epoch and no conflicting persisted QC;
+90. four live processes in a 2|2 partition with exactly two voters each, no PREPARED, no QC, and pending batch state;
+91. explicit healing and retries of saved votes completing the same epoch, root, proposal, primary, and process identities;
+92. primary process failure preserving safety without backup promotion or implicit view change;
+93. unchanged original source history, REORGED C, committed QC, immutable membership, and next-epoch Message E.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
 If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
 
-The validator integration applies its own migrations explicitly, chooses temporary local ports, injects runtime development keys, and cleans up its own validator processes and RPC observers. It first retains local prepare state with a pending source batch, then verifies COMMIT/QC authorization and commits the real batch atomically. Test-owned validator namespaces are reset for a complete run; restart recovery is checked within that run. No production validator store is reset.
+The validator integration applies existing migrations explicitly, chooses temporary local ports, injects runtime development keys, and cleans up its own processes and proxies. It preserves the complete normal consensus flow, then runs four isolated fault instances with fresh source/validator namespaces and real Chain A reconstruction. Test-owned namespaces are reset only during scenario preparation. Healing and restart recovery retain their durable state. No production validator store is reset.
 
 All stdout and stderr are displayed in the terminal and written to:
 
@@ -1284,7 +1317,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-PBFT COMMIT and Quorum Certificate
+PBFT Fault Tolerance and Safety
 ```
 
 ### Expected error output
@@ -1432,14 +1465,18 @@ Cross-Chain/
 │   │   ├── config.test.mjs
 │   │   ├── database.test.mjs
 │   │   ├── handshake.test.mjs
+│   │   ├── fault-transport.test.mjs
 │   │   ├── pre-prepare.test.mjs
 │   │   ├── prepare.test.mjs
 │   │   ├── server.test.mjs
 │   │   ├── source-validation.test.mjs
 │   │   └── helpers/
 │   │       ├── commit-fixtures.mjs
+│   │       ├── fault-transport.mjs
+│   │       ├── fault-scenarios.mjs
 │   │       ├── fixtures.mjs
-│   │       └── four-process.mjs
+│   │       ├── four-process.mjs
+│   │       └── process-cluster.mjs
 │   ├── package.json
 │   └── package-lock.json
 ├── zk/
@@ -1509,7 +1546,9 @@ Cross-Chain/
 - Signed PRE-PREPARE proposals use a separate canonical domain and authenticate the deterministic primary, but signature validity cannot replace independent source validation. One accepted digest per local identity/epoch is durable across restart; accepted proposals do not authorize `COMMITTED`.
 - Signed PREPARE votes use another canonical domain, bind the exact accepted proposal and voter identity, and count once per configured validator. Three matching voters produce durable local `PREPARED` state; duplicates and conflicts cannot add quorum weight or replace prior votes.
 - COMMIT votes bind the static committee and exact accepted proposal. One or two voters cannot commit; three distinct valid COMMIT signatures are required. QC submitters need no trusted identity, and persisted evidence is cryptographically reverified on committed reads.
-- The repository does not provide validator fault-scenario orchestration, Byzantine/partition recovery, view changes, validator rotation, Delivery Queue, destination gateway integration or destination QC verification, exactly-once downstream batch consumption, relaying, destination execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
+- The failure model retains progress with one unavailable non-primary and an honest available primary. A single conflicting backup cannot supply a conflicting QC. A 2|2 partition preserves safety and pauses progress until explicit retries restore delivery; connectivity changes do not reset vote locks or select a new primary.
+- Primary failure or Byzantine-primary withholding can stall the current protocol. Process availability is not commit authority. PostgreSQL never substitutes for independent source and signature verification.
+- The repository does not provide view changes, validator epoch/rotation, Delivery Queue, Transaction Manager, destination gateway integration or destination QC verification, exactly-once downstream batch consumption, relaying, destination execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.

@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="PBFT COMMIT and Quorum Certificate"
+VERIFICATION_NAME="PBFT Fault Tolerance and Safety"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -488,6 +488,17 @@ printf ' 69. Roll back an interrupted QC transaction and retry equivalent concur
 printf ' 70. Preserve the first QC when the fourth vote or another valid subset arrives\n'
 printf ' 71. Recover COMMIT locks and verify COMMITTED batch/QC in fresh processes\n'
 printf ' 72. Preserve source history, sealed membership, roots, proofs, and next-epoch Message E\n'
+printf ' 73. Check deterministic directional transport gates and bidirectional 2|2 partitions\n'
+printf ' 74. Verify consistent PREPARE snapshots while third-vote writes wait at explicit lock barriers\n'
+printf ' 75. Reindex real A/B/D into independent fully migrated source and validator test namespaces\n'
+printf ' 76. Stop a dynamically selected non-primary process and commit with exactly three live signers\n'
+printf ' 77. Restart the offline validator and verify the global QC without fabricating its historical votes\n'
+printf ' 78. Reject validly signed conflicting-root messages and forged QCs from one Byzantine backup\n'
+printf ' 79. Query durable state to require at most one committed root per source scope and epoch\n'
+printf ' 80. Keep four processes alive in a 2|2 partition with two voters per side and no quorum or QC\n'
+printf ' 81. Heal transport and complete the same proposal by retrying persisted votes without resetting locks\n'
+printf ' 82. Stop the deterministic primary and preserve pending state without replacement or view change\n'
+printf ' 83. Preserve source history, original REORGED C, membership, roots, QC, and Message E across fault scenarios\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -546,7 +557,7 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
         "$INDEXER_DIR/test/database.test.mjs" \
         "$INDEXER_DIR/test/batch-lifecycle.database.test.mjs"
 
-CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, and QC unit tests"
+CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$VALIDATOR_DIR/test/config.test.mjs" \
@@ -555,9 +566,10 @@ node --test \
     "$VALIDATOR_DIR/test/server.test.mjs" \
     "$VALIDATOR_DIR/test/pre-prepare.test.mjs" \
     "$VALIDATOR_DIR/test/prepare.test.mjs" \
-    "$VALIDATOR_DIR/test/commit.test.mjs"
+    "$VALIDATOR_DIR/test/commit.test.mjs" \
+    "$VALIDATOR_DIR/test/fault-transport.test.mjs"
 
-CURRENT_STEP="isolated validator migrations, PREPARED, COMMIT locks, and quorum persistence tests"
+CURRENT_STEP="isolated validator migrations, consistent PREPARE reads, COMMIT locks, and quorum persistence tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="${VALIDATOR_VERIFICATION_DATABASE_URL:-$DATABASE_URL}" \
 VALIDATOR_DATABASE_TEST_SCHEMA="cross_chain_validator_database_verification" \
@@ -1186,7 +1198,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source recovery, lifecycle, four validators, PREPARE, COMMIT, QC, and COMMITTED integration"
+CURRENT_STEP="real source recovery, lifecycle, four validators, normal consensus, crash, Byzantine, and partition safety integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

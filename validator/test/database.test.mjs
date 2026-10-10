@@ -281,6 +281,75 @@ test("concurrent duplicate and third-vote writes produce unique votes and atomic
   assert.equal(rows.rows[0].count, 3);
 });
 
+test("PREPARE reads hold a consistent snapshot while a third-vote writer waits at the metadata lock", async () => {
+  const proposal = await acceptProposal(0);
+  for (let index = 0; index < 2; index++) await stores[0].savePrepareVote(await signedVote(proposal, index));
+  const third = await signedVote(proposal, 2);
+  function checkpoint() {
+    let resolve;
+    const promise = new Promise((done) => { resolve = done; });
+    return { promise, resolve };
+  }
+  async function bounded(promise) {
+    let timer;
+    try { return await Promise.race([promise, new Promise((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error("database synchronization checkpoint timed out")), 5000);
+    })]); } finally { clearTimeout(timer); }
+  }
+  const readPaused = checkpoint();
+  const resumeRead = checkpoint();
+  const writerIssued = checkpoint();
+  let sharedLock = false;
+  async function readerQuery(query, sql, parameters) {
+    const result = await query(sql, parameters);
+    if (sql.includes("validator_metadata") && sql.includes("FOR SHARE")) sharedLock = true;
+    if (sql.includes("pbft_prepare_votes") && sql.includes("ORDER BY voter_identity")) {
+      readPaused.resolve(); await resumeRead.promise;
+    }
+    return result;
+  }
+  const readerPool = {
+    query: (sql, parameters) => readerQuery((...args) => pools[0].query(...args), sql, parameters),
+    async connect() {
+      const client = await pools[0].connect();
+      return { query: (sql, parameters) => readerQuery((...args) => client.query(...args), sql, parameters),
+        release: (...args) => client.release(...args) };
+    },
+  };
+  const writerPool = { async connect() {
+    const client = await pools[0].connect();
+    return { query(sql, parameters) {
+      const result = client.query(sql, parameters);
+      if (sql.includes("validator_metadata") && sql.includes("FOR UPDATE")) writerIssued.resolve();
+      return result;
+    }, release: (...args) => client.release(...args) };
+  } };
+  const reader = createValidatorStore({ config: configs[0], pool: readerPool });
+  const writer = createValidatorStore({ config: configs[0], pool: writerPool });
+  const reading = reader.readPrepareState(proposal.epoch);
+  reading.catch(() => {});
+  let writing;
+  let writerCompleted = false;
+  try {
+    await bounded(readPaused.promise);
+    assert.equal(sharedLock, true, "vote and PREPARED reads must share the writer's metadata lock");
+    writing = writer.savePrepareVote(third).then((value) => { writerCompleted = true; return value; });
+    writing.catch(() => {});
+    await bounded(writerIssued.promise);
+    assert.equal(writerCompleted, false);
+    resumeRead.resolve();
+    const observed = await bounded(reading);
+    assert.equal(observed.voteCount, 2); assert.equal(observed.prepared, null);
+    const saved = await bounded(writing);
+    assert.equal(saved.voteCount, 3); assert.ok(saved.prepared);
+    const after = await stores[0].readPrepareState(proposal.epoch);
+    assert.equal(after.voteCount, 3); assert.ok(after.prepared);
+  } finally {
+    resumeRead.resolve();
+    await Promise.allSettled([reading, writing].filter(Boolean));
+  }
+});
+
 test("wrong or conflicting PREPARE cannot replace a durable voter lock or create quorum", async () => {
   const proposal = await acceptProposal(0);
   const canonical = await signedVote(proposal, 1);

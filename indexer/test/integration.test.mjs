@@ -30,6 +30,7 @@ import { buildMessageMerkleTree, verifyMessageMerkleProof } from "../src/message
 import { createBatchLifecycle } from "../src/batch-lifecycle.mjs";
 import { decodeCrossChainMessageLog } from "../src/source-gateway-event.mjs";
 import { verifyFourIndependentValidators } from "../../validator/test/helpers/four-process.mjs";
+import { verifyValidatorFaults } from "../../validator/test/helpers/fault-scenarios.mjs";
 
 const IDENTITY_APPLICATION_ABI = parseAbi([
   "function sendCrossChainMessage(uint256 destinationDomain, address destinationGateway, address destinationReceiver, bytes payload, uint256 deadline) returns (bytes32 messageId, uint256 nonce)",
@@ -852,6 +853,8 @@ test("recovers source workers and seals durable batches from real finalized mess
     process.stderr.write(committedProcessRead.stderr);
     assert.deepEqual(JSON.parse(committedProcessRead.stdout), transportValue(consensus.snapshot));
     console.log("VALID: fresh source-reader process reconstructed COMMITTED A/B/D and independently verified the persisted QC");
+    await verifyValidatorFaults({ sourceConfig: config, sourcePool: activePool, snapshot: consensus.snapshot,
+      pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE") });
   } finally {
     for (const worker of activeWorkers) {
       worker.kill("SIGKILL");
