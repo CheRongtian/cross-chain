@@ -8,6 +8,9 @@ import { signPrePrepare } from "../src/pre-prepare.mjs";
 import { createPrePrepareService } from "../src/pre-prepare-service.mjs";
 import { signPrepare } from "../src/prepare.mjs";
 import { createPrepareService } from "../src/prepare-service.mjs";
+import { createCommitService } from "../src/commit-service.mjs";
+import { signCommit } from "../src/commit.mjs";
+import { expectedCommitStatement } from "../src/quorum-certificate.mjs";
 
 assert.ok(process.env.DATABASE_URL, "DATABASE_URL is required for validator database tests");
 const prefix = process.env.VALIDATOR_DATABASE_TEST_SCHEMA ?? "cross_chain_validator_database_test";
@@ -28,7 +31,9 @@ before(async () => {
 beforeEach(async () => {
   for (let index = 0; index < 4; index++) {
     const schema = configs[index].databaseSchema;
-    await pools[index].query(`TRUNCATE TABLE ${tableName(schema, "prepare_rejections")},
+    await pools[index].query(`TRUNCATE TABLE ${tableName(schema, "commit_rejections")},
+      ${tableName(schema, "pbft_commit_quorums")}, ${tableName(schema, "pbft_commit_votes")},
+      ${tableName(schema, "prepare_rejections")},
       ${tableName(schema, "pbft_prepared_states")}, ${tableName(schema, "pbft_prepare_votes")},
       ${tableName(schema, "validation_observations")},
       ${tableName(schema, "validated_batch_bindings")}, ${tableName(schema, "validator_metadata")},
@@ -60,6 +65,119 @@ async function acceptProposal(storeIndex = 0) {
   await stores[storeIndex].savePrePrepare(proposal, direction(configs[storeIndex], proposal));
   return proposal;
 }
+
+async function prepareProposal(storeIndex = 0, count = 3) {
+  const proposal = await acceptProposal(storeIndex);
+  for (let index = 0; index < count; index++) await stores[storeIndex].savePrepareVote(await signedVote(proposal, index));
+  return expectedCommitStatement(proposal, configs[storeIndex].peers);
+}
+
+async function commitVote(statement, voterIndex, overrides = {}) {
+  return signCommit(configs[voterIndex], { messageType: "COMMIT", ...statement,
+    voterIdentity: configs[voterIndex].validatorAddress, ...overrides });
+}
+
+test("COMMIT cast and receive require durable PREPARED; missing or two-prepare state has no commit weight", async () => {
+  const proposal = await signedProposal();
+  const statement = expectedCommitStatement(proposal, configs[0].peers);
+  const vote = await commitVote(statement, 0);
+  let signed = 0;
+  const signer = async (...args) => { signed++; return signCommit(...args); };
+  await assert.rejects(stores[0].castCommitVote(proposal.epoch, signer), /NOT_PREPARED/);
+  await assert.rejects(stores[0].saveCommitVote(vote), /NOT_PREPARED/);
+  await stores[0].savePrePrepare(proposal, direction(configs[0], proposal));
+  await assert.rejects(stores[0].castCommitVote(proposal.epoch, signer), /NOT_PREPARED/);
+  for (let i = 0; i < 2; i++) await stores[0].savePrepareVote(await signedVote(proposal, i));
+  await assert.rejects(stores[0].castCommitVote(proposal.epoch, signer), /NOT_PREPARED/);
+  await assert.rejects(stores[0].saveCommitVote(vote), /NOT_PREPARED/);
+  assert.equal(signed, 0);
+  assert.equal((await stores[0].readCommitState(proposal.epoch)).voteCount, 0);
+  await stores[0].savePrepareVote(await signedVote(proposal, 2));
+  assert.equal((await stores[0].castCommitVote(proposal.epoch, signer)).voteCount, 1);
+  assert.equal(signed, 1);
+});
+
+test("COMMIT locks, unique counts, quorum, and reconstructed QC survive migration and fresh pool", async () => {
+  const statement = await prepareProposal();
+  const votes = await Promise.all(configs.map((_config, index) => commitVote(statement, index)));
+  const self = await stores[0].castCommitVote(statement.epoch);
+  assert.equal(self.voteCount, 1); assert.equal(self.quorum, null); assert.equal(self.certificate, null);
+  for (let i = 0; i < 100; i++) assert.equal((await stores[0].saveCommitVote(votes[0])).voteCount, 1);
+  const two = await stores[0].saveCommitVote(votes[1]);
+  assert.equal(two.voteCount, 2); assert.equal(two.certificate, null);
+  const wrong = await commitVote(statement, 2, { messageRoot: `0x${"ed".repeat(32)}` });
+  await assert.rejects(stores[0].saveCommitVote(wrong), /WRONG_ROOT/);
+  assert.equal((await stores[0].readCommitState(statement.epoch)).quorum, null);
+  const three = await stores[0].saveCommitVote(votes[2]);
+  assert.equal(three.voteCount, 3); assert.equal(three.quorum.status, "COMMIT_QUORUM");
+  const four = await stores[0].saveCommitVote(votes[3]);
+  assert.equal(four.voteCount, 4); assert.deepEqual(four.quorum, three.quorum);
+  assert.deepEqual(four.certificate, three.certificate);
+  const conflict = await commitVote(statement, 3, { proposalDigest: `0x${"ee".repeat(32)}` });
+  await assert.rejects(stores[0].saveCommitVote(conflict), /CONFLICTING_COMMIT/);
+  await applyValidatorMigrations(pools[0], configs[0].databaseSchema);
+  const fresh = createValidatorPool(configs[0]);
+  try {
+    const restored = createValidatorStore({ config: configs[0], pool: fresh });
+    await restored.bindIdentity();
+    assert.deepEqual(await restored.readCommitState(statement.epoch), four);
+    let signatures = 0;
+    assert.deepEqual(await restored.castCommitVote(statement.epoch, async () => { signatures++; assert.fail("re-signed durable self vote"); }), four);
+    assert.equal(signatures, 0);
+    await assert.rejects(restored.saveCommitVote(conflict), /CONFLICTING_COMMIT/);
+  } finally { await fresh.end(); }
+  for (const table of ["pbft_commit_votes", "pbft_commit_quorums"]) {
+    await assert.rejects(pools[0].query(`DELETE FROM ${tableName(configs[0].databaseSchema, table)}`), /immutable/);
+  }
+  for (let i = 1; i < 4; i++) assert.equal((await stores[i].readCommitStates()).length, 0);
+});
+
+test("concurrent COMMIT casts sign once; concurrent duplicate/third votes create one durable quorum", async () => {
+  const statement = await prepareProposal();
+  let signatures = 0;
+  const signer = async (...args) => { signatures++; return signCommit(...args); };
+  const casts = await Promise.all(Array.from({ length: 6 }, () => stores[0].castCommitVote(statement.epoch, signer)));
+  assert.equal(signatures, 1);
+  for (const state of casts) assert.deepEqual(state, casts[0]);
+  const second = await commitVote(statement, 1);
+  const third = await commitVote(statement, 2);
+  const invalid = await commitVote(statement, 2, { batchId: `0x${"ef".repeat(32)}` });
+  const results = await Promise.allSettled([
+    ...Array.from({ length: 6 }, () => stores[0].saveCommitVote(second)),
+    ...Array.from({ length: 6 }, () => stores[0].saveCommitVote(third)), stores[0].saveCommitVote(invalid),
+  ]);
+  assert.equal(results.filter((result) => result.status === "rejected").length, 1);
+  const state = await stores[0].readCommitState(statement.epoch);
+  assert.equal(state.voteCount, 3); assert.equal(new Set(state.votes.map((v) => v.voterIdentity)).size, 3);
+  assert.ok(state.certificate); assert.equal(state.quorum.quorumVoters.length, 3);
+});
+
+test("COMMIT persistence failures and lost receiver responses recover from durable state", async () => {
+  const statement = await prepareProposal();
+  await assert.rejects(stores[0].castCommitVote(statement.epoch, async (...args) => {
+    await signCommit(...args); throw new Error("crash before persistence");
+  }), /crash before persistence/);
+  assert.equal((await stores[0].readCommitState(statement.epoch)).voteCount, 0);
+  const service = createCommitService({ config: configs[0], store: stores[0], logger: { warn() {} },
+    broadcast: async () => { throw new Error("crash after persistence"); } });
+  await assert.rejects(service.cast(statement.epoch), /crash after persistence/);
+  const saved = await stores[0].readCommitState(statement.epoch);
+  assert.equal(saved.voteCount, 1);
+  const remote = await commitVote(statement, 1);
+  const lostResponse = createCommitService({ config: configs[0], logger: { warn() {} }, store: {
+    ...stores[0], async saveCommitVote(vote) { await stores[0].saveCommitVote(vote); throw new Error("lost receiver response"); },
+  } });
+  await assert.rejects(lostResponse.receive(remote), /lost receiver response/);
+  const fresh = createValidatorPool(configs[0]);
+  try {
+    const restored = createValidatorStore({ config: configs[0], pool: fresh });
+    await restored.bindIdentity();
+    const retry = createCommitService({ config: configs[0], store: restored, logger: { warn() {} }, broadcast: async () => [] });
+    assert.deepEqual((await retry.cast(statement.epoch)).record.vote, saved.votes[0]);
+    assert.equal((await retry.receive(remote)).voteCount, 2);
+    assert.equal((await restored.readCommitState(statement.epoch)).voteCount, 2);
+  } finally { await fresh.end(); }
+});
 
 test("issued and accepted PRE-PREPARE survive migration and fresh-pool recovery without overwrites", async () => {
   const envelope = await signedProposal();

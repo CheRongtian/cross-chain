@@ -8,6 +8,7 @@ import {
   validateMessageBatch,
 } from "./message-batch.mjs";
 import { buildMessageMerkleTree } from "./message-merkle.mjs";
+import { expectedCommitStatement, QuorumCertificateError, verifyQuorumCertificate } from "../../validator/src/quorum-certificate.mjs";
 import {
   BATCH_STATUS,
   nextBatchEpoch,
@@ -48,7 +49,7 @@ function lifecycleRecord(row) {
   });
 }
 
-export function createBatchLifecycle({ config, pool }) {
+export function createBatchLifecycle({ config, pool, committee = config.peers, afterCertificatePersisted = async () => {} }) {
   const scope = normalizeSourceScope(config);
   const protocolScope = {
     sourceDomain: BigInt(scope.chainDomain),
@@ -58,7 +59,30 @@ export function createBatchLifecycle({ config, pool }) {
   const members = tableName(config.databaseSchema, "message_batch_members");
   const sources = tableName(config.databaseSchema, "source_messages");
   const cursors = tableName(config.databaseSchema, "indexer_cursors");
+  const certificates = tableName(config.databaseSchema, "batch_quorum_certificates");
+  const certificateSignatures = tableName(config.databaseSchema, "batch_quorum_certificate_signatures");
   const scopeParameters = [scope.chainDomain, scope.sourceGateway];
+
+  function certificateOptions(record) {
+    if (!committee) throw new Error("expected static committee is required to verify a COMMITTED batch");
+    return { peers: committee, expected: expectedCommitStatement({ ...protocolScope, epoch: record.epoch,
+      batchId: record.batchId, messageRoot: record.messageRoot }, committee) };
+  }
+
+  async function readCertificate(client, record) {
+    const rows = (await client.query(`SELECT * FROM ${certificates} WHERE batch_record_id = $1`, [record.batchRecordId])).rows;
+    if (rows.length !== 1) throw new Error("COMMITTED batch is missing its persisted QC");
+    const q = rows[0];
+    const statement = { protocolVersion: String(q.protocol_version), sourceDomain: q.source_domain,
+      sourceGateway: q.source_gateway, epoch: q.epoch, batchId: q.batch_id, messageRoot: q.message_root,
+      proposalDigest: q.proposal_digest, committeeDigest: q.committee_digest };
+    const signatures = (await client.query(`SELECT * FROM ${certificateSignatures}
+      WHERE batch_record_id = $1 ORDER BY voter_identity`, [record.batchRecordId])).rows;
+    const commits = signatures.map((row) => ({ messageType: "COMMIT", ...statement,
+      voterIdentity: row.voter_identity, commitDigest: row.commit_digest, signature: row.signature }));
+    return verifyQuorumCertificate({ messageType: "QUORUM_CERTIFICATE", ...statement,
+      qcDigest: q.qc_digest, commits }, certificateOptions(record));
+  }
 
   async function transaction(operation, { lockScope = true } = {}) {
     const client = await pool.connect();
@@ -195,6 +219,12 @@ export function createBatchLifecycle({ config, pool }) {
     if (normalizeBytes32(record.messageRoot, "persisted Message Root") !== tree.messageRoot) {
       throw new Error("persisted sealed Message Root mismatch");
     }
+    if (record.status === BATCH_STATUS.COMMITTED) {
+      const quorumCertificate = await readCertificate(client, record);
+      return Object.freeze({ record, members: persistedMembers, batch, tree, quorumCertificate });
+    }
+    const orphan = await client.query(`SELECT batch_record_id FROM ${certificates} WHERE batch_record_id = $1`, [record.batchRecordId]);
+    if (orphan.rowCount) throw new Error("persisted QC exists without a COMMITTED batch");
     return Object.freeze({ record, members: persistedMembers, batch, tree });
   }
 
@@ -247,6 +277,42 @@ export function createBatchLifecycle({ config, pool }) {
   }
 
   return {
+    async commitWithCertificate({ certificate }) {
+      const id = normalizeBytes32(certificate?.batchId, "QC batch ID");
+      return transaction(async (client) => {
+        const result = await client.query(`SELECT * FROM ${batches}
+          WHERE batch_id = $1 AND source_domain = $2 AND source_gateway = $3 FOR UPDATE`, [id, ...scopeParameters]);
+        if (result.rowCount !== 1) throw new QuorumCertificateError("QC_BATCH_NOT_FOUND");
+        const row = result.rows[0];
+        if (![BATCH_STATUS.CONSENSUS_PENDING, BATCH_STATUS.COMMITTED].includes(row.status)) {
+          throw new QuorumCertificateError("QC_REQUIRES_PENDING_BATCH");
+        }
+        const existing = await snapshot(client, row);
+        const verified = await verifyQuorumCertificate(certificate, certificateOptions(existing.record));
+        if (row.status === BATCH_STATUS.COMMITTED) {
+          if (existing.quorumCertificate.qcDigest !== verified.qcDigest) throw new Error("conflicting QC for COMMITTED batch");
+          return existing;
+        }
+        await client.query(`INSERT INTO ${certificates}
+          (batch_record_id, protocol_version, source_domain, source_gateway, epoch, batch_id,
+           message_root, proposal_digest, committee_digest, qc_digest)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+        [row.batch_record_id, Number(verified.protocolVersion), verified.sourceDomain, verified.sourceGateway,
+          verified.epoch, verified.batchId, verified.messageRoot, verified.proposalDigest, verified.committeeDigest, verified.qcDigest]);
+        for (const vote of verified.commits) {
+          await client.query(`INSERT INTO ${certificateSignatures}
+            (batch_record_id, voter_identity, commit_digest, signature) VALUES ($1,$2,$3,$4)`,
+          [row.batch_record_id, vote.voterIdentity, vote.commitDigest, vote.signature]);
+        }
+        await afterCertificatePersisted();
+        const updated = await client.query(`UPDATE ${batches}
+          SET status = 'COMMITTED', committed_at = CURRENT_TIMESTAMP
+          WHERE batch_record_id = $1 AND status = 'CONSENSUS_PENDING' RETURNING *`, [row.batch_record_id]);
+        if (updated.rowCount !== 1) throw new Error("QC commit did not transition exactly one pending batch");
+        return snapshot(client, updated.rows[0]);
+      }, { lockScope: false });
+    },
+
     async getOrCreateBuilding({ initialEpoch } = {}) {
       return transaction(async (client) => snapshot(client, await ensureBuilding(client, initialEpoch)));
     },

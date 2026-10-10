@@ -279,7 +279,7 @@ test("existing HTTP server exposes only PRE-PREPARE routes with bounded strict f
     assert.equal((await post("/pbft/pre-prepare", result.body.record.envelope)).status, 200);
     const malformed = await post("/pbft/pre-prepare", { ...result.body.record.envelope, proposalDigest: [result.body.proposalDigest] });
     assert.equal(malformed.status, 422); assert.equal(malformed.body.reason, "MALFORMED");
-    assert.equal((await post("/pbft/commit", {})).status, 404);
+    assert.equal((await post("/pbft/view-change", {})).status, 404);
     const list = await (await fetch(`${url}/pbft/pre-prepares`)).json();
     assert.equal(list.proposals.length, 1);
     assert.ok(!JSON.stringify(list).includes(h.config.privateKey));

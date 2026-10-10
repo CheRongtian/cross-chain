@@ -6,7 +6,9 @@ import { createBatchLifecycle } from "../../src/batch-lifecycle.mjs";
 const config = loadConfig();
 const pool = createDatabasePool(config);
 try {
-  const snapshot = await createBatchLifecycle({ config, pool }).readBatch({
+  const committee = process.env.EXPECTED_VALIDATOR_COMMITTEE
+    ? JSON.parse(process.env.EXPECTED_VALIDATOR_COMMITTEE) : undefined;
+  const snapshot = await createBatchLifecycle({ config, pool, committee }).readBatch({
     batchRecordId: process.argv[2],
   });
   process.stdout.write(JSON.stringify(snapshot, (_key, value) =>

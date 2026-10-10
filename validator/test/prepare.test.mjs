@@ -312,7 +312,7 @@ test("validator HTTP transport exposes strict PREPARE cast, receive, and local-s
     assert.equal((await post("/pbft/prepare", { ...cast.body.record.vote, extra: true })).status, 400);
     const states = await (await fetch(`${url}/pbft/prepares`)).json();
     assert.equal(states.states[0].voteCount, 1);
-    assert.equal((await post("/pbft/commit", {})).status, 404);
+    assert.equal((await post("/pbft/view-change", {})).status, 404);
     assert.ok(!JSON.stringify(states).includes(configs[0].privateKey));
   } finally { await runtime.close(); }
 });

@@ -10,6 +10,8 @@ import {
 import { computeCanonicalMessageId, computePayloadHash } from "../src/canonical-message.mjs";
 import { createMessageBatcher } from "../src/message-batch.mjs";
 import { buildMessageMerkleTree, verifyMessageMerkleProof } from "../src/message-merkle.mjs";
+import { commitConfigs, signedCommitFixture } from "../../validator/test/helpers/commit-fixtures.mjs";
+import { buildQuorumCertificate, expectedCommitStatement, qcDigest } from "../../validator/src/quorum-certificate.mjs";
 
 const config = loadDatabaseConfig({
   ...process.env,
@@ -25,6 +27,28 @@ const lifecycle = createBatchLifecycle({ config: lifecycleConfig, pool });
 const batches = tableName(config.databaseSchema, "message_batches");
 const members = tableName(config.databaseSchema, "message_batch_members");
 const failureFunction = tableName(config.databaseSchema, "reject_batch_seal_for_test");
+const committee = commitConfigs[0].peers;
+const certificateTable = tableName(config.databaseSchema, "batch_quorum_certificates");
+const signaturesTable = tableName(config.databaseSchema, "batch_quorum_certificate_signatures");
+const committingLifecycle = createBatchLifecycle({ config: lifecycleConfig, pool, committee });
+
+async function pendingCertificateFixture() {
+  const { id } = await collectedPair();
+  await lifecycle.sealBatch({ batchRecordId: id });
+  const pending = await lifecycle.markConsensusPending({ batchRecordId: id });
+  const statement = expectedCommitStatement({ sourceDomain: pending.record.sourceDomain, sourceGateway: pending.record.sourceGateway,
+    epoch: pending.record.epoch, batchId: pending.record.batchId, messageRoot: pending.record.messageRoot }, committee);
+  const options = { peers: committee, expected: statement };
+  const votes = await Promise.all(commitConfigs.map((identity) => signedCommitFixture(statement, identity)));
+  const a = await buildQuorumCertificate(votes.slice(0, 3), options);
+  const b = await buildQuorumCertificate([votes[0], votes[1], votes[3]], options);
+  return { id, pending, statement, options, votes, a, b };
+}
+
+async function certificateCounts() {
+  return (await pool.query(`SELECT (SELECT COUNT(*) FROM ${certificateTable})::int AS certificates,
+    (SELECT COUNT(*) FROM ${signaturesTable})::int AS signatures`)).rows[0];
+}
 
 function hash(value) {
   return `0x${BigInt(value).toString(16).padStart(64, "0")}`;
@@ -79,6 +103,113 @@ async function collectedPair(initialEpoch = 23n) {
   const collected = await lifecycle.collectEligible({ initialEpoch });
   return { ...source, collected, id: collected.snapshot.record.batchRecordId };
 }
+
+test("only a matching independently verified QC can commit; equivalent evidence preserves the first certificate", async () => {
+  const { id, pending, a, b, votes, options } = await pendingCertificateFixture();
+  const messagesBefore = await readMessages(pool, config.databaseSchema);
+  await assert.rejects(committingLifecycle.commitWithCertificate({}), /QC batch ID/);
+  await assert.rejects(committingLifecycle.commitWithCertificate({ certificate: { ...a, commits: a.commits.slice(0, 2) } }));
+  await assert.rejects(pool.query(`UPDATE ${batches} SET status = 'COMMITTED', committed_at = CURRENT_TIMESTAMP
+    WHERE batch_record_id = $1`, [id]), /PBFT quorum authorization/);
+  assert.deepEqual(await certificateCounts(), { certificates: 0, signatures: 0 });
+  const committed = await committingLifecycle.commitWithCertificate({ certificate: a });
+  assert.equal(committed.record.status, "COMMITTED");
+  assert.deepEqual(committed.members, pending.members); assert.deepEqual(committed.batch, pending.batch);
+  assert.deepEqual(committed.tree, pending.tree); assert.deepEqual(committed.quorumCertificate, a);
+  assert.deepEqual(await committingLifecycle.commitWithCertificate({ certificate: a }), committed);
+  assert.deepEqual(await committingLifecycle.commitWithCertificate({ certificate: b }), committed);
+  assert.deepEqual(await committingLifecycle.commitWithCertificate({ certificate: await buildQuorumCertificate(votes, options) }), committed);
+  assert.deepEqual(await certificateCounts(), { certificates: 1, signatures: 3 });
+  assert.deepEqual(await readMessages(pool, config.databaseSchema), messagesBefore);
+  await applyMigrations(pool, config.databaseSchema);
+  const fresh = createDatabasePool(config);
+  try {
+    const reader = createBatchLifecycle({ config: lifecycleConfig, pool: fresh, committee });
+    assert.deepEqual(await reader.readBatch({ batchRecordId: id }), committed);
+    assert.deepEqual(await reader.commitWithCertificate({ certificate: b }), committed);
+    await assert.rejects(createBatchLifecycle({ config: lifecycleConfig, pool: fresh }).readBatch({ batchRecordId: id }), /expected static committee/);
+  } finally { await fresh.end(); }
+  for (const status of ["CONSENSUS_PENDING", "SEALED"]) {
+    await assert.rejects(pool.query(`UPDATE ${batches} SET status = $2 WHERE batch_record_id = $1`, [id, status]), /illegal batch lifecycle/);
+  }
+  await assert.rejects(pool.query(`UPDATE ${batches} SET message_root = $2 WHERE batch_record_id = $1`, [id, hash(99)]), /immutable/);
+  await assert.rejects(pool.query(`DELETE FROM ${members} WHERE batch_record_id = $1`, [id]), /immutable/);
+  await assert.rejects(pool.query(`DELETE FROM ${certificateTable} WHERE batch_record_id = $1`, [id]), /immutable/);
+  await assert.rejects(pool.query(`UPDATE ${signaturesTable} SET signature = $2 WHERE batch_record_id = $1`, [id, `0x${"ff".repeat(65)}`]), /immutable/);
+});
+
+test("QC transaction failure rolls back both certificate and batch status; fresh retry completes atomically", async () => {
+  const { id, pending, a } = await pendingCertificateFixture();
+  const failing = createBatchLifecycle({ config: lifecycleConfig, pool, committee,
+    afterCertificatePersisted: async () => { throw new Error("injected failure after QC persistence"); } });
+  await assert.rejects(failing.commitWithCertificate({ certificate: a }), /injected failure/);
+  assert.deepEqual(await certificateCounts(), { certificates: 0, signatures: 0 });
+  assert.deepEqual(await lifecycle.readBatch({ batchRecordId: id }), pending);
+  const fresh = createDatabasePool(config);
+  try {
+    const retry = createBatchLifecycle({ config: lifecycleConfig, pool: fresh, committee });
+    assert.equal((await retry.commitWithCertificate({ certificate: a })).record.status, "COMMITTED");
+  } finally { await fresh.end(); }
+  assert.deepEqual(await certificateCounts(), { certificates: 1, signatures: 3 });
+});
+
+test("SQL cannot persist a certificate without the same transaction committing its batch", async () => {
+  const { id, pending, a } = await pendingCertificateFixture();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`INSERT INTO ${certificateTable}
+      (batch_record_id, protocol_version, source_domain, source_gateway, epoch, batch_id,
+       message_root, proposal_digest, committee_digest, qc_digest)
+      VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+    [id, a.sourceDomain, a.sourceGateway, a.epoch, a.batchId, a.messageRoot, a.proposalDigest, a.committeeDigest, a.qcDigest]);
+    for (const vote of a.commits) {
+      await client.query(`INSERT INTO ${signaturesTable}
+        (batch_record_id, voter_identity, commit_digest, signature) VALUES ($1,$2,$3,$4)`,
+      [id, vote.voterIdentity, vote.commitDigest, vote.signature]);
+    }
+    await assert.rejects(client.query("COMMIT"), /must be atomic/);
+  } finally { await client.query("ROLLBACK"); client.release(); }
+  assert.deepEqual(await certificateCounts(), { certificates: 0, signatures: 0 });
+  assert.deepEqual(await lifecycle.readBatch({ batchRecordId: id }), pending);
+});
+
+test("concurrent same or equivalent QCs commit once; a conflicting certificate cannot win", async () => {
+  const { id, a, b } = await pendingCertificateFixture();
+  const changed = { ...a, messageRoot: hash(991) };
+  changed.qcDigest = qcDigest(changed);
+  const outcomes = await Promise.allSettled([
+    committingLifecycle.commitWithCertificate({ certificate: a }),
+    committingLifecycle.commitWithCertificate({ certificate: b }),
+    committingLifecycle.commitWithCertificate({ certificate: a }),
+    committingLifecycle.commitWithCertificate({ certificate: changed }),
+  ]);
+  assert.equal(outcomes.filter((r) => r.status === "fulfilled").length, 3);
+  assert.equal(outcomes.filter((r) => r.status === "rejected").length, 1);
+  const committed = await committingLifecycle.readBatch({ batchRecordId: id });
+  for (const outcome of outcomes.filter((r) => r.status === "fulfilled")) assert.deepEqual(outcome.value, committed);
+  assert.deepEqual(await certificateCounts(), { certificates: 1, signatures: 3 });
+  assert.ok([a, b].some((q) => JSON.stringify(q) === JSON.stringify(committed.quorumCertificate)));
+});
+
+test("COMMITTED reads fail closed on corrupted persisted QC even when SQL structure is intact", async () => {
+  const { id, a } = await pendingCertificateFixture();
+  const committed = await committingLifecycle.commitWithCertificate({ certificate: a });
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // Test-owned corruption is isolated to a rollback transaction; normal guards stay enabled afterwards.
+    await client.query(`ALTER TABLE ${signaturesTable} DISABLE TRIGGER batch_quorum_certificate_signatures_guard`);
+    await client.query(`UPDATE ${signaturesTable} SET signature = $2 WHERE batch_record_id = $1`, [id, `0x${"ff".repeat(65)}`]);
+    // Read inside the corruption transaction without nesting BEGIN/COMMIT.
+    const readPool = { async connect() { return { async query(sql, values) {
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return {};
+      return client.query(sql, values);
+    }, release() {} }; } };
+    await assert.rejects(createBatchLifecycle({ config: lifecycleConfig, pool: readPool, committee }).readBatch({ batchRecordId: id }), /INVALID_SIGNATURE/);
+  } finally { await client.query("ROLLBACK"); client.release(); }
+  assert.deepEqual(await committingLifecycle.readBatch({ batchRecordId: id }), committed);
+});
 
 before(async () => {
   await applyMigrations(pool, config.databaseSchema);
@@ -305,6 +436,9 @@ async function mutateFixture(sql, parameters, table, trigger) {
     await client.query("BEGIN");
     await client.query(`ALTER TABLE ${table} DISABLE TRIGGER ${trigger}`);
     await client.query(sql, parameters);
+    // Drain deferred constraint events before changing trigger configuration.
+    // Constraints still run; an invalid fixture rolls back with its guards restored.
+    await client.query("SET CONSTRAINTS ALL IMMEDIATE");
     await client.query(`ALTER TABLE ${table} ENABLE TRIGGER ${trigger}`);
     await client.query("COMMIT");
   } catch (error) {
@@ -331,20 +465,31 @@ test("sealed reads and pending transitions independently reject corrupted persis
   await assert.rejects(lifecycle.readBatch({ batchRecordId: id }), /positions or canonical order mismatch/);
 });
 
-test("COMMITTED is representable and terminal while runtime authority remains unavailable", async () => {
-  const { id } = await collectedPair();
-  await lifecycle.sealBatch({ batchRecordId: id });
-  const pending = await lifecycle.markConsensusPending({ batchRecordId: id });
-  // A schema fixture exercises the reserved state. No production switch or commit API exists.
-  await mutateFixture(`UPDATE ${batches} SET status = 'COMMITTED', committed_at = CURRENT_TIMESTAMP
-    WHERE batch_record_id = $1`, [id], batches, "message_batches_record_guard");
-  const committed = await lifecycle.readBatch({ batchRecordId: id });
+test("QC-authorized COMMITTED is terminal and preserves the sealed commitment", async () => {
+  const { id, pending, a } = await pendingCertificateFixture();
+  const committed = await committingLifecycle.commitWithCertificate({ certificate: a });
   assert.equal(committed.record.status, "COMMITTED");
   assert.ok(committed.record.committedAt instanceof Date);
   assert.deepEqual(committed.batch, pending.batch);
   assert.deepEqual(committed.tree, pending.tree);
   await assert.rejects(lifecycle.markConsensusPending({ batchRecordId: id }), /illegal batch lifecycle transition/);
   await assert.rejects(pool.query(`UPDATE ${batches} SET status = 'CONSENSUS_PENDING' WHERE batch_record_id = $1`, [id]), /illegal batch lifecycle transition/);
+});
+
+test("finalized messages after COMMITTED enter the next epoch without changing the old QC or membership", async () => {
+  const { id, a } = await pendingCertificateFixture();
+  const committed = await committingLifecycle.commitWithCertificate({ certificate: a });
+  await persist(11n, 11n, [message(11n, 0n)]);
+  await finalityStore.advanceFinality(scope, { headBlock: 11n, finalityBlockDepth: 0n });
+  const next = await lifecycle.collectEligible();
+  assert.equal(next.assignedCount, 1);
+  assert.equal(next.snapshot.record.epoch, committed.record.epoch + 1n);
+  assert.equal(next.snapshot.record.status, "BUILDING");
+  const extra = (await readMessages(pool, config.databaseSchema)).at(-1);
+  await assert.rejects(lifecycle.assignMessages({ batchRecordId: id, sourceMessageIds: [extra.id] }), /only be assigned/);
+  await assert.rejects(pool.query(`INSERT INTO ${members} (batch_record_id, source_message_id, message_id)
+    VALUES ($1,$2,$3)`, [id, extra.id, extra.message_id]), /immutable/);
+  assert.deepEqual(await committingLifecycle.readBatch({ batchRecordId: id }), committed);
 });
 
 test("epoch rollover is exact for large values and rejects uint256 overflow", async () => {

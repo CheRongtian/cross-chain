@@ -3,10 +3,12 @@ import { isDeepStrictEqual } from "node:util";
 import pg from "pg";
 import { tableName } from "../../indexer/src/db.mjs";
 import { validateSchemaName } from "../../indexer/src/config.mjs";
-import { canonicalCommittee, protocolInteger } from "./committee.mjs";
+import { canonicalCommittee, committeeDigest, protocolInteger } from "./committee.mjs";
 import { authenticatePrePrepare, PrePrepareError } from "./pre-prepare.mjs";
 import { authenticatePrepare, PrepareError } from "./prepare.mjs";
 import { normalizeAddress } from "../../indexer/src/canonical-message.mjs";
+import { authenticateCommit, COMMIT_STATEMENT_FIELDS, CommitError, signCommit } from "./commit.mjs";
+import { buildQuorumCertificate, expectedCommitStatement, qcDigest } from "./quorum-certificate.mjs";
 
 export function createValidatorPool(config) {
   return new pg.Pool({ connectionString: config.databaseUrl });
@@ -40,6 +42,9 @@ export function createValidatorStore({ pool, config }) {
   const prepareVotes = tableName(config.databaseSchema, "pbft_prepare_votes");
   const preparedStates = tableName(config.databaseSchema, "pbft_prepared_states");
   const prepareRejections = tableName(config.databaseSchema, "prepare_rejections");
+  const commitVotes = tableName(config.databaseSchema, "pbft_commit_votes");
+  const commitQuorums = tableName(config.databaseSchema, "pbft_commit_quorums");
+  const commitRejections = tableName(config.databaseSchema, "commit_rejections");
   const expectedCommittee = canonicalCommittee(config.peers);
   const expectedIdentity = {
     validator_address: config.validatorAddress,
@@ -118,6 +123,94 @@ export function createValidatorStore({ pool, config }) {
       : { vote, voteCount: votes.length, prepared };
   }
 
+  async function requirePrepared(client, epoch) {
+    const accepted = proposalRecord((await client.query(`SELECT * FROM ${prepares}
+      WHERE local_validator_identity = $1 AND epoch = $2`, [config.validatorAddress, epoch])).rows[0]);
+    if (!accepted) throw new CommitError("NOT_PREPARED");
+    await authenticatePrePrepare(config, accepted.envelope);
+    const state = await prepareResult(client, epoch);
+    if (!state.prepared) throw new CommitError("NOT_PREPARED");
+    const statement = expectedCommitStatement(accepted.envelope, config.peers);
+    if (state.prepared.batchId !== statement.batchId || state.prepared.messageRoot !== statement.messageRoot ||
+        state.prepared.proposalDigest !== statement.proposalDigest) throw new CommitError("WRONG_PREPARED_PROPOSAL");
+    for (const vote of state.votes) {
+      const verified = await authenticatePrepare(config, vote);
+      if (["epoch", "batchId", "messageRoot", "proposalDigest"].some((field) => verified[field] !== statement[field])) {
+        throw new CommitError("WRONG_PREPARED_PROPOSAL");
+      }
+    }
+    return statement;
+  }
+
+  function commitVoteRecord(row) {
+    return { messageType: "COMMIT", protocolVersion: "1", sourceDomain: row.source_domain,
+      sourceGateway: row.source_gateway, epoch: row.epoch, batchId: row.batch_id,
+      messageRoot: row.message_root, proposalDigest: row.proposal_digest, committeeDigest: row.committee_digest,
+      voterIdentity: row.voter_identity, commitDigest: row.commit_digest, signature: row.voter_signature };
+  }
+
+  async function commitResult(client, epoch) {
+    const rows = (await client.query(`SELECT * FROM ${commitVotes}
+      WHERE local_validator_identity = $1 AND epoch = $2 ORDER BY voter_identity`, [config.validatorAddress, epoch])).rows;
+    const votes = await Promise.all(rows.map((row) => authenticateCommit(config, commitVoteRecord(row))));
+    const row = (await client.query(`SELECT * FROM ${commitQuorums}
+      WHERE local_validator_identity = $1 AND epoch = $2`, [config.validatorAddress, epoch])).rows[0];
+    let quorum = null;
+    let certificate = null;
+    if (votes.length || row) {
+      const statement = await requirePrepared(client, epoch);
+      if (votes.some((vote) => COMMIT_STATEMENT_FIELDS.some((field) => vote[field] !== statement[field]))) {
+        throw new Error("persisted COMMIT does not match PREPARED statement");
+      }
+      if (votes.length >= 3 && !row) throw new Error("durable COMMIT quorum state missing");
+      if (row) {
+        const voters = row.quorum_voters;
+        if (!Array.isArray(voters) || voters.length !== 3 || new Set(voters).size !== 3 ||
+            voters.some((voter) => !votes.some((vote) => vote.voterIdentity === voter)) ||
+            row.qc_digest !== qcDigest(statement) || row.committee_digest !== statement.committeeDigest ||
+            row.batch_id !== statement.batchId || row.message_root !== statement.messageRoot ||
+            row.proposal_digest !== statement.proposalDigest) throw new Error("invalid persisted COMMIT quorum");
+        certificate = await buildQuorumCertificate(votes.filter((vote) => voters.includes(vote.voterIdentity)),
+          { peers: config.peers, expected: statement });
+        quorum = { validatorAddress: config.validatorAddress, status: "COMMIT_QUORUM", ...statement,
+          qcDigest: row.qc_digest, quorumVoters: voters, reachedAt: row.reached_at.toISOString() };
+      }
+    }
+    return { validatorAddress: config.validatorAddress, epoch, voteCount: votes.length, votes, quorum, certificate };
+  }
+
+  async function persistCommit(client, vote) {
+    const statement = await requirePrepared(client, vote.epoch);
+    const existing = (await client.query(`SELECT * FROM ${commitVotes}
+      WHERE local_validator_identity = $1 AND epoch = $2 AND voter_identity = $3`,
+    [config.validatorAddress, vote.epoch, vote.voterIdentity])).rows[0];
+    if (existing && existing.commit_digest !== vote.commitDigest) throw new CommitError("CONFLICTING_COMMIT");
+    const mismatchReasons = { protocolVersion: "WRONG_VERSION", sourceDomain: "WRONG_CONTEXT",
+      sourceGateway: "WRONG_CONTEXT", epoch: "WRONG_EPOCH", batchId: "WRONG_BATCH_ID",
+      messageRoot: "WRONG_ROOT", proposalDigest: "WRONG_PROPOSAL", committeeDigest: "WRONG_COMMITTEE" };
+    for (const field of COMMIT_STATEMENT_FIELDS) {
+      if (vote[field] !== statement[field]) throw new CommitError(mismatchReasons[field]);
+    }
+    if (!existing) {
+      await client.query(`INSERT INTO ${commitVotes}
+        (local_validator_identity, voter_identity, epoch, source_domain, source_gateway, batch_id, message_root,
+         proposal_digest, committee_digest, commit_digest, voter_signature)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [config.validatorAddress, vote.voterIdentity, vote.epoch, vote.sourceDomain, vote.sourceGateway, vote.batchId,
+        vote.messageRoot, vote.proposalDigest, vote.committeeDigest, vote.commitDigest, vote.signature]);
+    }
+    const voters = (await client.query(`SELECT voter_identity FROM ${commitVotes}
+      WHERE local_validator_identity = $1 AND epoch = $2 ORDER BY voter_identity`, [config.validatorAddress, vote.epoch])).rows;
+    if (voters.length >= 3) {
+      await client.query(`INSERT INTO ${commitQuorums}
+        (local_validator_identity, epoch, batch_id, message_root, proposal_digest, committee_digest, qc_digest, quorum_voters)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb) ON CONFLICT (local_validator_identity, epoch) DO NOTHING`,
+      [config.validatorAddress, vote.epoch, vote.batchId, vote.messageRoot, vote.proposalDigest,
+        committeeDigest(config.peers), qcDigest(statement), JSON.stringify(voters.slice(0, 3).map((entry) => entry.voter_identity))]);
+    }
+    return commitResult(client, vote.epoch);
+  }
+
   async function transaction(operation) {
     const client = await pool.connect();
     let discarded = false;
@@ -133,6 +226,66 @@ export function createValidatorStore({ pool, config }) {
   }
 
   return {
+    async readCommitState(epoch) {
+      return transaction(async (client) => {
+        await checkState(client, "FOR SHARE");
+        return commitResult(client, protocolInteger(epoch).toString());
+      });
+    },
+
+    async readCommitStates() {
+      return transaction(async (client) => {
+        await checkState(client, "FOR SHARE");
+        const epochs = (await client.query(`SELECT epoch FROM ${prepares}
+          WHERE local_validator_identity = $1 ORDER BY epoch`, [config.validatorAddress])).rows;
+        const states = [];
+        for (const row of epochs) states.push(await commitResult(client, row.epoch));
+        return states;
+      });
+    },
+
+    async castCommitVote(epoch, sign = signCommit) {
+      return transaction(async (client) => {
+        // Serialize the lock check, signature creation, and persistence across processes.
+        await checkState(client, "FOR UPDATE");
+        const normalized = protocolInteger(epoch).toString();
+        const statement = await requirePrepared(client, normalized);
+        const existing = (await client.query(`SELECT * FROM ${commitVotes}
+          WHERE local_validator_identity = $1 AND epoch = $2 AND voter_identity = $3`,
+        [config.validatorAddress, normalized, config.validatorAddress])).rows[0];
+        if (existing) {
+          const vote = await authenticateCommit(config, commitVoteRecord(existing));
+          if (COMMIT_STATEMENT_FIELDS.some((field) => vote[field] !== statement[field])) throw new CommitError("DOUBLE_COMMIT");
+          return persistCommit(client, vote);
+        }
+        const vote = await authenticateCommit(config, await sign(config,
+          { messageType: "COMMIT", ...statement, voterIdentity: config.validatorAddress }));
+        return persistCommit(client, vote);
+      });
+    },
+
+    async saveCommitVote(input) {
+      const vote = await authenticateCommit(config, input);
+      return transaction(async (client) => {
+        await checkState(client, "FOR UPDATE");
+        return persistCommit(client, vote);
+      });
+    },
+
+    async recordCommitRejection(input, reason) {
+      let epoch = null;
+      try { epoch = protocolInteger(input?.epoch).toString(); } catch { /* omit malformed values */ }
+      const digest = typeof input?.commitDigest === "string" && /^0x[0-9a-fA-F]{64}$/.test(input.commitDigest)
+        ? input.commitDigest.toLowerCase() : null;
+      const voter = typeof input?.voterIdentity === "string" && /^0x[0-9a-fA-F]{40}$/.test(input.voterIdentity)
+        ? input.voterIdentity.toLowerCase() : null;
+      return transaction(async (client) => {
+        await checkState(client, "FOR UPDATE");
+        await client.query(`INSERT INTO ${commitRejections} (commit_digest, voter_identity, epoch, reason)
+          VALUES ($1,$2,$3,$4)`, [digest, voter, epoch, reason]);
+      });
+    },
+
     async checkIdentity() {
       await checkState(pool);
     },

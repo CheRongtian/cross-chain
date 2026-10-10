@@ -13,12 +13,17 @@ import { developmentKeys } from "./fixtures.mjs";
 import { deterministicPrimary } from "../../src/committee.mjs";
 import { prePrepareDigest } from "../../src/pre-prepare.mjs";
 import { prepareDigest } from "../../src/prepare.mjs";
+import { commitDigest } from "../../src/commit.mjs";
+import { buildQuorumCertificate, expectedCommitStatement, qcDigest, verifyQuorumCertificate } from "../../src/quorum-certificate.mjs";
+import { createBatchLifecycle } from "../../../indexer/src/batch-lifecycle.mjs";
 
 const MAIN = fileURLToPath(new URL("../../src/main.mjs", import.meta.url));
-const SOURCE_TABLES = ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batches", "message_batch_members"];
+const SOURCE_TABLES = ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batches", "message_batch_members",
+  "batch_quorum_certificates", "batch_quorum_certificate_signatures"];
 const ORDER = { source_messages: "id", indexer_cursors: "chain_domain, source_gateway",
   indexed_source_blocks: "source_domain, source_gateway, block_number", message_batches: "batch_record_id",
-  message_batch_members: "batch_record_id, source_message_id" };
+  message_batch_members: "batch_record_id, source_message_id", batch_quorum_certificates: "batch_record_id",
+  batch_quorum_certificate_signatures: "batch_record_id, voter_identity" };
 
 async function reservePort() {
   const server = createTcpServer();
@@ -111,7 +116,9 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     const config = loadValidatorConfig(environment);
     const pool = createValidatorPool(config); pools.push(pool);
     await applyValidatorMigrations(pool, config.databaseSchema);
-    await pool.query(`TRUNCATE TABLE ${tableName(config.databaseSchema, "prepare_rejections")},
+    await pool.query(`TRUNCATE TABLE ${tableName(config.databaseSchema, "commit_rejections")},
+      ${tableName(config.databaseSchema, "pbft_commit_quorums")}, ${tableName(config.databaseSchema, "pbft_commit_votes")},
+      ${tableName(config.databaseSchema, "prepare_rejections")},
       ${tableName(config.databaseSchema, "pbft_prepared_states")}, ${tableName(config.databaseSchema, "pbft_prepare_votes")},
       ${tableName(config.databaseSchema, "validation_observations")},
       ${tableName(config.databaseSchema, "validated_batch_bindings")}, ${tableName(config.databaseSchema, "validator_metadata")},
@@ -421,6 +428,14 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
       const initial = await state.store.readPrepareState(epoch);
       assert.equal(initial.voteCount, 0); assert.equal(initial.prepared, null);
     }
+    const earlyCommit = await request(peers[primaryIndex].url, "/pbft/commit/cast", { epoch });
+    assert.equal(earlyCommit.status, 422); assert.equal(earlyCommit.body.reason, "NOT_PREPARED");
+    const earlyFields = { messageType: "COMMIT", ...expectedCommitStatement(proposal, peers), voterIdentity: peers[primaryIndex].address };
+    const earlyDigest = commitDigest(earlyFields);
+    const earlySignature = await validatorAccount(keys[primaryIndex]).signMessage({ message: { raw: earlyDigest } });
+    const earlyRemote = await request(peers[backups[0]].url, "/pbft/commit",
+      { ...earlyFields, commitDigest: earlyDigest, signature: earlySignature });
+    assert.equal(earlyRemote.status, 422); assert.equal(earlyRemote.body.reason, "NOT_PREPARED");
     const prepareVoters = [primaryIndex, ...backups];
     const firstVoter = prepareVoters[0];
     const offlinePrepareReceiver = prepareVoters[3];
@@ -461,6 +476,8 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
       assert.equal((await states[index].store.readPrepareState(epoch)).voteCount, 2);
     }
     console.log("VALID: two unique matching PREPARE votes remained below quorum; duplicate delivery retained two votes");
+    const twoPrepareCommit = await request(peers[primaryIndex].url, "/pbft/commit/cast", { epoch });
+    assert.equal(twoPrepareCommit.status, 422); assert.equal(twoPrepareCommit.body.reason, "NOT_PREPARED");
 
     const thirdVoter = prepareVoters[2];
     const thirdCast = await request(peers[thirdVoter].url, "/pbft/prepare/cast", { epoch });
@@ -525,6 +542,138 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     console.log("VALID: validator operations preserved source rows, cursor, blocks, membership, roots, and CONSENSUS_PENDING");
     assert.deepEqual(await sourceState(sourcePool, sourceConfig.databaseSchema), originalSourceState);
     console.log("VALID: four local PREPARED states matched the canonical PRE-PREPARE; no COMMIT vote, commit quorum, or QC was created");
+
+    const commitStatement = expectedCommitStatement(proposal, peers);
+    const qcOptions = { peers, expected: commitStatement };
+    const firstCommitVoter = prepareVoters[0];
+    const offlineCommitReceiver = prepareVoters[3];
+    await stop(validators[offlineCommitReceiver]);
+    const firstCommit = await request(peers[firstCommitVoter].url, "/pbft/commit/cast", { epoch });
+    assert.equal(firstCommit.status, 200); assert.equal(firstCommit.body.voteCount, 1);
+    assert.equal(firstCommit.body.commitQuorum, false);
+    assert.equal(firstCommit.body.deliveries.find((entry) => entry.peerAddress === peers[offlineCommitReceiver].address).delivery, "FAILED");
+    const firstCommitVote = firstCommit.body.record.vote;
+    await stop(validators[firstCommitVoter]);
+    validators[firstCommitVoter] = await start(environments[firstCommitVoter]);
+    validators[offlineCommitReceiver] = await start(environments[offlineCommitReceiver]);
+    const retryCommit = await request(peers[firstCommitVoter].url, "/pbft/commit/cast", { epoch });
+    assert.equal(retryCommit.status, 200); assert.deepEqual(retryCommit.body.record.vote, firstCommitVote);
+    assert.ok(retryCommit.body.deliveries.every((entry) => entry.delivery === "DELIVERED" && entry.result === "ACCEPTED"));
+    console.log("VALID: durable self COMMIT survived partial broadcast and process restart; retry used the original envelope");
+
+    const secondCommit = await request(peers[prepareVoters[1]].url, "/pbft/commit/cast", { epoch });
+    assert.equal(secondCommit.status, 200);
+    for (let index = 0; index < 4; index++) {
+      const current = await states[index].store.readCommitState(epoch);
+      assert.equal(current.voteCount, 2); assert.equal(current.quorum, null); assert.equal(current.certificate, null);
+      for (let copy = 0; copy < 3; copy++) {
+        const duplicate = await request(peers[index].url, "/pbft/commit", secondCommit.body.record.vote);
+        assert.equal(duplicate.status, 200); assert.equal(duplicate.body.voteCount, 2); assert.equal(duplicate.body.commitQuorum, false);
+      }
+      const noQc = await request(peers[index].url, "/pbft/qc", { epoch });
+      assert.equal(noQc.status, 422); assert.equal(noQc.body.reason, "COMMIT_QUORUM_REQUIRED");
+    }
+    const sourceLifecycle = createBatchLifecycle({ config: sourceConfig, pool: sourcePool, committee: peers });
+    assert.equal((await sourceLifecycle.readBatch({ batchRecordId: snapshot.record.batchRecordId })).record.status, "CONSENSUS_PENDING");
+    assert.equal((await sourcePool.query(`SELECT COUNT(*)::int AS count FROM ${tableName(sourceConfig.databaseSchema, "batch_quorum_certificates")}`)).rows[0].count, 0);
+    console.log("VALID: two distinct COMMIT voters and duplicates could not form QC or commit the pending batch");
+
+    const thirdCommit = await request(peers[prepareVoters[2]].url, "/pbft/commit/cast", { epoch });
+    assert.equal(thirdCommit.status, 200);
+    const commitQuorumsAtThree = [];
+    for (const state of states) {
+      const current = await state.store.readCommitState(epoch);
+      assert.equal(current.voteCount, 3); assert.equal(current.quorum.status, "COMMIT_QUORUM");
+      await verifyQuorumCertificate(current.certificate, qcOptions);
+      commitQuorumsAtThree.push(current);
+    }
+    // Exercise the boundary where durable local QC exists before any global submission.
+    const qcRestart = prepareVoters[2];
+    await stop(validators[qcRestart]); validators[qcRestart] = await start(environments[qcRestart]);
+    const recoveredQc = await request(peers[qcRestart].url, "/pbft/qc", { epoch });
+    assert.equal(recoveredQc.status, 200);
+    assert.deepEqual(recoveredQc.body.certificate, commitQuorumsAtThree[qcRestart].certificate);
+    const certificate = recoveredQc.body.certificate;
+    const invalidCertificates = [
+      { ...certificate, commits: certificate.commits.slice(0, 2) },
+      { ...certificate, commits: [certificate.commits[0], certificate.commits[0], certificate.commits[1]] },
+      { ...certificate, messageRoot: `0x${"a1".repeat(32)}` },
+      { ...certificate, committeeDigest: `0x${"a2".repeat(32)}` },
+      { ...certificate, commits: certificate.commits.map((v, i) => i ? v : { ...v, signature: `0x${"ff".repeat(65)}` }) },
+    ];
+    for (const invalid of invalidCertificates) {
+      const rejection = await request(peers[0].url, "/pbft/qc/submit", invalid);
+      assert.equal(rejection.status, 422); assert.equal(rejection.body.result, "REJECTED");
+      assert.equal((await sourceLifecycle.readBatch({ batchRecordId: snapshot.record.batchRecordId })).record.status, "CONSENSUS_PENDING");
+    }
+    const failingLifecycle = createBatchLifecycle({ config: sourceConfig, pool: sourcePool, committee: peers,
+      afterCertificatePersisted: async () => { throw new Error("injected source QC transaction failure"); } });
+    await assert.rejects(failingLifecycle.commitWithCertificate({ certificate }), /injected source QC transaction failure/);
+    assert.deepEqual(await sourceState(sourcePool, sourceConfig.databaseSchema), originalSourceState);
+    console.log("VALID: invalid QC and injected transaction failure preserved pending status and left no certificate rows");
+
+    const submissions = await Promise.all(peers.map((peer) => request(peer.url, "/pbft/qc/submit", certificate)));
+    for (const response of submissions) {
+      assert.equal(response.status, 200); assert.equal(response.body.status, "COMMITTED");
+      assert.equal(response.body.qcDigest, certificate.qcDigest);
+    }
+    const committed = await sourceLifecycle.readBatch({ batchRecordId: snapshot.record.batchRecordId });
+    assert.equal(committed.record.status, "COMMITTED");
+    assert.deepEqual(committed.batch, snapshot.batch); assert.deepEqual(committed.members, snapshot.members);
+    assert.deepEqual(committed.tree, snapshot.tree);
+    await verifyQuorumCertificate(committed.quorumCertificate, qcOptions);
+    console.log("VALID: concurrent verified QC submissions atomically committed the real A/B/D batch exactly once");
+
+    const fourthCommitVoter = prepareVoters[3];
+    const fourthCommit = await request(peers[fourthCommitVoter].url, "/pbft/commit/cast", { epoch });
+    assert.equal(fourthCommit.status, 200);
+    const wrongCommitFields = { messageType: "COMMIT", ...commitStatement,
+      voterIdentity: peers[fourthCommitVoter].address, messageRoot: `0x${"ed".repeat(32)}` };
+    const wrongDigest = commitDigest(wrongCommitFields);
+    const wrongSignature = await validatorAccount(keys[fourthCommitVoter]).signMessage({ message: { raw: wrongDigest } });
+    const wrongCommit = { ...wrongCommitFields, commitDigest: wrongDigest, signature: wrongSignature };
+    for (let index = 0; index < 4; index++) {
+      const current = await states[index].store.readCommitState(epoch);
+      assert.equal(current.voteCount, 4); assert.deepEqual(current.quorum, commitQuorumsAtThree[index].quorum);
+      const conflict = await request(peers[index].url, "/pbft/commit", wrongCommit);
+      assert.equal(conflict.status, 422); assert.equal(conflict.body.reason, "CONFLICTING_COMMIT");
+      const duplicate = await request(peers[index].url, "/pbft/commit", fourthCommit.body.record.vote);
+      assert.equal(duplicate.status, 200); assert.equal(duplicate.body.voteCount, 4);
+    }
+    const allCommits = (await states[0].store.readCommitState(epoch)).votes;
+    const equivalent = await buildQuorumCertificate(allCommits.filter((v) => v.voterIdentity !== certificate.commits[0].voterIdentity), qcOptions);
+    assert.equal(equivalent.qcDigest, qcDigest(commitStatement));
+    assert.equal((await request(peers[1].url, "/pbft/qc/submit", equivalent)).status, 200);
+    assert.deepEqual(await sourceLifecycle.readBatch({ batchRecordId: snapshot.record.batchRecordId }), committed);
+
+    const restartCommitted = fourthCommitVoter;
+    const beforeCommitRestart = await states[restartCommitted].store.readCommitState(epoch);
+    const beforePrepareRestart = await states[restartCommitted].store.readPrepareState(epoch);
+    await stop(validators[restartCommitted]); validators[restartCommitted] = await start(environments[restartCommitted]);
+    const restoredCommits = await request(peers[restartCommitted].url, "/pbft/commits");
+    assert.equal(restoredCommits.status, 200); assert.deepEqual(restoredCommits.body.states[0], beforeCommitRestart);
+    const retrySelf = await request(peers[restartCommitted].url, "/pbft/commit/cast", { epoch });
+    assert.equal(retrySelf.status, 200); assert.deepEqual(retrySelf.body.record.vote, fourthCommit.body.record.vote);
+    const forcedDoubleCommit = await request(peers[restartCommitted].url, "/pbft/commit/cast",
+      { epoch, messageRoot: wrongCommit.messageRoot });
+    assert.equal(forcedDoubleCommit.status, 400);
+    assert.deepEqual(await states[restartCommitted].store.readCommitState(epoch), beforeCommitRestart);
+    const conflictAfterRestart = await request(peers[restartCommitted].url, "/pbft/commit", wrongCommit);
+    assert.equal(conflictAfterRestart.status, 422); assert.equal(conflictAfterRestart.body.reason, "CONFLICTING_COMMIT");
+    assert.equal((await request(peers[restartCommitted].url, "/pbft/qc/submit", certificate)).status, 200);
+    assert.deepEqual(await states[restartCommitted].store.readPrePrepares(), acceptedBeforeDuplicates[restartCommitted]);
+    assert.deepEqual(await states[restartCommitted].store.readPrepareState(epoch), beforePrepareRestart);
+
+    const sourceAfterCommit = await sourceState(sourcePool, sourceConfig.databaseSchema);
+    assert.equal(sourceAfterCommit.batch_quorum_certificates.length, 1);
+    assert.equal(sourceAfterCommit.batch_quorum_certificate_signatures.length, 3);
+    for (const name of ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batch_members"]) {
+      assert.deepEqual(sourceAfterCommit[name], originalSourceState[name]);
+    }
+    assert.deepEqual(sourceAfterCommit.message_batches.map((row) => row.batch_record_id === snapshot.record.batchRecordId
+      ? { ...row, status: "CONSENSUS_PENDING", committed_at: null } : row), originalSourceState.message_batches);
+    console.log("VALID: immutable first QC, fourth vote, equivalent subset, and restarted COMMIT lock preserved source history and next-epoch Message E");
+    return { snapshot: committed, committee: peers };
   } finally {
     controller.abort();
     const cleanup = await Promise.allSettled([

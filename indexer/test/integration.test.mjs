@@ -844,8 +844,14 @@ test("recovers source workers and seals durable batches from real finalized mess
     assert.deepEqual(await readCursor(activePool, config.databaseSchema, scope), beforeRolloverCursor);
     console.log("VALID: real Message E finalized after sealing and entered the next BUILDING epoch");
     console.log("VALID: old membership, batch ID, root, and proofs remained unchanged after rollover");
-    await verifyFourIndependentValidators({ sourceConfig: config, sourcePool: activePool,
+    const consensus = await verifyFourIndependentValidators({ sourceConfig: config, sourcePool: activePool,
       snapshot: oldAfterRollover, pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE") });
+    const committedProcessRead = await execFileAsync(process.execPath, [LIFECYCLE_READER_PATH, lifecycleId], {
+      env: { ...process.env, EXPECTED_VALIDATOR_COMMITTEE: JSON.stringify(consensus.committee) },
+    });
+    process.stderr.write(committedProcessRead.stderr);
+    assert.deepEqual(JSON.parse(committedProcessRead.stdout), transportValue(consensus.snapshot));
+    console.log("VALID: fresh source-reader process reconstructed COMMITTED A/B/D and independently verified the persisted QC");
   } finally {
     for (const worker of activeWorkers) {
       worker.kill("SIGKILL");

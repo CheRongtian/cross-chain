@@ -6,6 +6,8 @@ import { createValidatorServer } from "./server.mjs";
 import { tableName } from "../../indexer/src/db.mjs";
 import { createPrePrepareService } from "./pre-prepare-service.mjs";
 import { createPrepareService } from "./prepare-service.mjs";
+import { createCommitService } from "./commit-service.mjs";
+import { createBatchLifecycle } from "../../indexer/src/batch-lifecycle.mjs";
 
 let config;
 let pool;
@@ -28,12 +30,21 @@ try {
   // Migrations are explicit, owned by the validator subsystem, and applied before startup.
   await store.bindIdentity();
   await sourcePool.query(`SELECT batch_record_id FROM ${tableName(config.sourceDatabaseSchema, "message_batches")} LIMIT 0`);
+  for (const table of ["batch_quorum_certificates", "batch_quorum_certificate_signatures"]) {
+    await sourcePool.query(`SELECT batch_record_id FROM ${tableName(config.sourceDatabaseSchema, table)} LIMIT 0`);
+  }
+  for (const table of ["pbft_commit_votes", "pbft_commit_quorums"]) {
+    await pool.query(`SELECT local_validator_identity FROM ${tableName(config.databaseSchema, table)} LIMIT 0`);
+  }
   const publicClient = createChainClient(config);
   await validateSourceContext(publicClient, config);
   const service = createBatchValidationService({ config, sourcePool, store, publicClient });
   const prePrepare = createPrePrepareService({ config, validation: service, store });
   const prepare = createPrepareService({ config, store });
-  runtime = createValidatorServer({ config, service, store, prePrepare, prepare, checkReady: async () => {
+  const lifecycle = createBatchLifecycle({ config: { ...config, databaseSchema: config.sourceDatabaseSchema },
+    pool: sourcePool, committee: config.peers });
+  const commit = createCommitService({ config, store, lifecycle });
+  runtime = createValidatorServer({ config, service, store, prePrepare, prepare, commit, checkReady: async () => {
     await store.checkIdentity();
     await sourcePool.query(`SELECT batch_record_id FROM ${tableName(config.sourceDatabaseSchema, "message_batches")} LIMIT 0`);
     await validateSourceContext(publicClient, config);

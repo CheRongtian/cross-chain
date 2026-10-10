@@ -4,8 +4,11 @@ import { connectPeer, signHandshake } from "./handshake.mjs";
 import { publicIdentity } from "./identity.mjs";
 import { PRE_PREPARE_ENVELOPE_FIELDS } from "./pre-prepare.mjs";
 import { PREPARE_ENVELOPE_FIELDS } from "./prepare.mjs";
+import { COMMIT_ENVELOPE_FIELDS } from "./commit.mjs";
+import { QC_FIELDS } from "./quorum-certificate.mjs";
 
-export const MAX_REQUEST_BYTES = 4096;
+// A canonical QC may carry four complete signed COMMIT envelopes.
+export const MAX_REQUEST_BYTES = 8192;
 class InputError extends Error {}
 
 async function readBody(request, keys) {
@@ -28,7 +31,7 @@ async function readBody(request, keys) {
   return body;
 }
 
-export function createValidatorServer({ config, service, store, prePrepare, prepare,
+export function createValidatorServer({ config, service, store, prePrepare, prepare, commit,
   authenticatePeer = connectPeer, checkReady = async () => {}, logger = console }) {
   let ready = true;
   const server = createServer(async (request, response) => {
@@ -49,6 +52,27 @@ export function createValidatorServer({ config, service, store, prePrepare, prep
       if (request.method === "GET" && request.url === "/observations") return send(200, { observations: await store.readObservations() });
       if (request.method === "GET" && request.url === "/pbft/pre-prepares") return send(200, { proposals: await store.readPrePrepares() });
       if (request.method === "GET" && request.url === "/pbft/prepares") return send(200, await prepare.list());
+      if (request.method === "GET" && request.url === "/pbft/commits") return send(200, await commit.list());
+      if (request.method === "POST" && request.url === "/pbft/commit/cast") {
+        const body = await readBody(request, ["epoch"]);
+        const result = await commit.cast(body.epoch);
+        return send(result.result === "ACCEPTED" ? 200 : 422, result);
+      }
+      if (request.method === "POST" && request.url === "/pbft/commit") {
+        const body = await readBody(request, COMMIT_ENVELOPE_FIELDS);
+        const result = await commit.receive(body);
+        return send(result.result === "ACCEPTED" ? 200 : 422, result);
+      }
+      if (request.method === "POST" && request.url === "/pbft/qc") {
+        const body = await readBody(request, ["epoch"]);
+        const result = await commit.certificate(body.epoch);
+        return send(result.result === "ACCEPTED" ? 200 : 422, result);
+      }
+      if (request.method === "POST" && request.url === "/pbft/qc/submit") {
+        const body = await readBody(request, QC_FIELDS);
+        const result = await commit.submit(body);
+        return send(result.result === "ACCEPTED" ? 200 : 422, result);
+      }
       if (request.method === "POST" && request.url === "/pbft/primary") {
         const body = await readBody(request, ["epoch"]);
         let result;
