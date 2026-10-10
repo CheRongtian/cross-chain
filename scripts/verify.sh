@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Deterministic PBFT PRE-PREPARE"
+VERIFICATION_NAME="PBFT PREPARE"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -450,7 +450,7 @@ printf ' 31. Persist one BUILDING batch per source scope and assign finalized oc
 printf ' 32. Atomically seal canonical membership, batch ID, count, and Message Root\n'
 printf ' 33. Verify immutable sealed snapshots, rollback, and concurrent retries\n'
 printf ' 34. Restore SEALED and CONSENSUS_PENDING snapshots in fresh processes\n'
-printf ' 35. Reject COMMITTED transitions without future PBFT quorum authorization\n'
+printf ' 35. Reject COMMITTED transitions without future COMMIT quorum and QC authorization\n'
 printf ' 36. Finalize a later real message into the next epoch and preserve old proofs\n'
 printf ' 37. Detect committed Merkle fixture drift without rewriting expected values\n'
 printf ' 38. Match off-chain and Solidity domains, leaves, nodes, roots, and proofs to one shared fixture\n'
@@ -468,7 +468,15 @@ printf ' 49. Verify durable epoch locks, concurrent delivery, rejection isolatio
 printf ' 50. Propose the real pending A/B/D batch and independently revalidate it on backups\n'
 printf ' 51. Reject wrong primary, signature, epoch, reference, root, lifecycle, and source state\n'
 printf ' 52. Recover primary/backup safety locks and retry a controlled partial broadcast\n'
-printf ' 53. Preserve all source state and CONSENSUS_PENDING without PREPARE, COMMIT, or quorum\n'
+printf ' 53. Preserve all source state after PRE-PREPARE alone, before PREPARE voting\n'
+printf ' 54. Encode, sign, recover, and authenticate domain-separated PREPARE votes\n'
+printf ' 55. Require a durable accepted PRE-PREPARE before casting each validator vote\n'
+printf ' 56. Persist self PREPARE before broadcast and reject durable double-vote conflicts\n'
+printf ' 57. Exchange unique PREPARE votes across four independent validator processes\n'
+printf ' 58. Keep two matching votes below quorum and form local PREPARED state at three\n'
+printf ' 59. Exclude duplicate, wrong-context, and conflicting votes from quorum weight\n'
+printf ' 60. Recover PREPARE locks, vote collections, and PREPARED state after restart\n'
+printf ' 61. Preserve CONSENSUS_PENDING without COMMIT votes, commit quorum, or QC\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -527,16 +535,17 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
         "$INDEXER_DIR/test/database.test.mjs" \
         "$INDEXER_DIR/test/batch-lifecycle.database.test.mjs"
 
-CURRENT_STEP="independent validator and PRE-PREPARE unit tests"
+CURRENT_STEP="independent validator, PRE-PREPARE, and PREPARE unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$VALIDATOR_DIR/test/config.test.mjs" \
     "$VALIDATOR_DIR/test/handshake.test.mjs" \
     "$VALIDATOR_DIR/test/source-validation.test.mjs" \
     "$VALIDATOR_DIR/test/server.test.mjs" \
-    "$VALIDATOR_DIR/test/pre-prepare.test.mjs"
+    "$VALIDATOR_DIR/test/pre-prepare.test.mjs" \
+    "$VALIDATOR_DIR/test/prepare.test.mjs"
 
-CURRENT_STEP="isolated validator database migrations and persistence tests"
+CURRENT_STEP="isolated validator migrations, vote locks, and PREPARED persistence tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="${VALIDATOR_VERIFICATION_DATABASE_URL:-$DATABASE_URL}" \
 VALIDATOR_DATABASE_TEST_SCHEMA="cross_chain_validator_database_verification" \
@@ -1165,7 +1174,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source recovery, lifecycle, Solidity compatibility, four validators, and PRE-PREPARE integration"
+CURRENT_STEP="real source recovery, lifecycle, four validators, PRE-PREPARE, and PREPARE integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

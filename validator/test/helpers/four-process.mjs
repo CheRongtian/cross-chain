@@ -12,6 +12,7 @@ import { tableName } from "../../../indexer/src/db.mjs";
 import { developmentKeys } from "./fixtures.mjs";
 import { deterministicPrimary } from "../../src/committee.mjs";
 import { prePrepareDigest } from "../../src/pre-prepare.mjs";
+import { prepareDigest } from "../../src/prepare.mjs";
 
 const MAIN = fileURLToPath(new URL("../../src/main.mjs", import.meta.url));
 const SOURCE_TABLES = ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batches", "message_batch_members"];
@@ -110,7 +111,9 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     const config = loadValidatorConfig(environment);
     const pool = createValidatorPool(config); pools.push(pool);
     await applyValidatorMigrations(pool, config.databaseSchema);
-    await pool.query(`TRUNCATE TABLE ${tableName(config.databaseSchema, "validation_observations")},
+    await pool.query(`TRUNCATE TABLE ${tableName(config.databaseSchema, "prepare_rejections")},
+      ${tableName(config.databaseSchema, "pbft_prepared_states")}, ${tableName(config.databaseSchema, "pbft_prepare_votes")},
+      ${tableName(config.databaseSchema, "validation_observations")},
       ${tableName(config.databaseSchema, "validated_batch_bindings")}, ${tableName(config.databaseSchema, "validator_metadata")},
       ${tableName(config.databaseSchema, "validator_committee")}, ${tableName(config.databaseSchema, "pbft_pre_prepares")},
       ${tableName(config.databaseSchema, "pre_prepare_rejections")}`);
@@ -413,12 +416,115 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
       assert.deepEqual(await states[index].store.readObservations(), observations[index]);
       assert.equal((await request(peers[index].url, "/health")).status, 200);
     }
+
+    for (const state of states) {
+      const initial = await state.store.readPrepareState(epoch);
+      assert.equal(initial.voteCount, 0); assert.equal(initial.prepared, null);
+    }
+    const prepareVoters = [primaryIndex, ...backups];
+    const firstVoter = prepareVoters[0];
+    const offlinePrepareReceiver = prepareVoters[3];
+    await stop(validators[offlinePrepareReceiver]);
+    const firstCast = await request(peers[firstVoter].url, "/pbft/prepare/cast", { epoch });
+    assert.equal(firstCast.status, 200); assert.equal(firstCast.body.result, "ACCEPTED");
+    assert.equal(firstCast.body.voteCount, 1); assert.equal(firstCast.body.prepared, false);
+    assert.equal(firstCast.body.record.vote.voterIdentity, peers[firstVoter].address);
+    assert.equal(firstCast.body.deliveries.find((entry) => entry.peerAddress === peers[offlinePrepareReceiver].address).delivery, "FAILED");
+    const firstVote = firstCast.body.record.vote;
+    const firstVoterPid = validators[firstVoter].child.pid;
+    await stop(validators[firstVoter]);
+    validators[firstVoter] = await start(environments[firstVoter]);
+    assert.notEqual(validators[firstVoter].child.pid, firstVoterPid);
+    assert.deepEqual((await states[firstVoter].store.readPrepareVote(epoch, peers[firstVoter].address)).vote, firstVote);
+    validators[offlinePrepareReceiver] = await start(environments[offlinePrepareReceiver]);
+    const firstRetry = await request(peers[firstVoter].url, "/pbft/prepare/cast", { epoch });
+    assert.equal(firstRetry.status, 200); assert.deepEqual(firstRetry.body.record.vote, firstVote);
+    assert.ok(firstRetry.body.deliveries.every((entry) => entry.delivery === "DELIVERED" && entry.result === "ACCEPTED"));
+    for (const state of states) {
+      const current = await state.store.readPrepareState(epoch);
+      assert.equal(current.voteCount, 1); assert.equal(current.prepared, null);
+    }
+    console.log("VALID: self PREPARE persisted before a partial broadcast and fresh-process retry delivered the same vote");
+
+    const secondVoter = prepareVoters[1];
+    const secondCast = await request(peers[secondVoter].url, "/pbft/prepare/cast", { epoch });
+    assert.equal(secondCast.status, 200); assert.equal(secondCast.body.result, "ACCEPTED");
+    for (const state of states) {
+      const current = await state.store.readPrepareState(epoch);
+      assert.equal(current.voteCount, 2); assert.equal(current.prepared, null);
+    }
+    for (let index = 0; index < 4; index++) {
+      for (let duplicate = 0; duplicate < 3; duplicate++) {
+        const result = await request(peers[index].url, "/pbft/prepare", secondCast.body.record.vote);
+        assert.equal(result.status, 200); assert.equal(result.body.voteCount, 2); assert.equal(result.body.prepared, false);
+      }
+      assert.equal((await states[index].store.readPrepareState(epoch)).voteCount, 2);
+    }
+    console.log("VALID: two unique matching PREPARE votes remained below quorum; duplicate delivery retained two votes");
+
+    const thirdVoter = prepareVoters[2];
+    const thirdCast = await request(peers[thirdVoter].url, "/pbft/prepare/cast", { epoch });
+    assert.equal(thirdCast.status, 200); assert.equal(thirdCast.body.result, "ACCEPTED");
+    const preparedAtThree = [];
+    for (const state of states) {
+      const current = await state.store.readPrepareState(epoch);
+      assert.equal(current.voteCount, 3); assert.equal(current.prepared.quorumVoters.length, 3);
+      assert.equal(new Set(current.prepared.quorumVoters).size, 3);
+      preparedAtThree.push(current.prepared);
+    }
+    console.log("VALID: the third distinct durable PREPARE vote atomically produced validator-local PREPARED state");
+
+    const fourthVoter = prepareVoters[3];
+    async function signedPrepare(fields, signerIndex) {
+      const digest = prepareDigest(fields);
+      const signature = await validatorAccount(keys[signerIndex]).signMessage({ message: { raw: digest } });
+      return { ...fields, prepareDigest: digest, signature };
+    }
+    const conflictingFields = { messageType: "PREPARE", protocolVersion: "1",
+      sourceDomain: proposal.sourceDomain, sourceGateway: proposal.sourceGateway, epoch,
+      batchId: proposal.batchId, messageRoot: `0x${"ed".repeat(32)}`,
+      proposalDigest: canonical.proposalDigest, voterIdentity: peers[fourthVoter].address };
+    const conflictingVote = await signedPrepare(conflictingFields, fourthVoter);
+    const wrongRootVote = await request(peers[0].url, "/pbft/prepare", conflictingVote);
+    assert.equal(wrongRootVote.status, 422); assert.equal(wrongRootVote.body.reason, "WRONG_ROOT");
+    assert.equal((await states[0].store.readPrepareState(epoch)).voteCount, 3);
+    assert.deepEqual((await states[0].store.readPrepareState(epoch)).prepared, preparedAtThree[0]);
+    const fourthCast = await request(peers[fourthVoter].url, "/pbft/prepare/cast", { epoch });
+    assert.equal(fourthCast.status, 200); assert.equal(fourthCast.body.result, "ACCEPTED");
+    for (let index = 0; index < 4; index++) {
+      const current = await states[index].store.readPrepareState(epoch);
+      assert.equal(current.voteCount, 4); assert.deepEqual(current.prepared, preparedAtThree[index]);
+      const conflict = await request(peers[index].url, "/pbft/prepare", conflictingVote);
+      assert.equal(conflict.status, 422); assert.equal(conflict.body.reason, "CONFLICTING_PREPARE");
+      assert.equal((await states[index].store.readPrepareState(epoch)).voteCount, 4);
+    }
+    console.log("VALID: a conflicting fourth-validator vote was excluded and could not replace four canonical votes or PREPARED state");
+
+    const preparedRestartIndex = prepareVoters[1];
+    const preparedBeforeRestart = await states[preparedRestartIndex].store.readPrepareState(epoch);
+    const preparedPid = validators[preparedRestartIndex].child.pid;
+    await stop(validators[preparedRestartIndex]);
+    validators[preparedRestartIndex] = await start(environments[preparedRestartIndex]);
+    assert.notEqual(validators[preparedRestartIndex].child.pid, preparedPid);
+    const recoveredPrepare = await request(peers[preparedRestartIndex].url, "/pbft/prepares");
+    assert.equal(recoveredPrepare.status, 200);
+    assert.deepEqual(recoveredPrepare.body.states[0], preparedBeforeRestart);
+    const recoveredCast = await request(peers[preparedRestartIndex].url, "/pbft/prepare/cast", { epoch });
+    assert.equal(recoveredCast.status, 200);
+    assert.deepEqual(recoveredCast.body.record.vote,
+      (await states[preparedRestartIndex].store.readPrepareVote(epoch, peers[preparedRestartIndex].address)).vote);
+    for (let index = 0; index < 4; index++) {
+      const current = await states[index].store.readPrepareState(epoch);
+      assert.equal(current.voteCount, 4); assert.ok(current.prepared);
+    }
+    console.log("VALID: fresh validator process recovered its vote collection and monotonic PREPARED state without double voting");
+
     await assert.rejects(sourcePool.query(`UPDATE ${tableName(sourceConfig.databaseSchema, "message_batches")}
       SET status = 'COMMITTED', committed_at = CURRENT_TIMESTAMP WHERE batch_record_id = $1`,
     [snapshot.record.batchRecordId]), /PBFT quorum authorization/);
     console.log("VALID: validator operations preserved source rows, cursor, blocks, membership, roots, and CONSENSUS_PENDING");
     assert.deepEqual(await sourceState(sourcePool, sourceConfig.databaseSchema), originalSourceState);
-    console.log("VALID: four independent PRE-PREPARE safety records match; no PREPARE, quorum, COMMIT, or QC was created");
+    console.log("VALID: four local PREPARED states matched the canonical PRE-PREPARE; no COMMIT vote, commit quorum, or QC was created");
   } finally {
     controller.abort();
     const cleanup = await Promise.allSettled([

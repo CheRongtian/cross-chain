@@ -5,6 +5,7 @@ import { createChainClient } from "../../indexer/src/indexer.mjs";
 import { createValidatorServer } from "./server.mjs";
 import { tableName } from "../../indexer/src/db.mjs";
 import { createPrePrepareService } from "./pre-prepare-service.mjs";
+import { createPrepareService } from "./prepare-service.mjs";
 
 let config;
 let pool;
@@ -31,7 +32,8 @@ try {
   await validateSourceContext(publicClient, config);
   const service = createBatchValidationService({ config, sourcePool, store, publicClient });
   const prePrepare = createPrePrepareService({ config, validation: service, store });
-  runtime = createValidatorServer({ config, service, store, prePrepare, checkReady: async () => {
+  const prepare = createPrepareService({ config, store });
+  runtime = createValidatorServer({ config, service, store, prePrepare, prepare, checkReady: async () => {
     await store.checkIdentity();
     await sourcePool.query(`SELECT batch_record_id FROM ${tableName(config.sourceDatabaseSchema, "message_batches")} LIMIT 0`);
     await validateSourceContext(publicClient, config);

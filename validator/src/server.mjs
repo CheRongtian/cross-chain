@@ -3,6 +3,7 @@ import { normalizeAddress, normalizeBytes32 } from "../../indexer/src/canonical-
 import { connectPeer, signHandshake } from "./handshake.mjs";
 import { publicIdentity } from "./identity.mjs";
 import { PRE_PREPARE_ENVELOPE_FIELDS } from "./pre-prepare.mjs";
+import { PREPARE_ENVELOPE_FIELDS } from "./prepare.mjs";
 
 export const MAX_REQUEST_BYTES = 4096;
 class InputError extends Error {}
@@ -27,7 +28,8 @@ async function readBody(request, keys) {
   return body;
 }
 
-export function createValidatorServer({ config, service, store, prePrepare, authenticatePeer = connectPeer, checkReady = async () => {}, logger = console }) {
+export function createValidatorServer({ config, service, store, prePrepare, prepare,
+  authenticatePeer = connectPeer, checkReady = async () => {}, logger = console }) {
   let ready = true;
   const server = createServer(async (request, response) => {
     function send(status, body) {
@@ -46,6 +48,7 @@ export function createValidatorServer({ config, service, store, prePrepare, auth
       if (!ready) return send(503, { error: "validator is stopping" });
       if (request.method === "GET" && request.url === "/observations") return send(200, { observations: await store.readObservations() });
       if (request.method === "GET" && request.url === "/pbft/pre-prepares") return send(200, { proposals: await store.readPrePrepares() });
+      if (request.method === "GET" && request.url === "/pbft/prepares") return send(200, await prepare.list());
       if (request.method === "POST" && request.url === "/pbft/primary") {
         const body = await readBody(request, ["epoch"]);
         let result;
@@ -60,6 +63,16 @@ export function createValidatorServer({ config, service, store, prePrepare, auth
       if (request.method === "POST" && request.url === "/pbft/pre-prepare") {
         const body = await readBody(request, PRE_PREPARE_ENVELOPE_FIELDS);
         const result = await prePrepare.receive(body);
+        return send(result.result === "ACCEPTED" ? 200 : 422, result);
+      }
+      if (request.method === "POST" && request.url === "/pbft/prepare/cast") {
+        const body = await readBody(request, ["epoch"]);
+        const result = await prepare.cast(body.epoch);
+        return send(result.result === "ACCEPTED" ? 200 : 422, result);
+      }
+      if (request.method === "POST" && request.url === "/pbft/prepare") {
+        const body = await readBody(request, PREPARE_ENVELOPE_FIELDS);
+        const result = await prepare.receive(body);
         return send(result.result === "ACCEPTED" ? 200 : 422, result);
       }
       if (request.method === "POST" && request.url === "/handshake") {

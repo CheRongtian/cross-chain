@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, a persistent batch lifecycle, and four independent validator processes with signed PBFT PRE-PREPARE proposals. It provides a source-chain gateway, a two-chain local environment, user-held credential proofs, an identity application, a PostgreSQL-backed Indexer and Finality Watcher, durable sealed Message Roots, and validators that independently recheck Chain A and retain isolated local observations and proposal safety locks. Complete PBFT consensus and destination execution are not implemented.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, a persistent batch lifecycle, and four independent validator processes with signed PBFT PRE-PREPARE and PREPARE messages. It provides a source-chain gateway, a two-chain local environment, user-held credential proofs, an identity application, a PostgreSQL-backed Indexer and Finality Watcher, durable sealed Message Roots, and validators that independently recheck Chain A, retain isolated proposal/vote safety locks, and derive local `PREPARED` state from three distinct matching votes. Complete PBFT commitment and destination execution are not implemented.
 
 The current implementation can:
 
@@ -60,7 +60,10 @@ The current implementation can:
 - select a deterministic primary from a canonically ordered static committee for each exact batch epoch;
 - sign domain-separated PRE-PREPARE proposals only after independent validation of a pending batch;
 - independently authenticate and validate proposals on backups, retain one immutable proposal per epoch, and recover it after process loss;
-- retry partial proposal delivery without changing the primary, replacing accepted state, or forming a quorum.
+- retry partial proposal delivery without changing the primary or replacing accepted state;
+- create a domain-separated PREPARE vote only from a locally accepted PRE-PREPARE;
+- count one durable vote per committee identity and form validator-local `PREPARED` state at three matching votes;
+- recover self-vote locks, remote votes, and monotonic `PREPARED` state after process loss without committing the batch.
 
 ## Architecture
 
@@ -129,13 +132,22 @@ Unknown EOA or contract ──────────────────�
                                                                │
                                                                v
                                               validator-local accepted proposal locks
+                                                               │
+                                                               v
+                                                  signed PREPARE votes
+                                                               │
+                                                               v
+                                              3 distinct matching validators
+                                                               │
+                                                               v
+                                                validator-local PREPARED
 ```
 
 `IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The Indexer persists emitted source events, and the Finality Watcher advances their database lifecycle; neither component adds proof-to-message binding. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
 
 The Indexer and Finality Watcher are disposable worker processes. Their durable operational progress lives in PostgreSQL, and every new process reconciles that state with Chain A before continuing.
 
-The batch lifecycle assigns finalized source occurrences to durable batch records. Sealing reuses the deterministic batch and Merkle builders to persist an immutable snapshot, and reading it reconstructs its inclusion proofs. Batch operations preserve source lifecycle state. `COMMITTED` is reserved for future PBFT quorum authorization; consensus and destination delivery are outside the current implementation.
+The batch lifecycle assigns finalized source occurrences to durable batch records. Sealing reuses the deterministic batch and Merkle builders to persist an immutable snapshot, and reading it reconstructs its inclusion proofs. Batch operations preserve source lifecycle state. `COMMITTED` is reserved for future PBFT COMMIT-quorum and quorum-certificate authorization; destination delivery is outside the current implementation.
 
 The same commitment primitive is implemented in JavaScript and Solidity. Shared committed vectors constrain both runtimes, and complete verification passes a reconstructed real sealed batch into Foundry's local EVM. This compatibility path does not deploy a destination endpoint or execute a message on Chain B.
 
@@ -693,10 +705,10 @@ Golden vectors establish compatibility regression boundaries. They provide no co
 
 ```text
 BUILDING → SEALED → CONSENSUS_PENDING → COMMITTED
-                                      (reserved for future PBFT quorum authorization)
+                                      (reserved for future COMMIT quorum and QC authorization)
 ```
 
-Current operations stop at `CONSENSUS_PENDING`. A sealed batch is an immutable message commitment, and a pending batch is awaiting consensus; neither status represents validator agreement. The `COMMITTED` state is representable for future integration, but ordinary SQL inserts and transitions cannot create it. There is no production commit API, generic transition API, CLI override, or bypass flag. A future 3-of-4 PBFT quorum authorization mechanism must establish that transition.
+Current batch operations stop at `CONSENSUS_PENDING`. A sealed batch is an immutable message commitment, and a pending batch is awaiting final consensus; neither lifecycle status represents validator agreement. The validator subsystem may independently record local prepare-level support without changing that status. The `COMMITTED` state is representable for future integration, but ordinary SQL inserts and transitions cannot create it. There is no production commit API, generic transition API, CLI override, or bypass flag. A future 3-of-4 PBFT COMMIT quorum and quorum certificate must authorize that transition.
 
 Migration `005_batch_lifecycle.sql` adds two tables:
 
@@ -732,7 +744,7 @@ Batch membership uniqueness provides durable assignment ownership. It does not e
 
 The `validator/` subsystem runs one validator per Node.js process. The configured static set contains exactly four unique secp256k1-derived Ethereum addresses and four distinct HTTP endpoints. V1–V4 are verification aliases, not cryptographic identities. Each process has its own key, memory, endpoint, PostgreSQL namespace, and source RPC client. The production configuration supports separate database servers as well as isolated schemas on one server.
 
-The committee coordinates signed PRE-PREPARE proposals through one deterministic primary per batch epoch. Local `VALID` observations and accepted PRE-PREPARE records are distinct from PREPARE votes. There is no PREPARE or COMMIT phase, consensus view, validator-set epoch, quorum calculation, or quorum certificate. Even four accepted proposals cannot authorize `CONSENSUS_PENDING → COMMITTED`.
+The committee coordinates signed PRE-PREPARE proposals through one deterministic primary per batch epoch. After accepting the same proposal, every committee member, including the primary, can persist and broadcast one signed PREPARE vote. Three distinct matching voters produce validator-local `PREPARED` state. There is no COMMIT phase, commit quorum, consensus view, validator-set epoch, or quorum certificate. `PREPARED` cannot authorize `CONSENSUS_PENDING → COMMITTED`.
 
 ### Identity and persistence
 
@@ -747,9 +759,12 @@ The local schema contains:
 - `validation_observations`: immutable `VALID`/`INVALID` observations keyed by batch ID and source-head hash, with exact head number and an operational timestamp;
 - `validator_committee`: an immutable canonical array of four configured public identities;
 - `pbft_pre_prepares`: one immutable accepted proposal per local validator and batch epoch, including batch ID, root, digest, primary signature, `ISSUED`/`ACCEPTED` direction, and acceptance time;
-- `pre_prepare_rejections`: separate minimal public rejection evidence and stable reason categories, with no authority to reserve an accepted slot.
+- `pre_prepare_rejections`: separate minimal public rejection evidence and stable reason categories, with no authority to reserve an accepted slot;
+- `pbft_prepare_votes`: one immutable vote per local validator, batch epoch, and cryptographic voter identity, bound by foreign key to the exact locally accepted proposal;
+- `pbft_prepared_states`: an immutable local transition containing the accepted proposal and the first canonical set of three durable voter identities that established prepare quorum;
+- `prepare_rejections`: separate operational evidence for malformed, mismatched, unknown, and conflicting votes, with no quorum weight.
 
-Opening an existing namespace with another key, Gateway, domain, finality policy, or committee membership fails closed. Peer order and endpoint changes do not change the canonical identity array. Same-snapshot validation at the same head is idempotent. A different head adds an observation without deleting history. A changed root, epoch, or occurrence membership for an existing batch ID, or contradictory results at the same head, cannot overwrite prior state. No operational timestamp or local observation enters a message ID, batch ID, Merkle hash, or proposal signature. Ordered, rerunnable validator migrations preserve existing identity and observations; `002_pre_prepare.sql` adds proposal storage without rewriting the original migration.
+Opening an existing namespace with another key, Gateway, domain, finality policy, or committee membership fails closed. Peer order and endpoint changes do not change the canonical identity array. Same-snapshot validation at the same head is idempotent. A different head adds an observation without deleting history. A changed root, epoch, or occurrence membership for an existing batch ID, or contradictory results at the same head, cannot overwrite prior state. No operational timestamp or local observation enters a message ID, batch ID, Merkle hash, proposal signature, or vote signature. Ordered, rerunnable validator migrations preserve existing identity and observations; `002_pre_prepare.sql` adds proposal storage and `003_prepare.sql` adds vote/quorum storage without rewriting earlier migrations.
 
 An integrity-checked candidate that fails canonical-block or depth validation can produce a local `INVALID` observation. A malformed or corrupt snapshot cannot establish a batch binding; its request is rejected without recording its untrusted cryptographic assertions. Unavailable RPC data cannot produce `VALID` or overwrite an earlier observation. Validator operations never repair or rewrite source history.
 
@@ -784,6 +799,9 @@ The transport uses Node's built-in HTTP implementation. Requests have a bounded 
 | `POST /pbft/propose` | Validate a `batchId`, require this node to be primary, persist and broadcast its proposal |
 | `POST /pbft/pre-prepare` | Authenticate an envelope, independently validate its first acceptance, and persist a local safety lock |
 | `GET /pbft/pre-prepares` | Read this validator's durable issued/accepted proposals |
+| `POST /pbft/prepare/cast` | Load an accepted proposal by decimal-string epoch, persist this validator's vote, and broadcast it |
+| `POST /pbft/prepare` | Authenticate and persist a configured validator's matching PREPARE vote |
+| `GET /pbft/prepares` | Read local vote collections, unique counts, and durable `PREPARED` state |
 
 Handshake hashing is `keccak256(abi.encode(HANDSHAKE_DOMAIN, sourceDomain, sourceGateway, validatorAddress, challenge))`, with the type string `ValidatorIdentityHandshake(uint256 sourceDomain,address sourceGateway,address validator,bytes32 challenge)`. The response uses Ethereum personal-message signing of that raw digest. The requester recovers the signer and checks the expected static peer identity, source context, and challenge. Changed challenges, identities, context, signatures, and replay against a new challenge fail. No persistent handshake anti-replay ledger is needed; freshness belongs to the requester.
 
@@ -833,7 +851,52 @@ The database safety key is `(local_validator_identity, epoch)`. Transactions, a 
 
 Before persistence, a restart can validate and construct the same digest again. After persistence, the primary revalidates the pending candidate and reuses its stored envelope for rebroadcast. Partial delivery retries are idempotent for existing backups and produce first acceptance on previously offline backups. A fresh backup process reads the same safety lock, accepts duplicates idempotently, and still rejects conflicts. Source corruption or an unavailable RPC prevents a new proposal; validators do not repair source history or advance the batch lifecycle.
 
-Accepted PRE-PREPARE is not a PREPARE vote, quorum, `COMMITTED` state, or quorum certificate. The source batch stays `CONSENSUS_PENDING`. PREPARE, COMMIT, quorum certificates, Byzantine fault completion, partition recovery, view change, validator rotation, relaying, destination gateways, and destination execution are unsupported.
+Accepted PRE-PREPARE alone carries no PREPARE vote, quorum, `COMMITTED` state, or quorum certificate. The source batch stays `CONSENSUS_PENDING`.
+
+### PREPARE votes and local PREPARED state
+
+`POST /pbft/prepare/cast` accepts only a decimal-string `epoch`. The validator loads its immutable accepted PRE-PREPARE and constructs the vote from that record; callers cannot provide a batch, root, proposal digest, or claimed voter. A missing accepted proposal fails closed. Both the deterministic primary and backups follow this same rule.
+
+The canonical envelope is:
+
+```text
+messageType = "PREPARE"
+protocolVersion = "1"
+sourceDomain                    decimal uint256 string
+sourceGateway                   Ethereum address
+epoch                           decimal uint256 string
+batchId                         bytes32
+messageRoot                     bytes32
+proposalDigest                  accepted PRE-PREPARE digest
+voterIdentity                   configured validator address
+prepareDigest                   bytes32
+signature                       65-byte Ethereum signature
+```
+
+The authoritative digest uses the same ABI/Keccak convention as PRE-PREPARE with a separate domain:
+
+```text
+PREPARE_DOMAIN = keccak256(UTF8(
+  "PBFTPrepare(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,bytes32 batchId,bytes32 messageRoot,bytes32 proposalDigest,address voterIdentity)"
+))
+
+prepareDigest = keccak256(abi.encode(
+  PREPARE_DOMAIN, uint8(protocolVersion), uint256(sourceDomain), sourceGateway,
+  uint256(epoch), batchId, messageRoot, proposalDigest, voterIdentity
+))
+```
+
+The validator signs the raw digest with its existing Ethereum personal-message key. The receiver recomputes the digest, recovers the signer, requires `recovered signer == voterIdentity`, and checks membership in the static four-address committee. Binding the voter into the digest makes each member's vote cryptographically distinct. Binding the proposal digest, batch ID, root, epoch, and source context prevents votes from being mixed across proposals or protocol contexts. JSON serialization, timestamps, URLs, PIDs, database identifiers, and signatures do not enter the digest.
+
+A validator can cast at most one PREPARE per epoch. It checks its durable self-vote lock before signing, persists the signed vote, and only then broadcasts to the other three peers through the existing authenticated transport and five-second HTTP bound. A crash before persistence leaves no vote. A crash after persistence reuses the same saved vote on retry. Partial delivery is safe because receivers treat an identical vote idempotently. Delivery responses are operational acknowledgements and carry no additional voting weight.
+
+`POST /pbft/prepare` accepts only the strict signed envelope. The local accepted PRE-PREPARE must already exist, and epoch, batch ID, root, proposal digest, source context, and version must match it exactly. A valid committee signature cannot establish or replace a proposal. A vote arriving before its PRE-PREPARE is rejected and is not buffered. One voter occupies one durable `(local validator, epoch, voter)` slot. Repeated delivery preserves the original row; a different vote from the same identity and epoch is rejected without replacing it. Rejection evidence remains separate from valid votes.
+
+Prepare quorum is exactly three distinct configured voter identities for one locally accepted proposal. Request count, HTTP responses, signatures without signer recovery, and duplicate rows do not count. Vote insertion, unique-voter counting, and first creation of `PREPARED` occur in one database transaction. Concurrent second/third votes therefore cannot leave a durable three-vote collection without its matching `PREPARED` record. The first three voter identities are saved as immutable quorum evidence. A fourth matching vote is retained while the existing `PREPARED` timestamp and evidence remain unchanged.
+
+`PREPARED` is validator-local and monotonic. One node may be prepared while another has observed only two votes. A fresh process restores the accepted proposal, every observed vote, its own double-vote lock, and existing `PREPARED` state from its isolated namespace. Receiving duplicates, temporary peer loss, or restart cannot return the node to an unprepared state.
+
+`PREPARED` records prepare-level support only. It is not `COMMITTED`, a COMMIT vote, a commit quorum, a quorum certificate, destination authorization, or proof of delivery. No source table is changed during PREPARE processing, and the batch remains `CONSENSUS_PENDING`. COMMIT, quorum certificates, Byzantine fault-completion scenarios, partition recovery, view change, validator rotation, relaying, destination gateways, and destination execution are unsupported.
 
 ### Configuration
 
@@ -853,7 +916,11 @@ The flow stops V4 and verifies that V1/V2/V3 remain alive with unchanged state, 
 
 PRE-PREPARE unit tests add canonical committee permutations, exact uint256 rotation, field/digest/signature mutations, lifecycle/context checks, source corruption, and persistence/broadcast crash boundaries. Database tests cover issued/accepted recovery, rerunnable migration, committee binding, concurrent duplicates/conflicts, immutable locks, and rejection isolation.
 
+PREPARE unit tests cover its independent domain and canonical encoding, signer recovery, exact accepted-proposal matching, pre-PREPARE arrival, self-vote persistence before broadcast, durable double-vote prevention, unique-voter counting, duplicate/conflicting votes, and the one/two/three/four-vote thresholds. Database tests add concurrent duplicate delivery, concurrent second/third voters, atomic `PREPARED` creation, immutable vote/quorum rows, rejection isolation, migration reruns, and fresh-pool recovery.
+
 The same four-process flow uses a different peer ordering on each node and verifies that all select the same actual primary. It rejects non-primary proposals, malformed signatures, unknown references, wrong epochs, and primary-signed wrong roots before the canonical proposal. A deliberately stopped backup makes the first broadcast partial at a known boundary. The primary then restarts, the backup returns, and the same stored proposal is rebroadcast. Concurrent duplicate delivery, a fresh backup restart, and correctly signed conflicts preserve each node's original record. Fresh isolated source profiles exercise `SEALED`, corrupt roots/blocks, `REORGED` members, and insufficient depth without masking failures behind existing locks. Final assertions compare the original source tables and reject an unauthorized `COMMITTED` transition. These checks do not assert Byzantine consensus completion.
+
+After all four processes hold the canonical PRE-PREPARE, the integration stops one receiver, casts and persists the first PREPARE, restarts the voter and receiver, and rebroadcasts the same vote. Two unique voters leave every node unprepared despite repeated delivery. The third distinct vote atomically produces four independent local `PREPARED` records. A valid wrong-root vote and a later conflicting vote from the fourth validator are excluded without removing the existing three-vote state. The canonical fourth vote is retained without rewriting the earlier quorum evidence. A fresh validator process recovers its accepted proposal, four votes, self-vote lock, and `PREPARED` record. Source tables remain byte-for-byte equivalent and an unauthorized `COMMITTED` transition still fails.
 
 The integration helper tracks only its own child processes and handles failure and interruption cleanup. The root script also maintains an owned PID registry for fallback cleanup; it never targets unrelated validator processes. These recovery tests establish local persistence and process isolation, not PBFT fault tolerance or consensus liveness.
 
@@ -1096,13 +1163,19 @@ The script uses strict error handling and performs:
 63. a real primary-signed A/B/D PRE-PREPARE with independent backup RPC reconstruction;
 64. wrong-primary/signature/epoch/reference/root/lifecycle/source rejection and unchanged source state;
 65. controlled partial broadcast, fresh primary/backup recovery, and idempotent retry of the stored proposal;
-66. four matching isolated PRE-PREPARE records with the batch still pending and no PREPARE, COMMIT, or quorum.
+66. four matching isolated PRE-PREPARE records with the batch still pending;
+67. domain-separated PREPARE encoding, signatures, accepted-proposal binding, and durable self-vote locks;
+68. one/two/three/four unique-voter thresholds, duplicate exclusion, and atomic local `PREPARED` creation;
+69. wrong signer/context/epoch/batch/root/proposal rejection and conflicting-voter lock preservation;
+70. a controlled partial PREPARE broadcast followed by voter/receiver restart and idempotent recovery;
+71. four isolated durable vote collections and `PREPARED` records with source state unchanged;
+72. continued rejection of `COMMITTED` without COMMIT votes, commit quorum, or a quorum certificate.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
 If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
 
-The validator integration applies its own migrations explicitly, chooses temporary local ports, injects runtime development keys, and cleans up its own validator processes and RPC observers. It retains no quorum result and leaves the batch pending. Test-owned validator namespaces are reset for a complete run; restart recovery is checked within that run. No production validator store is reset.
+The validator integration applies its own migrations explicitly, chooses temporary local ports, injects runtime development keys, and cleans up its own validator processes and RPC observers. It retains validator-local prepare quorum state and leaves the source batch pending. Test-owned validator namespaces are reset for a complete run; restart recovery is checked within that run. No production validator store is reset.
 
 All stdout and stderr are displayed in the terminal and written to:
 
@@ -1114,7 +1187,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Deterministic PBFT PRE-PREPARE
+PBFT PREPARE
 ```
 
 ### Expected error output
@@ -1236,7 +1309,8 @@ Cross-Chain/
 │   ├── .env.example
 │   ├── migrations/
 │   │   ├── 001_validator_foundation.sql
-│   │   └── 002_pre_prepare.sql
+│   │   ├── 002_pre_prepare.sql
+│   │   └── 003_prepare.sql
 │   ├── src/
 │   │   ├── committee.mjs
 │   │   ├── config.mjs
@@ -1247,6 +1321,8 @@ Cross-Chain/
 │   │   ├── migrate.mjs
 │   │   ├── pre-prepare.mjs
 │   │   ├── pre-prepare-service.mjs
+│   │   ├── prepare.mjs
+│   │   ├── prepare-service.mjs
 │   │   ├── server.mjs
 │   │   └── source-validation.mjs
 │   ├── test/
@@ -1254,6 +1330,7 @@ Cross-Chain/
 │   │   ├── database.test.mjs
 │   │   ├── handshake.test.mjs
 │   │   ├── pre-prepare.test.mjs
+│   │   ├── prepare.test.mjs
 │   │   ├── server.test.mjs
 │   │   ├── source-validation.test.mjs
 │   │   └── helpers/
@@ -1320,13 +1397,14 @@ Cross-Chain/
 - Off-chain inclusion verification requires the caller's expected batch and root. A valid proof establishes membership within that commitment and supplies no consensus result, quorum certificate, Chain B authorization, or cross-chain acceptance.
 - Batch and Merkle computation preserve source lifecycle state and use only existing public message data and provenance. They introduce no private credential attributes.
 - PostgreSQL remains operational persistence. Batch and Merkle construction do not independently establish canonical-chain consensus or validator authority.
-- Persistent batch assignment, sealing, and epoch advancement preserve source lifecycle state. `CONSENSUS_PENDING` is the current authorization boundary; future PBFT quorum verification must authorize `COMMITTED`.
+- Persistent batch assignment, sealing, and epoch advancement preserve source lifecycle state. `CONSENSUS_PENDING` remains the lifecycle boundary while validators collect PREPARE votes. Validator-local `PREPARED` state has no authority to create `COMMITTED`.
 - The Solidity Merkle primitive requires independently trusted expected context, including member count, and does not replace canonical message-field validation or authenticate a relayer. Shared golden vectors lock compatibility and grant no destination permissions.
 - Four independent validator processes may share one source RPC provider; independent checking does not eliminate that provider's trust assumptions or produce a cryptographic source-finality proof.
 - Validator-local observations are separate from source persistence and are never consensus votes. One validator or four local `VALID` results cannot commit a batch.
 - Peer handshake signatures prove configured identity control in a distinct domain and cannot serve as future PREPARE/COMMIT signatures. Source mismatches fail closed and do not trigger source DB repairs.
 - Signed PRE-PREPARE proposals use a separate canonical domain and authenticate the deterministic primary, but signature validity cannot replace independent source validation. One accepted digest per local identity/epoch is durable across restart; accepted proposals do not authorize `COMMITTED`.
-- The repository does not provide PREPARE or COMMIT phases, quorum calculation/certificates, Byzantine fault completion, partition recovery, view change, validator rotation, destination gateway integration, QC verification, exactly-once downstream batch consumption, relaying, destination execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
+- Signed PREPARE votes use another canonical domain, bind the exact accepted proposal and voter identity, and count once per configured validator. Three matching voters produce durable local `PREPARED` state; duplicates and conflicts cannot add quorum weight or replace prior votes.
+- The repository does not provide COMMIT messages, commit quorum, quorum certificates, Byzantine fault completion, partition recovery, view change, validator rotation, destination gateway integration, QC verification, exactly-once downstream batch consumption, relaying, destination execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.
