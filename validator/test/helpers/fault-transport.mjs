@@ -6,6 +6,7 @@ export function createTransportGate(identities) {
   const committee = new Set(identities);
   if (committee.size !== 4 || identities.length !== 4) throw new Error("fault gate requires four distinct identities");
   const blocked = new Map();
+  const blockedRoutes = new Set();
   function check(from, to) {
     if (!committee.has(from) || !committee.has(to) || from === to) throw new Error("unknown or self transport edge");
   }
@@ -16,14 +17,16 @@ export function createTransportGate(identities) {
   }
   return {
     block,
-    isBlocked(from, to) { check(from, to); return blocked.get(from)?.has(to) ?? false; },
-    heal() { blocked.clear(); },
+    blockRoute(from, to, route) { check(from, to); blockedRoutes.add(`${from}:${to}:${route}`); },
+    allowRoute(from, to, route) { check(from, to); blockedRoutes.delete(`${from}:${to}:${route}`); },
+    isBlocked(from, to, route) { check(from, to); return (blocked.get(from)?.has(to) ?? false) || blockedRoutes.has(`${from}:${to}:${route}`); },
+    heal() { blocked.clear(); blockedRoutes.clear(); },
     partition(groups) {
       if (!Array.isArray(groups) || groups.length !== 2 || groups.some((group) => !Array.isArray(group) || group.length !== 2) ||
           new Set(groups.flat()).size !== 4 || groups.flat().some((identity) => !committee.has(identity))) {
         throw new Error("partition must contain two disjoint groups of two committee identities");
       }
-      blocked.clear();
+      blocked.clear(); blockedRoutes.clear();
       for (const from of groups[0]) for (const to of groups[1]) { block(from, to); block(to, from); }
     },
   };
@@ -36,7 +39,7 @@ export async function createPeerProxy({ from, to, targetUrl, gate, signal, fetch
   const server = createServer(async (request, response) => {
     const controller = new AbortController();
     requests.add(controller);
-    const record = { from, to, route: request.url, blocked: gate.isBlocked(from, to), delivery: "PENDING" };
+    const record = { from, to, route: request.url, blocked: gate.isBlocked(from, to, request.url), delivery: "PENDING" };
     records.push(record);
     try {
       if (record.blocked) {

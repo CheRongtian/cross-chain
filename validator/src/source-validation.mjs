@@ -110,6 +110,11 @@ export async function validateMembersAgainstChain({ config, publicClient, snapsh
 export function createBatchValidationService({ config, sourcePool, store,
   publicClient = createChainClient(config), reader = createSourceBatchReader({ config, pool: sourcePool }), logger = console }) {
   return {
+    async readCommitted(batchId) {
+      // The existing lifecycle reader reconstructs the batch and independently verifies its QC.
+      const snapshot = await reader.read(normalizeBytes32(batchId, "batch ID"));
+      return snapshot.record.status === "COMMITTED" ? snapshot : null;
+    },
     async validatePending(batchId) {
       return this.validate(batchId, { requirePending: true, withSnapshot: true });
     },

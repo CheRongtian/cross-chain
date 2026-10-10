@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. The static committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. View changes, rotation, relaying, and destination execution remain unimplemented.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. The static committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Rotation, relaying, and destination execution remain unimplemented.
 
 The current implementation can:
 
@@ -59,12 +59,12 @@ The current implementation can:
 - preserve validator-local validation observations across fresh-process restarts without granting commit authority;
 - select a deterministic primary from a canonically ordered static committee for each exact batch epoch;
 - sign domain-separated PRE-PREPARE proposals only after independent validation of a pending batch;
-- independently authenticate and validate proposals on backups, retain one immutable proposal per epoch, and recover it after process loss;
+- independently authenticate and validate proposals on backups, retain one immutable proposal per epoch/view, and recover it after process loss;
 - retry partial proposal delivery without changing the primary or replacing accepted state;
 - create a domain-separated PREPARE vote only from a locally accepted PRE-PREPARE;
 - count one durable vote per committee identity and form validator-local `PREPARED` state at three matching votes;
 - recover self-vote locks, remote votes, and monotonic `PREPARED` state after process loss without committing the batch;
-- persist and broadcast COMMIT only after durable local `PREPARED`, with one vote per validator and epoch;
+- persist and broadcast COMMIT only after durable local `PREPARED`, with one vote per validator and epoch/view;
 - bind the static four-validator committee into each COMMIT and QC;
 - construct and independently verify a QC carrying three or four distinct matching COMMIT signatures;
 - atomically persist an immutable QC and commit the corresponding pending batch;
@@ -129,7 +129,7 @@ Unknown EOA or contract ──────────────────�
                                               own key + state + Chain A RPC checks
                                                                │
                                                                v
-                                              deterministic primary per batch epoch
+                                              deterministic primary per batch epoch/view
                                                                │
                                                                v
                                                      signed PRE-PREPARE
@@ -778,14 +778,17 @@ The local schema contains:
 - `validated_batch_bindings`: one immutable batch ID, epoch, root, count, and ordered public source-occurrence references;
 - `validation_observations`: immutable `VALID`/`INVALID` observations keyed by batch ID and source-head hash, with exact head number and an operational timestamp;
 - `validator_committee`: an immutable canonical array of four configured public identities;
-- `pbft_pre_prepares`: one immutable accepted proposal per local validator and batch epoch, including batch ID, root, digest, primary signature, `ISSUED`/`ACCEPTED` direction, and acceptance time;
+- `pbft_pre_prepares`: one immutable accepted proposal per local validator, batch epoch, view, and protocol version, including batch ID, root, digest, primary signature, `ISSUED`/`ACCEPTED` direction, and acceptance time;
 - `pre_prepare_rejections`: separate minimal public rejection evidence and stable reason categories, with no authority to reserve an accepted slot;
-- `pbft_prepare_votes`: one immutable vote per local validator, batch epoch, and cryptographic voter identity, bound by foreign key to the exact locally accepted proposal;
+- `pbft_prepare_votes`: one immutable vote per local validator, batch epoch, view, protocol version, and cryptographic voter identity, bound by foreign key to the exact locally accepted proposal;
 - `pbft_prepared_states`: an immutable local transition containing the accepted proposal and the first canonical set of three durable voter identities that established prepare quorum;
 - `prepare_rejections`: separate operational evidence for malformed, mismatched, unknown, and conflicting PREPARE votes;
-- `pbft_commit_votes`: one immutable COMMIT per local validator, epoch, and voter, with an exact foreign key to local `PREPARED`;
+- `pbft_commit_votes`: one immutable COMMIT per local validator, epoch, view, protocol version, and voter, with an exact foreign key to local `PREPARED`;
 - `pbft_commit_quorums`: immutable local `COMMIT_QUORUM` statement, first three voter identities, and QC statement digest;
-- `commit_rejections`: separate public rejection evidence with no quorum weight.
+- `commit_rejections`: separate public rejection evidence with no quorum weight;
+- `pbft_epoch_views`: immutable batch/root binding, monotonic current view, transition intent, finality, and progress time;
+- `pbft_view_change_votes`: immutable signed safety evidence per sender/epoch/target view;
+- `pbft_new_views`: immutable accepted NEW_VIEW and selected proposal/quorum evidence.
 
 Opening an existing namespace with another key, Gateway, domain, finality policy, or committee membership fails closed. Peer order and endpoint changes do not change the canonical identity array. Same-snapshot validation at the same head is idempotent. A different head adds an observation without deleting history. A changed root, epoch, or occurrence membership for an existing batch ID, or contradictory results at the same head, cannot overwrite prior state. No operational timestamp or local observation enters a message ID, batch ID, Merkle hash, proposal signature, or vote signature. Ordered, rerunnable validator migrations preserve existing identity and observations; `002_pre_prepare.sql` adds proposals, `003_prepare.sql` adds PREPARE state, and `004_commit_and_qc.sql` adds COMMIT votes and quorum state without rewriting earlier migrations.
 
@@ -818,7 +821,7 @@ The transport uses Node's built-in HTTP implementation. Requests have a bounded 
 | `POST /handshake` | Sign a known peer's fresh bytes32 challenge in the identity-handshake domain |
 | `POST /connect-peer` | Authenticate one configured peer using an independently generated challenge |
 | `POST /validate-batch` | Independently validate a referenced source batch |
-| `POST /pbft/primary` | Compute the canonical committee and primary for a decimal-string batch epoch |
+| `POST /pbft/primary` | Compute primary for decimal-string `epoch` and `view` |
 | `POST /pbft/propose` | Validate a `batchId`, require this node to be primary, persist and broadcast its proposal |
 | `POST /pbft/pre-prepare` | Authenticate an envelope, independently validate its first acceptance, and persist a local safety lock |
 | `GET /pbft/pre-prepares` | Read this validator's durable issued/accepted proposals |
@@ -837,16 +840,17 @@ This handshake proves peer key control. It is not a PBFT vote, encrypted transpo
 
 ### Deterministic primary and PRE-PREPARE
 
-The static committee is sorted by unsigned address bytes, represented as equal-length lowercase hexadecimal addresses. Every validator computes `primaryIndex = epoch % 4n` using exact `BigInt` arithmetic, then selects that canonical position. Configuration insertion order, process startup, discovery, and reachability have no influence. The batch epoch is the sole proposal sequencing context. No independent sequence counter, view number, or validator-set epoch is introduced. An offline primary prevents proposal initiation; another validator is never promoted automatically.
+The static committee is sorted by unsigned address bytes, represented as equal-length lowercase hexadecimal addresses. Every validator computes `primaryIndex = (epoch + view) % 4n` using exact `BigInt` arithmetic. Epoch identifies a batch consensus instance; view identifies a leader round within that same epoch. View zero preserves the original primary selection. Configuration order, startup, discovery, and reachability have no influence. Replacement requires a verified three-of-four view-change quorum and signed NEW_VIEW.
 
 The wire envelope contains only:
 
 ```text
 messageType = "PRE_PREPARE"
-protocolVersion = "1"
+protocolVersion = "2"
 sourceDomain                    decimal uint256 string
 sourceGateway                   Ethereum address
 epoch                           decimal uint256 string
+view                            decimal uint256 string
 batchId                         bytes32
 messageRoot                     bytes32
 primaryIdentity                 Ethereum address
@@ -858,12 +862,12 @@ Integers are transported as canonical decimal strings, never JSON numbers. The a
 
 ```text
 PRE_PREPARE_DOMAIN = keccak256(UTF8(
-  "PBFTPrePrepare(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,bytes32 batchId,bytes32 messageRoot,address primaryIdentity)"
+  "PBFTPrePrepare(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,uint256 view,bytes32 batchId,bytes32 messageRoot,address primaryIdentity)"
 ))
 
 proposalDigest = keccak256(abi.encode(
   PRE_PREPARE_DOMAIN, uint8(protocolVersion), uint256(sourceDomain), sourceGateway,
-  uint256(epoch), batchId, messageRoot, primaryIdentity
+  uint256(epoch), uint256(view), batchId, messageRoot, primaryIdentity
 ))
 ```
 
@@ -873,9 +877,9 @@ The domain identifies the PRE-PREPARE message type and is distinct from handshak
 
 A receiving node checks strict fields, version/type, source context, recomputed digest, configured committee membership, recovered signer, and deterministic primary. First acceptance then independently rechecks canonical Chain A blocks, successful receipts, raw event logs, fixed-head finality, local batch epoch, reconstructed batch ID, and Merkle root. A valid primary signature cannot authorize a wrong root, corrupt source state, or an ineligible lifecycle. The primary coordinates proposals and has no source-truth authority. PostgreSQL remains operational evidence, not authoritative cross-chain truth.
 
-The primary persists its `ISSUED` accepted record before sending to the other three configured peers. Each delivery performs the existing peer handshake and a bounded HTTP PRE-PREPARE request, with a five-second timeout for each call. Delivery failures are reported individually; there is no endless retry, alternate-primary selection, or quorum interpretation. Responses are unsigned `ACCEPTED`/`REJECTED` operational results, never approval votes. Invalid bodies receive HTTP 400; well-formed rejected proposals receive 422; internal database failures return 503 and are not swallowed.
+The primary persists its `ISSUED` accepted record before sending to the other three configured peers. Each delivery performs the existing peer handshake and a bounded HTTP PRE-PREPARE request, with a five-second timeout for each call. Delivery failures are reported individually; delivery responses never establish quorum. In replacement views the scheduler retries durable messages and uses certified view transitions to replace stalled primaries. Responses are unsigned `ACCEPTED`/`REJECTED` operational results, never approval votes. Invalid bodies receive HTTP 400; well-formed rejected proposals receive 422; internal database failures return 503 and are not swallowed.
 
-The database safety key is `(local_validator_identity, epoch)`. Transactions, a unique constraint, and immutable-row guards prevent concurrent or sequential proposals from replacing the accepted digest. A completely identical delivery returns the original record without another row. A newly authenticated signature for the same digest also preserves the original stored signature. A different authenticated digest for an already-locked epoch returns `CONFLICTING_PRE_PREPARE` before acceptance. Rejection auditing never consumes that slot. Initial acceptance always requires source validation; an authenticated duplicate returns durable prior acceptance without claiming a new source-validation observation.
+The active database safety key is `(local_validator_identity, epoch, view, protocol_version)`. Transactions, a unique constraint, and immutable-row guards prevent concurrent or sequential proposals from replacing the accepted digest. A completely identical delivery returns the original record without another row. A newly authenticated signature for the same digest also preserves the original stored signature. A different authenticated digest for an already-locked epoch returns `CONFLICTING_PRE_PREPARE` before acceptance. Rejection auditing never consumes that slot. Initial acceptance always requires source validation; an authenticated duplicate returns durable prior acceptance without claiming a new source-validation observation.
 
 Before persistence, a restart can validate and construct the same digest again. After persistence, the primary revalidates the pending candidate and reuses its stored envelope for rebroadcast. Partial delivery retries are idempotent for existing backups and produce first acceptance on previously offline backups. A fresh backup process reads the same safety lock, accepts duplicates idempotently, and still rejects conflicts. Source corruption or an unavailable RPC prevents a new proposal; validators do not repair source history or advance the batch lifecycle.
 
@@ -889,10 +893,11 @@ The canonical envelope is:
 
 ```text
 messageType = "PREPARE"
-protocolVersion = "1"
+protocolVersion = "2"
 sourceDomain                    decimal uint256 string
 sourceGateway                   Ethereum address
 epoch                           decimal uint256 string
+view                            decimal uint256 string
 batchId                         bytes32
 messageRoot                     bytes32
 proposalDigest                  accepted PRE-PREPARE digest
@@ -905,20 +910,20 @@ The authoritative digest uses the same ABI/Keccak convention as PRE-PREPARE with
 
 ```text
 PREPARE_DOMAIN = keccak256(UTF8(
-  "PBFTPrepare(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,bytes32 batchId,bytes32 messageRoot,bytes32 proposalDigest,address voterIdentity)"
+  "PBFTPrepare(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,uint256 view,bytes32 batchId,bytes32 messageRoot,bytes32 proposalDigest,address voterIdentity)"
 ))
 
 prepareDigest = keccak256(abi.encode(
   PREPARE_DOMAIN, uint8(protocolVersion), uint256(sourceDomain), sourceGateway,
-  uint256(epoch), batchId, messageRoot, proposalDigest, voterIdentity
+  uint256(epoch), uint256(view), batchId, messageRoot, proposalDigest, voterIdentity
 ))
 ```
 
 The validator signs the raw digest with its existing Ethereum personal-message key. The receiver recomputes the digest, recovers the signer, requires `recovered signer == voterIdentity`, and checks membership in the static four-address committee. Binding the voter into the digest makes each member's vote cryptographically distinct. Binding the proposal digest, batch ID, root, epoch, and source context prevents votes from being mixed across proposals or protocol contexts. JSON serialization, timestamps, URLs, PIDs, database identifiers, and signatures do not enter the digest.
 
-A validator can cast at most one PREPARE per epoch. It checks its durable self-vote lock before signing, persists the signed vote, and only then broadcasts to the other three peers through the existing authenticated transport and five-second HTTP bound. A crash before persistence leaves no vote. A crash after persistence reuses the same saved vote on retry. Partial delivery is safe because receivers treat an identical vote idempotently. Delivery responses are operational acknowledgements and carry no additional voting weight.
+A validator can cast at most one PREPARE per epoch/view. Its lock check, signature creation, and persistence are serialized in one local transaction. It checks its durable self-vote lock before signing, persists the signed vote, and only then broadcasts to the other three peers through the existing authenticated transport and five-second HTTP bound. A crash before persistence leaves no vote. A crash after persistence reuses the same saved vote on retry. Partial delivery is safe because receivers treat an identical vote idempotently. Delivery responses are operational acknowledgements and carry no additional voting weight.
 
-`POST /pbft/prepare` accepts only the strict signed envelope. The local accepted PRE-PREPARE must already exist, and epoch, batch ID, root, proposal digest, source context, and version must match it exactly. A valid committee signature cannot establish or replace a proposal. A vote arriving before its PRE-PREPARE is rejected and is not buffered. One voter occupies one durable `(local validator, epoch, voter)` slot. Repeated delivery preserves the original row; a different vote from the same identity and epoch is rejected without replacing it. Rejection evidence remains separate from valid votes.
+`POST /pbft/prepare` accepts only the strict signed envelope. The local accepted PRE-PREPARE must already exist, and epoch, batch ID, root, proposal digest, source context, and version must match it exactly. A valid committee signature cannot establish or replace a proposal. A vote arriving before its PRE-PREPARE is rejected and is not buffered. One voter occupies one durable `(local validator, epoch, view, protocol version, voter)` slot. Repeated delivery preserves the original row; a different vote from the same identity and epoch is rejected without replacing it. Rejection evidence remains separate from valid votes.
 
 Prepare quorum is exactly three distinct configured voter identities for one locally accepted proposal. Request count, HTTP responses, signatures without signer recovery, and duplicate rows do not count. Vote insertion, unique-voter counting, and first creation of `PREPARED` occur in one database transaction. Concurrent second/third votes therefore cannot leave a durable three-vote collection without its matching `PREPARED` record. The first three voter identities are saved as immutable quorum evidence. A fourth matching vote is retained while the existing `PREPARED` timestamp and evidence remain unchanged.
 
@@ -930,15 +935,15 @@ Prepare quorum is exactly three distinct configured voter identities for one loc
 
 `POST /pbft/commit/cast` accepts only `{ "epoch": "..." }`. It reads the accepted proposal and durable local `PREPARED`, rechecks the PRE-PREPARE and PREPARE evidence, and checks the existing self-COMMIT lock before signing. The check, signature creation, vote insertion, and quorum update run under one validator-local database lock. Concurrent casts therefore reuse the same durable vote. Persistence completes before broadcasting to authenticated peers. Operational acknowledgements carry no vote weight.
 
-The COMMIT envelope contains `messageType = "COMMIT"`, `protocolVersion = "1"`, decimal-string `sourceDomain` and `epoch`, `sourceGateway`, `batchId`, `messageRoot`, `proposalDigest`, `committeeDigest`, `voterIdentity`, `commitDigest`, and the 65-byte `signature`. Its canonical digest is:
+The COMMIT envelope contains `messageType = "COMMIT"`, `protocolVersion = "2"`, decimal-string `sourceDomain`, `epoch`, and `view`, `sourceGateway`, `batchId`, `messageRoot`, `proposalDigest`, `committeeDigest`, `voterIdentity`, `commitDigest`, and the 65-byte `signature`. Its canonical digest is:
 
 ```text
 COMMIT_DOMAIN = keccak256(UTF8(
-  "PBFTCommit(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,bytes32 batchId,bytes32 messageRoot,bytes32 proposalDigest,bytes32 committeeDigest,address voterIdentity)"
+  "PBFTCommit(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,uint256 view,bytes32 batchId,bytes32 messageRoot,bytes32 proposalDigest,bytes32 committeeDigest,address voterIdentity)"
 ))
 commitDigest = keccak256(abi.encode(
   COMMIT_DOMAIN, uint8(protocolVersion), uint256(sourceDomain), sourceGateway,
-  uint256(epoch), batchId, messageRoot, proposalDigest, committeeDigest, voterIdentity
+  uint256(epoch), uint256(view), batchId, messageRoot, proposalDigest, committeeDigest, voterIdentity
 ))
 ```
 
@@ -953,23 +958,23 @@ committeeDigest = keccak256(abi.encode(
 ))
 ```
 
-Changing peer configuration order or URLs does not change this digest; replacing an identity does. There is no validator-set epoch or historical committee lookup. The receiver recomputes the COMMIT digest and recovers the Ethereum personal-message signer, then requires exact claimed identity, configured membership, committee digest, and accepted proposal context. It must itself be durably `PREPARED`. Early COMMIT is rejected as `NOT_PREPARED` and is not buffered. One signer occupies one immutable vote slot per local validator and epoch. Duplicate votes preserve the first row; conflicts return `CONFLICTING_COMMIT`.
+Changing peer configuration order or URLs does not change this digest; replacing an identity does. There is no validator-set epoch or historical committee lookup. The receiver recomputes the COMMIT digest and recovers the Ethereum personal-message signer, then requires exact claimed identity, configured membership, committee digest, and accepted proposal context. It must itself be durably `PREPARED`. Early COMMIT is rejected as `NOT_PREPARED` and is not buffered. One signer occupies one immutable vote slot per local validator, epoch, and view. Every local COMMIT lock additionally constrains all later views to the same batch/root. Duplicate votes preserve the first row; conflicts return `CONFLICTING_COMMIT`.
 
-One or two distinct matching COMMIT voters produce no quorum and no QC. The third durable voter atomically creates local `COMMIT_QUORUM` with the first three matching voter identities and QC statement digest. The fourth vote remains available locally without replacing that evidence. `POST /pbft/qc` reconstructs and verifies the certificate from durable votes; a crash between local quorum and global submission can be recovered by requesting and submitting that QC again.
+One or two distinct matching COMMIT voters produce no quorum and no QC. The third durable voter atomically creates local `COMMIT_QUORUM` with the first three matching voter identities and QC statement digest. The fourth vote remains available locally without replacing that evidence. `POST /pbft/qc` reconstructs and verifies the certificate from durable votes (an optional decimal-string `view` selects historical evidence); a crash between local quorum and global submission can be recovered by requesting and submitting that QC again.
 
 The QC envelope contains `messageType = "QUORUM_CERTIFICATE"`, the same statement fields through `committeeDigest`, `qcDigest`, and `commits`, an array of three or four complete COMMIT envelopes sorted by voter address. It carries no PREPARE history. Its statement identity excludes signatures and signer subsets:
 
 ```text
 QC_DOMAIN = keccak256(UTF8(
-  "PBFTQuorumCertificate(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,bytes32 batchId,bytes32 messageRoot,bytes32 proposalDigest,bytes32 committeeDigest)"
+  "PBFTQuorumCertificate(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,uint256 view,bytes32 batchId,bytes32 messageRoot,bytes32 proposalDigest,bytes32 committeeDigest)"
 ))
 qcDigest = keccak256(abi.encode(
   QC_DOMAIN, uint8(protocolVersion), uint256(sourceDomain), sourceGateway,
-  uint256(epoch), batchId, messageRoot, proposalDigest, committeeDigest
+  uint256(epoch), uint256(view), batchId, messageRoot, proposalDigest, committeeDigest
 ))
 ```
 
-`verifyQuorumCertificate(certificate, { peers, expected })` is an independent off-chain primitive. It requires an externally configured static committee and expected source/batch context. It derives the deterministic primary's PRE-PREPARE digest, checks every statement field and the QC digest, and independently recomputes and verifies every COMMIT signature. Duplicate signers, unknown members, mismatched fields, malformed signatures, noncanonical ordering, or fewer than three signatures fail closed. Different valid subsets can prove the same `qcDigest`.
+`verifyQuorumCertificate(certificate, { peers, expected })` is an independent off-chain primitive. It requires an externally configured static committee and expected source/batch context. It derives the deterministic primary's PRE-PREPARE digest, checks every statement field and the QC digest, and independently recomputes and verifies every COMMIT signature. Duplicate signers, unknown members, mismatched fields, malformed signatures, noncanonical ordering, or fewer than three signatures fail closed. Different valid subsets can prove the same `qcDigest`. Prepared and NEW_VIEW evidence also normalize recovered committee identities before uniqueness checks; address casing cannot add quorum weight.
 
 ### QC-authorized batch persistence
 
@@ -977,11 +982,11 @@ qcDigest = keccak256(abi.encode(
 
 Migration `006_pbft_commit.sql` adds `batch_quorum_certificates` and `batch_quorum_certificate_signatures`. The header binds the statement; child rows retain each signer, recomputable COMMIT digest, and signature with unique signer constraints. Certificate insertion, signature insertion, and the batch's `COMMITTED` transition occur in one transaction. Database guards preserve sealed membership, enforce terminal status, reject updates without matching complete certificate evidence, and reject a certificate left without its committed batch at transaction completion. Cryptographic verification belongs to application code; SQL constraints provide structural guarantees.
 
-The first valid global QC remains immutable. Repeated submission of the same certificate, another valid three-signer subset, or four signatures for the same statement returns the original batch and certificate. Concurrent submissions lock the same batch and converge on that result. A conflicting or forged QC cannot replace it. Any failure before transaction completion rolls back the certificate, signatures, status, and commit timestamp together.
+The normal integration verifies the fourth COMMIT, duplicates and conflicts before global submission. Once finalized, new votes are rejected and durable self-vote/QC retries preserve the existing result. The first valid global QC remains immutable. Repeated submission of the same certificate, another valid three-signer subset, or four signatures for the same statement returns the original batch and certificate. Concurrent submissions lock the same batch and converge on that result. A conflicting or forged QC cannot replace it. Any failure before transaction completion rolls back the certificate, signatures, status, and commit timestamp together.
 
 Every `COMMITTED` snapshot read reconstructs the immutable batch and Merkle tree, loads its stored QC evidence, and repeats independent certificate verification against the expected committee. Missing evidence, corrupted signatures, or context drift fails closed. PostgreSQL remains operational persistence and supplies no cryptographic authority by itself. Source messages, finality records, canonical blocks, cursor, membership, and existing proofs remain unchanged; later messages continue into subsequent batch epochs.
 
-This implementation supplies COMMIT/QC authorization for a static committee. The verification infrastructure exercises the failure model below. View changes, committee rotation, delivery queues, relaying, destination QC verification, and destination execution remain unsupported.
+This implementation supplies COMMIT/QC authorization for a static committee. The verification infrastructure exercises the failure model below. Committee rotation, delivery queues, relaying, destination QC verification, and destination execution remain unsupported.
 
 ### Consensus safety and failure model
 
@@ -993,11 +998,35 @@ With an honest primary and one adversarial backup, three honest validators can c
 
 During a bidirectional 2|2 partition, all four processes remain alive, but each side can observe only its own two PREPARE voters. Neither side reaches `PREPARED`, can legitimately cast COMMIT, or can form a QC; the batch stays pending. The test activates the partition only after all nodes have accepted PRE-PREPARE and before any PREPARE vote exists. Removing the gate changes delivery policy only. Explicit retries rebroadcast the exact saved envelopes and continue the same epoch, batch ID, root, proposal digest, committee, and deterministic primary. The database, vote locks, and process identities are not reset. Progress resumes under restored connectivity with the primary still available.
 
-An unavailable primary prevents a fresh proposal. Backups retain the same primary calculation, reject attempts to propose or impersonate it, and produce no quorum or certificate. Safety is preserved while liveness pauses. The current implementation has no automatic primary replacement, `VIEW_CHANGE`, `NEW_VIEW`, or view timeout. The same primary may return and resume ordinary operation; progress with a replacement primary requires a future view-change mechanism.
+An unavailable or unresponsive primary can be replaced after a valid three-of-four view-change quorum. Until NEW_VIEW is independently verified and persisted, backups cannot impersonate the primary or promote themselves. Under restored connectivity an available replacement resumes the same safe batch/root. A 2|2 partition cannot form that quorum; arbitrary network failures do not guarantee progress.
 
 Fault injection belongs exclusively to verification helpers. Each directed peer edge has a test proxy, so sender identity for a block rule comes from the configured edge rather than message fields. Rules block delivery without changing protocol bytes, signatures, or digests. There is no production Byzantine mode, partition administrator API, fault database table, or fault input to protocol hashing. Explicit process-stop boundaries, completed requests, durable checkpoints, and controlled retries determine the scenarios; random drops and timing-based success assumptions are unnecessary.
 
 Every scenario uses an independent source schema with the existing migrations and a fresh set of validator namespaces. The real Indexer rescans canonical Chain A events, the real Finality Watcher establishes eligibility, and the production lifecycle creates a new pending A/B/D batch. Validators independently fetch the real source receipts and blocks. The original committed batch, QC, `REORGED` C occurrence, next-epoch Message E, cursor, and canonical history remain unchanged. Source writes within each fault instance are restricted to the authorized QC/status transition.
+
+### View changes and primary recovery
+
+Normal flow is `CONSENSUS_PENDING → PRE-PREPARE → PREPARE → PREPARED → COMMIT → QC → COMMITTED` in an explicit view. Failure recovery is `progress timeout → VIEW_CHANGE → three-of-four quorum → NEW_VIEW → safe proposal → consensus in the next view`.
+
+`PBFT_VIEW_TIMEOUT_MS` defaults to 30000 and accepts a positive integer up to 2147483647. It is independent of the five-second HTTP timeout. A serialized scheduler discovers independently validated pending batches, restores durable view state on restart, and resets deadlines on new accepted proposals, votes, or NEW_VIEW. Duplicate deliveries do not extend deadlines. Timeout pauses local old-view voting and persists one signed VIEW_CHANGE for the next target. Active `current_view` and pending `target_view` are separate: failure to publish NEW_VIEW does not activate that target, and another full timeout can increment the durable target by one. Each target retains its own immutable signed intent; retries and the first replay after restart reuse it exactly. A valid higher-target NEW_VIEW with three distinct authenticated votes can activate that certified view directly. One caller or one vote cannot change the active view.
+
+VIEW_CHANGE binds version 2, its independent `PBFTViewChange` domain, source context, epoch, target view, sender, accepted proposal digest, and prepared-certificate digest. It includes the complete accepted signed proposal when present and the highest durable Prepared Certificate when PREPARED. That certificate carries the signed PRE-PREPARE and three or four matching signed PREPARE envelopes sorted by committee identity. It is independently verified and is distinct from a final COMMIT QC.
+
+NEW_VIEW binds version 2, its independent `PBFTNewView` domain, source context, epoch, target view, deterministic primary, selected batch/root, and the canonical array of VIEW_CHANGE digests. It includes three or four distinct authenticated VIEW_CHANGE messages. Every backup verifies all nested evidence and independently selects the proposal at the highest prepared view. Conflicts at the same highest view fail closed. Without prepared evidence, selection requires the independently validated canonical pending batch. The new primary also revalidates the immutable candidate against a fresh fixed Chain A head; the head need not equal an earlier observation.
+
+The primary persists NEW_VIEW before broadcasting it. Acceptance atomically stores evidence and advances the active view to the quorum-certified target; current view never decreases. A pending target is retained if it is already higher, so receiving older certified recovery evidence cannot undo a later local intent. There is no administrative set-view or force-primary endpoint. Historical votes remain immutable. Prepared history and local COMMIT locks constrain subsequent views to the safe batch/root. Old-view votes cannot count toward a new-view quorum. A valid older-view QC retains finality, ends timeout processing, and prevents conflicting commitment. Equivalent certificates from later views preserve the first final certificate.
+
+Before opening HTTP or reporting readiness, each validator completes initial pending-batch discovery, independent source validation, and local epoch registration. Discovery does not schedule timeouts, cast votes, or broadcast; existing durable views and safety evidence are retained. Startup storage failures propagate before the endpoint opens. The four-process verification captures these initialized observations as each node's baseline, then checks that explicit validation still performs independent RPC reads, remains idempotent, and leaves every other validator's baseline unchanged.
+
+After the listener opens, the scheduler retransmits each node's latest issued NEW_VIEW independently of whether it is waiting for another view. This lets a lagging peer recover after temporary delivery loss. It drives proposal/PREPARE/COMMIT/QC in active replacement views; view-zero initiation retains explicit proposal/cast interfaces. Timeout writes compare the original active view, target and durable progress revision under the metadata lock. A superseded timer cannot sign for a fresh view or erase new progress. The revision and timeout timestamps are operational state and never enter message IDs, batch IDs, roots or signatures.
+
+If another node commits between discovery and a pending-batch check, the existing lifecycle reader independently verifies the final QC and the local epoch is finalized. Corrupted or missing evidence still fails closed; ordinary COMMITTED convergence does not halt the scheduler. Recognizing a final QC never fabricates an accepted NEW_VIEW or forces local current view to equal the certificate's signing view. Storage or integrity failures remain fatal to scheduling and readiness.
+
+Additional routes are `POST /pbft/view-change`, `POST /pbft/new-view`, and read-only `GET /pbft/views`. Strict nested fields, exact integers, and evidence arrays bounded by the four-member committee are required. Request size is limited to 64 KiB.
+
+`validator/migrations/005_view_change.sql` retains old consensus rows as version-one view-zero history, including original signatures and digests, and adds view-bound locks, intents and NEW_VIEW evidence. Active consensus uses version 2; old signatures are never relabeled or counted as new-version votes. Historical version-one prepared/QC evidence uses the original encoding. `validator/migrations/006_view_recovery.sql` adds durable pending targets, intent deadlines and progress revisions, backfills existing intents, and preserves the prior migrations. `indexer/migrations/007_view_bound_qc.sql` stores QC view metadata and admits versions 1 and 2 without changing source messages, batch commitments, members or roots. Foundation identity/handshake and static committee encoding remain version 1.
+
+Verification preserves the earlier fault cases and independently reindexes real A/B/D for primary crashes before proposal, after proposal, after two PREPAREs, after PREPARED, and after two COMMITs. It restarts a sender after VIEW_CHANGE persistence, checks exact intent recovery, rejects a correctly signed unsafe NEW_VIEW, and checks old-view replay rejection. A repeated-failure case stalls replacement-primary proposal delivery using verification-only route gates, returns the original process to maintain the fault bound, and advances through views 1 and 2. Additional real-process cases delay NEW_VIEW delivery past a timeout and stop the candidate primary before it can publish NEW_VIEW, with at most one process offline at a time. The unavailable-candidate case requires a real quorum to activate view 2. The delayed-delivery case requires the exact original NEW_VIEW to be replayed after its primary has timed out, then heals transport and requires an independently verified three-signer QC from view 2 or later. Timers continue advancing pending targets during the delivery outage, so this case does not require every node to stop at view 2. Each final QC signer must retain independently verifiable NEW_VIEW evidence for its signing view. Verification-only COMMIT delivery gates establish an explicit all-node NEW_VIEW checkpoint in cases that require everyone to enter a particular view. General finality checks instead compare the independently verified final certificate and batch/root. All cases require one durable committed root and preserve original REORGED C, Message E, source history, membership and proofs.
 
 ### Configuration
 
@@ -1031,7 +1060,7 @@ The same four processes then cast real COMMIT votes. Early casts before `PREPARE
 
 The normal integration is followed by isolated real-process crash, adversarial-backup, partition/heal, and primary-failure scenarios. Transport unit tests cover directional blocking, both partition directions, same-group delivery, healing, unchanged signed wire bytes, and stale-signature exclusion. The fault integration queries persisted signer sets, QC evidence, batch status, and distinct committed roots rather than treating delivery acknowledgements as consensus.
 
-Normal and fault integrations share one process helper for startup, stop, restart, endpoint queries, signal handling, and the owned PID registry. Cleanup closes the created validators, transport/RPC proxies, port reservations, and pools on success, failure, or interruption. The root script retains fallback cleanup and never targets unrelated user processes. The claimed safety/liveness boundaries are limited to the explicit static-committee scenarios described above.
+Normal and fault integrations share one process helper for startup, stop, restart, endpoint queries, signal handling, and the owned PID registry. Fault-scenario cleanup waits for the created validators to exit before closing transport/RPC proxies and port reservations, then closes database pools. RPC remains available while pending validator ticks finish. Recovery failures report each node's active view, pending target, progress revision, finalized state, quorum targets, signer sets, and source status before cleanup; a cleanup failure cannot replace the original recovery failure. The root script retains fallback cleanup and never targets unrelated user processes. The claimed safety/liveness boundaries are limited to the explicit static-committee scenarios described above.
 
 ## Local Two-Chain Environment
 
@@ -1280,7 +1309,7 @@ The script uses strict error handling and performs:
 71. four isolated durable vote collections and `PREPARED` records with source state unchanged;
 72. continued rejection of `COMMITTED` without COMMIT votes, commit quorum, or a quorum certificate.
 73. COMMIT and static-committee ABI domains, signer recovery, and exact source/proposal binding;
-74. durable `PREPARED` prerequisites, one self-COMMIT per epoch, and concurrent casts signing once;
+74. durable `PREPARED` prerequisites, one self-COMMIT per epoch/view, and concurrent casts signing once;
 75. one/two/three/four distinct COMMIT counts with duplicate/conflict exclusion;
 76. canonical three/four-signature QC construction and independent verification;
 77. rejection of insufficient, duplicate, unknown, tampered, wrong-context, and wrong-committee evidence;
@@ -1298,14 +1327,28 @@ The script uses strict error handling and performs:
 89. durable proof of at most one committed root per source scope/epoch and no conflicting persisted QC;
 90. four live processes in a 2|2 partition with exactly two voters each, no PREPARED, no QC, and pending batch state;
 91. explicit healing and retries of saved votes completing the same epoch, root, proposal, primary, and process identities;
-92. primary process failure preserving safety without backup promotion or implicit view change;
-93. unchanged original source history, REORGED C, committed QC, immutable membership, and next-epoch Message E.
+92. primary process failure preserving safety before certified replacement;
+93. unchanged original source history, REORGED C, committed QC, immutable membership, and next-epoch Message E;
+94. exact view-bound signatures and deterministic primary rotation;
+95. independently verified prepared certificates, VIEW_CHANGE quorum, and safe NEW_VIEW selection;
+96. real primary crashes before proposal, after proposal, partial PREPARE, PREPARED, and partial COMMIT;
+97. restart recovery of persisted VIEW_CHANGE, NEW_VIEW, current view, and historical locks;
+98. unsafe new-primary proposal and old/future-view vote rejection;
+99. repeated primary failure/stall through views 1 and 2 without changing batch identity;
+100. preserved historical version-one evidence and at most one committed root across views;
+101. obsolete fixture schema rebuild, repeated rebuilds and rollback without source mutation;
+102. normalized signer uniqueness including checksummed/uppercase duplicates;
+103. superseded timeout suppression using an explicit database concurrency barrier;
+104. durable target escalation with an unpublished candidate primary and certified higher-view activation;
+105. exact lost NEW_VIEW replay after timeout, followed by a three-signer view-2-or-later QC with retained signing-view evidence;
+106. fourth-vote checks before finality and explicit view-entry checkpoints where required;
+107. validator-before-RPC shutdown ordering, cleanup failure propagation, and recovery diagnostics before resource cleanup.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
 If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
 
-The validator integration applies existing migrations explicitly, chooses temporary local ports, injects runtime development keys, and cleans up its own processes and proxies. It preserves the complete normal consensus flow, then runs four isolated fault instances with fresh source/validator namespaces and real Chain A reconstruction. Test-owned namespaces are reset only during scenario preparation. Healing and restart recovery retain their durable state. No production validator store is reset.
+The validator integration applies existing migrations explicitly, chooses temporary local ports, injects runtime development keys, and cleans up its own processes and proxies. It preserves the complete normal consensus flow, then runs four isolated fault instances with fresh source/validator namespaces and real Chain A reconstruction. Test-owned namespaces are reset only during scenario preparation. The seven mutable negative-fixture tables are transactionally recreated from current source definitions and copied with explicit column lists; leftover older schemas cannot retain obsolete QC columns or checks. Fixture rebuild failures roll back, and production source data and triggers are unchanged. Healing and restart recovery retain their durable state. No production validator store is reset.
 
 All stdout and stderr are displayed in the terminal and written to:
 
@@ -1317,7 +1360,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-PBFT Fault Tolerance and Safety
+PBFT View Change
 ```
 
 ### Expected error output
@@ -1386,7 +1429,8 @@ Cross-Chain/
 │   │   ├── 003_finality_watcher.sql
 │   │   ├── 004_source_reorg_detection.sql
 │   │   ├── 005_batch_lifecycle.sql
-│   │   └── 006_pbft_commit.sql
+│   │   ├── 006_pbft_commit.sql
+│   │   └── 007_view_bound_qc.sql
 │   ├── scripts/
 │   │   └── generate-merkle-golden-vectors.mjs
 │   ├── src/
@@ -1442,7 +1486,9 @@ Cross-Chain/
 │   │   ├── 001_validator_foundation.sql
 │   │   ├── 002_pre_prepare.sql
 │   │   ├── 003_prepare.sql
-│   │   └── 004_commit_and_qc.sql
+│   │   ├── 004_commit_and_qc.sql
+│   │   ├── 005_view_change.sql
+│   │   └── 006_view_recovery.sql
 │   ├── src/
 │   │   ├── committee.mjs
 │   │   ├── commit.mjs
@@ -1459,8 +1505,14 @@ Cross-Chain/
 │   │   ├── prepare-service.mjs
 │   │   ├── quorum-certificate.mjs
 │   │   ├── server.mjs
-│   │   └── source-validation.mjs
+│   │   ├── source-validation.mjs
+│   │   ├── protocol.mjs
+│   │   ├── prepared-certificate.mjs
+│   │   ├── view-change.mjs
+│   │   ├── view-change-service.mjs
+│   │   └── consensus-runtime.mjs
 │   ├── test/
+│   │   ├── view-change.test.mjs
 │   │   ├── commit.test.mjs
 │   │   ├── config.test.mjs
 │   │   ├── database.test.mjs
@@ -1476,7 +1528,8 @@ Cross-Chain/
 │   │       ├── fault-scenarios.mjs
 │   │       ├── fixtures.mjs
 │   │       ├── four-process.mjs
-│   │       └── process-cluster.mjs
+│   │       ├── process-cluster.mjs
+│   │       └── view-change-scenarios.mjs
 │   ├── package.json
 │   └── package-lock.json
 ├── zk/
@@ -1543,12 +1596,12 @@ Cross-Chain/
 - Four independent validator processes may share one source RPC provider; independent checking does not eliminate that provider's trust assumptions or produce a cryptographic source-finality proof.
 - Validator-local observations are separate from source persistence and are never consensus votes. One validator or four local `VALID` results cannot commit a batch.
 - Peer handshake signatures prove configured identity control in a distinct domain and cannot serve as PREPARE/COMMIT signatures. Source mismatches fail closed and do not trigger source DB repairs.
-- Signed PRE-PREPARE proposals use a separate canonical domain and authenticate the deterministic primary, but signature validity cannot replace independent source validation. One accepted digest per local identity/epoch is durable across restart; accepted proposals do not authorize `COMMITTED`.
+- Signed PRE-PREPARE proposals use a separate canonical domain and authenticate the deterministic primary, but signature validity cannot replace independent source validation. One accepted digest per local identity/epoch/view is durable across restart; accepted proposals do not authorize `COMMITTED`.
 - Signed PREPARE votes use another canonical domain, bind the exact accepted proposal and voter identity, and count once per configured validator. Three matching voters produce durable local `PREPARED` state; duplicates and conflicts cannot add quorum weight or replace prior votes.
 - COMMIT votes bind the static committee and exact accepted proposal. One or two voters cannot commit; three distinct valid COMMIT signatures are required. QC submitters need no trusted identity, and persisted evidence is cryptographically reverified on committed reads.
 - The failure model retains progress with one unavailable non-primary and an honest available primary. A single conflicting backup cannot supply a conflicting QC. A 2|2 partition preserves safety and pauses progress until explicit retries restore delivery; connectivity changes do not reset vote locks or select a new primary.
-- Primary failure or Byzantine-primary withholding can stall the current protocol. Process availability is not commit authority. PostgreSQL never substitutes for independent source and signature verification.
-- The repository does not provide view changes, validator epoch/rotation, Delivery Queue, Transaction Manager, destination gateway integration or destination QC verification, exactly-once downstream batch consumption, relaying, destination execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
+- Primary failure or withholding triggers progress timeouts; replacement still requires three valid VIEW_CHANGE votes and an available deterministic new primary. Process availability is not commit authority. PostgreSQL never substitutes for independent source and signature verification.
+- The repository does not provide validator epoch/rotation, Delivery Queue, Transaction Manager, destination gateway integration or destination QC verification, exactly-once downstream batch consumption, relaying, destination execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.

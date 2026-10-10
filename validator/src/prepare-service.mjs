@@ -35,7 +35,7 @@ export function createPrepareService({ config, store, broadcast = broadcastPrepa
       reason: error.code };
   }
   async function requireAccepted(vote) {
-    let accepted = await store.readPrePrepare(vote.epoch);
+    let accepted = await store.readPrePrepare(vote.epoch, vote.view);
     if (!accepted) {
       const sameProposal = await store.readPrePrepareByDigest(vote.proposalDigest);
       if (sameProposal && sameProposal.envelope.epoch !== vote.epoch) throw new PrepareError("WRONG_EPOCH");
@@ -54,15 +54,21 @@ export function createPrepareService({ config, store, broadcast = broadcastPrepa
       try {
         let normalizedEpoch;
         try { normalizedEpoch = protocolInteger(epoch).toString(); } catch { throw new PrepareError("MALFORMED"); }
-        const accepted = await store.readPrePrepare(normalizedEpoch);
+        if (store.castPrepareVote) {
+          const record = await store.castPrepareVote(normalizedEpoch, sign);
+          return { ...response(record), deliveries: await broadcast(config, record.vote) };
+        }
+        const view = store.currentView ? await store.currentView(normalizedEpoch) : "0";
+        if (store.checkActive) await store.checkActive(normalizedEpoch, view, PrepareError);
+        const accepted = await store.readPrePrepare(normalizedEpoch, view);
         if (!accepted) throw new PrepareError("PRE_PREPARE_REQUIRED");
         evidence = accepted.envelope;
-        const existing = await store.readPrepareVote(normalizedEpoch, config.validatorAddress);
+        const existing = await store.readPrepareVote(normalizedEpoch, config.validatorAddress, view);
         if (existing) {
           const vote = existing.vote;
           const proposal = accepted.envelope;
           if (vote.protocolVersion !== proposal.protocolVersion || vote.sourceDomain !== proposal.sourceDomain ||
-              vote.sourceGateway !== proposal.sourceGateway || vote.epoch !== proposal.epoch ||
+              vote.sourceGateway !== proposal.sourceGateway || vote.epoch !== proposal.epoch || vote.view !== proposal.view ||
               vote.batchId !== proposal.batchId || vote.messageRoot !== proposal.messageRoot ||
               vote.proposalDigest !== proposal.proposalDigest || vote.voterIdentity !== config.validatorAddress) {
             throw new PrepareError("DOUBLE_VOTE");
@@ -72,7 +78,7 @@ export function createPrepareService({ config, store, broadcast = broadcastPrepa
         }
         const vote = normalizePrepare({ messageType: "PREPARE", protocolVersion: accepted.envelope.protocolVersion,
           sourceDomain: accepted.envelope.sourceDomain, sourceGateway: accepted.envelope.sourceGateway,
-          epoch: accepted.envelope.epoch, batchId: accepted.envelope.batchId, messageRoot: accepted.envelope.messageRoot,
+          epoch: accepted.envelope.epoch, view: accepted.envelope.view, batchId: accepted.envelope.batchId, messageRoot: accepted.envelope.messageRoot,
           proposalDigest: accepted.envelope.proposalDigest, voterIdentity: config.validatorAddress });
         const envelope = await sign(config, vote);
         const record = await store.savePrepareVote(envelope);
@@ -83,8 +89,9 @@ export function createPrepareService({ config, store, broadcast = broadcastPrepa
     async receive(input) {
       try {
         const vote = await authenticatePrepare(config, input);
+        if (store.checkActive) await store.checkActive(vote.epoch, vote.view, PrepareError);
         const voter = normalizeAddress(vote.voterIdentity);
-        const existing = await store.readPrepareVote(vote.epoch, voter);
+        const existing = await store.readPrepareVote(vote.epoch, voter, vote.view);
         if (existing) {
           if (existing.vote.prepareDigest !== vote.prepareDigest) throw new PrepareError("CONFLICTING_PREPARE");
           return response(existing);

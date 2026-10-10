@@ -12,13 +12,13 @@ import { createFinalityWatcher } from "../../../indexer/src/finality-watcher.mjs
 import { createBatchLifecycle } from "../../../indexer/src/batch-lifecycle.mjs";
 import { normalizeBatchEpoch } from "../../../indexer/src/batch-lifecycle-policy.mjs";
 import { developmentKeys } from "./fixtures.mjs";
-import { createValidatorProcesses, initializeValidatorState, reservePort, rpcObserver } from "./process-cluster.mjs";
+import { closeScenarioResources, createValidatorProcesses, initializeValidatorState, reservePort, rpcObserver } from "./process-cluster.mjs";
 import { createPeerProxy, createTransportGate } from "./fault-transport.mjs";
 import { sourceState } from "./four-process.mjs";
 
 const quiet = { log() {}, warn() {}, error() {} };
 
-async function createScenario({ name, epoch, sourceConfig, template, orphanIds, pidFile }) {
+export async function createScenario({ name, epoch, sourceConfig, template, orphanIds, pidFile, viewTimeoutMs = "3600000" }) {
   const prefix = `cross_chain_fault_${name}`;
   const config = { ...sourceConfig, databaseSchema: `${prefix}_source`,
     sourceGatewayStartBlock: template.batch.messages.reduce((first, message) =>
@@ -31,14 +31,7 @@ async function createScenario({ name, epoch, sourceConfig, template, orphanIds, 
   const processes = createValidatorProcesses({ keys, pidFile });
   let closing;
   function close() {
-    if (!closing) closing = (async () => {
-      // Abort owned peer traffic and stop child processes before releasing their stores.
-      const transportCleanup = await Promise.allSettled([processes.close(), ...peerProxies.map((proxy) => proxy.close()),
-        ...rpcProxies.map((proxy) => proxy.close()), ...reservations.map((reservation) => reservation.release())]);
-      const poolCleanup = await Promise.allSettled(pools.map((pool) => pool.end()));
-      const failed = [...transportCleanup, ...poolCleanup].find((result) => result.status === "rejected");
-      if (failed) throw new Error(`fault scenario cleanup failed: ${failed.reason.message}`);
-    })();
+    if (!closing) closing = closeScenarioResources({ processes, peerProxies, rpcProxies, reservations, pools });
     return closing;
   }
   try {
@@ -81,7 +74,7 @@ async function createScenario({ name, epoch, sourceConfig, template, orphanIds, 
       VALIDATOR_DB_SCHEMA: `${prefix}_v${index + 1}`, SOURCE_DATABASE_URL: config.databaseUrl,
       SOURCE_DB_SCHEMA: config.databaseSchema, CHAIN_A_DOMAIN: config.chainDomain.toString(),
       SOURCE_GATEWAY_ADDRESS: config.sourceGateway, CHAIN_A_RPC_URL: rpcProxies[index].url,
-      FINALITY_BLOCK_DEPTH: config.finalityBlockDepth.toString(),
+      FINALITY_BLOCK_DEPTH: config.finalityBlockDepth.toString(), PBFT_VIEW_TIMEOUT_MS: String(viewTimeoutMs),
     }));
     const states = [];
     const validators = [];
@@ -200,7 +193,7 @@ async function createScenario({ name, epoch, sourceConfig, template, orphanIds, 
     }
     await assertAlive([0, 1, 2, 3]);
     console.log(`Fault scenario: ${name}; epoch=${epoch}; primary=${peers[primary].address}; real finalized A/B/D reconstructed`);
-    return { config, sourcePool, lifecycle, pending, peers, keys, states, validators, gate, links, peerProxies,
+    return { config, sourcePool, lifecycle, pending, peers, keys, states, validators, environments, gate, links, peerProxies,
       primary, backups, statement, options, request, send, stop, restart, assertAlive, propose, cast, assertPrepared, finish, assertSource, close };
   } catch (error) { await close(); throw error; }
 }
@@ -248,7 +241,7 @@ async function byzantineBackup(ctx) {
   const rootB = `0x${(BigInt(ctx.statement.messageRoot) ^ 1n).toString(16).padStart(64, "0")}`;
   assert.notEqual(rootB, ctx.statement.messageRoot);
   const badStatement = expectedCommitStatement({ ...ctx.statement, messageRoot: rootB, proposalDigest: undefined }, ctx.peers);
-  const proposal = await signAdversarial(ctx, adversary, { messageType: "PRE_PREPARE", protocolVersion: "1",
+  const proposal = await signAdversarial(ctx, adversary, { messageType: "PRE_PREPARE", protocolVersion: "2", view: "0",
     sourceDomain: ctx.statement.sourceDomain, sourceGateway: ctx.statement.sourceGateway, epoch: ctx.statement.epoch,
     batchId: ctx.statement.batchId, messageRoot: rootB, primaryIdentity: ctx.peers[adversary].address }, prePrepareDigest);
   for (const index of honest) {
@@ -257,7 +250,7 @@ async function byzantineBackup(ctx) {
   }
   await ctx.propose([0, 1, 2, 3]);
   const acceptedBefore = await Promise.all(ctx.states.map((state) => state.store.readPrePrepares()));
-  const badPrepare = await signAdversarial(ctx, adversary, { messageType: "PREPARE", protocolVersion: "1",
+  const badPrepare = await signAdversarial(ctx, adversary, { messageType: "PREPARE", protocolVersion: "2", view: "0",
     sourceDomain: badStatement.sourceDomain, sourceGateway: badStatement.sourceGateway, epoch: badStatement.epoch,
     batchId: badStatement.batchId, messageRoot: rootB, proposalDigest: badStatement.proposalDigest,
     voterIdentity: ctx.peers[adversary].address }, prepareDigest);
@@ -341,7 +334,7 @@ async function partitionAndHeal(ctx) {
     assert.deepEqual(retry.record.vote, savedVotes[index]);
     assert.ok(retry.deliveries.every((delivery) => delivery.delivery === "DELIVERED" && delivery.result === "ACCEPTED"));
     assert.deepEqual(await ctx.states[index].store.readPrePrepares(), acceptedBefore[index]);
-    const selection = await ctx.request(index, "/pbft/primary", { epoch: ctx.statement.epoch });
+    const selection = await ctx.request(index, "/pbft/primary", { view: "0", epoch: ctx.statement.epoch });
     assert.equal(selection.body.primaryIdentity, ctx.peers[ctx.primary].address);
   }
   await ctx.assertPrepared(indices, indices);
@@ -357,7 +350,7 @@ async function partitionAndHeal(ctx) {
 async function primaryCrash(ctx) {
   await ctx.stop(ctx.primary); await ctx.assertAlive(ctx.backups);
   for (const index of ctx.backups) {
-    const selection = await ctx.request(index, "/pbft/primary", { epoch: ctx.statement.epoch });
+    const selection = await ctx.request(index, "/pbft/primary", { view: "0", epoch: ctx.statement.epoch });
     assert.equal(selection.body.primaryIdentity, ctx.peers[ctx.primary].address);
     const rejected = await ctx.request(index, "/pbft/propose", { batchId: ctx.pending.record.batchId });
     assert.equal(rejected.status, 422); assert.equal(rejected.body.reason, "WRONG_PRIMARY");
@@ -369,10 +362,10 @@ async function primaryCrash(ctx) {
     assert.deepEqual(await ctx.states[index].store.readPrePrepares(), []);
     assert.deepEqual(await ctx.states[index].store.readPrepareStates(), []);
     assert.deepEqual(await ctx.states[index].store.readCommitStates(), []);
-    for (const route of ["/pbft/view-change", "/pbft/new-view"]) assert.equal((await ctx.request(index, route, {})).status, 404);
+    for (const route of ["/set-view", "/set-primary"]) assert.equal((await ctx.request(index, route, {})).status, 404);
   }
   const claimed = ctx.backups[0];
-  const envelope = await signAdversarial(ctx, claimed, { messageType: "PRE_PREPARE", protocolVersion: "1",
+  const envelope = await signAdversarial(ctx, claimed, { messageType: "PRE_PREPARE", protocolVersion: "2", view: "0",
     sourceDomain: ctx.statement.sourceDomain, sourceGateway: ctx.statement.sourceGateway, epoch: ctx.statement.epoch,
     batchId: ctx.statement.batchId, messageRoot: ctx.statement.messageRoot, primaryIdentity: ctx.peers[claimed].address }, prePrepareDigest);
   const response = await ctx.send(claimed, ctx.backups[1], "/pbft/pre-prepare", envelope);

@@ -1,3 +1,4 @@
+import { CONSENSUS_VERSION } from "./protocol.mjs";
 import { normalizeBytes32 } from "../../indexer/src/canonical-message.mjs";
 import { canonicalCommittee, deterministicPrimary, protocolInteger } from "./committee.mjs";
 import { connectPeer } from "./handshake.mjs";
@@ -40,9 +41,9 @@ export function createPrePrepareService({ config, validation, store, broadcast =
     return result.snapshot;
   }
   return {
-    primary(epoch) {
-      return { validatorAddress: config.validatorAddress, epoch: protocolInteger(epoch).toString(),
-        committee: canonicalCommittee(config.peers), primaryIdentity: deterministicPrimary(config.peers, epoch) };
+    primary(epoch, view = "0") {
+      return { validatorAddress: config.validatorAddress, epoch: protocolInteger(epoch).toString(), view: protocolInteger(view, "view").toString(),
+        committee: canonicalCommittee(config.peers), primaryIdentity: deterministicPrimary(config.peers, epoch, view) };
     },
     async propose(batchId) {
       let envelope;
@@ -51,13 +52,15 @@ export function createPrePrepareService({ config, validation, store, broadcast =
         let id;
         try { id = normalizeBytes32(batchId); } catch { throw new PrePrepareError("MALFORMED"); }
         const snapshot = await validatePending(id);
-        const proposal = normalizePrePrepare({ messageType: "PRE_PREPARE", protocolVersion: "1",
+        const view = store.currentView ? await store.currentView(snapshot.record.epoch.toString()) : "0";
+        if (store.checkActive) await store.checkActive(snapshot.record.epoch.toString(), view, PrePrepareError);
+        const proposal = normalizePrePrepare({ messageType: "PRE_PREPARE", protocolVersion: CONSENSUS_VERSION, view,
           sourceDomain: config.chainDomain, sourceGateway: config.sourceGateway, epoch: snapshot.record.epoch,
           batchId: snapshot.batch.batchId, messageRoot: snapshot.tree.messageRoot,
-          primaryIdentity: deterministicPrimary(config.peers, snapshot.record.epoch) });
+          primaryIdentity: deterministicPrimary(config.peers, snapshot.record.epoch, view) });
         evidence = proposal;
         if (proposal.primaryIdentity !== config.validatorAddress) throw new PrePrepareError("WRONG_PRIMARY");
-        const previous = await store.readPrePrepare(proposal.epoch);
+        const previous = await store.readPrePrepare(proposal.epoch, proposal.view);
         if (previous && (previous.envelope.batchId !== proposal.batchId || previous.envelope.messageRoot !== proposal.messageRoot)) {
           throw new PrePrepareError("CONFLICTING_PRE_PREPARE");
         }
@@ -71,7 +74,8 @@ export function createPrePrepareService({ config, validation, store, broadcast =
     async receive(input) {
       try {
         const envelope = await authenticatePrePrepare(config, input);
-        const previous = await store.readPrePrepare(envelope.epoch);
+        if (store.checkActive) await store.checkActive(envelope.epoch, envelope.view, PrePrepareError);
+        const previous = await store.readPrePrepare(envelope.epoch, envelope.view);
         if (previous) {
           if (previous.envelope.proposalDigest !== envelope.proposalDigest) throw new PrePrepareError("CONFLICTING_PRE_PREPARE");
           return accepted(previous);

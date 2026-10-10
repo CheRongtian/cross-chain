@@ -20,7 +20,7 @@ function primaryConfig(epoch) {
   return configs.find((config) => config.validatorAddress === deterministicPrimary(config.peers, epoch));
 }
 function fields(snapshot, overrides = {}) {
-  return { messageType: "PRE_PREPARE", protocolVersion: "1", sourceDomain: snapshot.record.sourceDomain.toString(),
+  return { messageType: "PRE_PREPARE", protocolVersion: "2", view: "0", sourceDomain: snapshot.record.sourceDomain.toString(),
     sourceGateway: snapshot.record.sourceGateway, epoch: snapshot.record.epoch.toString(),
     batchId: snapshot.record.batchId, messageRoot: snapshot.record.messageRoot,
     primaryIdentity: primaryConfig(snapshot.record.epoch).validatorAddress, ...overrides };
@@ -87,7 +87,7 @@ test("canonical ABI digest is deterministic, domain-separated, and binds every p
   const digest = prePrepareDigest(p);
   assert.equal(prePrepareDigest(Object.fromEntries(Object.entries(p).reverse())), digest);
   assert.equal(prePrepareDigest({ ...p, epoch: BigInt(p.epoch), sourceDomain: BigInt(p.sourceDomain) }), digest);
-  for (const mutation of [{ protocolVersion: "2" }, { sourceDomain: "2" },
+  for (const mutation of [{ protocolVersion: "3" }, { sourceDomain: "2" },
     { sourceGateway: "0x0000000000000000000000000000000000000099" }, { epoch: (BigInt(p.epoch) + 1n).toString() },
     { batchId: bytes("ab") }, { messageRoot: bytes("bc") }, { primaryIdentity: configs.find((c) => c.validatorAddress !== p.primaryIdentity).validatorAddress }]) {
     assert.notEqual(prePrepareDigest({ ...p, ...mutation }), digest);
@@ -106,7 +106,7 @@ test("authentication requires the exact primary, context, digest, and valid reco
   const signer = primaryConfig(p.epoch);
   const envelope = await signPrePrepare(signer, p);
   assert.equal((await authenticatePrePrepare(configs[0], envelope)).proposalDigest, envelope.proposalDigest);
-  for (const mutation of [{ protocolVersion: "2" }, { sourceDomain: "2" },
+  for (const mutation of [{ protocolVersion: "3" }, { sourceDomain: "2" },
     { sourceGateway: "0x0000000000000000000000000000000000000099" }, { epoch: (BigInt(p.epoch) + 1n).toString() },
     { batchId: bytes("ab") }, { messageRoot: bytes("bc") },
     { primaryIdentity: configs.find((config) => config !== signer).validatorAddress }]) {
@@ -126,7 +126,7 @@ test("authentication requires the exact primary, context, digest, and valid reco
   for (const mutation of [{ messageRoot: bytes("ee") }, { epoch: (BigInt(p.epoch) + 1n).toString() }, { proposalDigest: bytes("ee") }]) {
     await assert.rejects(authenticatePrePrepare(configs[0], { ...envelope, ...mutation }), { code: "INVALID_DIGEST" });
   }
-  await assert.rejects(authenticatePrePrepare(configs[0], await rawSigned({ ...p, protocolVersion: "2" })), { code: "WRONG_VERSION" });
+  await assert.rejects(authenticatePrePrepare(configs[0], await rawSigned({ ...p, protocolVersion: "3" })), { code: "WRONG_VERSION" });
   for (const mutation of [{ sourceDomain: "2" }, { sourceGateway: "0x0000000000000000000000000000000000000099" }]) {
     await assert.rejects(authenticatePrePrepare(configs[0], await rawSigned({ ...p, ...mutation })), { code: "WRONG_CONTEXT" });
   }
@@ -271,15 +271,15 @@ test("existing HTTP server exposes only PRE-PREPARE routes with bounded strict f
     return { status: response.status, body: await response.json() };
   }
   try {
-    assert.equal((await post("/pbft/primary", { epoch: snapshot.record.epoch.toString() })).body.primaryIdentity, h.config.validatorAddress);
-    assert.equal((await post("/pbft/primary", { epoch: 1 })).status, 400);
+    assert.equal((await post("/pbft/primary", { view: "0", epoch: snapshot.record.epoch.toString() })).body.primaryIdentity, h.config.validatorAddress);
+    assert.equal((await post("/pbft/primary", { view: "0", epoch: 1 })).status, 400);
     assert.equal((await post("/pbft/propose", { batchId: snapshot.record.batchId, messageRoot: snapshot.record.messageRoot })).status, 400);
     const result = await post("/pbft/propose", { batchId: snapshot.record.batchId });
     assert.equal(result.status, 200);
     assert.equal((await post("/pbft/pre-prepare", result.body.record.envelope)).status, 200);
     const malformed = await post("/pbft/pre-prepare", { ...result.body.record.envelope, proposalDigest: [result.body.proposalDigest] });
     assert.equal(malformed.status, 422); assert.equal(malformed.body.reason, "MALFORMED");
-    assert.equal((await post("/pbft/view-change", {})).status, 404);
+    assert.equal((await post("/pbft/view-change", {})).status, 400);
     const list = await (await fetch(`${url}/pbft/pre-prepares`)).json();
     assert.equal(list.proposals.length, 1);
     assert.ok(!JSON.stringify(list).includes(h.config.privateKey));

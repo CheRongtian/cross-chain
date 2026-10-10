@@ -12,6 +12,7 @@ import { createMessageBatcher } from "../src/message-batch.mjs";
 import { buildMessageMerkleTree, verifyMessageMerkleProof } from "../src/message-merkle.mjs";
 import { commitConfigs, signedCommitFixture } from "../../validator/test/helpers/commit-fixtures.mjs";
 import { buildQuorumCertificate, expectedCommitStatement, qcDigest } from "../../validator/src/quorum-certificate.mjs";
+import { cloneCandidateFixture, sourceState } from "../../validator/test/helpers/four-process.mjs";
 
 const config = loadDatabaseConfig({
   ...process.env,
@@ -49,6 +50,36 @@ async function certificateCounts() {
   return (await pool.query(`SELECT (SELECT COUNT(*) FROM ${certificateTable})::int AS certificates,
     (SELECT COUNT(*) FROM ${signaturesTable})::int AS signatures`)).rows[0];
 }
+
+test("fixture rebuild replaces obsolete QC columns and constraints without changing source data", async () => {
+  await pendingCertificateFixture();
+  const fixtureSchema = `${config.databaseSchema}_fixture`;
+  const obsoleteQC = tableName(fixtureSchema, "batch_quorum_certificates");
+  const before = await sourceState(pool, config.databaseSchema);
+  const triggersBefore = (await pool.query(`SELECT event_object_table,trigger_name,action_statement FROM information_schema.triggers
+    WHERE trigger_schema = $1 ORDER BY event_object_table,trigger_name,event_manipulation`, [config.databaseSchema])).rows;
+  await cloneCandidateFixture(pool, config.databaseSchema, fixtureSchema);
+  await pool.query(`ALTER TABLE ${obsoleteQC} DROP COLUMN view`);
+  await pool.query(`ALTER TABLE ${obsoleteQC} DROP CONSTRAINT batch_quorum_certificates_protocol_version_check`);
+  await pool.query(`ALTER TABLE ${obsoleteQC} ADD CONSTRAINT batch_quorum_certificates_protocol_version_check CHECK (protocol_version = 1)`);
+  for (let iteration = 0; iteration < 2; iteration++) {
+    await cloneCandidateFixture(pool, config.databaseSchema, fixtureSchema);
+    assert.deepEqual(await sourceState(pool, fixtureSchema), before);
+    const sourceColumns = (await pool.query(`SELECT column_name,data_type FROM information_schema.columns
+      WHERE table_schema = $1 AND table_name = 'batch_quorum_certificates' ORDER BY ordinal_position`, [config.databaseSchema])).rows;
+    const fixtureColumns = (await pool.query(`SELECT column_name,data_type FROM information_schema.columns
+      WHERE table_schema = $1 AND table_name = 'batch_quorum_certificates' ORDER BY ordinal_position`, [fixtureSchema])).rows;
+    assert.deepEqual(fixtureColumns, sourceColumns);
+    const checks = (await pool.query(`SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
+      WHERE conrelid = $1::regclass AND conname = 'batch_quorum_certificates_protocol_version_check'`, [obsoleteQC])).rows;
+    assert.ok(checks[0].definition.includes('2'));
+  }
+  await assert.rejects(cloneCandidateFixture(pool, `${config.databaseSchema}_missing`, fixtureSchema), /does not exist/);
+  assert.deepEqual(await sourceState(pool, fixtureSchema), before, "failed rebuild rolls back the previous complete fixture");
+  assert.deepEqual(await sourceState(pool, config.databaseSchema), before);
+  assert.deepEqual((await pool.query(`SELECT event_object_table,trigger_name,action_statement FROM information_schema.triggers
+    WHERE trigger_schema = $1 ORDER BY event_object_table,trigger_name,event_manipulation`, [config.databaseSchema])).rows, triggersBefore);
+});
 
 function hash(value) {
   return `0x${BigInt(value).toString(16).padStart(64, "0")}`;
@@ -161,7 +192,7 @@ test("SQL cannot persist a certificate without the same transaction committing i
     await client.query(`INSERT INTO ${certificateTable}
       (batch_record_id, protocol_version, source_domain, source_gateway, epoch, batch_id,
        message_root, proposal_digest, committee_digest, qc_digest)
-      VALUES ($1,1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      VALUES ($1,2,$2,$3,$4,$5,$6,$7,$8,$9)`,
     [id, a.sourceDomain, a.sourceGateway, a.epoch, a.batchId, a.messageRoot, a.proposalDigest, a.committeeDigest, a.qcDigest]);
     for (const vote of a.commits) {
       await client.query(`INSERT INTO ${signaturesTable}
@@ -584,4 +615,36 @@ test("concurrent identical seal attempts produce one canonical durable snapshot"
   assert.deepEqual(first, second);
   assert.equal((await pool.query(`SELECT COUNT(*) AS count FROM ${batches}`)).rows[0].count, "1");
   assert.equal(first.record.status, "SEALED");
+});
+
+test("view-bound QCs preserve the first final certificate across equivalent later and earlier views", async () => {
+  const { pending, a, id } = await pendingCertificateFixture();
+  const statement = expectedCommitStatement({ sourceDomain: pending.record.sourceDomain, sourceGateway: pending.record.sourceGateway,
+    epoch: pending.record.epoch, view: "1", batchId: pending.record.batchId, messageRoot: pending.record.messageRoot }, committee);
+  const commits = await Promise.all(commitConfigs.slice(0, 3).map((identity) => signedCommitFixture(statement, identity)));
+  const later = await buildQuorumCertificate(commits, { peers: committee, expected: statement });
+  const first = await committingLifecycle.commitWithCertificate({ certificate: later });
+  assert.equal(first.quorumCertificate.view, "1");
+  const lateOld = await committingLifecycle.commitWithCertificate({ certificate: a });
+  assert.deepEqual(lateOld, first);
+  assert.deepEqual(await certificateCounts(), { certificates: 1, signatures: 3 });
+  const row = (await pool.query(`SELECT view,protocol_version FROM ${certificateTable} WHERE batch_record_id = $1`, [id])).rows[0];
+  assert.equal(row.view, "1"); assert.equal(row.protocol_version, 2);
+  const rootCount = (await pool.query(`SELECT COUNT(DISTINCT message_root)::int AS count FROM ${certificateTable}
+    WHERE source_domain = $1 AND source_gateway = $2 AND epoch = $3`, [a.sourceDomain, a.sourceGateway, a.epoch])).rows[0].count;
+  assert.equal(rootCount, 1);
+});
+
+test("historical version-one QC remains verifiable after QC metadata migration", async () => {
+  const { pending, id } = await pendingCertificateFixture();
+  const statement = expectedCommitStatement({ protocolVersion: "1", sourceDomain: pending.record.sourceDomain,
+    sourceGateway: pending.record.sourceGateway, epoch: pending.record.epoch, batchId: pending.record.batchId,
+    messageRoot: pending.record.messageRoot }, committee);
+  const commits = await Promise.all(commitConfigs.slice(0, 3).map((identity) => signedCommitFixture(statement, identity)));
+  const certificate = await buildQuorumCertificate(commits, { peers: committee, expected: statement });
+  const committed = await committingLifecycle.commitWithCertificate({ certificate });
+  await applyMigrations(pool, config.databaseSchema);
+  assert.deepEqual(await committingLifecycle.readBatch({ batchRecordId: id }), committed);
+  assert.equal(committed.quorumCertificate.protocolVersion, "1");
+  assert.equal(Object.hasOwn(committed.quorumCertificate, "view"), false);
 });

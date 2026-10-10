@@ -39,12 +39,22 @@ export async function rpcObserver(upstream) {
   } };
 }
 
+export async function closeScenarioResources({ processes, peerProxies, rpcProxies, reservations, pools }) {
+  // RPC must remain available until the validators finish their pending ticks.
+  const processCleanup = await Promise.allSettled([processes.close()]);
+  const transportCleanup = await Promise.allSettled([...peerProxies.map((proxy) => proxy.close()),
+    ...rpcProxies.map((proxy) => proxy.close()), ...reservations.map((reservation) => reservation.release())]);
+  const poolCleanup = await Promise.allSettled(pools.map((pool) => pool.end()));
+  const failed = [...processCleanup, ...transportCleanup, ...poolCleanup].find((result) => result.status === "rejected");
+  if (failed) throw new Error(`fault scenario cleanup failed: ${failed.reason.message}`);
+}
+
 
 export async function initializeValidatorState(environment, registerPool) {
   const config = loadValidatorConfig(environment);
   const pool = createValidatorPool(config); registerPool(pool);
   await applyValidatorMigrations(pool, config.databaseSchema);
-  await pool.query(`TRUNCATE TABLE ${tableName(config.databaseSchema, "commit_rejections")},
+  await pool.query(`TRUNCATE TABLE ${tableName(config.databaseSchema, "pbft_new_views")}, ${tableName(config.databaseSchema, "pbft_view_change_votes")}, ${tableName(config.databaseSchema, "pbft_epoch_views")}, ${tableName(config.databaseSchema, "commit_rejections")},
     ${tableName(config.databaseSchema, "pbft_commit_quorums")}, ${tableName(config.databaseSchema, "pbft_commit_votes")},
     ${tableName(config.databaseSchema, "prepare_rejections")},
     ${tableName(config.databaseSchema, "pbft_prepared_states")}, ${tableName(config.databaseSchema, "pbft_prepare_votes")},

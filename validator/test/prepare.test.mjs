@@ -20,7 +20,7 @@ const bytes = (byte) => `0x${byte.repeat(32)}`;
 async function acceptedProposal(snapshot) {
   const primaryAddress = deterministicPrimary(configs[0].peers, snapshot.record.epoch);
   const primary = configs.find((config) => config.validatorAddress === primaryAddress);
-  const envelope = await signPrePrepare(primary, { messageType: "PRE_PREPARE", protocolVersion: "1",
+  const envelope = await signPrePrepare(primary, { messageType: "PRE_PREPARE", protocolVersion: "2", view: "0",
     sourceDomain: primary.chainDomain, sourceGateway: primary.sourceGateway, epoch: snapshot.record.epoch,
     batchId: snapshot.record.batchId, messageRoot: snapshot.record.messageRoot,
     primaryIdentity: primary.validatorAddress });
@@ -29,7 +29,7 @@ async function acceptedProposal(snapshot) {
 }
 
 function voteFields(proposal, config, overrides = {}) {
-  return { messageType: "PREPARE", protocolVersion: "1", sourceDomain: proposal.envelope.sourceDomain,
+  return { messageType: "PREPARE", protocolVersion: "2", view: "0", sourceDomain: proposal.envelope.sourceDomain,
     sourceGateway: proposal.envelope.sourceGateway, epoch: proposal.envelope.epoch,
     batchId: proposal.envelope.batchId, messageRoot: proposal.envelope.messageRoot,
     proposalDigest: proposal.envelope.proposalDigest, voterIdentity: config.validatorAddress, ...overrides };
@@ -107,7 +107,7 @@ test("PREPARE uses canonical ABI encoding, exact uint256 values, and an independ
   assert.equal(prepareDigest({ ...fields, epoch: BigInt(fields.epoch), sourceDomain: BigInt(fields.sourceDomain) }), digest);
   const maximum = (1n << 256n) - 1n;
   assert.equal(prepareDigest({ ...fields, epoch: maximum }), prepareDigest({ ...fields, epoch: maximum.toString() }));
-  for (const mutation of [{ protocolVersion: "2" }, { sourceDomain: "2" },
+  for (const mutation of [{ protocolVersion: "3" }, { sourceDomain: "2" },
     { sourceGateway: "0x0000000000000000000000000000000000000099" },
     { epoch: (BigInt(fields.epoch) + 1n).toString() }, { batchId: bytes("a1") },
     { messageRoot: bytes("a2") }, { proposalDigest: bytes("a3") },
@@ -129,7 +129,7 @@ test("PREPARE authentication binds the committee voter, recovered signer, digest
   const fields = voteFields(h.accepted, configs[1]);
   const envelope = await signPrepare(configs[1], fields);
   assert.equal((await authenticatePrepare(configs[0], envelope)).prepareDigest, envelope.prepareDigest);
-  for (const mutation of [{ protocolVersion: "2" }, { sourceDomain: "2" },
+  for (const mutation of [{ protocolVersion: "3" }, { sourceDomain: "2" },
     { sourceGateway: "0x0000000000000000000000000000000000000099" },
     { epoch: (BigInt(fields.epoch) + 1n).toString() }, { batchId: bytes("b1") },
     { messageRoot: bytes("b2") }, { proposalDigest: bytes("b3") }, { voterIdentity: configs[2].validatorAddress }]) {
@@ -312,7 +312,7 @@ test("validator HTTP transport exposes strict PREPARE cast, receive, and local-s
     assert.equal((await post("/pbft/prepare", { ...cast.body.record.vote, extra: true })).status, 400);
     const states = await (await fetch(`${url}/pbft/prepares`)).json();
     assert.equal(states.states[0].voteCount, 1);
-    assert.equal((await post("/pbft/view-change", {})).status, 404);
+    assert.equal((await post("/pbft/view-change", {})).status, 400);
     assert.ok(!JSON.stringify(states).includes(configs[0].privateKey));
   } finally { await runtime.close(); }
 });

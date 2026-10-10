@@ -53,9 +53,12 @@ export function createCommitService({ config, store, lifecycle, broadcast = broa
         return accepted(await store.saveCommitVote(vote), vote.voterIdentity);
       } catch (error) { return rejected(input, error); }
     },
-    async certificate(value) {
+    async certificate(value, view) {
       try {
-        const state = await store.readCommitState(epoch(value));
+        if (view !== undefined) {
+          try { view = protocolInteger(view, "view").toString(); } catch { throw new CommitError("MALFORMED"); }
+        }
+        const state = await store.readCommitState(epoch(value), view);
         if (!state.certificate) throw new CommitError("COMMIT_QUORUM_REQUIRED");
         return { validatorAddress: config.validatorAddress, result: "ACCEPTED", certificate: state.certificate };
       } catch (error) { return rejected({ epoch: value }, error); }
@@ -63,6 +66,7 @@ export function createCommitService({ config, store, lifecycle, broadcast = broa
     async submit(certificate) {
       try {
         const snapshot = await lifecycle.commitWithCertificate({ certificate });
+        if (store.finalizeEpoch) await store.finalizeEpoch(snapshot.quorumCertificate);
         return { validatorAddress: config.validatorAddress, result: "ACCEPTED", batchId: snapshot.record.batchId,
           status: snapshot.record.status, qcDigest: snapshot.quorumCertificate.qcDigest, certificate: snapshot.quorumCertificate };
       } catch (error) { return rejected(certificate, error); }

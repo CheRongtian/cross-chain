@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="PBFT Fault Tolerance and Safety"
+VERIFICATION_NAME="PBFT View Change"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -459,12 +459,12 @@ printf ' 40. Verify fresh-process SEALED A/B/D proofs in the Solidity test-local
 printf ' 41. Test validator identities, handshake domains, HTTP inputs, and independent source validation\n'
 printf ' 42. Apply validator-owned migrations and verify four isolated identity-bound stores\n'
 printf ' 43. Start four independent validator processes and authenticate all directed peer pairs\n'
-printf ' 44. Verify each validator rechecks real Chain A blocks, receipts, logs, and fixed-head finality\n'
+printf ' 44. Complete startup validation before readiness; verify isolated observations, receipts, logs, and fixed-head revalidation\n'
 printf ' 45. Reject corrupt real candidates and wrong chain, Gateway, or validator identity\n'
 printf ' 46. Restart V4, preserve independent local observations, and leave batches CONSENSUS_PENDING\n'
 printf ' 47. Verify canonical committee ordering and exact deterministic primary selection\n'
 printf ' 48. Encode, sign, and authenticate domain-separated PRE-PREPARE proposals\n'
-printf ' 49. Verify durable epoch locks, concurrent delivery, rejection isolation, and migration retries\n'
+printf ' 49. Verify durable epoch/view locks, concurrent delivery, rejection isolation, and migration retries\n'
 printf ' 50. Propose the real pending A/B/D batch and independently revalidate it on backups\n'
 printf ' 51. Reject wrong primary, signature, epoch, reference, root, lifecycle, and source state\n'
 printf ' 52. Recover primary/backup safety locks and retry a controlled partial broadcast\n'
@@ -479,7 +479,7 @@ printf ' 60. Recover PREPARE locks, vote collections, and PREPARED state after r
 printf ' 61. Preserve CONSENSUS_PENDING without COMMIT votes, commit quorum, or QC\n'
 printf ' 62. Encode and authenticate COMMIT votes bound to the static committee\n'
 printf ' 63. Require durable local PREPARED and persist self COMMIT before broadcast\n'
-printf ' 64. Preserve one COMMIT per voter and epoch across duplicates, conflicts, and restart\n'
+printf ' 64. Preserve one COMMIT per voter and epoch/view across duplicates, conflicts, and restart\n'
 printf ' 65. Require three distinct matching COMMIT voters for durable COMMIT_QUORUM\n'
 printf ' 66. Construct and independently verify canonical 3-of-4 and 4-of-4 QCs\n'
 printf ' 67. Reject insufficient, duplicate-signer, tampered, and mismatched QCs\n'
@@ -497,8 +497,26 @@ printf ' 78. Reject validly signed conflicting-root messages and forged QCs from
 printf ' 79. Query durable state to require at most one committed root per source scope and epoch\n'
 printf ' 80. Keep four processes alive in a 2|2 partition with two voters per side and no quorum or QC\n'
 printf ' 81. Heal transport and complete the same proposal by retrying persisted votes without resetting locks\n'
-printf ' 82. Stop the deterministic primary and preserve pending state without replacement or view change\n'
+printf ' 82. Stop the deterministic primary and preserve safety before a certified view transition\n'
 printf ' 83. Preserve source history, original REORGED C, membership, roots, QC, and Message E across fault scenarios\n'
+
+printf ' 84. Bind PRE-PREPARE, PREPARE, COMMIT, and QC to exact epoch/view context\n'
+printf ' 85. Verify signed VIEW_CHANGE and independent three-PREPARE safety certificates\n'
+printf ' 86. Require three distinct view-change signers and independently verify NEW_VIEW selection\n'
+printf ' 87. Stop real primary processes before/after proposal, partial PREPARE, PREPARED, and partial COMMIT\n'
+printf ' 88. Recover timeout intents, current views, NEW_VIEW, and cross-view locks after process restart\n'
+printf ' 89. Resume the same safe batch/root through new-view PRE-PREPARE, PREPARE, COMMIT, and QC\n'
+printf ' 90. Reject unsafe new-primary roots and old/future-view vote replay\n'
+printf ' 91. Advance through views 1 and 2 with an unavailable then stalled primary\n'
+printf ' 92. Preserve version-one historical evidence and one committed root across all views\n'
+printf ' 93. Rebuild obsolete verification fixtures transactionally and preserve original source tables\n'
+printf ' 94. Validate evidence before signing, reject cased duplicates, and preserve canonical digests\n'
+printf ' 95. Bind timeout actions to the original view and durable progress revision\n'
+printf ' 96. Advance durable pending targets while a candidate primary cannot publish NEW_VIEW\n'
+printf ' 97. Require exact delayed NEW_VIEW replay and a verified later-view QC after healing\n'
+printf ' 98. Verify an existing final QC instead of halting on a concurrent COMMITTED transition\n'
+printf ' 99. Check fourth votes before finality and distinguish final QC recognition from active view\n'
+printf '100. Keep RPC available through validator shutdown and report recovery state before cleanup\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -567,7 +585,8 @@ node --test \
     "$VALIDATOR_DIR/test/pre-prepare.test.mjs" \
     "$VALIDATOR_DIR/test/prepare.test.mjs" \
     "$VALIDATOR_DIR/test/commit.test.mjs" \
-    "$VALIDATOR_DIR/test/fault-transport.test.mjs"
+    "$VALIDATOR_DIR/test/fault-transport.test.mjs" \
+    "$VALIDATOR_DIR/test/view-change.test.mjs"
 
 CURRENT_STEP="isolated validator migrations, consistent PREPARE reads, COMMIT locks, and quorum persistence tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1198,7 +1217,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source recovery, lifecycle, four validators, normal consensus, crash, Byzantine, and partition safety integration"
+CURRENT_STEP="real source recovery, normal consensus, fault safety, repeated primary failure, and view recovery integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

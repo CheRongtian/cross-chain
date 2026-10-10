@@ -26,18 +26,28 @@ export async function sourceState(pool, schema) {
   return result;
 }
 
-async function cloneCandidateFixture(pool, sourceSchema, fixtureSchema) {
-  // Only isolated test tables are mutable. Original source tables and triggers are untouched.
-  await pool.query(`CREATE SCHEMA IF NOT EXISTS "${fixtureSchema}"`);
-  for (const table of SOURCE_TABLES) {
-    await pool.query(`CREATE TABLE IF NOT EXISTS ${tableName(fixtureSchema, table)}
-      (LIKE ${tableName(sourceSchema, table)} INCLUDING ALL)`);
-  }
-  await pool.query(`TRUNCATE TABLE ${SOURCE_TABLES.map((table) => tableName(fixtureSchema, table)).join(", ")}`);
-  for (const table of SOURCE_TABLES) {
-    const override = ["source_messages", "message_batches"].includes(table) ? "OVERRIDING SYSTEM VALUE" : "";
-    await pool.query(`INSERT INTO ${tableName(fixtureSchema, table)} ${override} SELECT * FROM ${tableName(sourceSchema, table)}`);
-  }
+export async function cloneCandidateFixture(pool, sourceSchema, fixtureSchema) {
+  if (sourceSchema === fixtureSchema || !fixtureSchema.endsWith("_fixture")) throw new Error("a distinct verification fixture namespace is required");
+  // Recreate only these verification-owned tables. No CASCADE or source writes.
+  const namespace = tableName(fixtureSchema, "source_messages").split(".")[0];
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+    await client.query(`CREATE SCHEMA IF NOT EXISTS ${namespace}`);
+    for (const table of [...SOURCE_TABLES].reverse()) await client.query(`DROP TABLE IF EXISTS ${tableName(fixtureSchema, table)}`);
+    for (const table of SOURCE_TABLES) {
+      await client.query(`CREATE TABLE ${tableName(fixtureSchema, table)} (LIKE ${tableName(sourceSchema, table)} INCLUDING ALL)`);
+      const columns = (await client.query(`SELECT column_name FROM information_schema.columns
+        WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position`, [sourceSchema, table])).rows;
+      if (!columns.length) throw new Error(`source fixture table is missing: ${table}`);
+      const names = columns.map(({ column_name: name }) => `"${name.replaceAll('"', '""')}"`).join(", ");
+      const override = ["source_messages", "message_batches"].includes(table) ? "OVERRIDING SYSTEM VALUE" : "";
+      await client.query(`INSERT INTO ${tableName(fixtureSchema, table)} (${names}) ${override}
+        SELECT ${names} FROM ${tableName(sourceSchema, table)}`);
+    }
+    await client.query("COMMIT");
+  } catch (error) { await client.query("ROLLBACK"); throw error; }
+  finally { client.release(); }
 }
 
 export async function verifyFourIndependentValidators({ sourceConfig, sourcePool, snapshot, pidFile }) {
@@ -66,7 +76,7 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
       VALIDATOR_DATABASE_URL: localUrl, VALIDATOR_DB_SCHEMA: `${prefix}_v${index + 1}`,
       SOURCE_DATABASE_URL: sourceConfig.databaseUrl, SOURCE_DB_SCHEMA: sourceConfig.databaseSchema,
       CHAIN_A_DOMAIN: sourceConfig.chainDomain.toString(), SOURCE_GATEWAY_ADDRESS: sourceConfig.sourceGateway,
-      CHAIN_A_RPC_URL: proxies[index].url, FINALITY_BLOCK_DEPTH: sourceConfig.finalityBlockDepth.toString(),
+      CHAIN_A_RPC_URL: proxies[index].url, FINALITY_BLOCK_DEPTH: sourceConfig.finalityBlockDepth.toString(), PBFT_VIEW_TIMEOUT_MS: "3600000",
     }));
     const states = [];
     const validators = [];
@@ -83,7 +93,21 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     }
     assert.equal(new Set(validators.map((record) => record.child.pid)).size, 4);
     assert.equal(new Set(peers.map((peer) => peer.address)).size, 4);
+    const startupObservations = await Promise.all(states.map((state) => state.store.readObservations()));
+    for (let index = 0; index < 4; index++) {
+      assert.equal(startupObservations[index].length, 1, "ready must follow initial pending-batch validation");
+      assert.equal(startupObservations[index][0].batch_id, snapshot.record.batchId);
+      assert.equal(startupObservations[index][0].result, "VALID");
+      assert.equal(await states[index].store.currentView(snapshot.record.epoch), "0");
+      const receiptCalls = proxies[index].calls.filter((call) => call.method === "eth_getTransactionReceipt");
+      for (const member of snapshot.batch.messages) {
+        assert.ok(receiptCalls.some((call) => call.params[0] === member.sourceTransactionHash),
+          "each ready validator must independently fetch its source receipts");
+      }
+    }
+    assert.deepEqual(await sourceState(sourcePool, sourceConfig.databaseSchema), originalSourceState);
     console.log("VALID: four independent validator PIDs, keys, endpoints, and persistent namespaces");
+    console.log("VALID: readiness followed independent startup validation and local epoch registration; source state unchanged");
 
     for (let requester = 0; requester < 4; requester++) {
       for (let responder = 0; responder < 4; responder++) {
@@ -115,13 +139,19 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
       assert.ok(calls.some((call) => call.method === "eth_getCode"));
       observations.push(await states[index].store.readObservations());
       assert.equal(observations[index].length, 1);
-      if (index === 0) {
-        for (let other = 1; other < 4; other++) assert.deepEqual(await states[other].store.readObservations(), []);
+      assert.deepEqual(observations[index], startupObservations[index]);
+      for (let other = 0; other < 4; other++) {
+        if (other !== index) assert.deepEqual(await states[other].store.readObservations(), startupObservations[other],
+          "explicit validation must not alter another validator's startup observations");
       }
       const again = await request(peers[index].url, "/validate-batch", { batchId: snapshot.record.batchId });
       assert.equal(again.status, 200);
       assert.deepEqual(await states[index].store.readObservations(), observations[index]);
-      console.log(`VALID: V${index + 1} independently queried Chain A, reconstructed the pending batch, and persisted a local VALID observation`);
+      for (let other = 0; other < 4; other++) {
+        if (other !== index) assert.deepEqual(await states[other].store.readObservations(), startupObservations[other],
+          "repeated validation must preserve every other validator's isolated observations");
+      }
+      console.log(`VALID: V${index + 1} independently revalidated Chain A and preserved its durable observation and all other validators' state`);
     }
     const wrongId = await request(peers[0].url, "/validate-batch", { batchId: `0x${"ff".repeat(32)}` });
     assert.equal(wrongId.status, 422);
@@ -194,12 +224,12 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     const primaryIndex = peers.findIndex((peer) => peer.address === primaryAddress);
     const backups = peers.map((_, index) => index).filter((index) => index !== primaryIndex);
     for (let index = 0; index < 4; index++) {
-      const selection = await request(peers[index].url, "/pbft/primary", { epoch });
+      const selection = await request(peers[index].url, "/pbft/primary", { epoch, view: "0" });
       assert.equal(selection.status, 200);
       assert.equal(selection.body.primaryIdentity, primaryAddress);
       console.log(`VALID: V${index + 1} independently selected primary ${primaryAddress} for epoch ${epoch}`);
     }
-    const proposal = { messageType: "PRE_PREPARE", protocolVersion: "1", sourceDomain: sourceConfig.chainDomain.toString(),
+    const proposal = { messageType: "PRE_PREPARE", protocolVersion: "2", view: "0", sourceDomain: sourceConfig.chainDomain.toString(),
       sourceGateway: sourceConfig.sourceGateway, epoch, batchId: snapshot.record.batchId,
       messageRoot: snapshot.record.messageRoot, primaryIdentity: primaryAddress };
     async function signedProposal(fields, signerIndex = primaryIndex) {
@@ -394,7 +424,7 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
       const signature = await validatorAccount(keys[signerIndex]).signMessage({ message: { raw: digest } });
       return { ...fields, prepareDigest: digest, signature };
     }
-    const conflictingFields = { messageType: "PREPARE", protocolVersion: "1",
+    const conflictingFields = { messageType: "PREPARE", protocolVersion: "2", view: "0",
       sourceDomain: proposal.sourceDomain, sourceGateway: proposal.sourceGateway, epoch,
       batchId: proposal.batchId, messageRoot: `0x${"ed".repeat(32)}`,
       proposalDigest: canonical.proposalDigest, voterIdentity: peers[fourthVoter].address };
@@ -509,18 +539,6 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     assert.deepEqual(await sourceState(sourcePool, sourceConfig.databaseSchema), originalSourceState);
     console.log("VALID: invalid QC and injected transaction failure preserved pending status and left no certificate rows");
 
-    const submissions = await Promise.all(peers.map((peer) => request(peer.url, "/pbft/qc/submit", certificate)));
-    for (const response of submissions) {
-      assert.equal(response.status, 200); assert.equal(response.body.status, "COMMITTED");
-      assert.equal(response.body.qcDigest, certificate.qcDigest);
-    }
-    const committed = await sourceLifecycle.readBatch({ batchRecordId: snapshot.record.batchRecordId });
-    assert.equal(committed.record.status, "COMMITTED");
-    assert.deepEqual(committed.batch, snapshot.batch); assert.deepEqual(committed.members, snapshot.members);
-    assert.deepEqual(committed.tree, snapshot.tree);
-    await verifyQuorumCertificate(committed.quorumCertificate, qcOptions);
-    console.log("VALID: concurrent verified QC submissions atomically committed the real A/B/D batch exactly once");
-
     const fourthCommitVoter = prepareVoters[3];
     const fourthCommit = await request(peers[fourthCommitVoter].url, "/pbft/commit/cast", { epoch });
     assert.equal(fourthCommit.status, 200);
@@ -537,6 +555,20 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
       const duplicate = await request(peers[index].url, "/pbft/commit", fourthCommit.body.record.vote);
       assert.equal(duplicate.status, 200); assert.equal(duplicate.body.voteCount, 4);
     }
+    console.log("VALID: fourth COMMIT and duplicate/conflict checks completed before global finality; first quorum unchanged");
+
+    const submissions = await Promise.all(peers.map((peer) => request(peer.url, "/pbft/qc/submit", certificate)));
+    for (const response of submissions) {
+      assert.equal(response.status, 200); assert.equal(response.body.status, "COMMITTED");
+      assert.equal(response.body.qcDigest, certificate.qcDigest);
+    }
+    const committed = await sourceLifecycle.readBatch({ batchRecordId: snapshot.record.batchRecordId });
+    assert.equal(committed.record.status, "COMMITTED");
+    assert.deepEqual(committed.batch, snapshot.batch); assert.deepEqual(committed.members, snapshot.members);
+    assert.deepEqual(committed.tree, snapshot.tree);
+    await verifyQuorumCertificate(committed.quorumCertificate, qcOptions);
+    console.log("VALID: concurrent verified QC submissions atomically committed the real A/B/D batch exactly once");
+
     const allCommits = (await states[0].store.readCommitState(epoch)).votes;
     const equivalent = await buildQuorumCertificate(allCommits.filter((v) => v.voterIdentity !== certificate.commits[0].voterIdentity), qcOptions);
     assert.equal(equivalent.qcDigest, qcDigest(commitStatement));
@@ -556,7 +588,7 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     assert.equal(forcedDoubleCommit.status, 400);
     assert.deepEqual(await states[restartCommitted].store.readCommitState(epoch), beforeCommitRestart);
     const conflictAfterRestart = await request(peers[restartCommitted].url, "/pbft/commit", wrongCommit);
-    assert.equal(conflictAfterRestart.status, 422); assert.equal(conflictAfterRestart.body.reason, "CONFLICTING_COMMIT");
+    assert.equal(conflictAfterRestart.status, 422); assert.equal(conflictAfterRestart.body.reason, "ALREADY_COMMITTED");
     assert.equal((await request(peers[restartCommitted].url, "/pbft/qc/submit", certificate)).status, 200);
     assert.deepEqual(await states[restartCommitted].store.readPrePrepares(), acceptedBeforeDuplicates[restartCommitted]);
     assert.deepEqual(await states[restartCommitted].store.readPrepareState(epoch), beforePrepareRestart);

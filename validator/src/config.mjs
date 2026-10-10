@@ -76,7 +76,13 @@ export function loadValidatorConfig(environment = process.env) {
   if (!self) throw new Error("derived validator identity is not in the configured four-validator set");
   const ownHost = listenHost.includes(":") ? `[${listenHost}]` : listenHost;
   if (self.url !== new URL(`http://${ownHost}:${listenPort}`).origin) throw new Error("self peer URL must match the HTTP listen endpoint");
+  const timeoutText = environment.PBFT_VIEW_TIMEOUT_MS ?? "30000";
+  const viewTimeoutMs = Number(timeoutText);
+  if (!/^[1-9][0-9]*$/.test(timeoutText) || !Number.isSafeInteger(viewTimeoutMs) || viewTimeoutMs > 2147483647) {
+    throw new Error("PBFT_VIEW_TIMEOUT_MS must be a positive timer interval at most 2147483647");
+  }
   return {
+    viewTimeoutMs,
     privateKey, validatorAddress, listenHost, listenPort, peers,
     sourceDatabaseUrl: sourceDb.databaseUrl, sourceDatabaseSchema: sourceDb.databaseSchema,
     databaseUrl: localDb.databaseUrl, databaseSchema: localDb.databaseSchema,

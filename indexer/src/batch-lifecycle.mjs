@@ -63,17 +63,18 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, a
   const certificateSignatures = tableName(config.databaseSchema, "batch_quorum_certificate_signatures");
   const scopeParameters = [scope.chainDomain, scope.sourceGateway];
 
-  function certificateOptions(record) {
+  function certificateOptions(record, certificate) {
     if (!committee) throw new Error("expected static committee is required to verify a COMMITTED batch");
     return { peers: committee, expected: expectedCommitStatement({ ...protocolScope, epoch: record.epoch,
-      batchId: record.batchId, messageRoot: record.messageRoot }, committee) };
+      batchId: record.batchId, messageRoot: record.messageRoot,
+      protocolVersion: certificate.protocolVersion, view: certificate.view ?? "0" }, committee) };
   }
 
   async function readCertificate(client, record) {
     const rows = (await client.query(`SELECT * FROM ${certificates} WHERE batch_record_id = $1`, [record.batchRecordId])).rows;
     if (rows.length !== 1) throw new Error("COMMITTED batch is missing its persisted QC");
     const q = rows[0];
-    const statement = { protocolVersion: String(q.protocol_version), sourceDomain: q.source_domain,
+    const statement = { protocolVersion: String(q.protocol_version), ...(q.protocol_version === 2 ? { view: q.view } : {}), sourceDomain: q.source_domain,
       sourceGateway: q.source_gateway, epoch: q.epoch, batchId: q.batch_id, messageRoot: q.message_root,
       proposalDigest: q.proposal_digest, committeeDigest: q.committee_digest };
     const signatures = (await client.query(`SELECT * FROM ${certificateSignatures}
@@ -81,7 +82,7 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, a
     const commits = signatures.map((row) => ({ messageType: "COMMIT", ...statement,
       voterIdentity: row.voter_identity, commitDigest: row.commit_digest, signature: row.signature }));
     return verifyQuorumCertificate({ messageType: "QUORUM_CERTIFICATE", ...statement,
-      qcDigest: q.qc_digest, commits }, certificateOptions(record));
+      qcDigest: q.qc_digest, commits }, certificateOptions(record, statement));
   }
 
   async function transaction(operation, { lockScope = true } = {}) {
@@ -288,17 +289,17 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, a
           throw new QuorumCertificateError("QC_REQUIRES_PENDING_BATCH");
         }
         const existing = await snapshot(client, row);
-        const verified = await verifyQuorumCertificate(certificate, certificateOptions(existing.record));
+        const verified = await verifyQuorumCertificate(certificate, certificateOptions(existing.record, certificate));
         if (row.status === BATCH_STATUS.COMMITTED) {
-          if (existing.quorumCertificate.qcDigest !== verified.qcDigest) throw new Error("conflicting QC for COMMITTED batch");
+          // Different views can certify the same immutable batch. Preserve the first final QC.
           return existing;
         }
         await client.query(`INSERT INTO ${certificates}
           (batch_record_id, protocol_version, source_domain, source_gateway, epoch, batch_id,
-           message_root, proposal_digest, committee_digest, qc_digest)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+           message_root, proposal_digest, committee_digest, qc_digest, view)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
         [row.batch_record_id, Number(verified.protocolVersion), verified.sourceDomain, verified.sourceGateway,
-          verified.epoch, verified.batchId, verified.messageRoot, verified.proposalDigest, verified.committeeDigest, verified.qcDigest]);
+          verified.epoch, verified.batchId, verified.messageRoot, verified.proposalDigest, verified.committeeDigest, verified.qcDigest, verified.view ?? "0"]);
         for (const vote of verified.commits) {
           await client.query(`INSERT INTO ${certificateSignatures}
             (batch_record_id, voter_identity, commit_digest, signature) VALUES ($1,$2,$3,$4)`,

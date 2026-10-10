@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import { validatorAccount } from "../src/identity.mjs";
 import { after, before, beforeEach, test } from "node:test";
 import { applyValidatorMigrations, createValidatorPool, createValidatorStore } from "../src/db.mjs";
 import { tableName } from "../../indexer/src/db.mjs";
 import { configuration, snapshotFixture } from "./helpers/fixtures.mjs";
 import { canonicalCommittee, deterministicPrimary } from "../src/committee.mjs";
-import { signPrePrepare } from "../src/pre-prepare.mjs";
+import { prePrepareDigest, signPrePrepare } from "../src/pre-prepare.mjs";
 import { createPrePrepareService } from "../src/pre-prepare-service.mjs";
 import { signPrepare } from "../src/prepare.mjs";
 import { createPrepareService } from "../src/prepare-service.mjs";
 import { createCommitService } from "../src/commit-service.mjs";
 import { signCommit } from "../src/commit.mjs";
+import { buildPreparedCertificate, proposalIdentity } from "../src/prepared-certificate.mjs";
+import { signNewView, signViewChange, selectSafeProposal } from "../src/view-change.mjs";
 import { expectedCommitStatement } from "../src/quorum-certificate.mjs";
 
 assert.ok(process.env.DATABASE_URL, "DATABASE_URL is required for validator database tests");
@@ -31,7 +35,7 @@ before(async () => {
 beforeEach(async () => {
   for (let index = 0; index < 4; index++) {
     const schema = configs[index].databaseSchema;
-    await pools[index].query(`TRUNCATE TABLE ${tableName(schema, "commit_rejections")},
+    await pools[index].query(`TRUNCATE TABLE ${tableName(schema, "pbft_new_views")}, ${tableName(schema, "pbft_view_change_votes")}, ${tableName(schema, "pbft_epoch_views")}, ${tableName(schema, "commit_rejections")},
       ${tableName(schema, "pbft_commit_quorums")}, ${tableName(schema, "pbft_commit_votes")},
       ${tableName(schema, "prepare_rejections")},
       ${tableName(schema, "pbft_prepared_states")}, ${tableName(schema, "pbft_prepare_votes")},
@@ -43,9 +47,9 @@ beforeEach(async () => {
   }
 });
 
-async function signedProposal(root = snapshot.tree.messageRoot) {
-  const primary = configs.find((config) => config.validatorAddress === deterministicPrimary(configs[0].peers, snapshot.record.epoch));
-  return signPrePrepare(primary, { messageType: "PRE_PREPARE", protocolVersion: "1",
+async function signedProposal(root = snapshot.tree.messageRoot, view = "0") {
+  const primary = configs.find((config) => config.validatorAddress === deterministicPrimary(configs[0].peers, snapshot.record.epoch, view));
+  return signPrePrepare(primary, { messageType: "PRE_PREPARE", protocolVersion: "2", view,
     sourceDomain: primary.chainDomain, sourceGateway: primary.sourceGateway, epoch: snapshot.record.epoch,
     batchId: snapshot.record.batchId, messageRoot: root, primaryIdentity: primary.validatorAddress });
 }
@@ -54,7 +58,7 @@ function direction(config, envelope) { return config.validatorAddress === envelo
 
 async function signedVote(proposal, voterIndex, overrides = {}) {
   const config = configs[voterIndex];
-  return signPrepare(config, { messageType: "PREPARE", protocolVersion: "1",
+  return signPrepare(config, { messageType: "PREPARE", protocolVersion: "2", view: proposal.view,
     sourceDomain: proposal.sourceDomain, sourceGateway: proposal.sourceGateway, epoch: proposal.epoch,
     batchId: proposal.batchId, messageRoot: proposal.messageRoot,
     proposalDigest: proposal.proposalDigest, voterIdentity: config.validatorAddress, ...overrides });
@@ -449,4 +453,228 @@ test("conflicting roots, epochs, or occurrence membership cannot replace existin
   }
   const data = JSON.stringify({ identities: await stores[0].bindIdentity(), observations: before });
   assert.ok(!data.includes(configs[0].privateKey));
+});
+
+async function transition(view, prepared = null) {
+  const proposal = prepared?.proposal ?? await signedProposal();
+  const votes = await Promise.all(configs.slice(0, 3).map((c, index) => signViewChange(c, {
+    epoch: proposal.epoch, targetView: view, acceptedProposal: proposal, preparedCertificate: index === 0 ? prepared : null,
+  })));
+  const primary = configs.find((c) => c.validatorAddress === deterministicPrimary(configs[0].peers, proposal.epoch, view));
+  const message = await signNewView(primary, { epoch: proposal.epoch, view, viewChanges: votes,
+    selectedProposal: selectSafeProposal(votes, proposal) }, proposalIdentity(proposal));
+  return { message, votes, proposal };
+}
+
+test("durable VIEW_CHANGE pauses old voting; duplicate timeouts and restart reuse the exact signed intent", async () => {
+  const proposal = await acceptProposal();
+  for (let index = 0; index < 3; index++) await stores[0].savePrepareVote(await signedVote(proposal, index));
+  const prepared = await stores[0].preparedCertificate(proposal.epoch);
+  assert.ok(prepared);
+  const votes = await Promise.all(Array.from({ length: 10 }, () => stores[0].castViewChange(proposal.epoch)));
+  for (const vote of votes) assert.deepEqual(vote, votes[0]);
+  assert.deepEqual(votes[0].preparedCertificate, prepared);
+  assert.equal(await stores[0].currentView(proposal.epoch), "0");
+  await assert.rejects(stores[0].castPrepareVote(proposal.epoch), /VIEW_CHANGE_IN_PROGRESS/);
+  const reopened = createValidatorStore({ config: configs[0], pool: pools[0] });
+  assert.deepEqual(await reopened.castViewChange(proposal.epoch), votes[0]);
+  const conflict = await signViewChange(configs[0], { epoch: proposal.epoch, targetView: "1", acceptedProposal: null, preparedCertificate: null });
+  await assert.rejects(reopened.saveViewChange(conflict), /CONFLICTING_VIEW_CHANGE/);
+});
+
+test("NEW_VIEW acceptance is atomic, monotonic, concurrent-idempotent, and survives migrations and fresh pools", async () => {
+  const original = await acceptProposal();
+  for (let index = 0; index < 3; index++) await stores[0].savePrepareVote(await signedVote(original, index));
+  const prepared = await stores[0].preparedCertificate(original.epoch);
+  const { message, votes } = await transition("1", prepared);
+  for (const vote of votes) await stores[0].saveViewChange(vote);
+  assert.equal((await stores[0].readViewChanges(original.epoch, "1")).length, 3);
+  const accepted = await Promise.all(Array.from({ length: 10 }, () => stores[0].acceptNewView(message, proposalIdentity(original))));
+  for (const value of accepted) assert.deepEqual(value, message);
+  assert.equal(await stores[0].currentView(original.epoch), "1");
+  await assert.rejects(stores[0].savePrePrepare(original, direction(configs[0], original)), /STALE_VIEW/);
+  await assert.rejects(stores[0].savePrepareVote(await signedVote(original, 0)), /STALE_VIEW/);
+  const statement = expectedCommitStatement(original, configs[0].peers);
+  await assert.rejects(stores[0].saveCommitVote(await commitVote(statement, 0)), /STALE_VIEW/);
+  await assert.rejects(stores[0].saveViewChange(votes[0]), /STALE_VIEW/);
+  const future = await signedProposal(snapshot.tree.messageRoot, "5");
+  await assert.rejects(stores[0].savePrePrepare(future, direction(configs[0], future)), /NEW_VIEW_REQUIRED/);
+  await applyValidatorMigrations(pools[0], configs[0].databaseSchema);
+  const freshPool = createValidatorPool(configs[0]);
+  try {
+    const restored = createValidatorStore({ config: configs[0], pool: freshPool });
+    assert.equal(await restored.currentView(original.epoch), "1");
+    assert.deepEqual(await restored.readNewView(original.epoch, "1"), message);
+    assert.deepEqual(await restored.preparedCertificate(original.epoch), prepared);
+    const next = await signedProposal(snapshot.tree.messageRoot, "1");
+    await restored.savePrePrepare(next, direction(configs[0], next));
+    for (let index = 0; index < 3; index++) await restored.savePrepareVote(await signedVote(next, index));
+    assert.equal((await restored.readPrepareState(original.epoch)).voteCount, 3);
+    assert.equal((await restored.readPrepareState(original.epoch, "0")).voteCount, 3);
+    assert.notEqual(next.proposalDigest, original.proposalDigest);
+    const second = await transition("2", await restored.preparedCertificate(original.epoch));
+    await restored.acceptNewView(second.message, proposalIdentity(original));
+    assert.equal(await restored.currentView(original.epoch), "2");
+    await assert.rejects(restored.acceptNewView(message, proposalIdentity(original)), /STALE_VIEW/);
+    assert.equal((await restored.readPrePrepares()).length, 2);
+  } finally { await freshPool.end(); }
+});
+
+test("cross-view COMMIT lock retains the safe root; an old-view QC can finalize after NEW_VIEW", async () => {
+  const originalStatement = await prepareProposal();
+  const original = (await stores[0].readPrePrepare(originalStatement.epoch)).envelope;
+  for (let index = 0; index < 3; index++) await stores[0].saveCommitVote(await commitVote(originalStatement, index));
+  const oldQC = (await stores[0].readCommitState(original.epoch)).certificate;
+  const prepared = await stores[0].preparedCertificate(original.epoch);
+  const nextView = await transition("1", prepared);
+  await stores[0].acceptNewView(nextView.message, proposalIdentity(original));
+  const next = await signedProposal(snapshot.tree.messageRoot, "1");
+  await stores[0].savePrePrepare(next, direction(configs[0], next));
+  for (let index = 0; index < 3; index++) await stores[0].savePrepareVote(await signedVote(next, index));
+  const self = await stores[0].castCommitVote(next.epoch);
+  assert.equal(self.votes[0].view, "1");
+  assert.equal(self.votes[0].messageRoot, original.messageRoot);
+  const wrong = await signedProposal(`0x${"fa".repeat(32)}`, "1");
+  await assert.rejects(stores[0].savePrePrepare(wrong, direction(configs[0], wrong)), /CONFLICTING_PRE_PREPARE/);
+  assert.deepEqual((await stores[0].readCommitState(original.epoch, "0")).certificate, oldQC);
+  await stores[0].finalizeEpoch(oldQC);
+  assert.equal(await stores[0].currentView(original.epoch), "1");
+  await assert.rejects(stores[0].castViewChange(original.epoch), /ALREADY_COMMITTED/);
+  const fresh = createValidatorStore({ config: configs[0], pool: pools[0] });
+  await assert.rejects(fresh.acceptNewView((await transition("2", prepared)).message, proposalIdentity(original)), /ALREADY_COMMITTED/);
+});
+
+test("two VIEW_CHANGE senders cannot establish NEW_VIEW and malformed evidence cannot enter persistence", async () => {
+  const proposal = await acceptProposal();
+  const { votes } = await transition("1");
+  for (const vote of votes.slice(0, 2)) await stores[0].saveViewChange(vote);
+  assert.equal((await stores[0].readViewChanges(proposal.epoch, "1")).length, 2);
+  await stores[0].saveViewChange(votes[0]);
+  assert.equal((await stores[0].readViewChanges(proposal.epoch, "1")).length, 2);
+  await assert.rejects(stores[0].saveViewChange({ ...votes[2], signature: "0x00" }));
+  const primary = configs.find((c) => c.validatorAddress === deterministicPrimary(configs[0].peers, proposal.epoch, "1"));
+  await assert.rejects(signNewView(primary, { epoch: proposal.epoch, view: "1", viewChanges: votes.slice(0, 2),
+    selectedProposal: proposalIdentity(proposal) }, proposalIdentity(proposal)), /QUORUM_REQUIRED/);
+  assert.equal(await stores[0].currentView(proposal.epoch), "0");
+});
+
+test("view migration retains version-one signed proposal bytes and is rerunnable", async () => {
+  const schema = `${prefix}_history`;
+  const client = await pools[0].connect();
+  const primary = configs.find((c) => c.validatorAddress === deterministicPrimary(configs[0].peers, snapshot.record.epoch));
+  const proposal = { messageType: "PRE_PREPARE", protocolVersion: "1",
+    sourceDomain: primary.chainDomain.toString(), sourceGateway: primary.sourceGateway,
+    epoch: snapshot.record.epoch.toString(), batchId: snapshot.record.batchId, messageRoot: snapshot.tree.messageRoot,
+    primaryIdentity: primary.validatorAddress };
+  const digest = prePrepareDigest(proposal);
+  const signature = await validatorAccount(primary.privateKey).signMessage({ message: { raw: digest } });
+  try {
+    await client.query("BEGIN");
+    await client.query(`CREATE SCHEMA IF NOT EXISTS "${schema}"`);
+    await client.query(`SET LOCAL search_path TO "${schema}"`);
+    for (const name of ["001_validator_foundation.sql", "002_pre_prepare.sql", "003_prepare.sql", "004_commit_and_qc.sql"]) {
+      await client.query(await readFile(new URL(`../migrations/${name}`, import.meta.url), "utf8"));
+    }
+    await client.query(`INSERT INTO pbft_pre_prepares
+      (local_validator_identity,epoch,batch_id,message_root,proposal_digest,primary_identity,primary_signature,direction)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING`,
+      [configs[0].validatorAddress, proposal.epoch, proposal.batchId, proposal.messageRoot, digest, proposal.primaryIdentity,
+        signature, direction(configs[0], { primaryIdentity: proposal.primaryIdentity })]);
+    await client.query("COMMIT");
+  } catch (error) { await client.query("ROLLBACK"); throw error; }
+  finally { client.release(); }
+  for (let iteration = 0; iteration < 2; iteration++) {
+    await applyValidatorMigrations(pools[0], schema);
+    const row = (await pools[0].query(`SELECT * FROM ${tableName(schema, "pbft_pre_prepares")}
+      WHERE local_validator_identity = $1 AND epoch = $2 AND view = 0 AND protocol_version = 1`,
+      [configs[0].validatorAddress, proposal.epoch])).rows[0];
+    assert.equal(row.proposal_digest, digest);
+    assert.equal(row.primary_signature, signature);
+    assert.equal(row.message_root, proposal.messageRoot);
+    assert.equal(row.view, "0"); assert.equal(row.protocol_version, 1);
+  }
+});
+
+test("superseded timeout snapshots never sign for a newly accepted view or newly advanced progress", async () => {
+  const proposal = await acceptProposal();
+  const snapshot = (await stores[0].readViewStates())[0];
+  await stores[0].savePrepareVote(await signedVote(proposal, 1));
+  const expired = { view: snapshot.current_view, targetView: snapshot.target_view,
+    progressRevision: snapshot.progress_revision, now: snapshot.progress_at.getTime() + configs[0].viewTimeoutMs };
+  await assert.rejects(stores[0].castViewChange(proposal.epoch, expired), /SUPERSEDED_TIMEOUT/);
+  assert.deepEqual(await stores[0].readViewChanges(proposal.epoch, "1"), []);
+  const next = await transition("1");
+  await stores[0].acceptNewView(next.message, proposalIdentity(proposal));
+  await assert.rejects(stores[0].castViewChange(proposal.epoch, expired), /STALE_VIEW/);
+  const state = (await stores[0].readViewStates())[0];
+  assert.equal(state.current_view, "1"); assert.equal(state.target_view, "1"); assert.equal(state.changing_view, false);
+  assert.deepEqual(await stores[0].readViewChanges(proposal.epoch, "2"), []);
+});
+
+test("pending view targets advance durably after another timeout without activating an uncertified view", async () => {
+  const statement = await prepareProposal();
+  const prepared = await stores[0].preparedCertificate(statement.epoch);
+  const first = await stores[0].castViewChange(statement.epoch);
+  const state = (await stores[0].readViewStates())[0];
+  const next = await stores[0].castViewChange(statement.epoch, { view: state.current_view, targetView: state.target_view,
+    progressRevision: state.progress_revision, now: state.view_change_at.getTime() + configs[0].viewTimeoutMs });
+  assert.equal(first.targetView, "1"); assert.equal(next.targetView, "2");
+  assert.equal(await stores[0].currentView(statement.epoch), "0");
+  assert.deepEqual((await stores[0].readViewChanges(statement.epoch, "1"))[0], first);
+  assert.deepEqual(await stores[0].castViewChange(statement.epoch), next, "retry cannot rewrite the latest target intent");
+  await applyValidatorMigrations(pools[0], configs[0].databaseSchema);
+  const fresh = createValidatorPool(configs[0]);
+  try {
+    const restored = createValidatorStore({ config: configs[0], pool: fresh });
+    assert.equal((await restored.readViewStates())[0].target_view, "2");
+    assert.deepEqual(await restored.castViewChange(statement.epoch), next);
+    const target = await transition("2", prepared);
+    for (const vote of target.votes.slice(1)) await restored.saveViewChange(vote);
+    assert.deepEqual(await restored.readViewChangeTargets(statement.epoch), ["2"]);
+    await restored.acceptNewView(target.message, proposalIdentity(prepared.proposal));
+    assert.equal(await restored.currentView(statement.epoch), "2");
+    assert.equal((await restored.readViewStates())[0].changing_view, false);
+    assert.deepEqual(await restored.preparedCertificate(statement.epoch), prepared);
+  } finally { await fresh.end(); }
+});
+
+test("one far-future VIEW_CHANGE cannot advance local target or current view", async () => {
+  const proposal = await acceptProposal();
+  const vote = await signViewChange(configs[1], { epoch: proposal.epoch, targetView: "100",
+    acceptedProposal: proposal, preparedCertificate: null });
+  await assert.rejects(stores[0].saveViewChange(vote), /WRONG_TARGET_VIEW/);
+  const state = (await stores[0].readViewStates())[0];
+  assert.equal(state.current_view, "0"); assert.equal(state.target_view, "0"); assert.equal(state.changing_view, false);
+});
+
+test("a timer waiting for the metadata lock cannot sign for an HTTP-accepted newer view", async () => {
+  const proposal = await acceptProposal();
+  const state = (await stores[0].readViewStates())[0];
+  const next = await transition("1");
+  let signalWaiting; const waiting = new Promise((resolve) => { signalWaiting = resolve; });
+  let releaseTimer; const released = new Promise((resolve) => { releaseTimer = resolve; });
+  const guardedPool = { async connect() {
+    const client = await pools[0].connect();
+    return { async query(sql, parameters) {
+      if (sql.includes("validator_metadata") && sql.includes("FOR UPDATE")) {
+        signalWaiting(); await released;
+      }
+      return client.query(sql, parameters);
+    }, release: (...args) => client.release(...args) };
+  } };
+  const timerStore = createValidatorStore({ config: configs[0], pool: guardedPool });
+  const timed = timerStore.castViewChange(proposal.epoch, { view: state.current_view, targetView: state.target_view,
+    progressRevision: state.progress_revision, now: state.progress_at.getTime() + configs[0].viewTimeoutMs });
+  const rejected = assert.rejects(timed, /STALE_VIEW/);
+  let watchdog;
+  try {
+    await Promise.race([waiting, new Promise((_resolve, reject) => {
+      watchdog = setTimeout(() => reject(new Error("timer lock checkpoint not reached")), 5000);
+    })]);
+    await stores[0].acceptNewView(next.message, proposalIdentity(proposal));
+    releaseTimer(); await rejected;
+    assert.equal(await stores[0].currentView(proposal.epoch), "1");
+    assert.deepEqual(await stores[0].readViewChanges(proposal.epoch, "2"), []);
+    assert.equal((await stores[0].readViewStates())[0].changing_view, false);
+  } finally { clearTimeout(watchdog); releaseTimer(); await rejected; }
 });

@@ -6,12 +6,13 @@ import { PRE_PREPARE_ENVELOPE_FIELDS } from "./pre-prepare.mjs";
 import { PREPARE_ENVELOPE_FIELDS } from "./prepare.mjs";
 import { COMMIT_ENVELOPE_FIELDS } from "./commit.mjs";
 import { QC_FIELDS } from "./quorum-certificate.mjs";
+import { NEW_VIEW_FIELDS, VIEW_CHANGE_FIELDS } from "./view-change.mjs";
 
-// A canonical QC may carry four complete signed COMMIT envelopes.
-export const MAX_REQUEST_BYTES = 8192;
+// Four VIEW_CHANGE messages may each carry four signed PREPAREs and a proposal.
+export const MAX_REQUEST_BYTES = 65536;
 class InputError extends Error {}
 
-async function readBody(request, keys) {
+async function readBody(request, keys, optional = []) {
   if (request.headers["content-type"]?.split(";")[0].trim() !== "application/json") throw new InputError("JSON content type required");
   if (request.headers["content-length"] !== undefined && Number(request.headers["content-length"]) > MAX_REQUEST_BYTES) {
     throw new InputError("request body too large");
@@ -25,13 +26,16 @@ async function readBody(request, keys) {
   }
   let body;
   try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { throw new InputError("malformed JSON"); }
-  if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).sort().join(",") !== [...keys].sort().join(",")) {
+  const expectedKeys = body?.protocolVersion === "1" ? keys.filter((field) => field !== "view") : keys;
+  if (!body || typeof body !== "object" || Array.isArray(body) ||
+      expectedKeys.some((field) => !Object.hasOwn(body, field)) ||
+      Object.keys(body).some((field) => !expectedKeys.includes(field) && !optional.includes(field))) {
     throw new InputError("unexpected request fields");
   }
   return body;
 }
 
-export function createValidatorServer({ config, service, store, prePrepare, prepare, commit,
+export function createValidatorServer({ config, service, store, prePrepare, prepare, commit, viewChange,
   authenticatePeer = connectPeer, checkReady = async () => {}, logger = console }) {
   let ready = true;
   const server = createServer(async (request, response) => {
@@ -53,6 +57,17 @@ export function createValidatorServer({ config, service, store, prePrepare, prep
       if (request.method === "GET" && request.url === "/pbft/pre-prepares") return send(200, { proposals: await store.readPrePrepares() });
       if (request.method === "GET" && request.url === "/pbft/prepares") return send(200, await prepare.list());
       if (request.method === "GET" && request.url === "/pbft/commits") return send(200, await commit.list());
+      if (request.method === "GET" && request.url === "/pbft/views") return send(200, { states: await store.readViewStates() });
+      if (request.method === "POST" && request.url === "/pbft/view-change") {
+        const body = await readBody(request, VIEW_CHANGE_FIELDS);
+        const result = await viewChange.receiveViewChange(body);
+        return send(result.result === "ACCEPTED" ? 200 : 422, result);
+      }
+      if (request.method === "POST" && request.url === "/pbft/new-view") {
+        const body = await readBody(request, NEW_VIEW_FIELDS);
+        const result = await viewChange.receiveNewView(body);
+        return send(result.result === "ACCEPTED" ? 200 : 422, result);
+      }
       if (request.method === "POST" && request.url === "/pbft/commit/cast") {
         const body = await readBody(request, ["epoch"]);
         const result = await commit.cast(body.epoch);
@@ -64,8 +79,8 @@ export function createValidatorServer({ config, service, store, prePrepare, prep
         return send(result.result === "ACCEPTED" ? 200 : 422, result);
       }
       if (request.method === "POST" && request.url === "/pbft/qc") {
-        const body = await readBody(request, ["epoch"]);
-        const result = await commit.certificate(body.epoch);
+        const body = await readBody(request, ["epoch"], ["view"]);
+        const result = await commit.certificate(body.epoch, body.view);
         return send(result.result === "ACCEPTED" ? 200 : 422, result);
       }
       if (request.method === "POST" && request.url === "/pbft/qc/submit") {
@@ -74,9 +89,9 @@ export function createValidatorServer({ config, service, store, prePrepare, prep
         return send(result.result === "ACCEPTED" ? 200 : 422, result);
       }
       if (request.method === "POST" && request.url === "/pbft/primary") {
-        const body = await readBody(request, ["epoch"]);
+        const body = await readBody(request, ["epoch", "view"]);
         let result;
-        try { result = prePrepare.primary(body.epoch); } catch { throw new InputError("invalid batch epoch"); }
+        try { result = prePrepare.primary(body.epoch, body.view); } catch { throw new InputError("invalid epoch or view"); }
         return send(200, result);
       }
       if (request.method === "POST" && request.url === "/pbft/propose") {

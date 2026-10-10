@@ -4,6 +4,7 @@ import { createPeerProxy, createTransportGate } from "./helpers/fault-transport.
 import { commitConfigs, commitFixture, signedCommitFixture } from "./helpers/commit-fixtures.mjs";
 import { authenticateCommit } from "../src/commit.mjs";
 import { buildQuorumCertificate } from "../src/quorum-certificate.mjs";
+import { closeScenarioResources } from "./helpers/process-cluster.mjs";
 
 const identities = commitConfigs.map((config) => config.validatorAddress);
 
@@ -70,4 +71,49 @@ test("two isolated signer groups cannot form a QC; three matching live signers e
   const stale = await signedCommitFixture(statement, commitConfigs[3], { epoch: (BigInt(votes[3].epoch) + 1n).toString() });
   await authenticateCommit(commitConfigs[0], stale);
   await assert.rejects(buildQuorumCertificate([votes[0], votes[1], stale], options));
+});
+
+test("a route can heal without removing other directed recovery boundaries", () => {
+  const peers = commitConfigs[0].peers.map((peer) => peer.address);
+  const gate = createTransportGate(peers);
+  gate.blockRoute(peers[0], peers[1], "/pbft/new-view");
+  gate.blockRoute(peers[0], peers[1], "/pbft/view-change");
+  gate.allowRoute(peers[0], peers[1], "/pbft/new-view");
+  assert.equal(gate.isBlocked(peers[0], peers[1], "/pbft/new-view"), false);
+  assert.equal(gate.isBlocked(peers[0], peers[1], "/pbft/view-change"), true);
+  gate.heal(); assert.equal(gate.isBlocked(peers[0], peers[1], "/pbft/view-change"), false);
+});
+
+test("scenario cleanup keeps RPC and stores available until validator shutdown completes", async () => {
+  const events = [];
+  let release;
+  const stopped = new Promise((resolve) => { release = resolve; });
+  let processStopped = false;
+  const closing = closeScenarioResources({
+    processes: { async close() { events.push("stopping"); await stopped; processStopped = true; events.push("stopped"); } },
+    peerProxies: [{ async close() { assert.equal(processStopped, true); events.push("peer"); } }],
+    rpcProxies: [{ async close() { assert.equal(processStopped, true); events.push("rpc"); } }],
+    reservations: [{ async release() { assert.equal(processStopped, true); events.push("port"); } }],
+    pools: [{ async end() {
+      assert.ok(["peer", "rpc", "port"].every((event) => events.includes(event)));
+      events.push("pool");
+    } }],
+  });
+  try {
+    assert.deepEqual(events, ["stopping"]);
+    release(); await closing;
+    assert.equal(events[1], "stopped"); assert.equal(events.at(-1), "pool");
+  } finally { release(); await closing; }
+});
+
+test("scenario cleanup releases remaining owned resources and reports transport cleanup failure", async () => {
+  const events = [];
+  await assert.rejects(closeScenarioResources({
+    processes: { async close() { events.push("stopped"); } },
+    peerProxies: [{ async close() { throw new Error("peer cleanup failed"); } }],
+    rpcProxies: [{ async close() { assert.deepEqual(events, ["stopped"]); events.push("rpc"); } }],
+    reservations: [{ async release() { events.push("port"); } }],
+    pools: [{ async end() { events.push("pool"); } }],
+  }), /fault scenario cleanup failed: peer cleanup failed/);
+  assert.deepEqual(events, ["stopped", "rpc", "port", "pool"]);
 });

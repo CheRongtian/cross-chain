@@ -24,6 +24,6 @@ export function canonicalCommittee(peers) {
   return Object.freeze(addresses.sort());
 }
 
-export function deterministicPrimary(peers, epoch) {
-  return canonicalCommittee(peers)[Number(protocolInteger(epoch) % 4n)];
+export function deterministicPrimary(peers, epoch, view = "0") {
+  return canonicalCommittee(peers)[Number((protocolInteger(epoch) + protocolInteger(view, "view")) % 4n)];
 }
