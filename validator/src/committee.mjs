@@ -19,6 +19,7 @@ export function protocolInteger(value, label = "epoch") {
 export function canonicalCommittee(peers) {
   if (!Array.isArray(peers) || peers.length !== 4) throw new Error("committee must contain exactly four validators");
   const addresses = peers.map((peer) => normalizeAddress(typeof peer === "string" ? peer : peer.address));
+  if (addresses.includes(`0x${"00".repeat(20)}`)) throw new Error("zero validator identity is forbidden");
   if (new Set(addresses).size !== 4) throw new Error("committee identities must be unique");
   // Equal-length lowercase hex address order is identical to unsigned byte order.
   return Object.freeze(addresses.sort());

@@ -4,8 +4,9 @@ import { validatorAccount } from "../src/identity.mjs";
 import { after, before, beforeEach, test } from "node:test";
 import { applyValidatorMigrations, createValidatorPool, createValidatorStore } from "../src/db.mjs";
 import { tableName } from "../../indexer/src/db.mjs";
-import { configuration, snapshotFixture } from "./helpers/fixtures.mjs";
-import { canonicalCommittee, deterministicPrimary } from "../src/committee.mjs";
+import { configuration, snapshotFixture, developmentKeys, environment } from "./helpers/fixtures.mjs";
+import { loadValidatorConfig } from "../src/config.mjs";
+import { committeeDigest, deterministicPrimary } from "../src/committee.mjs";
 import { prePrepareDigest, signPrePrepare } from "../src/pre-prepare.mjs";
 import { createPrePrepareService } from "../src/pre-prepare-service.mjs";
 import { signPrepare } from "../src/prepare.mjs";
@@ -35,7 +36,7 @@ before(async () => {
 beforeEach(async () => {
   for (let index = 0; index < 4; index++) {
     const schema = configs[index].databaseSchema;
-    await pools[index].query(`TRUNCATE TABLE ${tableName(schema, "pbft_new_views")}, ${tableName(schema, "pbft_view_change_votes")}, ${tableName(schema, "pbft_epoch_views")}, ${tableName(schema, "commit_rejections")},
+    await pools[index].query(`TRUNCATE TABLE ${tableName(schema, "validator_set_history")}, ${tableName(schema, "pbft_new_views")}, ${tableName(schema, "pbft_view_change_votes")}, ${tableName(schema, "pbft_epoch_views")}, ${tableName(schema, "commit_rejections")},
       ${tableName(schema, "pbft_commit_quorums")}, ${tableName(schema, "pbft_commit_votes")},
       ${tableName(schema, "prepare_rejections")},
       ${tableName(schema, "pbft_prepared_states")}, ${tableName(schema, "pbft_prepare_votes")},
@@ -49,7 +50,7 @@ beforeEach(async () => {
 
 async function signedProposal(root = snapshot.tree.messageRoot, view = "0") {
   const primary = configs.find((config) => config.validatorAddress === deterministicPrimary(configs[0].peers, snapshot.record.epoch, view));
-  return signPrePrepare(primary, { messageType: "PRE_PREPARE", protocolVersion: "2", view,
+  return signPrePrepare(primary, { messageType: "PRE_PREPARE", protocolVersion: "3", view,
     sourceDomain: primary.chainDomain, sourceGateway: primary.sourceGateway, epoch: snapshot.record.epoch,
     batchId: snapshot.record.batchId, messageRoot: root, primaryIdentity: primary.validatorAddress });
 }
@@ -58,7 +59,7 @@ function direction(config, envelope) { return config.validatorAddress === envelo
 
 async function signedVote(proposal, voterIndex, overrides = {}) {
   const config = configs[voterIndex];
-  return signPrepare(config, { messageType: "PREPARE", protocolVersion: "2", view: proposal.view,
+  return signPrepare(config, { messageType: "PREPARE", protocolVersion: "3", view: proposal.view, validatorEpoch: proposal.validatorEpoch, committeeDigest: proposal.committeeDigest,
     sourceDomain: proposal.sourceDomain, sourceGateway: proposal.sourceGateway, epoch: proposal.epoch,
     batchId: proposal.batchId, messageRoot: proposal.messageRoot,
     proposalDigest: proposal.proposalDigest, voterIdentity: config.validatorAddress, ...overrides });
@@ -217,7 +218,7 @@ test("database safety slots serialize concurrent duplicates and conflicting sign
   assert.equal((await stores[1].readPrePrepares()).length, 1);
 });
 
-test("rejection audit never reserves a safety slot; committee permutations preserve binding", async () => {
+test("rejection audit never reserves a safety slot; endpoint permutations preserve binding", async () => {
   const p = await signedProposal();
   await stores[0].recordPrePrepareRejection({ ...p, epoch: "bad" }, "MALFORMED");
   assert.deepEqual(await stores[0].readPrePrepares(), []);
@@ -225,9 +226,52 @@ test("rejection audit never reserves a safety slot; committee permutations prese
   const reordered = createValidatorStore({ pool: pools[0], config: { ...configs[0], peers: [...configs[0].peers].reverse() } });
   await reordered.bindIdentity();
   assert.deepEqual(await reordered.readPrePrepares(), await stores[0].readPrePrepares());
+});
+
+test("endpoint directory missing a trusted committee member is rejected before database binding", async () => {
+  const p = await signedProposal();
+  const accepted = await stores[0].savePrePrepare(p, direction(configs[0], p));
+  const viewStates = await stores[0].readViewStates();
   const altered = configs[0].peers.map((peer, index) => index === 1 ? { ...peer, address: "0x0000000000000000000000000000000000000099" } : peer);
-  assert.notDeepEqual(canonicalCommittee(altered), canonicalCommittee(configs[0].peers));
-  await assert.rejects(createValidatorStore({ pool: pools[0], config: { ...configs[0], peers: altered } }).bindIdentity(), /committee mismatch/);
+  assert.throws(() => configuration({
+    SOURCE_DATABASE_URL: configs[0].sourceDatabaseUrl,
+    VALIDATOR_DATABASE_URL: configs[0].databaseUrl,
+    VALIDATOR_DB_SCHEMA: configs[0].databaseSchema,
+    VALIDATOR_PEERS: JSON.stringify(altered),
+    VALIDATOR_SET_HISTORY: JSON.stringify(configs[0].validatorSets.history),
+  }), /validator history has a member without an endpoint/);
+  assert.deepEqual(await stores[0].readPrePrepares(), [accepted]);
+  assert.deepEqual(await stores[0].readViewStates(), viewStates);
+});
+
+test("conflicting trusted committee history cannot overwrite persisted history or proposal bindings", async () => {
+  const p = await signedProposal();
+  const accepted = await stores[0].savePrePrepare(p, direction(configs[0], p));
+  const viewStates = await stores[0].readViewStates();
+  const historyTable = tableName(configs[0].databaseSchema, "validator_set_history");
+  const persistedHistory = (await pools[0].query(`SELECT * FROM ${historyTable} ORDER BY validator_epoch`)).rows;
+  const altered = configs[0].peers.map((peer, index) => index === 1 ? { ...peer, address: "0x0000000000000000000000000000000000000099" } : peer);
+  const alteredHistory = [{
+    ...configs[0].validatorSets.history[0],
+    validators: altered.map((peer) => peer.address),
+    committeeDigest: committeeDigest(altered),
+  }];
+  const conflictingConfig = configuration({
+    SOURCE_DATABASE_URL: configs[0].sourceDatabaseUrl,
+    VALIDATOR_DATABASE_URL: configs[0].databaseUrl,
+    VALIDATOR_DB_SCHEMA: configs[0].databaseSchema,
+    VALIDATOR_PEERS: JSON.stringify(altered),
+    VALIDATOR_SET_HISTORY: JSON.stringify(alteredHistory),
+  });
+  assert.notDeepEqual(conflictingConfig.validatorSets.history[0].validators, configs[0].validatorSets.history[0].validators);
+  await assert.rejects(
+    createValidatorStore({ pool: pools[0], config: conflictingConfig }).bindIdentity(),
+    /conflicting persisted validator set/,
+  );
+  await stores[0].checkIdentity();
+  assert.deepEqual((await pools[0].query(`SELECT * FROM ${historyTable} ORDER BY validator_epoch`)).rows, persistedHistory);
+  assert.deepEqual(await stores[0].readPrePrepares(), [accepted]);
+  assert.deepEqual(await stores[0].readViewStates(), viewStates);
 });
 
 test("failed source validation records rejection without creating accepted state", async () => {
@@ -593,6 +637,44 @@ test("view migration retains version-one signed proposal bytes and is rerunnable
     assert.equal(row.message_root, proposal.messageRoot);
     assert.equal(row.view, "0"); assert.equal(row.protocol_version, 1);
   }
+});
+
+test("trusted history appends idempotently, persists across restart and cannot rebind in-flight batches", async () => {
+  const proposal = await acceptProposal();
+  const oldRecord = await stores[0].readPrePrepare(proposal.epoch);
+  const keys = developmentKeys(5);
+  const peers = keys.map((key,index) => ({ address: validatorAccount(key).address.toLowerCase(),url: `http://127.0.0.1:${31001 + index}` }));
+  const initial = configs[0].validatorSets.history[0];
+  const next = { validatorEpoch: "1",activationBatchEpoch: (BigInt(proposal.epoch) + 1n).toString(),
+    validators: peers.slice(1).map((peer) => peer.address),committeeDigest: committeeDigest(peers.slice(1)) };
+  const reloadedConfig = loadValidatorConfig(environment({ SOURCE_DATABASE_URL: process.env.DATABASE_URL,
+    VALIDATOR_DATABASE_URL: process.env.DATABASE_URL,VALIDATOR_DB_SCHEMA: configs[0].databaseSchema,
+    VALIDATOR_PEERS: JSON.stringify(peers),VALIDATOR_SET_HISTORY: JSON.stringify([initial,next]) }));
+  const reloaded = createValidatorStore({ pool: pools[0],config: reloadedConfig });
+  const retroactiveConfig = loadValidatorConfig(environment({ SOURCE_DATABASE_URL: process.env.DATABASE_URL,
+    VALIDATOR_DATABASE_URL: process.env.DATABASE_URL,VALIDATOR_DB_SCHEMA: configs[0].databaseSchema,
+    VALIDATOR_PEERS: JSON.stringify(peers),VALIDATOR_SET_HISTORY: JSON.stringify([initial,{ ...next,activationBatchEpoch: proposal.epoch }]) }));
+  await assert.rejects(createValidatorStore({ pool: pools[0],config: retroactiveConfig }).bindIdentity(), /already-started/);
+  await Promise.all([reloaded.bindIdentity(),reloaded.bindIdentity()]);
+  const restarted = createValidatorStore({ pool: pools[0],config: reloadedConfig });
+  await restarted.bindIdentity();
+  assert.deepEqual(await restarted.readPrePrepare(proposal.epoch),oldRecord);
+  const state = (await restarted.readViewStates())[0];
+  assert.equal(state.validator_epoch,"0"); assert.equal(state.committee_digest,initial.committeeDigest);
+  await assert.rejects(restarted.registerEpoch({ ...proposal,validatorEpoch: "1",committeeDigest: next.committeeDigest }), /WRONG_VALIDATOR_EPOCH/);
+  const vote = await restarted.castViewChange(proposal.epoch);
+  assert.equal(vote.validatorEpoch,"0"); assert.equal(vote.committeeDigest,initial.committeeDigest);
+  const historyTable = tableName(configs[0].databaseSchema,"validator_set_history");
+  assert.equal((await pools[0].query(`SELECT COUNT(*)::int AS count FROM ${historyTable}`)).rows[0].count,2);
+  await assert.rejects(pools[0].query(`UPDATE ${historyTable} SET committee_digest = $1 WHERE validator_epoch = 0`,[`0x${"ab".repeat(32)}`]), /immutable/);
+  await assert.rejects(pools[0].query(`DELETE FROM ${historyTable} WHERE validator_epoch = 0`), /immutable/);
+  const conflictingConfig = loadValidatorConfig(environment({ SOURCE_DATABASE_URL: process.env.DATABASE_URL,
+    VALIDATOR_DATABASE_URL: process.env.DATABASE_URL,VALIDATOR_DB_SCHEMA: configs[0].databaseSchema,
+    VALIDATOR_PEERS: JSON.stringify(peers),VALIDATOR_SET_HISTORY: JSON.stringify([initial,{ ...next,validators: peers.slice(0,4).map((peer) => peer.address),committeeDigest: initial.committeeDigest }]) }));
+  await assert.rejects(createValidatorStore({ pool: pools[0],config: conflictingConfig }).bindIdentity(), /conflicting persisted/);
+  await applyValidatorMigrations(pools[0],configs[0].databaseSchema);
+  assert.deepEqual(await restarted.readPrePrepare(proposal.epoch),oldRecord);
+  assert.equal((await pools[0].query(`SELECT protocol_version,validator_epoch FROM ${tableName(configs[0].databaseSchema,"pbft_view_change_votes")} WHERE epoch = $1`,[proposal.epoch])).rows[0].validator_epoch,"0");
 });
 
 test("superseded timeout snapshots never sign for a newly accepted view or newly advanced progress", async () => {

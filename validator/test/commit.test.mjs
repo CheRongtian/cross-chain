@@ -22,7 +22,7 @@ test("COMMIT and static committee use independent deterministic ABI domains and 
   const max = (1n << 256n) - 1n;
   assert.equal(commitDigest({ ...vote, epoch: max }), commitDigest({ ...vote, epoch: max.toString() }));
   assert.throws(() => commitDigest({ ...vote, epoch: Number.MAX_SAFE_INTEGER }), { code: "MALFORMED" });
-  for (const mutation of [{ protocolVersion: "3" }, { sourceDomain: "2" }, { sourceGateway: configs[1].validatorAddress },
+  for (const mutation of [{ protocolVersion: "4" }, { sourceDomain: "2" }, { sourceGateway: configs[1].validatorAddress },
     { epoch: (BigInt(statement.epoch) + 1n).toString() }, { batchId: bytes("11") }, { messageRoot: bytes("12") },
     { proposalDigest: bytes("13") }, { committeeDigest: bytes("14") }, { voterIdentity: configs[1].validatorAddress }]) {
     assert.notEqual(commitDigest({ ...vote, ...mutation }), vote.commitDigest);
@@ -42,7 +42,7 @@ test("COMMIT authentication recomputes digest and binds signer, membership, comm
     const changed = { ...votes[0], ...mutation };
     await assert.rejects(authenticateCommit(configs[1], { ...changed, commitDigest: commitDigest(changed) }), { code: "INVALID_SIGNATURE" });
   }
-  for (const [mutation, code] of [[{ protocolVersion: "3" }, "WRONG_VERSION"], [{ sourceDomain: "2" }, "WRONG_CONTEXT"],
+  for (const [mutation, code] of [[{ protocolVersion: "4" }, "WRONG_VERSION"], [{ sourceDomain: "2" }, "WRONG_CONTEXT"],
     [{ sourceGateway: configs[1].validatorAddress }, "WRONG_CONTEXT"], [{ committeeDigest: bytes("24") }, "WRONG_COMMITTEE"]]) {
     await assert.rejects(authenticateCommit(configs[1], await signedCommitFixture(statement, configs[0], mutation)), { code });
   }
@@ -83,7 +83,7 @@ test("QC rejects insufficient, duplicate, unknown, forged, malformed, or mismatc
   const key = `0x${99n.toString(16).padStart(64, "0")}`;
   const unknown = await signedCommitFixture(statement, { privateKey: key, validatorAddress: validatorAccount(key).address.toLowerCase() });
   await assert.rejects(buildQuorumCertificate([votes[0], votes[1], unknown], options), { code: "UNKNOWN_VALIDATOR" });
-  for (const mutation of [{ protocolVersion: "3" }, { sourceDomain: "2" }, { sourceGateway: configs[1].validatorAddress },
+  for (const mutation of [{ protocolVersion: "4" }, { sourceDomain: "2" }, { sourceGateway: configs[1].validatorAddress },
     { epoch: "1" }, { batchId: bytes("31") }, { messageRoot: bytes("32") }, { proposalDigest: bytes("33") },
     { committeeDigest: bytes("34") }]) {
     const changed = { ...q, ...mutation };

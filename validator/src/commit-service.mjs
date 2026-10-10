@@ -1,10 +1,11 @@
+import { consensusPeers } from "./validator-sets.mjs";
 import { protocolInteger } from "./committee.mjs";
 import { connectPeer } from "./handshake.mjs";
 import { authenticateCommit, CommitError, signCommit } from "./commit.mjs";
-import { QuorumCertificateError } from "./quorum-certificate.mjs";
+import { QuorumCertificateError, verifyQuorumCertificate } from "./quorum-certificate.mjs";
 
 export async function broadcastCommit(config, envelope, { fetchImplementation = fetch, authenticatePeer = connectPeer } = {}) {
-  return Promise.all(config.peers.filter((peer) => peer.address !== config.validatorAddress).map(async (peer) => {
+  return Promise.all(consensusPeers(config, envelope).filter((peer) => peer.address !== config.validatorAddress).map(async (peer) => {
     try {
       await authenticatePeer(config, peer.address, fetchImplementation);
       const response = await fetchImplementation(`${peer.url}/pbft/commit`, {
@@ -62,6 +63,18 @@ export function createCommitService({ config, store, lifecycle, broadcast = broa
         if (!state.certificate) throw new CommitError("COMMIT_QUORUM_REQUIRED");
         return { validatorAddress: config.validatorAddress, result: "ACCEPTED", certificate: state.certificate };
       } catch (error) { return rejected({ epoch: value }, error); }
+    },
+    async verify(certificate) {
+      try {
+        const verified = await verifyQuorumCertificate(certificate, { peers: config.peers, validatorSets: config.validatorSets,
+          expected: { protocolVersion: certificate.protocolVersion, sourceDomain: config.chainDomain, sourceGateway: config.sourceGateway,
+            epoch: certificate.epoch, validatorEpoch: certificate.validatorEpoch, view: certificate.view ?? "0",
+            batchId: certificate.batchId, messageRoot: certificate.messageRoot } });
+        return { validatorAddress: config.validatorAddress, result: "ACCEPTED", qcDigest: verified.qcDigest, certificate: verified };
+      } catch (error) {
+        if (!(error instanceof QuorumCertificateError)) throw error;
+        return { validatorAddress: config.validatorAddress, result: "REJECTED", reason: error.code };
+      }
     },
     async submit(certificate) {
       try {

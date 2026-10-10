@@ -1,6 +1,7 @@
 import { isIP } from "node:net";
 import { normalizeAddress, toUint256 } from "../../indexer/src/canonical-message.mjs";
 import { loadDatabaseConfig, validateSchemaName } from "../../indexer/src/config.mjs";
+import { loadValidatorSetResolver } from "./validator-sets.mjs";
 import { validatorAccount } from "./identity.mjs";
 
 function required(value, name) {
@@ -57,9 +58,10 @@ export function loadValidatorConfig(environment = process.env) {
   const sourceGateway = normalizeAddress(required(environment.SOURCE_GATEWAY_ADDRESS, "SOURCE_GATEWAY_ADDRESS"));
   const chainRpcUrl = httpUrl(environment.CHAIN_A_RPC_URL, "CHAIN_A_RPC_URL");
   const finalityBlockDepth = uint(environment.FINALITY_BLOCK_DEPTH, "FINALITY_BLOCK_DEPTH");
+  const validatorSets = loadValidatorSetResolver(environment);
   let peers;
   try { peers = JSON.parse(required(environment.VALIDATOR_PEERS, "VALIDATOR_PEERS")); } catch { throw new Error("VALIDATOR_PEERS must be a JSON array"); }
-  if (!Array.isArray(peers) || peers.length !== 4) throw new Error("VALIDATOR_PEERS must contain exactly four validators");
+  if (!Array.isArray(peers) || peers.length < 4) throw new Error("VALIDATOR_PEERS must contain at least four unique endpoint identities");
   const addresses = new Set();
   const endpoints = new Set();
   peers = peers.map((peer) => {
@@ -72,8 +74,12 @@ export function loadValidatorConfig(environment = process.env) {
     addresses.add(address); endpoints.add(url);
     return { address, url };
   });
+  for (const set of validatorSets.history) {
+    if (set.validators.some((address) => !addresses.has(address))) throw new Error("validator history has a member without an endpoint");
+  }
+  if (!validatorSets.history.some((set) => set.validators.includes(validatorAddress))) throw new Error("local identity is not in validator history");
   const self = peers.find((peer) => peer.address === validatorAddress);
-  if (!self) throw new Error("derived validator identity is not in the configured four-validator set");
+  if (!self) throw new Error("derived validator identity has no configured endpoint");
   const ownHost = listenHost.includes(":") ? `[${listenHost}]` : listenHost;
   if (self.url !== new URL(`http://${ownHost}:${listenPort}`).origin) throw new Error("self peer URL must match the HTTP listen endpoint");
   const timeoutText = environment.PBFT_VIEW_TIMEOUT_MS ?? "30000";
@@ -82,7 +88,7 @@ export function loadValidatorConfig(environment = process.env) {
     throw new Error("PBFT_VIEW_TIMEOUT_MS must be a positive timer interval at most 2147483647");
   }
   return {
-    viewTimeoutMs,
+    viewTimeoutMs, validatorSets,
     privateKey, validatorAddress, listenHost, listenPort, peers,
     sourceDatabaseUrl: sourceDb.databaseUrl, sourceDatabaseSchema: sourceDb.databaseSchema,
     databaseUrl: localDb.databaseUrl, databaseSchema: localDb.databaseSchema,

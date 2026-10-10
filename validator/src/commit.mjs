@@ -1,14 +1,20 @@
 import { keccak256, recoverMessageAddress, stringToHex } from "viem";
 import { normalizeAddress, normalizeBytes32 } from "../../indexer/src/canonical-message.mjs";
-import { canonicalCommittee, committeeDigest, protocolInteger } from "./committee.mjs";
+import { protocolInteger } from "./committee.mjs";
 import { validatorAccount } from "./identity.mjs";
 
-import { CONSENSUS_VERSION, consensusDigest, viewFields } from "./protocol.mjs";
+import { consensusBinding, consensusCommittee } from "./validator-sets.mjs";
+import { consensusType, CONSENSUS_VERSION, versionedDigest, envelopeFields, validatorFields, viewFields } from "./protocol.mjs";
 
-export const COMMIT_TYPE = "PBFTCommit(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,uint256 view,bytes32 batchId,bytes32 messageRoot,bytes32 proposalDigest,bytes32 committeeDigest,address voterIdentity)";
+function committee(config, input) {
+  try { return consensusCommittee(config, input); }
+  catch (error) { throw new CommitError(error.code ?? "WRONG_COMMITTEE"); }
+}
+
+export const COMMIT_TYPE = consensusType("PBFTCommit(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,uint256 view,bytes32 batchId,bytes32 messageRoot,bytes32 proposalDigest,bytes32 committeeDigest,address voterIdentity)", { hasCommittee: true });
 export const COMMIT_DOMAIN = keccak256(stringToHex(COMMIT_TYPE));
 export const COMMIT_STATEMENT_FIELDS = Object.freeze([
-  "protocolVersion", "sourceDomain", "sourceGateway", "epoch", "view", "batchId", "messageRoot", "proposalDigest", "committeeDigest",
+  "protocolVersion", "sourceDomain", "sourceGateway", "epoch", "view", "validatorEpoch", "batchId", "messageRoot", "proposalDigest", "committeeDigest",
 ]);
 export const COMMIT_ENVELOPE_FIELDS = Object.freeze([
   "messageType", ...COMMIT_STATEMENT_FIELDS, "voterIdentity", "commitDigest", "signature",
@@ -25,7 +31,7 @@ export function normalizeCommitStatement(input) {
     if (version > 255n) throw new Error("version exceeds uint8");
     return { protocolVersion: version.toString(), sourceDomain: protocolInteger(input.sourceDomain).toString(),
       sourceGateway: normalizeAddress(input.sourceGateway), epoch: protocolInteger(input.epoch).toString(),
-      ...viewFields(input), batchId: normalizeBytes32(input.batchId), messageRoot: normalizeBytes32(input.messageRoot),
+      ...viewFields(input), ...validatorFields(input), batchId: normalizeBytes32(input.batchId), messageRoot: normalizeBytes32(input.messageRoot),
       proposalDigest: normalizeBytes32(input.proposalDigest), committeeDigest: normalizeBytes32(input.committeeDigest) };
   } catch { throw new CommitError("MALFORMED"); }
 }
@@ -39,15 +45,15 @@ export function normalizeCommit(input) {
 
 export function commitDigest(input) {
   const v = normalizeCommit(input);
-  return consensusDigest(COMMIT_TYPE, PARAMETERS, [Number(v.protocolVersion),
+  return versionedDigest(COMMIT_TYPE, PARAMETERS, [Number(v.protocolVersion),
     BigInt(v.sourceDomain), v.sourceGateway, BigInt(v.epoch), BigInt(v.view ?? "0"), v.batchId, v.messageRoot,
-    v.proposalDigest, v.committeeDigest, v.voterIdentity], v.protocolVersion);
+    v.proposalDigest, v.committeeDigest, v.voterIdentity], v, { hasCommittee: true });
 }
 
 export async function signCommit(config, input) {
-  const vote = normalizeCommit(input);
-  if (vote.protocolVersion !== CONSENSUS_VERSION) throw new CommitError("WRONG_VERSION");
-  if (vote.voterIdentity !== config.validatorAddress || !canonicalCommittee(config.peers).includes(vote.voterIdentity)) {
+  const vote = normalizeCommit(String(input.protocolVersion) === "3" ? { ...consensusBinding(config, input.epoch), ...input } : input);
+  if (![CONSENSUS_VERSION, "2"].includes(vote.protocolVersion)) throw new CommitError("WRONG_VERSION");
+  if (vote.voterIdentity !== config.validatorAddress || !committee(config, vote).validators.includes(vote.voterIdentity)) {
     throw new CommitError("UNKNOWN_VALIDATOR");
   }
   const digest = commitDigest(vote);
@@ -57,14 +63,14 @@ export async function signCommit(config, input) {
 
 export async function authenticateCommit(config, input) {
   if (!input || typeof input !== "object" || Array.isArray(input) ||
-      Object.keys(input).sort().join(",") !== [...COMMIT_ENVELOPE_FIELDS].filter((field) => field !== "view" || input.protocolVersion !== "1").sort().join(",")) throw new CommitError("MALFORMED");
+      Object.keys(input).sort().join(",") !== envelopeFields(COMMIT_ENVELOPE_FIELDS, input.protocolVersion, { hasCommittee: true }).sort().join(",")) throw new CommitError("MALFORMED");
   const vote = normalizeCommit(input);
-  if (vote.protocolVersion !== CONSENSUS_VERSION && !(config.allowHistorical && vote.protocolVersion === "1")) throw new CommitError("WRONG_VERSION");
+  if (vote.protocolVersion !== CONSENSUS_VERSION && !(config.allowHistorical && ["1", "2"].includes(vote.protocolVersion))) throw new CommitError("WRONG_VERSION");
   if (vote.sourceDomain !== config.chainDomain.toString() || vote.sourceGateway !== config.sourceGateway) {
     throw new CommitError("WRONG_CONTEXT");
   }
-  if (vote.committeeDigest !== committeeDigest(config.peers)) throw new CommitError("WRONG_COMMITTEE");
-  if (!canonicalCommittee(config.peers).includes(vote.voterIdentity)) throw new CommitError("UNKNOWN_VALIDATOR");
+  if (vote.committeeDigest !== committee(config, vote).committeeDigest) throw new CommitError("WRONG_COMMITTEE");
+  if (!committee(config, vote).validators.includes(vote.voterIdentity)) throw new CommitError("UNKNOWN_VALIDATOR");
   let supplied;
   try { supplied = normalizeBytes32(input.commitDigest); } catch { throw new CommitError("MALFORMED"); }
   const digest = commitDigest(vote);

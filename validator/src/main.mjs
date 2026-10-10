@@ -1,6 +1,6 @@
 import { loadValidatorConfig } from "./config.mjs";
 import { createValidatorPool, createValidatorStore } from "./db.mjs";
-import { createBatchValidationService, validateSourceContext } from "./source-validation.mjs";
+import { createBatchValidationService, validateConsensusBindings, validateSourceContext } from "./source-validation.mjs";
 import { createChainClient } from "../../indexer/src/indexer.mjs";
 import { createValidatorServer } from "./server.mjs";
 import { tableName } from "../../indexer/src/db.mjs";
@@ -26,12 +26,11 @@ async function shutdown() {
 }
 
 try {
-  config = loadValidatorConfig();
+  config = { ...loadValidatorConfig(), allowHistorical: true };
   pool = createValidatorPool(config);
   sourcePool = createValidatorPool({ databaseUrl: config.sourceDatabaseUrl });
   const store = createValidatorStore({ pool, config });
   // Migrations are explicit, owned by the validator subsystem, and applied before startup.
-  await store.bindIdentity();
   await sourcePool.query(`SELECT batch_record_id FROM ${tableName(config.sourceDatabaseSchema, "message_batches")} LIMIT 0`);
   for (const table of ["batch_quorum_certificates", "batch_quorum_certificate_signatures"]) {
     await sourcePool.query(`SELECT batch_record_id FROM ${tableName(config.sourceDatabaseSchema, table)} LIMIT 0`);
@@ -40,13 +39,15 @@ try {
     await pool.query(`SELECT local_validator_identity FROM ${tableName(config.databaseSchema, table)} LIMIT 0`);
   }
   await pool.query(`SELECT target_view,view_change_at,progress_revision FROM ${tableName(config.databaseSchema, "pbft_epoch_views")} LIMIT 0`);
+  await validateConsensusBindings(config,sourcePool);
+  await store.bindIdentity();
   const publicClient = createChainClient(config);
   await validateSourceContext(publicClient, config);
   const service = createBatchValidationService({ config, sourcePool, store, publicClient });
   const prePrepare = createPrePrepareService({ config, validation: service, store });
   const prepare = createPrepareService({ config, store });
   const lifecycle = createBatchLifecycle({ config: { ...config, databaseSchema: config.sourceDatabaseSchema },
-    pool: sourcePool, committee: config.peers });
+    pool: sourcePool, committee: config.peers, validatorSets: config.validatorSets });
   const commit = createCommitService({ config, store, lifecycle });
   const viewChange = createViewChangeService({ config, store, validation: service });
   consensus = createConsensusRuntime({ config, sourcePool, store, validation: service, lifecycle, prePrepare, prepare, commit, viewChange });

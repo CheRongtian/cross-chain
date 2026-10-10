@@ -24,12 +24,12 @@ export async function preparedFixture(view = "0", root, epoch) {
   const snapshot = await snapshotFixture();
   epoch ??= snapshot.record.epoch.toString();
   const primary = configs.find((c) => c.validatorAddress === deterministicPrimary(config.peers, epoch, view));
-  const proposal = await signPrePrepare(primary, { messageType: "PRE_PREPARE", protocolVersion: "2", view,
+  const proposal = await signPrePrepare(primary, { messageType: "PRE_PREPARE", protocolVersion: "3", view,
     sourceDomain: primary.chainDomain.toString(), sourceGateway: primary.sourceGateway, epoch,
     batchId: snapshot.record.batchId, messageRoot: root ?? snapshot.record.messageRoot, primaryIdentity: primary.validatorAddress });
   const prepares = await Promise.all(configs.map((c) => signPrepare(c, { messageType: "PREPARE", ...expectedCommitStatement(proposal, config.peers),
     voterIdentity: c.validatorAddress })));
-  // PREPARE has no committeeDigest; signPrepare normalizes away non-PREPARE fields.
+  // Current PREPARE binds the same validator epoch and committee as its proposal.
   return { proposal, prepares, certificate: await buildPreparedCertificate(proposal, prepares.slice(0, 3), config) };
 }
 async function vcSet(proposal, certificate = null, targetView = "1") {

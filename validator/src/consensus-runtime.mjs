@@ -18,7 +18,9 @@ export function createConsensusRuntime({ config, sourcePool, store, validation, 
   }
   async function advance(state) {
     if (state.finalized) return;
+    if (!config.validatorSets.resolveForBatchEpoch(state.epoch).validators.includes(config.validatorAddress)) return;
     const epoch = state.epoch;
+    const committee = state.protocol_version === 2 ? config.validatorSets.history[0].validators : config.validatorSets.resolveForBatchEpoch(epoch).validators;
     const view = state.current_view;
     const key = `${epoch}:${view}`;
     // Recovery of an already certified view is independent of the next timeout.
@@ -29,7 +31,7 @@ export function createConsensusRuntime({ config, sourcePool, store, validation, 
     const candidates = await store.readViewChangeTargets(epoch);
     for (const target of candidates) {
       if (BigInt(target) <= BigInt(view) || BigInt(target) < BigInt(state.target_view)) continue;
-      if (deterministicPrimary(config.peers, epoch, target) === config.validatorAddress) {
+      if (deterministicPrimary(committee, epoch, target) === config.validatorAddress) {
         await viewChange.establish(epoch, target, state.batch_id);
         return;
       }
@@ -53,7 +55,7 @@ export function createConsensusRuntime({ config, sourcePool, store, validation, 
       return;
     }
     if (view === "0") return;
-    if (deterministicPrimary(config.peers, epoch, view) === config.validatorAddress && due(`${key}:proposal`)) {
+    if (deterministicPrimary(committee, epoch, view) === config.validatorAddress && due(`${key}:proposal`)) {
       const result = await prePrepare.propose(state.batch_id);
       if (result.result !== "ACCEPTED") return;
     }
@@ -88,6 +90,7 @@ export function createConsensusRuntime({ config, sourcePool, store, validation, 
           await store.finalizeEpoch(snapshot.quorumCertificate);
         }
       } else if (!registered.has(row.epoch)) {
+        if (!config.validatorSets.resolveForBatchEpoch(row.epoch).validators.includes(config.validatorAddress)) continue;
         const result = await validation.validatePending(row.batch_id);
         if (result.result !== "VALID") continue;
         await store.registerEpoch({ epoch: row.epoch, batchId: result.snapshot.record.batchId, messageRoot: result.snapshot.record.messageRoot });

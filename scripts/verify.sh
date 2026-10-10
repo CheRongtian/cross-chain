@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="PBFT View Change"
+VERIFICATION_NAME="Validator Epoch and Rotation"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -517,6 +517,13 @@ printf ' 97. Require exact delayed NEW_VIEW replay and a verified later-view QC 
 printf ' 98. Verify an existing final QC instead of halting on a concurrent COMMITTED transition\n'
 printf ' 99. Check fourth votes before finality and distinguish final QC recognition from active view\n'
 printf '100. Keep RPC available through validator shutdown and report recovery state before cleanup\n'
+printf '101. Persist append-only validator history and pin batch consensus epochs and committee digests\n'
+printf '102. Verify version-three epoch-bound evidence and preserve original version-one/two signatures\n'
+printf '103. Reject cross-epoch replay, mixed quorums, removed members, and future members\n'
+printf '104. Start five independent validators with two four-member historical committees\n'
+printf '105. Commit real A/B/D with epoch 7 and Message E with epoch 8\n'
+printf '106. Recover rotated-primary failure without changing the pinned validator epoch\n'
+printf '107. Reverify the immutable historical QC after rotation and V1 shutdown\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -567,7 +574,7 @@ node --test \
     "$INDEXER_DIR/test/message-merkle-golden.test.mjs" \
     "$INDEXER_DIR/test/batch-lifecycle-policy.test.mjs"
 
-CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, and lifecycle tests"
+CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, lifecycle, fixed-initial-epoch rollover, and persisted consensus binding tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
@@ -586,9 +593,10 @@ node --test \
     "$VALIDATOR_DIR/test/prepare.test.mjs" \
     "$VALIDATOR_DIR/test/commit.test.mjs" \
     "$VALIDATOR_DIR/test/fault-transport.test.mjs" \
-    "$VALIDATOR_DIR/test/view-change.test.mjs"
+    "$VALIDATOR_DIR/test/view-change.test.mjs" \
+    "$VALIDATOR_DIR/test/validator-sets.test.mjs"
 
-CURRENT_STEP="isolated validator migrations, consistent PREPARE reads, COMMIT locks, and quorum persistence tests"
+CURRENT_STEP="isolated validator migrations, endpoint/history separation, consistent PREPARE reads, COMMIT locks, and quorum persistence tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="${VALIDATOR_VERIFICATION_DATABASE_URL:-$DATABASE_URL}" \
 VALIDATOR_DATABASE_TEST_SCHEMA="cross_chain_validator_database_verification" \
@@ -1217,7 +1225,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source recovery, normal consensus, fault safety, repeated primary failure, and view recovery integration"
+CURRENT_STEP="real source recovery, validator identity-bound recovery, normal consensus, fault safety, view recovery, validator rotation and historical QC integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

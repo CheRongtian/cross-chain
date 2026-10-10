@@ -49,7 +49,7 @@ function lifecycleRecord(row) {
   });
 }
 
-export function createBatchLifecycle({ config, pool, committee = config.peers, afterCertificatePersisted = async () => {} }) {
+export function createBatchLifecycle({ config, pool, committee = config.peers, validatorSets = config.validatorSets, afterCertificatePersisted = async () => {} }) {
   const scope = normalizeSourceScope(config);
   const protocolScope = {
     sourceDomain: BigInt(scope.chainDomain),
@@ -60,21 +60,22 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, a
   const sources = tableName(config.databaseSchema, "source_messages");
   const cursors = tableName(config.databaseSchema, "indexer_cursors");
   const certificates = tableName(config.databaseSchema, "batch_quorum_certificates");
+  const consensusBindings = tableName(config.databaseSchema, "batch_consensus_bindings");
   const certificateSignatures = tableName(config.databaseSchema, "batch_quorum_certificate_signatures");
   const scopeParameters = [scope.chainDomain, scope.sourceGateway];
 
   function certificateOptions(record, certificate) {
-    if (!committee) throw new Error("expected static committee is required to verify a COMMITTED batch");
-    return { peers: committee, expected: expectedCommitStatement({ ...protocolScope, epoch: record.epoch,
+    if (!committee && !validatorSets) throw new Error("expected static committee is required to verify a COMMITTED batch");
+    return { peers: committee ?? validatorSets.history[0].validators.map((address) => ({ address })), validatorSets, expected: expectedCommitStatement({ ...protocolScope, epoch: record.epoch,
       batchId: record.batchId, messageRoot: record.messageRoot,
-      protocolVersion: certificate.protocolVersion, view: certificate.view ?? "0" }, committee) };
+      protocolVersion: certificate.protocolVersion, validatorEpoch: certificate.validatorEpoch, view: certificate.view ?? "0" }, { peers: committee, validatorSets }) };
   }
 
   async function readCertificate(client, record) {
     const rows = (await client.query(`SELECT * FROM ${certificates} WHERE batch_record_id = $1`, [record.batchRecordId])).rows;
     if (rows.length !== 1) throw new Error("COMMITTED batch is missing its persisted QC");
     const q = rows[0];
-    const statement = { protocolVersion: String(q.protocol_version), ...(q.protocol_version === 2 ? { view: q.view } : {}), sourceDomain: q.source_domain,
+    const statement = { protocolVersion: String(q.protocol_version), ...(q.protocol_version >= 2 ? { view: q.view } : {}), ...(q.protocol_version === 3 ? { validatorEpoch: q.validator_epoch } : {}), sourceDomain: q.source_domain,
       sourceGateway: q.source_gateway, epoch: q.epoch, batchId: q.batch_id, messageRoot: q.message_root,
       proposalDigest: q.proposal_digest, committeeDigest: q.committee_digest };
     const signatures = (await client.query(`SELECT * FROM ${certificateSignatures}
@@ -220,13 +221,36 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, a
     if (normalizeBytes32(record.messageRoot, "persisted Message Root") !== tree.messageRoot) {
       throw new Error("persisted sealed Message Root mismatch");
     }
+    // Pending consensus and committed reads use the same persisted binding.
+    // Readers must not infer it from the certificate or the current committee.
+    const bindingRow = (await client.query(
+      `SELECT * FROM ${consensusBindings} WHERE batch_record_id = $1`,
+      [record.batchRecordId],
+    )).rows[0];
+    const consensusBinding = bindingRow ? Object.freeze({
+      protocolVersion: String(bindingRow.protocol_version),
+      validatorEpoch: bindingRow.validator_epoch,
+      committeeDigest: bindingRow.committee_digest,
+    }) : null;
+    if (consensusBinding?.protocolVersion === "3" && validatorSets) {
+      const expected = validatorSets.resolveForBatchEpoch(record.epoch);
+      if (expected.validatorEpoch !== consensusBinding.validatorEpoch ||
+          expected.committeeDigest !== consensusBinding.committeeDigest) {
+        throw new Error("source batch committee binding differs from trusted history");
+      }
+    }
     if (record.status === BATCH_STATUS.COMMITTED) {
       const quorumCertificate = await readCertificate(client, record);
-      return Object.freeze({ record, members: persistedMembers, batch, tree, quorumCertificate });
+      if (quorumCertificate?.protocolVersion === "3" && (!consensusBinding || consensusBinding.protocolVersion !== "3" ||
+        consensusBinding.validatorEpoch !== quorumCertificate.validatorEpoch || consensusBinding.committeeDigest !== quorumCertificate.committeeDigest)) {
+        throw new Error("stored QC differs from the immutable source consensus binding");
+      }
+      if (quorumCertificate && consensusBinding && quorumCertificate.protocolVersion !== consensusBinding.protocolVersion) throw new Error("stored QC protocol differs from the immutable source consensus binding");
+      return Object.freeze({ record, members: persistedMembers, batch, tree, quorumCertificate, consensusBinding });
     }
     const orphan = await client.query(`SELECT batch_record_id FROM ${certificates} WHERE batch_record_id = $1`, [record.batchRecordId]);
     if (orphan.rowCount) throw new Error("persisted QC exists without a COMMITTED batch");
-    return Object.freeze({ record, members: persistedMembers, batch, tree });
+    return Object.freeze({ record, members: persistedMembers, batch, tree, consensusBinding });
   }
 
   async function assign(client, row, sourceMessageIds) {
@@ -277,7 +301,19 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, a
     }
   }
 
+  async function pin(client,row) {
+    if (!validatorSets) throw new Error("trusted validator history is required to pin consensus");
+    if (row.status !== "CONSENSUS_PENDING") throw new Error("only pending batches can begin consensus");
+    const set = validatorSets.resolveForBatchEpoch(row.epoch);
+    await client.query(`INSERT INTO ${consensusBindings} (batch_record_id,protocol_version,validator_epoch,committee_digest)
+      VALUES ($1,3,$2,$3) ON CONFLICT DO NOTHING`,[row.batch_record_id,set.validatorEpoch,set.committeeDigest]);
+    const existing = (await client.query(`SELECT * FROM ${consensusBindings} WHERE batch_record_id = $1`,[row.batch_record_id])).rows[0];
+    if (existing.protocol_version !== 3 || existing.validator_epoch !== set.validatorEpoch || existing.committee_digest !== set.committeeDigest) throw new Error("conflicting source batch consensus binding");
+  }
   return {
+    async pinConsensus({ batchRecordId }) {
+      return transaction(async (client) => { const row = await readRecord(client,batchRecordId); await pin(client,row); return snapshot(client,row); });
+    },
     async commitWithCertificate({ certificate }) {
       const id = normalizeBytes32(certificate?.batchId, "QC batch ID");
       return transaction(async (client) => {
@@ -289,6 +325,8 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, a
           throw new QuorumCertificateError("QC_REQUIRES_PENDING_BATCH");
         }
         const existing = await snapshot(client, row);
+        if (existing.consensusBinding && existing.consensusBinding.protocolVersion !== certificate.protocolVersion) throw new QuorumCertificateError("WRONG_CONSENSUS_BINDING");
+        if (certificate.protocolVersion === "3" && (!existing.consensusBinding || existing.consensusBinding.validatorEpoch !== certificate.validatorEpoch || existing.consensusBinding.committeeDigest !== certificate.committeeDigest)) throw new QuorumCertificateError("WRONG_CONSENSUS_BINDING");
         const verified = await verifyQuorumCertificate(certificate, certificateOptions(existing.record, certificate));
         if (row.status === BATCH_STATUS.COMMITTED) {
           // Different views can certify the same immutable batch. Preserve the first final QC.
@@ -296,10 +334,10 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, a
         }
         await client.query(`INSERT INTO ${certificates}
           (batch_record_id, protocol_version, source_domain, source_gateway, epoch, batch_id,
-           message_root, proposal_digest, committee_digest, qc_digest, view)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+           message_root, proposal_digest, committee_digest, qc_digest, view, validator_epoch)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
         [row.batch_record_id, Number(verified.protocolVersion), verified.sourceDomain, verified.sourceGateway,
-          verified.epoch, verified.batchId, verified.messageRoot, verified.proposalDigest, verified.committeeDigest, verified.qcDigest, verified.view ?? "0"]);
+          verified.epoch, verified.batchId, verified.messageRoot, verified.proposalDigest, verified.committeeDigest, verified.qcDigest, verified.view ?? "0", verified.validatorEpoch ?? null]);
         for (const vote of verified.commits) {
           await client.query(`INSERT INTO ${certificateSignatures}
             (batch_record_id, voter_identity, commit_digest, signature) VALUES ($1,$2,$3,$4)`,
@@ -397,6 +435,7 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, a
         validateBatchTransition(row.status, BATCH_STATUS.CONSENSUS_PENDING);
         const existing = await snapshot(client, row);
         if (row.status === BATCH_STATUS.CONSENSUS_PENDING) {
+          if (validatorSets) { await pin(client,row); return snapshot(client,row); }
           return existing;
         }
         const updated = await client.query(
@@ -407,6 +446,7 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, a
         if (updated.rowCount !== 1) {
           throw new Error("consensus-pending transition did not update exactly one SEALED record");
         }
+        if (validatorSets) await pin(client,updated.rows[0]);
         return snapshot(client, updated.rows[0]);
       });
     },

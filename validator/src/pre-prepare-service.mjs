@@ -1,13 +1,14 @@
+import { consensusBinding, consensusPeers } from "./validator-sets.mjs";
 import { CONSENSUS_VERSION } from "./protocol.mjs";
 import { normalizeBytes32 } from "../../indexer/src/canonical-message.mjs";
-import { canonicalCommittee, deterministicPrimary, protocolInteger } from "./committee.mjs";
+import { deterministicPrimary, protocolInteger } from "./committee.mjs";
 import { connectPeer } from "./handshake.mjs";
 import { authenticatePrePrepare, normalizePrePrepare, PrePrepareError, signPrePrepare } from "./pre-prepare.mjs";
 
 const SOURCE_REASONS = { BATCH_NOT_FOUND: "UNKNOWN_BATCH", BATCH_STATUS: "INVALID_LIFECYCLE" };
 
 export async function broadcastPrePrepare(config, envelope, { fetchImplementation = fetch, authenticatePeer = connectPeer } = {}) {
-  return Promise.all(config.peers.filter((peer) => peer.address !== config.validatorAddress).map(async (peer) => {
+  return Promise.all(consensusPeers(config, envelope).filter((peer) => peer.address !== config.validatorAddress).map(async (peer) => {
     try {
       await authenticatePeer(config, peer.address, fetchImplementation);
       const response = await fetchImplementation(`${peer.url}/pbft/pre-prepare`, {
@@ -43,7 +44,8 @@ export function createPrePrepareService({ config, validation, store, broadcast =
   return {
     primary(epoch, view = "0") {
       return { validatorAddress: config.validatorAddress, epoch: protocolInteger(epoch).toString(), view: protocolInteger(view, "view").toString(),
-        committee: canonicalCommittee(config.peers), primaryIdentity: deterministicPrimary(config.peers, epoch, view) };
+        ...consensusBinding(config, epoch), committee: config.validatorSets.resolveForBatchEpoch(epoch).validators,
+        primaryIdentity: deterministicPrimary(config.validatorSets.resolveForBatchEpoch(epoch).validators, epoch, view) };
     },
     async propose(batchId) {
       let envelope;
@@ -54,10 +56,15 @@ export function createPrePrepareService({ config, validation, store, broadcast =
         const snapshot = await validatePending(id);
         const view = store.currentView ? await store.currentView(snapshot.record.epoch.toString()) : "0";
         if (store.checkActive) await store.checkActive(snapshot.record.epoch.toString(), view, PrePrepareError);
-        const proposal = normalizePrePrepare({ messageType: "PRE_PREPARE", protocolVersion: CONSENSUS_VERSION, view,
+        const old = await store.readPrePrepare(snapshot.record.epoch.toString(), view);
+        const states = store.readViewStates ? await store.readViewStates() : [];
+        const legacy = states.find((state) => state.epoch === snapshot.record.epoch.toString())?.protocol_version === 2;
+        const version = old?.envelope.protocolVersion ?? (legacy ? "2" : CONSENSUS_VERSION);
+        const proposal = normalizePrePrepare({ messageType: "PRE_PREPARE", protocolVersion: version, view,
+          ...(version === "3" ? consensusBinding(config, snapshot.record.epoch) : {}),
           sourceDomain: config.chainDomain, sourceGateway: config.sourceGateway, epoch: snapshot.record.epoch,
           batchId: snapshot.batch.batchId, messageRoot: snapshot.tree.messageRoot,
-          primaryIdentity: deterministicPrimary(config.peers, snapshot.record.epoch, view) });
+          primaryIdentity: deterministicPrimary(version === "3" ? config.validatorSets.resolveForBatchEpoch(snapshot.record.epoch).validators : config.validatorSets.history[0].validators, snapshot.record.epoch, view) });
         evidence = proposal;
         if (proposal.primaryIdentity !== config.validatorAddress) throw new PrePrepareError("WRONG_PRIMARY");
         const previous = await store.readPrePrepare(proposal.epoch, proposal.view);

@@ -1,6 +1,7 @@
 import { createServer } from "node:http";
 import { normalizeAddress, normalizeBytes32 } from "../../indexer/src/canonical-message.mjs";
 import { connectPeer, signHandshake } from "./handshake.mjs";
+import { envelopeFields } from "./protocol.mjs";
 import { publicIdentity } from "./identity.mjs";
 import { PRE_PREPARE_ENVELOPE_FIELDS } from "./pre-prepare.mjs";
 import { PREPARE_ENVELOPE_FIELDS } from "./prepare.mjs";
@@ -26,7 +27,7 @@ async function readBody(request, keys, optional = []) {
   }
   let body;
   try { body = JSON.parse(Buffer.concat(chunks).toString("utf8")); } catch { throw new InputError("malformed JSON"); }
-  const expectedKeys = body?.protocolVersion === "1" ? keys.filter((field) => field !== "view") : keys;
+  const expectedKeys = envelopeFields(keys, body?.protocolVersion, { hasCommittee: keys === COMMIT_ENVELOPE_FIELDS || keys === QC_FIELDS });
   if (!body || typeof body !== "object" || Array.isArray(body) ||
       expectedKeys.some((field) => !Object.hasOwn(body, field)) ||
       Object.keys(body).some((field) => !expectedKeys.includes(field) && !optional.includes(field))) {
@@ -58,6 +59,12 @@ export function createValidatorServer({ config, service, store, prePrepare, prep
       if (request.method === "GET" && request.url === "/pbft/prepares") return send(200, await prepare.list());
       if (request.method === "GET" && request.url === "/pbft/commits") return send(200, await commit.list());
       if (request.method === "GET" && request.url === "/pbft/views") return send(200, { states: await store.readViewStates() });
+      if (request.method === "GET" && request.url === "/validator-sets") return send(200, { history: config.validatorSets.history });
+      if (request.method === "POST" && request.url === "/pbft/qc/verify") {
+        const body = await readBody(request, QC_FIELDS);
+        const result = await commit.verify(body);
+        return send(result.result === "ACCEPTED" ? 200 : 422, result);
+      }
       if (request.method === "POST" && request.url === "/pbft/view-change") {
         const body = await readBody(request, VIEW_CHANGE_FIELDS);
         const result = await viewChange.receiveViewChange(body);

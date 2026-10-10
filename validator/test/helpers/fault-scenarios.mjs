@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { recoverMessageAddress } from "viem";
+import { committeeDigest } from "../../src/committee.mjs";
+import { createValidatorSetResolver } from "../../src/validator-sets.mjs";
 import { validatorAccount } from "../../src/identity.mjs";
 import { deterministicPrimary } from "../../src/committee.mjs";
 import { prePrepareDigest } from "../../src/pre-prepare.mjs";
@@ -58,7 +60,8 @@ export async function createScenario({ name, epoch, sourceConfig, template, orph
         targetUrl: peers[to].url, gate, signal: processes.signal });
       peerProxies.push(proxy); links[from].set(to, proxy);
     }
-    const lifecycle = createBatchLifecycle({ config, pool: sourcePool, committee: peers });
+    const validatorSets = createValidatorSetResolver([{ validatorEpoch: "0", activationBatchEpoch: "0", validators: peers.map((peer) => peer.address), committeeDigest: committeeDigest(peers) }]);
+    const lifecycle = createBatchLifecycle({ config, pool: sourcePool, committee: peers, validatorSets });
     const building = await lifecycle.getOrCreateBuilding({ initialEpoch: epoch });
     await lifecycle.assignMessages({ batchRecordId: building.record.batchRecordId, sourceMessageIds: selected.map((row) => row.id) });
     await lifecycle.sealBatch({ batchRecordId: building.record.batchRecordId });
@@ -68,6 +71,7 @@ export async function createScenario({ name, epoch, sourceConfig, template, orph
     const before = await sourceState(sourcePool, config.databaseSchema);
     const environments = peers.map((peer, index) => ({
       VALIDATOR_PRIVATE_KEY: keys[index], VALIDATOR_LISTEN_HOST: "127.0.0.1", VALIDATOR_LISTEN_PORT: String(reservations[index].port),
+      VALIDATOR_SET_HISTORY_FILE: "", VALIDATOR_SET_HISTORY: JSON.stringify(validatorSets.history),
       VALIDATOR_PEERS: JSON.stringify(peers.map((entry, other) => ({ address: entry.address,
         url: index === other ? entry.url : links[index].get(other).url })).reverse()),
       VALIDATOR_DATABASE_URL: process.env.VALIDATOR_VERIFICATION_DATABASE_URL || config.databaseUrl,
@@ -87,7 +91,7 @@ export async function createScenario({ name, epoch, sourceConfig, template, orph
     assert.ok(primary >= 0);
     const backups = peers.map((_peer, index) => index).filter((index) => index !== primary);
     const statement = expectedCommitStatement({ sourceDomain: config.chainDomain, sourceGateway: config.sourceGateway,
-      epoch, batchId: pending.record.batchId, messageRoot: pending.record.messageRoot }, peers);
+      epoch, ...pending.consensusBinding, batchId: pending.record.batchId, messageRoot: pending.record.messageRoot }, peers, validatorSets);
     const options = { peers, expected: statement };
     async function request(index, route, body) { return processes.request(peers[index].url, route, body); }
     async function send(from, to, route, body) { return processes.request(links[from].get(to).url, route, body); }
@@ -174,7 +178,7 @@ export async function createScenario({ name, epoch, sourceConfig, template, orph
     }
     async function assertSource(committed, conflictingRoot) {
       const after = await sourceState(sourcePool, config.databaseSchema);
-      for (const name of ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batch_members"]) {
+      for (const name of ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batch_members", "batch_consensus_bindings"]) {
         assert.deepEqual(after[name], before[name]);
       }
       assert.deepEqual(after.message_batches.map((row) => committed && row.batch_record_id === pending.record.batchRecordId
@@ -194,7 +198,7 @@ export async function createScenario({ name, epoch, sourceConfig, template, orph
     await assertAlive([0, 1, 2, 3]);
     console.log(`Fault scenario: ${name}; epoch=${epoch}; primary=${peers[primary].address}; real finalized A/B/D reconstructed`);
     return { config, sourcePool, lifecycle, pending, peers, keys, states, validators, environments, gate, links, peerProxies,
-      primary, backups, statement, options, request, send, stop, restart, assertAlive, propose, cast, assertPrepared, finish, assertSource, close };
+      primary, backups, statement, options, validatorSets, request, send, stop, restart, assertAlive, propose, cast, assertPrepared, finish, assertSource, close };
   } catch (error) { await close(); throw error; }
 }
 
@@ -241,7 +245,7 @@ async function byzantineBackup(ctx) {
   const rootB = `0x${(BigInt(ctx.statement.messageRoot) ^ 1n).toString(16).padStart(64, "0")}`;
   assert.notEqual(rootB, ctx.statement.messageRoot);
   const badStatement = expectedCommitStatement({ ...ctx.statement, messageRoot: rootB, proposalDigest: undefined }, ctx.peers);
-  const proposal = await signAdversarial(ctx, adversary, { messageType: "PRE_PREPARE", protocolVersion: "2", view: "0",
+  const proposal = await signAdversarial(ctx, adversary, { messageType: "PRE_PREPARE", protocolVersion: "3", view: "0", validatorEpoch: ctx.statement.validatorEpoch, committeeDigest: ctx.statement.committeeDigest,
     sourceDomain: ctx.statement.sourceDomain, sourceGateway: ctx.statement.sourceGateway, epoch: ctx.statement.epoch,
     batchId: ctx.statement.batchId, messageRoot: rootB, primaryIdentity: ctx.peers[adversary].address }, prePrepareDigest);
   for (const index of honest) {
@@ -250,7 +254,8 @@ async function byzantineBackup(ctx) {
   }
   await ctx.propose([0, 1, 2, 3]);
   const acceptedBefore = await Promise.all(ctx.states.map((state) => state.store.readPrePrepares()));
-  const badPrepare = await signAdversarial(ctx, adversary, { messageType: "PREPARE", protocolVersion: "2", view: "0",
+  const badPrepare = await signAdversarial(ctx, adversary, { messageType: "PREPARE", protocolVersion: "3", view: "0",
+    validatorEpoch: ctx.statement.validatorEpoch,committeeDigest: ctx.statement.committeeDigest,
     sourceDomain: badStatement.sourceDomain, sourceGateway: badStatement.sourceGateway, epoch: badStatement.epoch,
     batchId: badStatement.batchId, messageRoot: rootB, proposalDigest: badStatement.proposalDigest,
     voterIdentity: ctx.peers[adversary].address }, prepareDigest);
@@ -365,7 +370,8 @@ async function primaryCrash(ctx) {
     for (const route of ["/set-view", "/set-primary"]) assert.equal((await ctx.request(index, route, {})).status, 404);
   }
   const claimed = ctx.backups[0];
-  const envelope = await signAdversarial(ctx, claimed, { messageType: "PRE_PREPARE", protocolVersion: "2", view: "0",
+  const envelope = await signAdversarial(ctx, claimed, { messageType: "PRE_PREPARE", protocolVersion: "3", view: "0",
+    validatorEpoch: ctx.statement.validatorEpoch,committeeDigest: ctx.statement.committeeDigest,
     sourceDomain: ctx.statement.sourceDomain, sourceGateway: ctx.statement.sourceGateway, epoch: ctx.statement.epoch,
     batchId: ctx.statement.batchId, messageRoot: ctx.statement.messageRoot, primaryIdentity: ctx.peers[claimed].address }, prePrepareDigest);
   const response = await ctx.send(claimed, ctx.backups[1], "/pbft/pre-prepare", envelope);

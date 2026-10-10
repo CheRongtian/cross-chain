@@ -20,8 +20,8 @@ function primaryConfig(epoch) {
   return configs.find((config) => config.validatorAddress === deterministicPrimary(config.peers, epoch));
 }
 function fields(snapshot, overrides = {}) {
-  return { messageType: "PRE_PREPARE", protocolVersion: "2", view: "0", sourceDomain: snapshot.record.sourceDomain.toString(),
-    sourceGateway: snapshot.record.sourceGateway, epoch: snapshot.record.epoch.toString(),
+  return { messageType: "PRE_PREPARE", protocolVersion: "3", view: "0", sourceDomain: snapshot.record.sourceDomain.toString(),
+    ...snapshot.consensusBinding, sourceGateway: snapshot.record.sourceGateway, epoch: snapshot.record.epoch.toString(),
     batchId: snapshot.record.batchId, messageRoot: snapshot.record.messageRoot,
     primaryIdentity: primaryConfig(snapshot.record.epoch).validatorAddress, ...overrides };
 }
@@ -87,7 +87,7 @@ test("canonical ABI digest is deterministic, domain-separated, and binds every p
   const digest = prePrepareDigest(p);
   assert.equal(prePrepareDigest(Object.fromEntries(Object.entries(p).reverse())), digest);
   assert.equal(prePrepareDigest({ ...p, epoch: BigInt(p.epoch), sourceDomain: BigInt(p.sourceDomain) }), digest);
-  for (const mutation of [{ protocolVersion: "3" }, { sourceDomain: "2" },
+  for (const mutation of [{ protocolVersion: "4" }, { sourceDomain: "2" },
     { sourceGateway: "0x0000000000000000000000000000000000000099" }, { epoch: (BigInt(p.epoch) + 1n).toString() },
     { batchId: bytes("ab") }, { messageRoot: bytes("bc") }, { primaryIdentity: configs.find((c) => c.validatorAddress !== p.primaryIdentity).validatorAddress }]) {
     assert.notEqual(prePrepareDigest({ ...p, ...mutation }), digest);
@@ -106,7 +106,7 @@ test("authentication requires the exact primary, context, digest, and valid reco
   const signer = primaryConfig(p.epoch);
   const envelope = await signPrePrepare(signer, p);
   assert.equal((await authenticatePrePrepare(configs[0], envelope)).proposalDigest, envelope.proposalDigest);
-  for (const mutation of [{ protocolVersion: "3" }, { sourceDomain: "2" },
+  for (const mutation of [{ protocolVersion: "4" }, { sourceDomain: "2" },
     { sourceGateway: "0x0000000000000000000000000000000000000099" }, { epoch: (BigInt(p.epoch) + 1n).toString() },
     { batchId: bytes("ab") }, { messageRoot: bytes("bc") },
     { primaryIdentity: configs.find((config) => config !== signer).validatorAddress }]) {
@@ -126,7 +126,7 @@ test("authentication requires the exact primary, context, digest, and valid reco
   for (const mutation of [{ messageRoot: bytes("ee") }, { epoch: (BigInt(p.epoch) + 1n).toString() }, { proposalDigest: bytes("ee") }]) {
     await assert.rejects(authenticatePrePrepare(configs[0], { ...envelope, ...mutation }), { code: "INVALID_DIGEST" });
   }
-  await assert.rejects(authenticatePrePrepare(configs[0], await rawSigned({ ...p, protocolVersion: "3" })), { code: "WRONG_VERSION" });
+  await assert.rejects(authenticatePrePrepare(configs[0], await rawSigned({ ...p, protocolVersion: "4" })), { code: "WRONG_VERSION" });
   for (const mutation of [{ sourceDomain: "2" }, { sourceGateway: "0x0000000000000000000000000000000000000099" }]) {
     await assert.rejects(authenticatePrePrepare(configs[0], await rawSigned({ ...p, ...mutation })), { code: "WRONG_CONTEXT" });
   }

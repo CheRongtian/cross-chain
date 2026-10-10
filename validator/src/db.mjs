@@ -3,7 +3,9 @@ import { isDeepStrictEqual } from "node:util";
 import pg from "pg";
 import { tableName } from "../../indexer/src/db.mjs";
 import { validateSchemaName } from "../../indexer/src/config.mjs";
-import { canonicalCommittee, committeeDigest, protocolInteger } from "./committee.mjs";
+import { consensusBinding } from "./validator-sets.mjs";
+import { validatorFields } from "./protocol.mjs";
+import { protocolInteger } from "./committee.mjs";
 import { authenticatePrePrepare, PrePrepareError } from "./pre-prepare.mjs";
 import { authenticatePrepare, PrepareError, signPrepare } from "./prepare.mjs";
 import { normalizeAddress } from "../../indexer/src/canonical-message.mjs";
@@ -26,7 +28,13 @@ export async function applyValidatorMigrations(pool, schema) {
     await client.query("BEGIN");
     await client.query(`CREATE SCHEMA IF NOT EXISTS ${identifier}`);
     await client.query(`SET LOCAL search_path TO ${identifier}`);
-    for (const sql of migrations) await client.query(sql);
+    await client.query("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)");
+    await client.query("LOCK TABLE schema_migrations IN EXCLUSIVE MODE");
+    for (let index = 0; index < migrations.length; index++) {
+      if ((await client.query("SELECT name FROM schema_migrations WHERE name = $1", [names[index]])).rowCount) continue;
+      await client.query(migrations[index]);
+      await client.query("INSERT INTO schema_migrations (name) VALUES ($1)", [names[index]]);
+    }
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -50,7 +58,9 @@ export function createValidatorStore({ pool, config }) {
   const epochViews = tableName(config.databaseSchema, "pbft_epoch_views");
   const viewVotes = tableName(config.databaseSchema, "pbft_view_change_votes");
   const newViews = tableName(config.databaseSchema, "pbft_new_views");
-  const expectedCommittee = canonicalCommittee(config.peers);
+  const expectedCommittee = config.validatorSets.history[0].validators;
+  const historyTable = tableName(config.databaseSchema, "validator_set_history");
+  const protocolConfig = { ...config, allowHistorical: true };
   const expectedIdentity = {
     validator_address: config.validatorAddress,
     source_domain: config.chainDomain.toString(),
@@ -69,13 +79,19 @@ export function createValidatorStore({ pool, config }) {
     checkIdentity((await client.query(`SELECT * FROM ${metadata} WHERE singleton = true ${lock}`)).rows[0]);
     const row = (await client.query(`SELECT addresses FROM ${committee} WHERE singleton = true`)).rows[0];
     if (!row || !isDeepStrictEqual(row.addresses, expectedCommittee)) throw new Error("validator committee mismatch");
+    const history = (await client.query(`SELECT * FROM ${historyTable} ORDER BY validator_epoch`)).rows;
+    if (history.length !== config.validatorSets.history.length || history.some((row,index) => {
+      const set = config.validatorSets.history[index];
+      return row.validator_epoch !== set.validatorEpoch || row.activation_batch_epoch !== set.activationBatchEpoch ||
+        row.committee_digest !== set.committeeDigest || !isDeepStrictEqual(row.validators,set.validators);
+    })) throw new Error("validator set history conflicts with trusted configuration");
   }
 
   function proposalRecord(row) {
     if (!row) return null;
     return { validatorAddress: row.local_validator_identity, direction: row.direction, status: row.status,
       acceptedAt: row.accepted_at.toISOString(), envelope: {
-        messageType: "PRE_PREPARE", protocolVersion: String(row.protocol_version), ...(row.protocol_version === 2 ? { view: row.view } : {}), sourceDomain: config.chainDomain.toString(),
+        messageType: "PRE_PREPARE", protocolVersion: String(row.protocol_version), ...(row.protocol_version >= 2 ? { view: row.view } : {}), ...validatorFields({ protocolVersion: String(row.protocol_version), validatorEpoch: row.validator_epoch, committeeDigest: row.committee_digest }), sourceDomain: config.chainDomain.toString(),
         sourceGateway: config.sourceGateway, epoch: row.epoch, batchId: row.batch_id, messageRoot: row.message_root,
         primaryIdentity: row.primary_identity, proposalDigest: row.proposal_digest, signature: row.primary_signature,
       } };
@@ -84,7 +100,7 @@ export function createValidatorStore({ pool, config }) {
   function prepareVoteRecord(row) {
     if (!row) return null;
     return {
-      messageType: "PREPARE", protocolVersion: String(row.protocol_version), ...(row.protocol_version === 2 ? { view: row.view } : {}), sourceDomain: row.source_domain,
+      messageType: "PREPARE", protocolVersion: String(row.protocol_version), ...(row.protocol_version >= 2 ? { view: row.view } : {}), ...validatorFields({ protocolVersion: String(row.protocol_version), validatorEpoch: row.validator_epoch, committeeDigest: row.committee_digest }), sourceDomain: row.source_domain,
       sourceGateway: row.source_gateway, epoch: row.epoch, batchId: row.batch_id,
       messageRoot: row.message_root, proposalDigest: row.proposal_digest,
       voterIdentity: row.voter_identity, prepareDigest: row.prepare_digest,
@@ -94,7 +110,8 @@ export function createValidatorStore({ pool, config }) {
 
   function preparedRecord(row) {
     if (!row) return null;
-    return { validatorAddress: row.local_validator_identity, epoch: row.epoch, view: row.view, batchId: row.batch_id,
+    return { validatorAddress: row.local_validator_identity, epoch: row.epoch, view: row.view,
+      ...validatorFields({ protocolVersion: String(row.protocol_version), validatorEpoch: row.validator_epoch, committeeDigest: row.committee_digest }), batchId: row.batch_id,
       messageRoot: row.message_root, proposalDigest: row.proposal_digest,
       quorumVoters: row.quorum_voters, preparedAt: row.prepared_at.toISOString() };
   }
@@ -105,15 +122,15 @@ export function createValidatorStore({ pool, config }) {
     if (voterIdentity !== undefined) {
       const voter = normalizeAddress(voterIdentity);
       vote = prepareVoteRecord((await client.query(`SELECT * FROM ${prepareVotes}
-        WHERE local_validator_identity = $1 AND epoch = $2 AND voter_identity = $3 AND view = $4 AND protocol_version = 2`,
+        WHERE local_validator_identity = $1 AND epoch = $2 AND voter_identity = $3 AND view = $4 AND protocol_version IN (2,3)`,
       [config.validatorAddress, normalizedEpoch, voter, view])).rows[0]);
       if (!vote) return null;
     }
     const votes = (await client.query(`SELECT * FROM ${prepareVotes}
-      WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 2 ORDER BY voter_identity`,
+      WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (2,3) ORDER BY voter_identity`,
     [config.validatorAddress, normalizedEpoch, view])).rows.map(prepareVoteRecord);
     const prepared = preparedRecord((await client.query(`SELECT * FROM ${preparedStates}
-      WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 2`,
+      WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (2,3)`,
     [config.validatorAddress, normalizedEpoch, view])).rows[0]);
     if (prepared) {
       const quorumVoters = prepared.quorumVoters;
@@ -130,16 +147,16 @@ export function createValidatorStore({ pool, config }) {
 
   async function requirePrepared(client, epoch, view = "0") {
     const accepted = proposalRecord((await client.query(`SELECT * FROM ${prepares}
-      WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 2`, [config.validatorAddress, epoch, view])).rows[0]);
+      WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (2,3)`, [config.validatorAddress, epoch, view])).rows[0]);
     if (!accepted) throw new CommitError("NOT_PREPARED");
-    await authenticatePrePrepare(config, accepted.envelope);
+    await authenticatePrePrepare(protocolConfig, accepted.envelope);
     const state = await prepareResult(client, epoch, undefined, view);
     if (!state.prepared) throw new CommitError("NOT_PREPARED");
-    const statement = expectedCommitStatement(accepted.envelope, config.peers);
+    const statement = expectedCommitStatement(accepted.envelope, config);
     if (state.prepared.batchId !== statement.batchId || state.prepared.messageRoot !== statement.messageRoot ||
         state.prepared.proposalDigest !== statement.proposalDigest) throw new CommitError("WRONG_PREPARED_PROPOSAL");
     for (const vote of state.votes) {
-      const verified = await authenticatePrepare(config, vote);
+      const verified = await authenticatePrepare(protocolConfig, vote);
       if (["epoch", "view", "batchId", "messageRoot", "proposalDigest"].some((field) => verified[field] !== statement[field])) {
         throw new CommitError("WRONG_PREPARED_PROPOSAL");
       }
@@ -148,7 +165,7 @@ export function createValidatorStore({ pool, config }) {
   }
 
   function commitVoteRecord(row) {
-    return { messageType: "COMMIT", protocolVersion: String(row.protocol_version), ...(row.protocol_version === 2 ? { view: row.view } : {}), sourceDomain: row.source_domain,
+    return { messageType: "COMMIT", protocolVersion: String(row.protocol_version), ...(row.protocol_version >= 2 ? { view: row.view } : {}), ...validatorFields({ protocolVersion: String(row.protocol_version), validatorEpoch: row.validator_epoch, committeeDigest: row.committee_digest }), sourceDomain: row.source_domain,
       sourceGateway: row.source_gateway, epoch: row.epoch, batchId: row.batch_id,
       messageRoot: row.message_root, proposalDigest: row.proposal_digest, committeeDigest: row.committee_digest,
       voterIdentity: row.voter_identity, commitDigest: row.commit_digest, signature: row.voter_signature };
@@ -156,10 +173,10 @@ export function createValidatorStore({ pool, config }) {
 
   async function commitResult(client, epoch, view = "0") {
     const rows = (await client.query(`SELECT * FROM ${commitVotes}
-      WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 2 ORDER BY voter_identity`, [config.validatorAddress, epoch, view])).rows;
-    const votes = await Promise.all(rows.map((row) => authenticateCommit(config, commitVoteRecord(row))));
+      WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (2,3) ORDER BY voter_identity`, [config.validatorAddress, epoch, view])).rows;
+    const votes = await Promise.all(rows.map((row) => authenticateCommit(protocolConfig, commitVoteRecord(row))));
     const row = (await client.query(`SELECT * FROM ${commitQuorums}
-      WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 2`, [config.validatorAddress, epoch, view])).rows[0];
+      WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (2,3)`, [config.validatorAddress, epoch, view])).rows[0];
     let quorum = null;
     let certificate = null;
     if (votes.length || row) {
@@ -176,7 +193,7 @@ export function createValidatorStore({ pool, config }) {
             row.batch_id !== statement.batchId || row.message_root !== statement.messageRoot ||
             row.proposal_digest !== statement.proposalDigest) throw new Error("invalid persisted COMMIT quorum");
         certificate = await buildQuorumCertificate(votes.filter((vote) => voters.includes(vote.voterIdentity)),
-          { peers: config.peers, expected: statement });
+          { peers: config.peers, validatorSets: config.validatorSets, expected: statement });
         quorum = { validatorAddress: config.validatorAddress, status: "COMMIT_QUORUM", ...statement,
           qcDigest: row.qc_digest, quorumVoters: voters, reachedAt: row.reached_at.toISOString() };
       }
@@ -188,11 +205,11 @@ export function createValidatorStore({ pool, config }) {
     await assertActive(client, vote.epoch, vote.view, CommitError);
     const statement = await requirePrepared(client, vote.epoch, vote.view);
     const existing = (await client.query(`SELECT * FROM ${commitVotes}
-      WHERE local_validator_identity = $1 AND epoch = $2 AND voter_identity = $3 AND view = $4 AND protocol_version = 2`,
+      WHERE local_validator_identity = $1 AND epoch = $2 AND voter_identity = $3 AND view = $4 AND protocol_version IN (2,3)`,
     [config.validatorAddress, vote.epoch, vote.voterIdentity, vote.view])).rows[0];
     if (existing && existing.commit_digest !== vote.commitDigest) throw new CommitError("CONFLICTING_COMMIT");
     const mismatchReasons = { protocolVersion: "WRONG_VERSION", sourceDomain: "WRONG_CONTEXT",
-      sourceGateway: "WRONG_CONTEXT", epoch: "WRONG_EPOCH", view: "WRONG_VIEW", batchId: "WRONG_BATCH_ID",
+      sourceGateway: "WRONG_CONTEXT", epoch: "WRONG_EPOCH", view: "WRONG_VIEW", validatorEpoch: "WRONG_VALIDATOR_EPOCH", batchId: "WRONG_BATCH_ID",
       messageRoot: "WRONG_ROOT", proposalDigest: "WRONG_PROPOSAL", committeeDigest: "WRONG_COMMITTEE" };
     for (const field of COMMIT_STATEMENT_FIELDS) {
       if (vote[field] !== statement[field]) throw new CommitError(mismatchReasons[field]);
@@ -200,20 +217,20 @@ export function createValidatorStore({ pool, config }) {
     if (!existing) {
       await client.query(`INSERT INTO ${commitVotes}
         (local_validator_identity, voter_identity, epoch, source_domain, source_gateway, batch_id, message_root,
-         proposal_digest, committee_digest, commit_digest, voter_signature, view, protocol_version)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,2)`,
+         proposal_digest, committee_digest, commit_digest, voter_signature, view, protocol_version, validator_epoch)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
       [config.validatorAddress, vote.voterIdentity, vote.epoch, vote.sourceDomain, vote.sourceGateway, vote.batchId,
-        vote.messageRoot, vote.proposalDigest, vote.committeeDigest, vote.commitDigest, vote.signature, vote.view]);
+        vote.messageRoot, vote.proposalDigest, vote.committeeDigest, vote.commitDigest, vote.signature, vote.view, Number(vote.protocolVersion), vote.validatorEpoch ?? null]);
       await progress(client, vote.epoch);
     }
     const voters = (await client.query(`SELECT voter_identity FROM ${commitVotes}
-      WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 2 ORDER BY voter_identity`, [config.validatorAddress, vote.epoch, vote.view])).rows;
+      WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (2,3) ORDER BY voter_identity`, [config.validatorAddress, vote.epoch, vote.view])).rows;
     if (voters.length >= 3) {
       await client.query(`INSERT INTO ${commitQuorums}
-        (local_validator_identity, epoch, batch_id, message_root, proposal_digest, committee_digest, qc_digest, quorum_voters, view, protocol_version)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,2) ON CONFLICT (local_validator_identity, epoch, view, protocol_version) DO NOTHING`,
+        (local_validator_identity, epoch, batch_id, message_root, proposal_digest, committee_digest, qc_digest, quorum_voters, view, protocol_version,validator_epoch)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11) ON CONFLICT (local_validator_identity, epoch, view, protocol_version) DO NOTHING`,
       [config.validatorAddress, vote.epoch, vote.batchId, vote.messageRoot, vote.proposalDigest,
-        committeeDigest(config.peers), qcDigest(statement), JSON.stringify(voters.slice(0, 3).map((entry) => entry.voter_identity)), vote.view]);
+        vote.committeeDigest, qcDigest(statement), JSON.stringify(voters.slice(0, 3).map((entry) => entry.voter_identity)), vote.view, Number(vote.protocolVersion), vote.validatorEpoch ?? null]);
     }
     return commitResult(client, vote.epoch, vote.view);
   }
@@ -235,37 +252,37 @@ export function createValidatorStore({ pool, config }) {
   async function persistPrepare(client, vote) {
         await assertActive(client, vote.epoch, vote.view, PrepareError);
         const accepted = (await client.query(`SELECT * FROM ${prepares}
-          WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 2 FOR UPDATE`,
+          WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (2,3) FOR UPDATE`,
         [config.validatorAddress, vote.epoch, vote.view])).rows[0];
         if (!accepted) throw new PrepareError("PRE_PREPARE_REQUIRED");
         if (accepted.batch_id !== vote.batchId) throw new PrepareError("WRONG_BATCH_ID");
         if (accepted.message_root !== vote.messageRoot) throw new PrepareError("WRONG_ROOT");
         if (accepted.proposal_digest !== vote.proposalDigest) throw new PrepareError("WRONG_PROPOSAL");
         const existing = (await client.query(`SELECT * FROM ${prepareVotes}
-          WHERE local_validator_identity = $1 AND epoch = $2 AND voter_identity = $3 AND view = $4 AND protocol_version = 2 FOR UPDATE`,
+          WHERE local_validator_identity = $1 AND epoch = $2 AND voter_identity = $3 AND view = $4 AND protocol_version IN (2,3) FOR UPDATE`,
         [config.validatorAddress, vote.epoch, vote.voterIdentity, vote.view])).rows[0];
         if (existing && existing.prepare_digest !== vote.prepareDigest) throw new PrepareError("CONFLICTING_PREPARE");
         if (!existing) {
           await client.query(`INSERT INTO ${prepareVotes}
             (local_validator_identity, voter_identity, epoch, source_domain, source_gateway, batch_id,
-             message_root, proposal_digest, prepare_digest, voter_signature, view, protocol_version)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 2)`,
+             message_root, proposal_digest, prepare_digest, voter_signature, view, protocol_version, validator_epoch,committee_digest)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,$13,$14)`,
           [config.validatorAddress, vote.voterIdentity, vote.epoch, vote.sourceDomain, vote.sourceGateway,
-            vote.batchId, vote.messageRoot, vote.proposalDigest, vote.prepareDigest, vote.signature, vote.view]);
+            vote.batchId, vote.messageRoot, vote.proposalDigest, vote.prepareDigest, vote.signature, vote.view, Number(vote.protocolVersion), vote.validatorEpoch ?? null, vote.committeeDigest ?? null]);
           await progress(client, vote.epoch);
         }
         const matching = (await client.query(`SELECT voter_identity FROM ${prepareVotes}
           WHERE local_validator_identity = $1 AND epoch = $2 AND batch_id = $3
-            AND message_root = $4 AND proposal_digest = $5 AND view = $6 AND protocol_version = 2 ORDER BY voter_identity`,
+            AND message_root = $4 AND proposal_digest = $5 AND view = $6 AND protocol_version IN (2,3) ORDER BY voter_identity`,
         [config.validatorAddress, vote.epoch, vote.batchId, vote.messageRoot, vote.proposalDigest, vote.view])).rows;
         if (matching.length >= 3) {
           const quorumVoters = matching.slice(0, 3).map((row) => row.voter_identity);
           await client.query(`INSERT INTO ${preparedStates}
-            (local_validator_identity, epoch, batch_id, message_root, proposal_digest, quorum_voters, view, protocol_version)
-            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, 2)
+            (local_validator_identity, epoch, batch_id, message_root, proposal_digest, quorum_voters, view, protocol_version, validator_epoch,committee_digest)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8,$9,$10)
             ON CONFLICT (local_validator_identity, epoch, view, protocol_version) DO NOTHING`,
           [config.validatorAddress, vote.epoch, vote.batchId, vote.messageRoot, vote.proposalDigest,
-            JSON.stringify(quorumVoters), vote.view]);
+            JSON.stringify(quorumVoters), vote.view, Number(vote.protocolVersion), vote.validatorEpoch ?? null, vote.committeeDigest ?? null]);
         }
         const result = await prepareResult(client, vote.epoch, vote.voterIdentity, vote.view);
         if (!result || result.vote.prepareDigest !== vote.prepareDigest) {
@@ -286,12 +303,23 @@ export function createValidatorStore({ pool, config }) {
     return row?.current_view ?? "0";
   }
   async function ensureEpoch(client, proposal) {
-    await client.query(`INSERT INTO ${epochViews} (local_validator_identity,epoch,batch_id,message_root)
-      VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`, [config.validatorAddress, proposal.epoch, proposal.batchId, proposal.messageRoot]);
+    const existing = (await client.query(`SELECT * FROM ${epochViews} WHERE local_validator_identity = $1 AND epoch = $2`,
+      [config.validatorAddress,proposal.epoch])).rows[0];
+    const version = proposal.protocolVersion ?? "3";
+    if (!existing && version !== "3") throw new ViewChangeError("LEGACY_INSTANCE_REQUIRED");
+    const binding = version === "3" ? consensusBinding(config,proposal.epoch) : { validatorEpoch: null,committeeDigest: null };
+    if (version === "3" && ((proposal.validatorEpoch !== undefined && proposal.validatorEpoch !== binding.validatorEpoch) ||
+        (proposal.committeeDigest !== undefined && proposal.committeeDigest !== binding.committeeDigest))) throw new ViewChangeError("WRONG_VALIDATOR_EPOCH");
+    await client.query(`INSERT INTO ${epochViews} (local_validator_identity,epoch,batch_id,message_root,protocol_version,validator_epoch,committee_digest)
+      VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`,
+      [config.validatorAddress,proposal.epoch,proposal.batchId,proposal.messageRoot,Number(version),binding.validatorEpoch,binding.committeeDigest]);
+    if (existing && (existing.protocol_version !== Number(version) || existing.validator_epoch !== binding.validatorEpoch ||
+      existing.committee_digest !== binding.committeeDigest)) throw new ViewChangeError("CONFLICTING_CONSENSUS_BINDING");
   }
   async function assertSafe(client, proposal, ErrorType) {
     const row = (await client.query(`SELECT * FROM ${epochViews} WHERE local_validator_identity = $1 AND epoch = $2`,
       [config.validatorAddress, proposal.epoch])).rows[0];
+    if (row && proposal.validatorEpoch !== undefined && (row.validator_epoch !== proposal.validatorEpoch || row.committee_digest !== proposal.committeeDigest)) throw new ErrorType("WRONG_VALIDATOR_EPOCH");
     if (row && (row.batch_id !== proposal.batchId || row.message_root !== proposal.messageRoot)) throw new ErrorType(ErrorType === PrePrepareError ? "CONFLICTING_PRE_PREPARE" : "UNSAFE_SELECTED_PROPOSAL");
   }
   async function assertActive(client, epoch, view, ErrorType, allowFinalizedDuplicate = false) {
@@ -364,14 +392,14 @@ export function createValidatorStore({ pool, config }) {
         }
         const previous = (await client.query(`SELECT envelope FROM ${viewVotes} WHERE local_validator_identity = $1 AND epoch = $2 AND target_view = $3 AND voter_identity = $1`,
           [config.validatorAddress, epoch, targetView])).rows[0];
-        if (previous) return authenticateViewChange(config, previous.envelope);
+        if (previous) return authenticateViewChange(protocolConfig, previous.envelope);
         const accepted = proposalRecord((await client.query(`SELECT * FROM ${prepares}
           WHERE local_validator_identity = $1 AND epoch = $2 ORDER BY view DESC,protocol_version DESC LIMIT 1`, [config.validatorAddress, epoch])).rows[0]);
-        const vote = await signViewChange(config, { epoch, targetView, acceptedProposal: accepted?.envelope ?? null,
+        const vote = await signViewChange(config, { epoch, targetView, protocolVersion: String(state.protocol_version), acceptedProposal: accepted?.envelope ?? null,
           preparedCertificate: await highestPrepared(client, epoch) });
         await client.query(`INSERT INTO ${viewVotes}
-          (local_validator_identity,epoch,target_view,voter_identity,digest,envelope) VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
-          [config.validatorAddress, epoch, targetView, config.validatorAddress, vote.viewChangeDigest, JSON.stringify(vote)]);
+          (local_validator_identity,epoch,target_view,voter_identity,digest,envelope,protocol_version,validator_epoch,committee_digest) VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9)`,
+          [config.validatorAddress, epoch, targetView, config.validatorAddress, vote.viewChangeDigest, JSON.stringify(vote), Number(vote.protocolVersion), vote.validatorEpoch ?? null, vote.committeeDigest ?? null]);
         await client.query(`UPDATE ${epochViews} SET changing_view = true,target_view = $3,
           view_change_at = COALESCE($4::timestamptz,CURRENT_TIMESTAMP)
           WHERE local_validator_identity = $1 AND epoch = $2`, [config.validatorAddress, epoch, targetView,
@@ -380,7 +408,7 @@ export function createValidatorStore({ pool, config }) {
       });
     },
     async saveViewChange(input) {
-      const vote = await authenticateViewChange(config, input);
+      const vote = await authenticateViewChange(protocolConfig, input);
       return transaction(async (client) => {
         await checkState(client, "FOR UPDATE");
         const state = (await client.query(`SELECT * FROM ${epochViews} WHERE local_validator_identity = $1 AND epoch = $2`, [config.validatorAddress, vote.epoch])).rows[0];
@@ -388,8 +416,11 @@ export function createValidatorStore({ pool, config }) {
         if (BigInt(vote.targetView) <= BigInt(state.current_view)) throw new ViewChangeError("STALE_VIEW");
         const nextTarget = (BigInt(state.target_view) > BigInt(state.current_view) ? BigInt(state.target_view) : BigInt(state.current_view) + 1n) + 1n;
         if (BigInt(vote.targetView) > nextTarget) throw new ViewChangeError("WRONG_TARGET_VIEW");
-        await client.query(`INSERT INTO ${viewVotes} VALUES ($1,$2,$3,$4,$5,$6::jsonb) ON CONFLICT DO NOTHING`,
-          [config.validatorAddress, vote.epoch, vote.targetView, vote.voterIdentity, vote.viewChangeDigest, JSON.stringify(vote)]);
+        if (state.protocol_version !== Number(vote.protocolVersion) || (vote.protocolVersion === "3" && (state.validator_epoch !== vote.validatorEpoch || state.committee_digest !== vote.committeeDigest))) throw new ViewChangeError("WRONG_VALIDATOR_EPOCH");
+        await client.query(`INSERT INTO ${viewVotes} (local_validator_identity,epoch,target_view,voter_identity,digest,envelope,protocol_version,validator_epoch,committee_digest)
+          VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,$8,$9) ON CONFLICT DO NOTHING`,
+          [config.validatorAddress, vote.epoch, vote.targetView, vote.voterIdentity, vote.viewChangeDigest, JSON.stringify(vote),
+            Number(vote.protocolVersion), vote.validatorEpoch ?? null, vote.committeeDigest ?? null]);
         const row = (await client.query(`SELECT * FROM ${viewVotes} WHERE local_validator_identity = $1 AND epoch = $2 AND target_view = $3 AND voter_identity = $4`,
           [config.validatorAddress, vote.epoch, vote.targetView, vote.voterIdentity])).rows[0];
         if (row.digest !== vote.viewChangeDigest) throw new ViewChangeError("CONFLICTING_VIEW_CHANGE");
@@ -401,7 +432,7 @@ export function createValidatorStore({ pool, config }) {
       const rows = (await pool.query(`SELECT envelope FROM ${viewVotes}
         WHERE local_validator_identity = $1 AND epoch = $2 AND target_view = $3 ORDER BY voter_identity`,
         [config.validatorAddress, protocolInteger(epoch).toString(), protocolInteger(targetView).toString()])).rows;
-      return Promise.all(rows.map((row) => authenticateViewChange(config, row.envelope)));
+      return Promise.all(rows.map((row) => authenticateViewChange(protocolConfig, row.envelope)));
     },
     async readViewChangeTargets(epoch) {
       await checkState(pool);
@@ -421,10 +452,10 @@ export function createValidatorStore({ pool, config }) {
       return row?.envelope ?? null;
     },
     async acceptNewView(input, pendingProposal) {
-      const message = await authenticateNewView(config, input, pendingProposal);
+      const message = await authenticateNewView(protocolConfig, input, pendingProposal);
       return transaction(async (client) => {
         await checkState(client, "FOR UPDATE");
-        await ensureEpoch(client, message.selectedProposal);
+        await ensureEpoch(client, { ...message.selectedProposal, protocolVersion: message.protocolVersion });
         await assertSafe(client, message.selectedProposal, ViewChangeError);
         const state = (await client.query(`SELECT * FROM ${epochViews} WHERE local_validator_identity = $1 AND epoch = $2`, [config.validatorAddress, message.epoch])).rows[0];
         if (state.finalized) throw new ViewChangeError("ALREADY_COMMITTED");
@@ -436,8 +467,8 @@ export function createValidatorStore({ pool, config }) {
         const prepared = await highestPrepared(client, message.epoch);
         if (prepared && !sameProposal(prepared.proposal, message.selectedProposal)) throw new ViewChangeError("UNSAFE_SELECTED_PROPOSAL");
         await assertCommitLock(client, message.epoch);
-        await client.query(`INSERT INTO ${newViews} VALUES ($1,$2,$3,$4,$5::jsonb)`,
-          [config.validatorAddress, message.epoch, message.view, message.newViewDigest, JSON.stringify(message)]);
+        await client.query(`INSERT INTO ${newViews} (local_validator_identity,epoch,view,digest,envelope,protocol_version,validator_epoch,committee_digest) VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8)`,
+          [config.validatorAddress, message.epoch, message.view, message.newViewDigest, JSON.stringify(message), Number(message.protocolVersion), message.validatorEpoch ?? null, message.committeeDigest ?? null]);
         await client.query(`UPDATE ${epochViews} SET current_view = $3, target_view = GREATEST(target_view,$3), changing_view = target_view > $3,
           progress_at = CURRENT_TIMESTAMP, progress_revision = progress_revision + 1,
           view_change_at = CASE WHEN target_view > $3 THEN view_change_at ELSE NULL END
@@ -447,7 +478,10 @@ export function createValidatorStore({ pool, config }) {
     },
     async finalizeEpoch(proposal) {
       return transaction(async (client) => {
-        await checkState(client, "FOR UPDATE"); await ensureEpoch(client, proposal);
+        await checkState(client, "FOR UPDATE");
+        const known = (await client.query(`SELECT epoch FROM ${epochViews} WHERE local_validator_identity = $1 AND epoch = $2`,[config.validatorAddress,proposal.epoch])).rowCount;
+        if (!known && proposal.protocolVersion !== "3") return;
+        await ensureEpoch(client, proposal);
         await assertSafe(client, proposal, ViewChangeError);
         await client.query(`UPDATE ${epochViews} SET finalized = true, changing_view = false
           WHERE local_validator_identity = $1 AND epoch = $2`, [config.validatorAddress, proposal.epoch]);
@@ -464,7 +498,7 @@ export function createValidatorStore({ pool, config }) {
       return transaction(async (client) => {
         await checkState(client, "FOR SHARE");
         const epochs = (await client.query(`SELECT epoch, view FROM ${prepares}
-          WHERE local_validator_identity = $1 AND protocol_version = 2 ORDER BY epoch, view`, [config.validatorAddress])).rows;
+          WHERE local_validator_identity = $1 AND protocol_version IN (2,3) ORDER BY epoch, view`, [config.validatorAddress])).rows;
         const states = [];
         for (const row of epochs) states.push(await commitResult(client, row.epoch, row.view));
         return states;
@@ -480,24 +514,24 @@ export function createValidatorStore({ pool, config }) {
         await assertCommitLock(client, normalized);
         const statement = await requirePrepared(client, normalized, view);
         const existing = (await client.query(`SELECT * FROM ${commitVotes}
-          WHERE local_validator_identity = $1 AND epoch = $2 AND voter_identity = $3 AND view = $4 AND protocol_version = 2`,
+          WHERE local_validator_identity = $1 AND epoch = $2 AND voter_identity = $3 AND view = $4 AND protocol_version IN (2,3)`,
         [config.validatorAddress, normalized, config.validatorAddress, view])).rows[0];
         if (existing) {
-          const vote = await authenticateCommit(config, commitVoteRecord(existing));
+          const vote = await authenticateCommit(protocolConfig, commitVoteRecord(existing));
           if (COMMIT_STATEMENT_FIELDS.some((field) => vote[field] !== statement[field])) throw new CommitError("DOUBLE_COMMIT");
           await assertSafe(client, vote, CommitError);
           await assertActive(client, normalized, view, CommitError, true);
           return commitResult(client, normalized, view);
         }
         await assertActive(client, normalized, view, CommitError);
-        const vote = await authenticateCommit(config, await sign(config,
+        const vote = await authenticateCommit(protocolConfig, await sign(config,
           { messageType: "COMMIT", ...statement, voterIdentity: config.validatorAddress }));
         return persistCommit(client, vote);
       });
     },
 
     async saveCommitVote(input) {
-      const vote = await authenticateCommit(config, input);
+      const vote = await authenticateCommit(protocolConfig, input);
       return transaction(async (client) => {
         await checkState(client, "FOR UPDATE");
         return persistCommit(client, vote);
@@ -531,6 +565,22 @@ export function createValidatorStore({ pool, config }) {
         checkIdentity(result.rows[0]);
         await client.query(`INSERT INTO ${committee} (addresses) VALUES ($1::jsonb)
           ON CONFLICT (singleton) DO NOTHING`, [JSON.stringify(expectedCommittee)]);
+        const persisted = (await client.query(`SELECT * FROM ${historyTable} ORDER BY validator_epoch`)).rows;
+        if (persisted.length > config.validatorSets.history.length) throw new Error("trusted configuration omitted persisted history");
+        for (let index = 0; index < config.validatorSets.history.length; index++) {
+          const set = config.validatorSets.history[index];
+          const old = persisted[index];
+          if (old && (old.validator_epoch !== set.validatorEpoch || old.activation_batch_epoch !== set.activationBatchEpoch ||
+            old.committee_digest !== set.committeeDigest || !isDeepStrictEqual(old.validators,set.validators))) throw new Error("conflicting persisted validator set");
+          if (!old) {
+            if (index > 0) {
+              const highest = (await client.query(`SELECT MAX(epoch) AS epoch FROM ${epochViews}`)).rows[0].epoch;
+              if (highest !== null && BigInt(set.activationBatchEpoch) <= BigInt(highest)) throw new Error("rotation would change an already-started consensus instance");
+            }
+            await client.query(`INSERT INTO ${historyTable} (validator_epoch,activation_batch_epoch,validators,committee_digest)
+              VALUES ($1,$2,$3::jsonb,$4)`,[set.validatorEpoch,set.activationBatchEpoch,JSON.stringify(set.validators),set.committeeDigest]);
+          }
+        }
         await checkState(client);
         return result.rows[0];
       });
@@ -574,7 +624,7 @@ export function createValidatorStore({ pool, config }) {
 
     async readPrePrepare(epoch, view) {
       await checkState(pool);
-      return proposalRecord((await pool.query(`SELECT * FROM ${prepares} WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 2`,
+      return proposalRecord((await pool.query(`SELECT * FROM ${prepares} WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (2,3)`,
         [config.validatorAddress, protocolInteger(epoch).toString(), view ?? await currentView(pool, epoch)])).rows[0]);
     },
 
@@ -592,20 +642,21 @@ export function createValidatorStore({ pool, config }) {
     },
 
     async savePrePrepare(input, direction) {
-      const p = await authenticatePrePrepare(config, input);
+      const p = await authenticatePrePrepare(protocolConfig, input);
       const expectedDirection = p.primaryIdentity === config.validatorAddress ? "ISSUED" : "ACCEPTED";
       if (direction !== expectedDirection) throw new Error("invalid PRE-PREPARE direction");
       return transaction(async (client) => {
         await checkState(client, "FOR UPDATE");
-        await ensureEpoch(client, p);
+        try { await ensureEpoch(client, p); }
+        catch (error) { if (error instanceof ViewChangeError) throw new PrePrepareError(error.code); throw error; }
         await assertActive(client, p.epoch, p.view, PrePrepareError);
         await assertSafe(client, p, PrePrepareError);
         const inserted = await client.query(`INSERT INTO ${prepares}
-          (local_validator_identity, epoch, batch_id, message_root, proposal_digest, primary_identity, primary_signature, direction, view, protocol_version)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 2)
+          (local_validator_identity, epoch, batch_id, message_root, proposal_digest, primary_identity, primary_signature, direction, view, protocol_version,validator_epoch,committee_digest)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,$11,$12)
           ON CONFLICT (local_validator_identity, epoch, view, protocol_version) DO NOTHING`,
-        [config.validatorAddress, p.epoch, p.batchId, p.messageRoot, p.proposalDigest, p.primaryIdentity, p.signature, direction, p.view]);
-        const row = (await client.query(`SELECT * FROM ${prepares} WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 2`,
+        [config.validatorAddress, p.epoch, p.batchId, p.messageRoot, p.proposalDigest, p.primaryIdentity, p.signature, direction, p.view, Number(p.protocolVersion), p.validatorEpoch ?? null, p.committeeDigest ?? null]);
+        const row = (await client.query(`SELECT * FROM ${prepares} WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (2,3)`,
           [config.validatorAddress, p.epoch, p.view])).rows[0];
         if (row.proposal_digest !== p.proposalDigest || row.batch_id !== p.batchId ||
             row.message_root !== p.messageRoot || row.primary_identity !== p.primaryIdentity || row.direction !== direction) {
@@ -647,7 +698,7 @@ export function createValidatorStore({ pool, config }) {
       return transaction(async (client) => {
         await checkState(client, "FOR SHARE");
         const epochs = (await client.query(`SELECT epoch, view FROM ${prepares}
-          WHERE local_validator_identity = $1 AND protocol_version = 2 ORDER BY epoch, view`, [config.validatorAddress])).rows;
+          WHERE local_validator_identity = $1 AND protocol_version IN (2,3) ORDER BY epoch, view`, [config.validatorAddress])).rows;
         const states = [];
         for (const row of epochs) states.push(await prepareResult(client, row.epoch, undefined, row.view));
         return states;
@@ -661,21 +712,21 @@ export function createValidatorStore({ pool, config }) {
         const view = await currentView(client, epoch);
         await assertActive(client, epoch, view, PrepareError);
         const accepted = proposalRecord((await client.query(`SELECT * FROM ${prepares}
-          WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 2`,
+          WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (2,3)`,
           [config.validatorAddress, epoch, view])).rows[0]);
         if (!accepted) throw new PrepareError("PRE_PREPARE_REQUIRED");
         const existing = await prepareResult(client, epoch, config.validatorAddress, view);
         if (existing) return existing;
         const proposal = accepted.envelope;
-        const vote = await authenticatePrepare(config, await sign(config, { messageType: "PREPARE",
+        const vote = await authenticatePrepare(protocolConfig, await sign(config, { messageType: "PREPARE",
           protocolVersion: proposal.protocolVersion, sourceDomain: proposal.sourceDomain, sourceGateway: proposal.sourceGateway,
-          epoch, view, batchId: proposal.batchId, messageRoot: proposal.messageRoot,
+          epoch, view, ...validatorFields(proposal), batchId: proposal.batchId, messageRoot: proposal.messageRoot,
           proposalDigest: proposal.proposalDigest, voterIdentity: config.validatorAddress }));
         return persistPrepare(client, vote);
       });
     },
     async savePrepareVote(input) {
-      const vote = await authenticatePrepare(config, input);
+      const vote = await authenticatePrepare(protocolConfig, input);
       return transaction(async (client) => {
         await checkState(client, "FOR UPDATE");
         return persistPrepare(client, vote);

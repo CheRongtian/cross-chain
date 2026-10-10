@@ -3,13 +3,19 @@ import { normalizeAddress, normalizeBytes32 } from "../../indexer/src/canonical-
 import { deterministicPrimary, protocolInteger } from "./committee.mjs";
 import { validatorAccount } from "./identity.mjs";
 
-import { CONSENSUS_VERSION, consensusDigest, viewFields } from "./protocol.mjs";
+import { consensusBinding, consensusCommittee } from "./validator-sets.mjs";
+import { consensusType, CONSENSUS_VERSION, versionedDigest, envelopeFields, validatorFields, viewFields } from "./protocol.mjs";
+
+function committee(config, input) {
+  try { return consensusCommittee(config, input); }
+  catch (error) { throw new PrePrepareError(error.code ?? "WRONG_COMMITTEE"); }
+}
 
 export const PRE_PREPARE_VERSION = CONSENSUS_VERSION;
-export const PRE_PREPARE_TYPE = "PBFTPrePrepare(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,uint256 view,bytes32 batchId,bytes32 messageRoot,address primaryIdentity)";
+export const PRE_PREPARE_TYPE = consensusType("PBFTPrePrepare(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch,uint256 view,bytes32 batchId,bytes32 messageRoot,address primaryIdentity)");
 export const PRE_PREPARE_DOMAIN = keccak256(stringToHex(PRE_PREPARE_TYPE));
 export const PRE_PREPARE_FIELDS = Object.freeze([
-  "messageType", "protocolVersion", "sourceDomain", "sourceGateway", "epoch", "view", "batchId", "messageRoot", "primaryIdentity",
+  "messageType", "protocolVersion", "sourceDomain", "sourceGateway", "epoch", "view", "validatorEpoch", "committeeDigest", "batchId", "messageRoot", "primaryIdentity",
 ]);
 export const PRE_PREPARE_ENVELOPE_FIELDS = Object.freeze([...PRE_PREPARE_FIELDS, "proposalDigest", "signature"]);
 const PARAMETERS = ["uint8", "uint256", "address", "uint256", "uint256", "bytes32", "bytes32", "address"];
@@ -27,7 +33,7 @@ export function normalizePrePrepare(input) {
       messageType: "PRE_PREPARE", protocolVersion: version.toString(),
       sourceDomain: protocolInteger(input.sourceDomain, "source domain").toString(),
       sourceGateway: normalizeAddress(input.sourceGateway), epoch: protocolInteger(input.epoch).toString(),
-      ...viewFields(input), batchId: normalizeBytes32(input.batchId), messageRoot: normalizeBytes32(input.messageRoot),
+      ...viewFields(input), ...validatorFields(input), batchId: normalizeBytes32(input.batchId), messageRoot: normalizeBytes32(input.messageRoot),
       primaryIdentity: normalizeAddress(input.primaryIdentity),
     };
   } catch { throw new PrePrepareError("MALFORMED"); }
@@ -35,15 +41,16 @@ export function normalizePrePrepare(input) {
 
 export function prePrepareDigest(input) {
   const p = normalizePrePrepare(input);
-  return consensusDigest(PRE_PREPARE_TYPE, PARAMETERS, [Number(p.protocolVersion),
-    BigInt(p.sourceDomain), p.sourceGateway, BigInt(p.epoch), BigInt(p.view ?? "0"), p.batchId, p.messageRoot, p.primaryIdentity], p.protocolVersion);
+  return versionedDigest(PRE_PREPARE_TYPE, PARAMETERS, [Number(p.protocolVersion),
+    BigInt(p.sourceDomain), p.sourceGateway, BigInt(p.epoch), BigInt(p.view ?? "0"), p.batchId, p.messageRoot, p.primaryIdentity], p);
 }
 
 export async function signPrePrepare(config, input) {
-  const proposal = normalizePrePrepare(input);
-  if (proposal.protocolVersion !== CONSENSUS_VERSION) throw new PrePrepareError("WRONG_VERSION");
+  const proposal = normalizePrePrepare(String(input.protocolVersion) === "3" ? { ...consensusBinding(config, input.epoch), ...input } : input);
+  if (![CONSENSUS_VERSION, "2"].includes(proposal.protocolVersion)) throw new PrePrepareError("WRONG_VERSION");
+  const set = committee(config, proposal);
   if (proposal.primaryIdentity !== config.validatorAddress ||
-      deterministicPrimary(config.peers, proposal.epoch, proposal.view ?? "0") !== config.validatorAddress) throw new PrePrepareError("WRONG_PRIMARY");
+      deterministicPrimary(set.validators, proposal.epoch, proposal.view ?? "0") !== config.validatorAddress) throw new PrePrepareError("WRONG_PRIMARY");
   const proposalDigest = prePrepareDigest(proposal);
   const signature = await validatorAccount(config.privateKey).signMessage({ message: { raw: proposalDigest } });
   return { ...proposal, proposalDigest, signature };
@@ -51,17 +58,18 @@ export async function signPrePrepare(config, input) {
 
 export async function authenticatePrePrepare(config, input) {
   if (!input || typeof input !== "object" || Array.isArray(input) ||
-      Object.keys(input).sort().join(",") !== [...PRE_PREPARE_ENVELOPE_FIELDS].filter((field) => field !== "view" || input.protocolVersion !== "1").sort().join(",")) {
+      Object.keys(input).sort().join(",") !== envelopeFields(PRE_PREPARE_ENVELOPE_FIELDS, input.protocolVersion).sort().join(",")) {
     throw new PrePrepareError("MALFORMED");
   }
   const p = normalizePrePrepare(input);
-  if (p.protocolVersion !== PRE_PREPARE_VERSION && !(config.allowHistorical && p.protocolVersion === "1")) throw new PrePrepareError("WRONG_VERSION");
+  if (p.protocolVersion !== PRE_PREPARE_VERSION && !(config.allowHistorical && ["1", "2"].includes(p.protocolVersion))) throw new PrePrepareError("WRONG_VERSION");
   if (p.sourceDomain !== config.chainDomain.toString() || p.sourceGateway !== config.sourceGateway) throw new PrePrepareError("WRONG_CONTEXT");
   let digest;
   try { digest = normalizeBytes32(input.proposalDigest); } catch { throw new PrePrepareError("MALFORMED"); }
   if (digest !== prePrepareDigest(p)) throw new PrePrepareError("INVALID_DIGEST");
-  if (!config.peers.some((peer) => peer.address === p.primaryIdentity) ||
-      deterministicPrimary(config.peers, p.epoch, p.view ?? "0") !== p.primaryIdentity) throw new PrePrepareError("WRONG_PRIMARY");
+  const set = committee(config, p);
+  if (!set.validators.includes(p.primaryIdentity) ||
+      deterministicPrimary(set.validators, p.epoch, p.view ?? "0") !== p.primaryIdentity) throw new PrePrepareError("WRONG_PRIMARY");
   let signer;
   try {
     if (typeof input.signature !== "string" || !/^0x[0-9a-fA-F]{130}$/.test(input.signature)) throw new Error("signature length");

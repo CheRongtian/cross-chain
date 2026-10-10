@@ -1,5 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { encodeAbiParameters, encodeEventTopics, parseAbiParameters } from "viem";
+import { committeeDigest } from "../../src/committee.mjs";
 import { validatorAccount } from "../../src/identity.mjs";
 import { loadValidatorConfig } from "../../src/config.mjs";
 import { buildMessageBatch } from "../../../indexer/src/message-batch.mjs";
@@ -7,8 +8,8 @@ import { buildMessageMerkleTree } from "../../../indexer/src/message-merkle.mjs"
 import { CROSS_CHAIN_MESSAGE_EVENT } from "../../../indexer/src/source-gateway-event.mjs";
 
 // Scalars are constructed only by test/verification runtime. No production key file exists.
-export function developmentKeys() {
-  return Array.from({ length: 4 }, (_, index) => `0x${BigInt(index + 1).toString(16).padStart(64, "0")}`);
+export function developmentKeys(count = 4) {
+  return Array.from({ length: count }, (_, index) => `0x${BigInt(index + 1).toString(16).padStart(64, "0")}`);
 }
 
 export function environment(overrides = {}, index = 0) {
@@ -17,6 +18,8 @@ export function environment(overrides = {}, index = 0) {
   return {
     VALIDATOR_PRIVATE_KEY: keys[index], VALIDATOR_LISTEN_HOST: "127.0.0.1", VALIDATOR_LISTEN_PORT: String(31001 + index),
     VALIDATOR_PEERS: JSON.stringify(peers),
+    VALIDATOR_SET_HISTORY_FILE: "",
+    VALIDATOR_SET_HISTORY: JSON.stringify([{ validatorEpoch: "0", activationBatchEpoch: "0", validators: peers.map((peer) => peer.address), committeeDigest: committeeDigest(peers) }]),
     SOURCE_DATABASE_URL: "postgresql://fixture:placeholder@127.0.0.1/unused", SOURCE_DB_SCHEMA: "validator_fixture_source",
     VALIDATOR_DATABASE_URL: "postgresql://fixture:placeholder@127.0.0.1/unused", VALIDATOR_DB_SCHEMA: `validator_fixture_local_${index}`,
     CHAIN_A_DOMAIN: "10011", SOURCE_GATEWAY_ADDRESS: "0x1111111111111111111111111111111111111111",
@@ -34,7 +37,7 @@ export async function snapshotFixture(status = "CONSENSUS_PENDING") {
     record: { batchRecordId: "1", batchId: batch.batchId, sourceDomain: batch.sourceDomain, sourceGateway: batch.sourceGateway,
       epoch: batch.epoch, messageCount: BigInt(batch.messages.length), messageRoot: tree.messageRoot, status },
     members: batch.messages.map((message, index) => ({ sourceMessageId: String(index + 1), messageId: message.messageId, position: BigInt(index) })),
-    batch, tree,
+    batch, tree, consensusBinding: { protocolVersion: "3", validatorEpoch: "0", committeeDigest: committeeDigest(developmentKeys().map((key) => validatorAccount(key).address.toLowerCase())) },
   };
 }
 

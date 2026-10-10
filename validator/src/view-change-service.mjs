@@ -1,3 +1,4 @@
+import { consensusPeers, consensusBinding } from "./validator-sets.mjs";
 import { connectPeer } from "./handshake.mjs";
 import { deterministicPrimary } from "./committee.mjs";
 import { proposalIdentity, ViewChangeError } from "./prepared-certificate.mjs";
@@ -5,7 +6,7 @@ import { authenticateNewView, authenticateViewChange, selectSafeProposal, signNe
 
 export async function broadcastViewMessage(config, envelope, { fetchImplementation = fetch, authenticatePeer = connectPeer } = {}) {
   const route = envelope.messageType === "VIEW_CHANGE" ? "view-change" : "new-view";
-  return Promise.all(config.peers.filter((peer) => peer.address !== config.validatorAddress).map(async (peer) => {
+  return Promise.all(consensusPeers(config, envelope).filter((peer) => peer.address !== config.validatorAddress).map(async (peer) => {
     try {
       await authenticatePeer(config, peer.address, fetchImplementation);
       const response = await fetchImplementation(`${peer.url}/pbft/${route}`, {
@@ -36,8 +37,10 @@ export function createViewChangeService({ config, store, validation, broadcast =
       }
       throw new ViewChangeError("INVALID_SOURCE_STATE");
     }
+    const states = store.readViewStates ? await store.readViewStates() : [];
+    const legacy = states.some((state) => state.batch_id === batchId && state.protocol_version === 2);
     return proposalIdentity({ sourceDomain: config.chainDomain.toString(), sourceGateway: config.sourceGateway,
-      epoch: result.snapshot.record.epoch.toString(), batchId: result.snapshot.batch.batchId, messageRoot: result.snapshot.tree.messageRoot });
+      epoch: result.snapshot.record.epoch.toString(), ...(legacy ? {} : consensusBinding(config,result.snapshot.record.epoch)), batchId: result.snapshot.batch.batchId, messageRoot: result.snapshot.tree.messageRoot });
   }
   return {
     async timeout(epoch, expected) {
@@ -64,7 +67,7 @@ export function createViewChangeService({ config, store, validation, broadcast =
       catch (error) { if (!(error instanceof ViewChangeError)) throw error; return rejection(error); }
     },
     async establish(epoch, targetView, batchId) {
-      if (deterministicPrimary(config.peers, epoch, targetView) !== config.validatorAddress) throw new ViewChangeError("WRONG_PRIMARY");
+      if (deterministicPrimary((store.readViewStates ? await store.readViewStates() : []).find((state) => state.epoch === String(epoch))?.protocol_version === 2 ? config.validatorSets.history[0].validators : config.validatorSets.resolveForBatchEpoch(epoch).validators, epoch, targetView) !== config.validatorAddress) throw new ViewChangeError("WRONG_PRIMARY");
       const canonical = await pending(batchId);
       if (canonical.epoch !== String(epoch)) throw new ViewChangeError("WRONG_EPOCH");
       let message = await store.readNewView(epoch, targetView);

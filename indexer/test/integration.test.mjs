@@ -31,6 +31,7 @@ import { createBatchLifecycle } from "../src/batch-lifecycle.mjs";
 import { decodeCrossChainMessageLog } from "../src/source-gateway-event.mjs";
 import { verifyFourIndependentValidators } from "../../validator/test/helpers/four-process.mjs";
 import { verifyValidatorFaults } from "../../validator/test/helpers/fault-scenarios.mjs";
+import { verifyValidatorRotation } from "../../validator/test/helpers/rotation-scenarios.mjs";
 import { verifyViewChanges } from "../../validator/test/helpers/view-change-scenarios.mjs";
 
 const IDENTITY_APPLICATION_ABI = parseAbi([
@@ -849,7 +850,7 @@ test("recovers source workers and seals durable batches from real finalized mess
     const consensus = await verifyFourIndependentValidators({ sourceConfig: config, sourcePool: activePool,
       snapshot: oldAfterRollover, pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE") });
     const committedProcessRead = await execFileAsync(process.execPath, [LIFECYCLE_READER_PATH, lifecycleId], {
-      env: { ...process.env, EXPECTED_VALIDATOR_COMMITTEE: JSON.stringify(consensus.committee) },
+      env: { ...process.env, EXPECTED_VALIDATOR_COMMITTEE: JSON.stringify(consensus.committee), EXPECTED_VALIDATOR_SET_HISTORY: JSON.stringify(consensus.history) },
     });
     process.stderr.write(committedProcessRead.stderr);
     assert.deepEqual(JSON.parse(committedProcessRead.stdout), transportValue(consensus.snapshot));
@@ -858,6 +859,8 @@ test("recovers source workers and seals durable batches from real finalized mess
       pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE") });
     await verifyViewChanges({ sourceConfig: config, sourcePool: activePool, snapshot: consensus.snapshot,
       pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE") });
+    await verifyValidatorRotation({ sourceConfig: config, sourcePool: activePool, snapshot: consensus.snapshot,
+      nextMessageId: messageE.messageId, pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE") });
   } finally {
     for (const worker of activeWorkers) {
       worker.kill("SIGKILL");

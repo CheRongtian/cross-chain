@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { committeeDigest } from "../../src/committee.mjs";
+import { createValidatorSetResolver } from "../../src/validator-sets.mjs";
+import { loadValidatorConfig } from "../../src/config.mjs";
 import { validatorAccount } from "../../src/identity.mjs";
 import { verifyHandshakeResponse } from "../../src/handshake.mjs";
 import { tableName } from "../../../indexer/src/db.mjs";
@@ -11,11 +14,11 @@ import { buildQuorumCertificate, expectedCommitStatement, qcDigest, verifyQuorum
 import { createBatchLifecycle } from "../../../indexer/src/batch-lifecycle.mjs";
 
 import { createValidatorProcesses, initializeValidatorState, reservePort, rpcObserver } from "./process-cluster.mjs";
-const SOURCE_TABLES = ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batches", "message_batch_members",
+const SOURCE_TABLES = ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batches", "message_batch_members", "batch_consensus_bindings",
   "batch_quorum_certificates", "batch_quorum_certificate_signatures"];
 const ORDER = { source_messages: "id", indexer_cursors: "chain_domain, source_gateway",
   indexed_source_blocks: "source_domain, source_gateway, block_number", message_batches: "batch_record_id",
-  message_batch_members: "batch_record_id, source_message_id", batch_quorum_certificates: "batch_record_id",
+  message_batch_members: "batch_record_id, source_message_id", batch_consensus_bindings: "batch_record_id", batch_quorum_certificates: "batch_record_id",
   batch_quorum_certificate_signatures: "batch_record_id, voter_identity" };
 
 export async function sourceState(pool, schema) {
@@ -67,11 +70,15 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
   }
 
   try {
-    const originalSourceState = await sourceState(sourcePool, sourceConfig.databaseSchema);
+    let originalSourceState;
     for (let index = 0; index < 4; index++) { reservations.push(await reservePort()); proxies.push(await rpcObserver(sourceConfig.chainRpcUrl)); }
     const peers = keys.map((key, index) => ({ address: validatorAccount(key).address.toLowerCase(), url: `http://127.0.0.1:${reservations[index].port}` }));
+    const validatorSets = createValidatorSetResolver([{ validatorEpoch: "0", activationBatchEpoch: "0", validators: peers.map((peer) => peer.address), committeeDigest: committeeDigest(peers) }]);
+    snapshot = await createBatchLifecycle({ config: sourceConfig, pool: sourcePool, committee: peers, validatorSets }).pinConsensus({ batchRecordId: snapshot.record.batchRecordId });
+    originalSourceState = await sourceState(sourcePool, sourceConfig.databaseSchema);
     const environments = peers.map((peer, index) => ({
       VALIDATOR_PRIVATE_KEY: keys[index], VALIDATOR_LISTEN_HOST: "127.0.0.1", VALIDATOR_LISTEN_PORT: String(reservations[index].port),
+      VALIDATOR_SET_HISTORY_FILE: "", VALIDATOR_SET_HISTORY: JSON.stringify(validatorSets.history),
       VALIDATOR_PEERS: JSON.stringify([...peers.slice(index), ...peers.slice(0, index)].reverse()),
       VALIDATOR_DATABASE_URL: localUrl, VALIDATOR_DB_SCHEMA: `${prefix}_v${index + 1}`,
       SOURCE_DATABASE_URL: sourceConfig.databaseUrl, SOURCE_DB_SCHEMA: sourceConfig.databaseSchema,
@@ -203,10 +210,30 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     assert.match(gatewayFailure.stderr, /no contract bytecode/);
     console.log("VALID: real wrong reference/root/block, injected REORGED member, insufficient RPC depth, wrong chain, and wrong Gateway rejected");
 
-    const wrongKey = `0x${99n.toString(16).padStart(64, "0")}`;
-    const wrongPeers = peers.map((peer, index) => index === 3 ? { ...peer, address: validatorAccount(wrongKey).address.toLowerCase() } : peer);
-    const wrongIdentity = await start({ ...environments[3], VALIDATOR_PRIVATE_KEY: wrongKey, VALIDATOR_PEERS: JSON.stringify(wrongPeers) }, { expectFailure: true });
+    // V1 has a valid endpoint and trusted membership, but cannot open V4's store.
+    // Startup must reject the persisted identity before opening the HTTP listener.
+    const wrongIdentityEnvironment = {
+      ...environments[0],
+      VALIDATOR_DB_SCHEMA: environments[3].VALIDATOR_DB_SCHEMA,
+    };
+    const wrongIdentityConfig = loadValidatorConfig(wrongIdentityEnvironment);
+    assert.equal(wrongIdentityConfig.validatorAddress, peers[0].address);
+    assert.notEqual(wrongIdentityConfig.validatorAddress, states[3].config.validatorAddress);
+    assert.equal(wrongIdentityConfig.databaseSchema, states[3].config.databaseSchema);
+    assert.deepEqual(wrongIdentityConfig.validatorSets.history, states[3].config.validatorSets.history);
+    const metadataTable = tableName(states[3].config.databaseSchema, "validator_metadata");
+    const historyTable = tableName(states[3].config.databaseSchema, "validator_set_history");
+    const metadataBefore = (await pools[3].query(`SELECT * FROM ${metadataTable}`)).rows;
+    const historyBefore = (await pools[3].query(`SELECT * FROM ${historyTable} ORDER BY validator_epoch`)).rows;
+    const viewsBefore = await states[3].store.readViewStates();
+    const proposalsBefore = await states[3].store.readPrePrepares();
+    const wrongIdentity = await start(wrongIdentityEnvironment, { expectFailure: true });
     assert.match(wrongIdentity.stderr, /identity or source context mismatch/);
+    await states[3].store.checkIdentity();
+    assert.deepEqual((await pools[3].query(`SELECT * FROM ${metadataTable}`)).rows, metadataBefore);
+    assert.deepEqual((await pools[3].query(`SELECT * FROM ${historyTable} ORDER BY validator_epoch`)).rows, historyBefore);
+    assert.deepEqual(await states[3].store.readViewStates(), viewsBefore);
+    assert.deepEqual(await states[3].store.readPrePrepares(), proposalsBefore);
     assert.deepEqual(await states[3].store.readObservations(), observations[3]);
     const previousPid = validators[3].child.pid;
     validators[3] = await start(environments[3]);
@@ -217,6 +244,7 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     assert.equal((await request(peers[3].url, "/validate-batch", { batchId: snapshot.record.batchId })).status, 200);
     for (let index = 0; index < 4; index++) assert.deepEqual(await states[index].store.readObservations(), observations[index]);
     assert.deepEqual(await sourceState(sourcePool, sourceConfig.databaseSchema), originalSourceState);
+    console.log("VALID: V1 configuration passed; opening V4's store rejected by identity binding without changing its history or state");
     console.log("VALID: fresh V4 process recovered its own identity and observation; wrong-key recovery rejected");
 
     const epoch = snapshot.record.epoch.toString();
@@ -229,7 +257,7 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
       assert.equal(selection.body.primaryIdentity, primaryAddress);
       console.log(`VALID: V${index + 1} independently selected primary ${primaryAddress} for epoch ${epoch}`);
     }
-    const proposal = { messageType: "PRE_PREPARE", protocolVersion: "2", view: "0", sourceDomain: sourceConfig.chainDomain.toString(),
+    const proposal = { ...snapshot.consensusBinding, messageType: "PRE_PREPARE", protocolVersion: "3", view: "0", sourceDomain: sourceConfig.chainDomain.toString(),
       sourceGateway: sourceConfig.sourceGateway, epoch, batchId: snapshot.record.batchId,
       messageRoot: snapshot.record.messageRoot, primaryIdentity: primaryAddress };
     async function signedProposal(fields, signerIndex = primaryIndex) {
@@ -424,7 +452,7 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
       const signature = await validatorAccount(keys[signerIndex]).signMessage({ message: { raw: digest } });
       return { ...fields, prepareDigest: digest, signature };
     }
-    const conflictingFields = { messageType: "PREPARE", protocolVersion: "2", view: "0",
+    const conflictingFields = { ...snapshot.consensusBinding, messageType: "PREPARE", protocolVersion: "3", view: "0",
       sourceDomain: proposal.sourceDomain, sourceGateway: proposal.sourceGateway, epoch,
       batchId: proposal.batchId, messageRoot: `0x${"ed".repeat(32)}`,
       proposalDigest: canonical.proposalDigest, voterIdentity: peers[fourthVoter].address };
@@ -596,13 +624,13 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     const sourceAfterCommit = await sourceState(sourcePool, sourceConfig.databaseSchema);
     assert.equal(sourceAfterCommit.batch_quorum_certificates.length, 1);
     assert.equal(sourceAfterCommit.batch_quorum_certificate_signatures.length, 3);
-    for (const name of ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batch_members"]) {
+    for (const name of ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batch_members", "batch_consensus_bindings"]) {
       assert.deepEqual(sourceAfterCommit[name], originalSourceState[name]);
     }
     assert.deepEqual(sourceAfterCommit.message_batches.map((row) => row.batch_record_id === snapshot.record.batchRecordId
       ? { ...row, status: "CONSENSUS_PENDING", committed_at: null } : row), originalSourceState.message_batches);
     console.log("VALID: immutable first QC, fourth vote, equivalent subset, and restarted COMMIT lock preserved source history and next-epoch Message E");
-    return { snapshot: committed, committee: peers };
+    return { snapshot: committed, committee: peers, history: validatorSets.history };
   } finally {
     const cleanup = await Promise.allSettled([
       processes.close(), ...reservations.map((reservation) => reservation.release()),

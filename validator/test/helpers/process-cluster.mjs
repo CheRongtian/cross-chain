@@ -54,7 +54,7 @@ export async function initializeValidatorState(environment, registerPool) {
   const config = loadValidatorConfig(environment);
   const pool = createValidatorPool(config); registerPool(pool);
   await applyValidatorMigrations(pool, config.databaseSchema);
-  await pool.query(`TRUNCATE TABLE ${tableName(config.databaseSchema, "pbft_new_views")}, ${tableName(config.databaseSchema, "pbft_view_change_votes")}, ${tableName(config.databaseSchema, "pbft_epoch_views")}, ${tableName(config.databaseSchema, "commit_rejections")},
+  await pool.query(`TRUNCATE TABLE ${tableName(config.databaseSchema, "validator_set_history")}, ${tableName(config.databaseSchema, "pbft_new_views")}, ${tableName(config.databaseSchema, "pbft_view_change_votes")}, ${tableName(config.databaseSchema, "pbft_epoch_views")}, ${tableName(config.databaseSchema, "commit_rejections")},
     ${tableName(config.databaseSchema, "pbft_commit_quorums")}, ${tableName(config.databaseSchema, "pbft_commit_votes")},
     ${tableName(config.databaseSchema, "prepare_rejections")},
     ${tableName(config.databaseSchema, "pbft_prepared_states")}, ${tableName(config.databaseSchema, "pbft_prepare_votes")},

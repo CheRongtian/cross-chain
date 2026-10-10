@@ -177,8 +177,12 @@ export async function applyMigrations(pool, schema) {
     await client.query("BEGIN");
     await client.query(`CREATE SCHEMA IF NOT EXISTS ${quoteIdentifier(schema)}`);
     await client.query(`SET LOCAL search_path TO ${quoteIdentifier(schema)}`);
+    await client.query("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)");
+    await client.query("LOCK TABLE schema_migrations IN EXCLUSIVE MODE");
     for (const migration of migrations) {
+      if ((await client.query("SELECT name FROM schema_migrations WHERE name = $1", [migration.name])).rowCount) continue;
       await client.query(migration.sql);
+      await client.query("INSERT INTO schema_migrations (name) VALUES ($1)", [migration.name]);
     }
     await client.query("COMMIT");
     return migrations.map((migration) => migration.name);
@@ -941,6 +945,7 @@ export async function readTableColumns(pool, schema, table) {
 export async function resetIndexerTables(pool, schema) {
   await pool.query(
     `TRUNCATE TABLE
+        ${tableName(schema, "batch_consensus_bindings")},
         ${tableName(schema, "batch_quorum_certificate_signatures")},
         ${tableName(schema, "batch_quorum_certificates")},
         ${tableName(schema, "message_batch_members")},

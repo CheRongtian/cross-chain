@@ -1,10 +1,12 @@
+import { consensusPeers } from "./validator-sets.mjs";
+import { validatorFields } from "./protocol.mjs";
 import { normalizeAddress } from "../../indexer/src/canonical-message.mjs";
 import { protocolInteger } from "./committee.mjs";
 import { connectPeer } from "./handshake.mjs";
 import { authenticatePrepare, normalizePrepare, PrepareError, signPrepare } from "./prepare.mjs";
 
 export async function broadcastPrepare(config, envelope, { fetchImplementation = fetch, authenticatePeer = connectPeer } = {}) {
-  return Promise.all(config.peers.filter((peer) => peer.address !== config.validatorAddress).map(async (peer) => {
+  return Promise.all(consensusPeers(config, envelope).filter((peer) => peer.address !== config.validatorAddress).map(async (peer) => {
     try {
       await authenticatePeer(config, peer.address, fetchImplementation);
       const response = await fetchImplementation(`${peer.url}/pbft/prepare`, {
@@ -78,7 +80,7 @@ export function createPrepareService({ config, store, broadcast = broadcastPrepa
         }
         const vote = normalizePrepare({ messageType: "PREPARE", protocolVersion: accepted.envelope.protocolVersion,
           sourceDomain: accepted.envelope.sourceDomain, sourceGateway: accepted.envelope.sourceGateway,
-          epoch: accepted.envelope.epoch, view: accepted.envelope.view, batchId: accepted.envelope.batchId, messageRoot: accepted.envelope.messageRoot,
+          epoch: accepted.envelope.epoch, view: accepted.envelope.view, ...validatorFields(accepted.envelope), batchId: accepted.envelope.batchId, messageRoot: accepted.envelope.messageRoot,
           proposalDigest: accepted.envelope.proposalDigest, voterIdentity: config.validatorAddress });
         const envelope = await sign(config, vote);
         const record = await store.savePrepareVote(envelope);

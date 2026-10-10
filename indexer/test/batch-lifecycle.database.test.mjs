@@ -10,6 +10,7 @@ import {
 import { computeCanonicalMessageId, computePayloadHash } from "../src/canonical-message.mjs";
 import { createMessageBatcher } from "../src/message-batch.mjs";
 import { buildMessageMerkleTree, verifyMessageMerkleProof } from "../src/message-merkle.mjs";
+import { createValidatorSetResolver } from "../../validator/src/validator-sets.mjs";
 import { commitConfigs, signedCommitFixture } from "../../validator/test/helpers/commit-fixtures.mjs";
 import { buildQuorumCertificate, expectedCommitStatement, qcDigest } from "../../validator/src/quorum-certificate.mjs";
 import { cloneCandidateFixture, sourceState } from "../../validator/test/helpers/four-process.mjs";
@@ -31,14 +32,16 @@ const failureFunction = tableName(config.databaseSchema, "reject_batch_seal_for_
 const committee = commitConfigs[0].peers;
 const certificateTable = tableName(config.databaseSchema, "batch_quorum_certificates");
 const signaturesTable = tableName(config.databaseSchema, "batch_quorum_certificate_signatures");
-const committingLifecycle = createBatchLifecycle({ config: lifecycleConfig, pool, committee });
+const validatorSets = commitConfigs[0].validatorSets;
+const committingLifecycle = createBatchLifecycle({ config: lifecycleConfig, pool, committee, validatorSets });
 
 async function pendingCertificateFixture() {
   const { id } = await collectedPair();
   await lifecycle.sealBatch({ batchRecordId: id });
-  const pending = await lifecycle.markConsensusPending({ batchRecordId: id });
+  await lifecycle.markConsensusPending({ batchRecordId: id });
+  const pending = await committingLifecycle.pinConsensus({ batchRecordId: id });
   const statement = expectedCommitStatement({ sourceDomain: pending.record.sourceDomain, sourceGateway: pending.record.sourceGateway,
-    epoch: pending.record.epoch, batchId: pending.record.batchId, messageRoot: pending.record.messageRoot }, committee);
+    epoch: pending.record.epoch, batchId: pending.record.batchId, messageRoot: pending.record.messageRoot, validatorEpoch: "0" }, committee, validatorSets);
   const options = { peers: committee, expected: statement };
   const votes = await Promise.all(commitConfigs.map((identity) => signedCommitFixture(statement, identity)));
   const a = await buildQuorumCertificate(votes.slice(0, 3), options);
@@ -191,9 +194,9 @@ test("SQL cannot persist a certificate without the same transaction committing i
     await client.query("BEGIN");
     await client.query(`INSERT INTO ${certificateTable}
       (batch_record_id, protocol_version, source_domain, source_gateway, epoch, batch_id,
-       message_root, proposal_digest, committee_digest, qc_digest)
-      VALUES ($1,2,$2,$3,$4,$5,$6,$7,$8,$9)`,
-    [id, a.sourceDomain, a.sourceGateway, a.epoch, a.batchId, a.messageRoot, a.proposalDigest, a.committeeDigest, a.qcDigest]);
+       message_root, proposal_digest, committee_digest, qc_digest,validator_epoch)
+      VALUES ($1,3,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+    [id, a.sourceDomain, a.sourceGateway, a.epoch, a.batchId, a.messageRoot, a.proposalDigest, a.committeeDigest, a.qcDigest,a.validatorEpoch]);
     for (const vote of a.commits) {
       await client.query(`INSERT INTO ${signaturesTable}
         (batch_record_id, voter_identity, commit_digest, signature) VALUES ($1,$2,$3,$4)`,
@@ -523,6 +526,48 @@ test("finalized messages after COMMITTED enter the next epoch without changing t
   assert.deepEqual(await committingLifecycle.readBatch({ batchRecordId: id }), committed);
 });
 
+test("fixed initial epoch automatically advances pending batches across a validator epoch boundary", async () => {
+  const initialEpoch = 23n;
+  const nextEpoch = initialEpoch + 1n;
+  const { id } = await collectedPair(initialEpoch);
+  const history = createValidatorSetResolver([
+    { ...validatorSets.history[0], validatorEpoch: "7" },
+    { ...validatorSets.history[0], validatorEpoch: "8", activationBatchEpoch: nextEpoch.toString() },
+  ]);
+  const manager = createBatchLifecycle({ config: lifecycleConfig, pool, committee, validatorSets: history });
+  await manager.sealBatch({ batchRecordId: id });
+  const first = await manager.markConsensusPending({ batchRecordId: id });
+  assert.equal(first.record.epoch, initialEpoch);
+  assert.equal(first.consensusBinding.validatorEpoch, "7");
+
+  await persist(11n, 11n, [message(11n, 0n)]);
+  await finalityStore.advanceFinality(scope, { headBlock: 11n, finalityBlockDepth: 0n });
+  const building = await manager.getOrCreateBuilding({ initialEpoch });
+  assert.equal(building.record.epoch, nextEpoch);
+  assert.equal(building.record.status, "BUILDING");
+  assert.deepEqual(await manager.getOrCreateBuilding({ initialEpoch }), building);
+  await assert.rejects(
+    manager.getOrCreateBuilding({ initialEpoch: nextEpoch }),
+    /initial epoch does not match persisted batch history/,
+  );
+  assert.deepEqual(await manager.readBatch({ batchRecordId: building.record.batchRecordId }), building);
+  const extra = (await readMessages(pool, config.databaseSchema)).find((row) => row.source_block_number === "11");
+  assert.ok(extra);
+  await manager.assignMessages({ batchRecordId: building.record.batchRecordId, sourceMessageIds: [extra.id] });
+  await manager.sealBatch({ batchRecordId: building.record.batchRecordId });
+  const second = await manager.markConsensusPending({ batchRecordId: building.record.batchRecordId });
+  assert.equal(second.record.epoch, nextEpoch);
+  assert.equal(second.record.status, "CONSENSUS_PENDING");
+  assert.deepEqual(second.consensusBinding, {
+    protocolVersion: "3",
+    validatorEpoch: "8",
+    committeeDigest: history.resolveForBatchEpoch(nextEpoch).committeeDigest,
+  });
+  assert.deepEqual(await manager.readBatch({ batchRecordId: id }), first);
+  assert.deepEqual(await manager.markConsensusPending({ batchRecordId: second.record.batchRecordId }), second);
+  assert.deepEqual(await certificateCounts(), { certificates: 0, signatures: 0 });
+});
+
 test("epoch rollover is exact for large values and rejects uint256 overflow", async () => {
   const large = (1n << 200n) + 1n;
   const { id } = await collectedPair(large);
@@ -620,7 +665,7 @@ test("concurrent identical seal attempts produce one canonical durable snapshot"
 test("view-bound QCs preserve the first final certificate across equivalent later and earlier views", async () => {
   const { pending, a, id } = await pendingCertificateFixture();
   const statement = expectedCommitStatement({ sourceDomain: pending.record.sourceDomain, sourceGateway: pending.record.sourceGateway,
-    epoch: pending.record.epoch, view: "1", batchId: pending.record.batchId, messageRoot: pending.record.messageRoot }, committee);
+    epoch: pending.record.epoch, validatorEpoch: "0", view: "1", batchId: pending.record.batchId, messageRoot: pending.record.messageRoot }, committee, validatorSets);
   const commits = await Promise.all(commitConfigs.slice(0, 3).map((identity) => signedCommitFixture(statement, identity)));
   const later = await buildQuorumCertificate(commits, { peers: committee, expected: statement });
   const first = await committingLifecycle.commitWithCertificate({ certificate: later });
@@ -629,14 +674,107 @@ test("view-bound QCs preserve the first final certificate across equivalent late
   assert.deepEqual(lateOld, first);
   assert.deepEqual(await certificateCounts(), { certificates: 1, signatures: 3 });
   const row = (await pool.query(`SELECT view,protocol_version FROM ${certificateTable} WHERE batch_record_id = $1`, [id])).rows[0];
-  assert.equal(row.view, "1"); assert.equal(row.protocol_version, 2);
+  assert.equal(row.view, "1"); assert.equal(row.protocol_version, 3);
   const rootCount = (await pool.query(`SELECT COUNT(DISTINCT message_root)::int AS count FROM ${certificateTable}
     WHERE source_domain = $1 AND source_gateway = $2 AND epoch = $3`, [a.sourceDomain, a.sourceGateway, a.epoch])).rows[0].count;
   assert.equal(rootCount, 1);
+  await applyMigrations(pool,config.databaseSchema);
+  assert.deepEqual(await committingLifecycle.readBatch({ batchRecordId: id }),first);
+});
+
+test("source consensus pinning is idempotent, immutable and rejects a conflicting trusted epoch", async () => {
+  const { id,pending } = await pendingCertificateFixture();
+  const expected = validatorSets.resolveForBatchEpoch(pending.record.epoch);
+  assert.deepEqual(pending.consensusBinding, {
+    protocolVersion: "3",
+    validatorEpoch: expected.validatorEpoch,
+    committeeDigest: expected.committeeDigest,
+  });
+  assert.equal(Object.isFrozen(pending.consensusBinding), true);
+  assert.deepEqual(await lifecycle.readBatch({ batchRecordId: id }), pending);
+  const [first,second] = await Promise.all([committingLifecycle.pinConsensus({ batchRecordId: id }),committingLifecycle.pinConsensus({ batchRecordId: id })]);
+  assert.deepEqual(first,second); assert.deepEqual(first,pending);
+  const bindingTable = tableName(config.databaseSchema,"batch_consensus_bindings");
+  await assert.rejects(pool.query(`UPDATE ${bindingTable} SET validator_epoch = 1 WHERE batch_record_id = $1`,[id]), /immutable/);
+  await assert.rejects(pool.query(`DELETE FROM ${bindingTable} WHERE batch_record_id = $1`,[id]), /immutable/);
+  const differentHistory = createValidatorSetResolver([{ ...validatorSets.history[0],validatorEpoch: "1" }]);
+  const conflicting = createBatchLifecycle({ config: lifecycleConfig,pool,committee,validatorSets: differentHistory });
+  await assert.rejects(conflicting.pinConsensus({ batchRecordId: id }), /conflicting source batch consensus binding/);
+  await assert.rejects(conflicting.readBatch({ batchRecordId: id }), /source batch committee binding differs from trusted history/);
+  assert.deepEqual(await committingLifecycle.readBatch({ batchRecordId: id }),pending);
+});
+
+test("pending transition returns its persisted binding across retries and fresh readers", async () => {
+  const { id } = await collectedPair();
+  const sealed = await committingLifecycle.sealBatch({ batchRecordId: id });
+  assert.equal(sealed.consensusBinding, null);
+  const pending = await committingLifecycle.markConsensusPending({ batchRecordId: id });
+  const expected = validatorSets.resolveForBatchEpoch(pending.record.epoch);
+  assert.equal(pending.record.status, "CONSENSUS_PENDING");
+  assert.deepEqual(pending.consensusBinding, {
+    protocolVersion: "3",
+    validatorEpoch: expected.validatorEpoch,
+    committeeDigest: expected.committeeDigest,
+  });
+  assert.deepEqual(pending.members, sealed.members);
+  assert.deepEqual(pending.batch, sealed.batch);
+  assert.deepEqual(pending.tree, sealed.tree);
+  assert.deepEqual(await committingLifecycle.markConsensusPending({ batchRecordId: id }), pending);
+  const fresh = createDatabasePool(config);
+  try {
+    const reader = createBatchLifecycle({ config: lifecycleConfig, pool: fresh, committee, validatorSets });
+    assert.deepEqual(await reader.readBatch({ batchRecordId: id }), pending);
+    assert.deepEqual(await reader.pinConsensus({ batchRecordId: id }), pending);
+    const unconfiguredReader = createBatchLifecycle({ config: lifecycleConfig, pool: fresh });
+    assert.deepEqual(await unconfiguredReader.readBatch({ batchRecordId: id }), pending);
+  } finally { await fresh.end(); }
+});
+
+test("pending QC submission rejects each mismatched binding without changing state", async () => {
+  const { id, pending, a } = await pendingCertificateFixture();
+  for (const certificate of [
+    { ...a, protocolVersion: "2" },
+    { ...a, validatorEpoch: "1" },
+    { ...a, committeeDigest: hash(991) },
+  ]) {
+    await assert.rejects(
+      committingLifecycle.commitWithCertificate({ certificate }),
+      { code: "WRONG_CONSENSUS_BINDING" },
+    );
+    assert.deepEqual(await committingLifecycle.readBatch({ batchRecordId: id }), pending);
+    assert.deepEqual(await certificateCounts(), { certificates: 0, signatures: 0 });
+  }
+  const committed = await committingLifecycle.commitWithCertificate({ certificate: a });
+  assert.equal(committed.record.status, "COMMITTED");
+  assert.deepEqual(committed.consensusBinding, pending.consensusBinding);
+});
+
+test("an unbound pending batch cannot adopt the validator epoch from a valid QC", async () => {
+  const { id } = await collectedPair();
+  await lifecycle.sealBatch({ batchRecordId: id });
+  const pending = await lifecycle.markConsensusPending({ batchRecordId: id });
+  assert.equal(pending.consensusBinding, null);
+  const statement = expectedCommitStatement({
+    sourceDomain: pending.record.sourceDomain,
+    sourceGateway: pending.record.sourceGateway,
+    epoch: pending.record.epoch,
+    batchId: pending.record.batchId,
+    messageRoot: pending.record.messageRoot,
+  }, committee, validatorSets);
+  const commits = await Promise.all(commitConfigs.slice(0, 3).map((identity) => signedCommitFixture(statement, identity)));
+  const certificate = await buildQuorumCertificate(commits, { peers: committee, expected: statement, validatorSets });
+  await assert.rejects(
+    committingLifecycle.commitWithCertificate({ certificate }),
+    { code: "WRONG_CONSENSUS_BINDING" },
+  );
+  assert.deepEqual(await lifecycle.readBatch({ batchRecordId: id }), pending);
+  assert.deepEqual(await certificateCounts(), { certificates: 0, signatures: 0 });
 });
 
 test("historical version-one QC remains verifiable after QC metadata migration", async () => {
-  const { pending, id } = await pendingCertificateFixture();
+  const { id } = await collectedPair();
+  await lifecycle.sealBatch({ batchRecordId: id });
+  const pending = await lifecycle.markConsensusPending({ batchRecordId: id });
   const statement = expectedCommitStatement({ protocolVersion: "1", sourceDomain: pending.record.sourceDomain,
     sourceGateway: pending.record.sourceGateway, epoch: pending.record.epoch, batchId: pending.record.batchId,
     messageRoot: pending.record.messageRoot }, committee);

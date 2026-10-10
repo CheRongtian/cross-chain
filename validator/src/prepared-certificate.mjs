@@ -20,10 +20,10 @@ export function canonicalEvidence(entries, field) {
 }
 export function proposalIdentity(proposal) {
   return { sourceDomain: proposal.sourceDomain, sourceGateway: proposal.sourceGateway,
-    epoch: proposal.epoch, batchId: proposal.batchId, messageRoot: proposal.messageRoot };
+    epoch: proposal.epoch, ...(proposal.validatorEpoch === undefined ? {} : { validatorEpoch: proposal.validatorEpoch, committeeDigest: proposal.committeeDigest }), batchId: proposal.batchId, messageRoot: proposal.messageRoot };
 }
 export function sameProposal(a, b) {
-  return ["sourceDomain", "sourceGateway", "epoch", "batchId", "messageRoot"].every((field) => a[field] === b[field]);
+  return ["sourceDomain", "sourceGateway", "epoch", "validatorEpoch", "committeeDigest", "batchId", "messageRoot"].every((field) => a[field] === b[field]);
 }
 export async function verifyPreparedCertificate(input, config) {
   strictFields(input, ["messageType", "proposal", "prepares"]);
@@ -33,7 +33,7 @@ export async function verifyPreparedCertificate(input, config) {
   if (input.prepares.some((vote, index) => vote.voterIdentity !== ordered[index].voterIdentity)) throw new ViewChangeError("NONCANONICAL_EVIDENCE");
   const prepares = [];
   for (const evidence of ordered) {
-    const vote = await authenticatePrepare({ ...config, allowHistorical: proposal.protocolVersion === "1" }, evidence);
+    const vote = await authenticatePrepare({ ...config, allowHistorical: proposal.protocolVersion !== "3" }, evidence);
     if (!sameProposal(vote, proposal) || vote.protocolVersion !== proposal.protocolVersion ||
         (vote.view ?? "0") !== (proposal.view ?? "0") || vote.proposalDigest !== proposal.proposalDigest) {
       throw new ViewChangeError("WRONG_PREPARED_PROPOSAL");

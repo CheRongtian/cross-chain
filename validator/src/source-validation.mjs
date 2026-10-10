@@ -7,6 +7,8 @@ import { isFinalizedByDepth } from "../../indexer/src/finality-policy.mjs";
 import { decodeCrossChainMessageLog } from "../../indexer/src/source-gateway-event.mjs";
 import { createChainClient, validateChainSource } from "../../indexer/src/indexer.mjs";
 
+import { consensusBinding } from "./validator-sets.mjs";
+
 export class SourceValidationError extends Error {
   constructor(code, message) { super(message); this.code = code; }
 }
@@ -22,6 +24,24 @@ export async function validateSourceContext(publicClient, config) {
       throw new SourceValidationError("SOURCE_CONTEXT", error.message);
     }
     throw new SourceValidationError("RPC_UNAVAILABLE", "Chain A RPC prerequisite check failed");
+  }
+}
+
+export async function validateConsensusBindings(config, sourcePool) {
+  const rows = (await sourcePool.query(`SELECT b.epoch,b.status,p.validator_epoch,p.committee_digest
+    FROM ${tableName(config.sourceDatabaseSchema,"message_batches")} b
+    LEFT JOIN ${tableName(config.sourceDatabaseSchema,"batch_consensus_bindings")} p USING (batch_record_id)
+    WHERE b.source_domain = $1 AND b.source_gateway = $2 AND b.status IN ('CONSENSUS_PENDING','COMMITTED')`,
+  [config.chainDomain.toString(),config.sourceGateway])).rows;
+  for (const row of rows) {
+    const set = config.validatorSets.resolveForBatchEpoch(row.epoch);
+    if (row.validator_epoch !== null) {
+      check(row.validator_epoch === set.validatorEpoch && row.committee_digest === set.committeeDigest,
+        "CONSENSUS_BINDING", "trusted schedule would change an already-pinned source batch");
+    } else if (row.status === "CONSENSUS_PENDING") {
+      check(set.validatorEpoch === config.validatorSets.history[0].validatorEpoch,
+        "CONSENSUS_BINDING", "unbound legacy in-flight batch cannot be rotated retroactively");
+    }
   }
 }
 
@@ -41,8 +61,17 @@ export function createSourceBatchReader({ config, pool }) {
   };
 }
 
-export function validateCandidateSnapshot(snapshot, config, requestedBatchId) {
+export function validateCandidateSnapshot(snapshot, config, requestedBatchId, legacyContext = null) {
   check(snapshot && ["SEALED", "CONSENSUS_PENDING"].includes(snapshot.record?.status), "BATCH_STATUS", "only SEALED or CONSENSUS_PENDING snapshots can be validated");
+  const expectedCommittee = consensusBinding(config,snapshot.record.epoch);
+  if (legacyContext) {
+    check((!snapshot.consensusBinding || snapshot.consensusBinding.protocolVersion === "2") && legacyContext.batch_id === requestedBatchId &&
+      legacyContext.message_root === snapshot.record.messageRoot && legacyContext.protocol_version === 2,
+    "CONSENSUS_BINDING", "legacy consensus cannot acquire a new signed validator epoch");
+  } else if (snapshot.record.status === "CONSENSUS_PENDING" || snapshot.consensusBinding) {
+    check(snapshot.consensusBinding?.protocolVersion === "3" && snapshot.consensusBinding.validatorEpoch === expectedCommittee.validatorEpoch &&
+      snapshot.consensusBinding.committeeDigest === expectedCommittee.committeeDigest, "CONSENSUS_BINDING", "source consensus binding differs from trusted validator history");
+  }
   const batch = validateMessageBatch(snapshot.batch);
   const tree = buildMessageMerkleTree(batch);
   const record = snapshot.record;
@@ -58,8 +87,8 @@ export function validateCandidateSnapshot(snapshot, config, requestedBatchId) {
   return { batch, tree };
 }
 
-export async function validateMembersAgainstChain({ config, publicClient, snapshot, head }) {
-  const { batch } = validateCandidateSnapshot(snapshot, config, snapshot.record.batchId);
+export async function validateMembersAgainstChain({ config, publicClient, snapshot, head, legacyContext = null }) {
+  const { batch } = validateCandidateSnapshot(snapshot, config, snapshot.record.batchId, legacyContext);
   const blocks = new Map();
   const receipts = new Map();
   const validated = [];
@@ -116,9 +145,11 @@ export function createBatchValidationService({ config, sourcePool, store,
       return snapshot.record.status === "COMMITTED" ? snapshot : null;
     },
     async validatePending(batchId) {
-      return this.validate(batchId, { requirePending: true, withSnapshot: true });
+      const states = store.readViewStates ? await store.readViewStates() : [];
+      const legacyContext = states.find((state) => state.batch_id === batchId && state.protocol_version === 2) ?? null;
+      return this.validate(batchId, { requirePending: true, withSnapshot: true, legacyContext });
     },
-    async validate(batchId, { requirePending = false, withSnapshot = false } = {}) {
+    async validate(batchId, { requirePending = false, withSnapshot = false, legacyContext = null } = {}) {
       const id = normalizeBytes32(batchId, "batch ID");
       let head;
       let snapshot;
@@ -130,10 +161,13 @@ export function createBatchValidationService({ config, sourcePool, store,
         check(typeof block.number === "bigint", "RPC_HEAD", "Chain A head has no exact block number");
         head = { number: block.number, hash: normalizeBytes32(block.hash, "source head hash") };
         snapshot = await reader.read(id);
+        if (!legacyContext && snapshot.consensusBinding?.protocolVersion === "2" && store.readViewStates) {
+          legacyContext = (await store.readViewStates()).find((state) => state.batch_id === id && state.protocol_version === 2) ?? null;
+        }
         if (requirePending) check(snapshot.record?.status === "CONSENSUS_PENDING", "BATCH_STATUS", "PRE-PREPARE requires CONSENSUS_PENDING");
-        validateCandidateSnapshot(snapshot, config, id);
+        validateCandidateSnapshot(snapshot, config, id, legacyContext);
         integrityChecked = true;
-        reconstructed = await validateMembersAgainstChain({ config, publicClient, snapshot, head });
+        reconstructed = await validateMembersAgainstChain({ config, publicClient, snapshot, head, legacyContext });
       } catch (error) {
         const reason = error instanceof SourceValidationError ? error.code : "INVALID_SOURCE_OR_SNAPSHOT";
         let message = error.message;

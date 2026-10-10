@@ -9,7 +9,7 @@ export async function commitFixture() {
   const snapshot = await snapshotFixture();
   const statement = expectedCommitStatement({ sourceDomain: snapshot.record.sourceDomain,
     sourceGateway: snapshot.record.sourceGateway, epoch: snapshot.record.epoch,
-    batchId: snapshot.record.batchId, messageRoot: snapshot.record.messageRoot }, commitConfigs[0].peers);
+    batchId: snapshot.record.batchId, messageRoot: snapshot.record.messageRoot }, commitConfigs[0]);
   const options = { peers: commitConfigs[0].peers, expected: statement };
   const votes = await Promise.all(commitConfigs.map((config) => signedCommitFixture(statement, config)));
   return { snapshot, statement, options, votes };
