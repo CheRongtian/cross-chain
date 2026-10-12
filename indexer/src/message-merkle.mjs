@@ -1,7 +1,7 @@
 import { encodeAbiParameters, keccak256, parseAbiParameters, stringToHex } from "viem";
 
-import { normalizeBytes32 } from "./canonical-message.mjs";
-import { normalizeBatchMessage, validateMessageBatch } from "./message-batch.mjs";
+import { normalizeBytes32, validateCanonicalMessage } from "./canonical-message.mjs";
+import { normalizeBatchMessage, validateMessageBatch, validateMessageBatchCommitment } from "./message-batch.mjs";
 
 export const MESSAGE_MERKLE_LEAF_TYPE =
   "MessageMerkleLeaf(bytes32 batchId,uint256 index,bytes32 messageId)";
@@ -39,6 +39,11 @@ export function computeMessageMerkleNode(leftChild, rightChild) {
 
 export function buildMessageMerkleTree(batch) {
   const canonical = validateMessageBatch(batch);
+  return buildMessageMerkleTreeFromCommitment(canonical);
+}
+
+export function buildMessageMerkleTreeFromCommitment(input) {
+  const canonical = validateMessageBatchCommitment(input);
   const leaves = canonical.messageIds.map((messageId, index) => computeMessageMerkleLeaf({
     batchId: canonical.batchId,
     index,
@@ -110,6 +115,19 @@ export function verifyMessageMerkleProof(input) {
       return false;
     }
 
+    return verifyMessageMerklePath(canonical, candidate.messageId, proof, expectedRoot);
+  } catch {
+    return false;
+  }
+}
+
+// The same ordered path algorithm is shared by source and portable evidence.
+function verifyMessageMerklePath(canonical, messageId, proof, expectedRoot) {
+    validateIndex(proof.index, canonical.messageIds.length);
+    if (proof.leafCount !== canonical.messageIds.length ||
+        normalizeBytes32(proof.batchId) !== canonical.batchId ||
+        normalizeBytes32(proof.messageId) !== messageId ||
+        canonical.messageIds[proof.index] !== messageId || !Array.isArray(proof.siblings)) return false;
     let pathLength = 0;
     for (let width = proof.leafCount; width > 1; width = Math.ceil(width / 2)) {
       pathLength += 1;
@@ -121,7 +139,7 @@ export function verifyMessageMerkleProof(input) {
     let node = computeMessageMerkleLeaf({
       batchId: canonical.batchId,
       index: proof.index,
-      messageId: candidate.messageId,
+      messageId,
     });
     let position = proof.index;
     let width = proof.leafCount;
@@ -139,6 +157,17 @@ export function verifyMessageMerkleProof(input) {
       width = Math.ceil(width / 2);
     }
     return node === expectedRoot;
+}
+
+export function verifyCommittedMessageMerkleProof({ commitment, message, proof, messageRoot }) {
+  try {
+    const canonical = validateMessageBatchCommitment(commitment);
+    const candidate = validateCanonicalMessage(message, message.messageId);
+    if (candidate.payload === undefined || candidate.sourceDomain !== canonical.sourceDomain ||
+        candidate.sourceGateway !== canonical.sourceGateway) return false;
+    const root = normalizeBytes32(messageRoot, "Message Root");
+    if (buildMessageMerkleTreeFromCommitment(canonical).messageRoot !== root) return false;
+    return verifyMessageMerklePath(canonical, candidate.messageId, proof, root);
   } catch {
     return false;
   }

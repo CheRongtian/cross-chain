@@ -17,6 +17,7 @@ import { developmentKeys } from "./fixtures.mjs";
 import { signedCommitFixture } from "./commit-fixtures.mjs";
 import { closeScenarioResources, createValidatorProcesses, initializeValidatorState, reservePort, rpcObserver } from "./process-cluster.mjs";
 import { sourceState } from "./four-process.mjs";
+import { verifyDeliveryQueue } from "../../../indexer/test/helpers/delivery-integration.mjs";
 
 const quiet = { log() {},warn() {},error() {} };
 
@@ -184,6 +185,8 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     assert.equal((await request(4,"/pbft/qc/verify",oldQc)).status,200);
     assert.deepEqual(await lifecycle.readBatch({ batchRecordId: oldBatch.record.batchRecordId }),oldCommitted);
     assert.deepEqual(newCommitted.batch,newBatch.batch); assert.deepEqual(newCommitted.members,newBatch.members); assert.deepEqual(newCommitted.tree,newBatch.tree);
+    await verifyDeliveryQueue({ config, pool, snapshots: [oldCommitted,newCommitted], validatorSets,
+      orphanMessageIds: original.source_messages.filter((row) => row.status === "REORGED").map((row) => row.message_id) });
     const after = await sourceState(pool,config.databaseSchema);
     for (const table of ["source_messages","indexed_source_blocks","indexer_cursors","message_batch_members","batch_consensus_bindings"]) assert.deepEqual(after[table],sourceBefore[table]);
     assert.equal(after.batch_quorum_certificates.length,2);

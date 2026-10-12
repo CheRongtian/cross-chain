@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Validator Epoch and Rotation"
+VERIFICATION_NAME="Committed Message Delivery Queue"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -524,6 +524,15 @@ printf '104. Start five independent validators with two four-member historical c
 printf '105. Commit real A/B/D with epoch 7 and Message E with epoch 8\n'
 printf '106. Recover rotated-primary failure without changing the pinned validator epoch\n'
 printf '107. Reverify the immutable historical QC after rotation and V1 shutdown\n'
+printf '108. Install the durable READY delivery projection with the existing migration entry point\n'
+printf '109. Reject non-COMMITTED batches and reverify canonical message, membership, root and historical QC evidence\n'
+printf '110. Construct portable per-message packages with sealed positions, proofs and ordered batch message IDs\n'
+printf '111. Atomically project complete batches and preserve one immutable READY job per position\n'
+printf '112. Reject corrupted message, destination, proof, root, QC and validator-epoch bindings\n'
+printf '113. Roll back interrupted delivery inserts and recover after commit without duplicate jobs\n'
+printf '114. Run concurrent fresh delivery projectors and strict package readers\n'
+printf '115. Queue real A/B/D while excluding REORGED C and preserving source persistence\n'
+printf '116. Queue real Message E and retain epoch-7 and epoch-8 historical packages without Chain B submission\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -558,7 +567,7 @@ CURRENT_STEP="committed Merkle golden fixture drift check"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node "$INDEXER_DIR/scripts/generate-merkle-golden-vectors.mjs" --check
 
-CURRENT_STEP="Chain A Indexer, recovery, batch, Merkle, golden compatibility, and lifecycle unit tests"
+CURRENT_STEP="Chain A Indexer, recovery, batch, Merkle, golden compatibility, lifecycle and portable delivery package unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$INDEXER_DIR/test/config.test.mjs" \
@@ -572,15 +581,18 @@ node --test \
     "$INDEXER_DIR/test/message-batch.test.mjs" \
     "$INDEXER_DIR/test/message-merkle.test.mjs" \
     "$INDEXER_DIR/test/message-merkle-golden.test.mjs" \
-    "$INDEXER_DIR/test/batch-lifecycle-policy.test.mjs"
+    "$INDEXER_DIR/test/batch-lifecycle-policy.test.mjs" \
+    "$INDEXER_DIR/test/delivery-config.test.mjs" \
+    "$INDEXER_DIR/test/delivery-package.test.mjs"
 
-CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, lifecycle, fixed-initial-epoch rollover, and persisted consensus binding tests"
+CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, lifecycle, fixed-initial-epoch rollover, consensus binding and atomic delivery queue tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
     node --test \
         "$INDEXER_DIR/test/database.test.mjs" \
-        "$INDEXER_DIR/test/batch-lifecycle.database.test.mjs"
+        "$INDEXER_DIR/test/batch-lifecycle.database.test.mjs" \
+        "$INDEXER_DIR/test/delivery.database.test.mjs"
 
 CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1225,7 +1237,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source recovery, validator identity-bound recovery, normal consensus, fault safety, view recovery, validator rotation and historical QC integration"
+CURRENT_STEP="real source recovery, validator identity-bound recovery, normal consensus, fault safety, view recovery, validator rotation, historical QC and durable delivery queue integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

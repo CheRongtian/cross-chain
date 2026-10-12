@@ -425,7 +425,9 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
       });
     },
 
-    async readBatch({ batchRecordId }) {
+    async readBatch({ batchRecordId }, client) {
+      // A caller-owned transaction keeps strict source reads and queue writes atomic.
+      if (client) return snapshot(client, await readRecord(client, batchRecordId, "FOR SHARE"));
       return transaction(async (client) => snapshot(client, await readRecord(client, batchRecordId, "FOR SHARE")), { lockScope: false });
     },
 

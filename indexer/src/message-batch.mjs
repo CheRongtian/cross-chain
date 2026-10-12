@@ -32,6 +32,33 @@ function requiredUint256(value, label) {
   return toUint256(value, label);
 }
 
+// A portable batch commitment preserves the sealed order; it never sorts IDs.
+export function computeMessageBatchId({ version = MESSAGE_BATCH_VERSION, sourceDomain, sourceGateway, epoch, messageIds }) {
+  if (requiredUint256(version, "batch version") !== MESSAGE_BATCH_VERSION) throw new Error("unsupported batch version");
+  if (!Array.isArray(messageIds) || messageIds.length === 0) throw new Error("empty message batch is invalid");
+  const ids = messageIds.map((id) => normalizeBytes32(id, "batch message ID"));
+  if (new Set(ids).size !== ids.length) throw new Error("duplicate message ID in batch");
+  return keccak256(encodeAbiParameters(BATCH_PARAMETERS, [
+    MESSAGE_BATCH_TYPEHASH, Number(MESSAGE_BATCH_VERSION),
+    requiredUint256(sourceDomain, "batch source domain"),
+    normalizeAddress(sourceGateway, "batch source gateway"),
+    requiredUint256(epoch, "batch epoch"), ids,
+  ])).toLowerCase();
+}
+
+export function validateMessageBatchCommitment(input) {
+  const canonical = {
+    version: requiredUint256(input.version, "batch version"),
+    sourceDomain: requiredUint256(input.sourceDomain, "batch source domain"),
+    sourceGateway: normalizeAddress(input.sourceGateway, "batch source gateway"),
+    epoch: requiredUint256(input.epoch, "batch epoch"),
+    messageIds: Object.freeze(input.messageIds.map((id) => normalizeBytes32(id, "batch message ID"))),
+    batchId: normalizeBytes32(input.batchId, "batch ID"),
+  };
+  if (computeMessageBatchId(canonical) !== canonical.batchId) throw new Error("batch ID does not match canonical batch");
+  return Object.freeze(canonical);
+}
+
 export function normalizeBatchMessage(message, scope) {
   if (message === null || typeof message !== "object") {
     throw new Error("invalid batch message");
@@ -131,14 +158,6 @@ export function buildMessageBatch({ sourceDomain, sourceGateway, epoch, messages
 
   const orderedMessages = normalizedMessages.sort(compareSourceOccurrences);
   const orderedMessageIds = orderedMessages.map((message) => message.messageId);
-  const encoded = encodeAbiParameters(BATCH_PARAMETERS, [
-    MESSAGE_BATCH_TYPEHASH,
-    Number(MESSAGE_BATCH_VERSION),
-    scope.sourceDomain,
-    scope.sourceGateway,
-    normalizedEpoch,
-    orderedMessageIds,
-  ]);
 
   return Object.freeze({
     version: MESSAGE_BATCH_VERSION,
@@ -146,7 +165,7 @@ export function buildMessageBatch({ sourceDomain, sourceGateway, epoch, messages
     epoch: normalizedEpoch,
     messages: Object.freeze(orderedMessages.map(Object.freeze)),
     messageIds: Object.freeze(orderedMessageIds),
-    batchId: keccak256(encoded).toLowerCase(),
+    batchId: computeMessageBatchId({ ...scope, epoch: normalizedEpoch, messageIds: orderedMessageIds }),
   });
 }
 

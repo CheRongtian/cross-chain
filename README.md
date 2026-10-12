@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history; relaying and destination execution remain unimplemented.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch; relaying and destination execution remain unimplemented.
 
 The current implementation can:
 
@@ -71,6 +71,9 @@ The current implementation can:
 - verify persisted certificates when reading `COMMITTED` batches and recover the same result after restart.
 - continue the same consensus instance through explicit durable-message retries after connectivity returns;
 - exercise deterministic process and transport faults while preserving quorum identity, immutable vote locks, and source history.
+- strictly reverify COMMITTED batches and materialize one immutable READY delivery job per sealed message position;
+- recover complete portable message, batch, Merkle and historical QC evidence after worker restart;
+- serialize concurrent queue projection and roll back interrupted batches without partial or duplicate jobs.
 
 ## Architecture
 
@@ -160,13 +163,19 @@ Unknown EOA or contract ──────────────────�
                                                                │
                                                                v
                                               atomic QC persistence + COMMITTED
+                                                               │
+                                                               v
+                                              strict evidence verification
+                                                               │
+                                                               v
+                                              Delivery Queue: one READY job/message
 ```
 
 `IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The Indexer persists emitted source events, and the Finality Watcher advances their database lifecycle; neither component adds proof-to-message binding. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
 
 The Indexer and Finality Watcher are disposable worker processes. Their durable operational progress lives in PostgreSQL, and every new process reconciles that state with Chain A before continuing.
 
-The batch lifecycle assigns finalized source occurrences to durable batch records. Sealing reuses the deterministic batch and Merkle builders to persist an immutable snapshot, and reading it reconstructs its inclusion proofs. A verified QC authorizes `CONSENSUS_PENDING → COMMITTED`. Source messages and finality data remain unchanged by that transition; destination delivery is outside the current implementation.
+The batch lifecycle assigns finalized source occurrences to durable batch records. Sealing reuses the deterministic batch and Merkle builders to persist an immutable snapshot, and reading it reconstructs its inclusion proofs. A verified QC authorizes `CONSENSUS_PENDING → COMMITTED`. The Delivery Queue consumes that exact committed evidence without changing source messages, finality data or consensus state. READY denotes materialized evidence; destination submission and execution remain unimplemented.
 
 The same commitment primitive is implemented in JavaScript and Solidity. Shared committed vectors constrain both runtimes, and complete verification passes a reconstructed real sealed batch into Foundry's local EVM. This compatibility path does not deploy a destination endpoint or execute a message on Chain B.
 
@@ -1025,7 +1034,7 @@ The normal integration verifies the fourth COMMIT, duplicates and conflicts befo
 
 Every `COMMITTED` snapshot read reconstructs the immutable batch and Merkle tree, loads its stored QC evidence, and repeats independent certificate verification against the expected committee. Missing evidence, corrupted signatures, or context drift fails closed. PostgreSQL remains operational persistence and supplies no cryptographic authority by itself. Source messages, finality records, canonical blocks, cursor, membership, and existing proofs remain unchanged; later messages continue into subsequent batch epochs.
 
-This implementation supplies COMMIT/QC authorization for each exact historical four-member committee. The verification infrastructure exercises the failure model below. Delivery queues, relaying, destination validator-set integration, destination QC verification, and destination execution remain unsupported.
+This implementation supplies COMMIT/QC authorization for each exact historical four-member committee. The Delivery Queue consumes canonical committed certificates. The verification infrastructure exercises the failure model below. Relaying, destination validator-set integration, destination QC verification, and destination execution remain unsupported.
 
 ### Consensus safety and failure model
 
@@ -1100,6 +1109,58 @@ The same four processes then cast real COMMIT votes. Early casts before `PREPARE
 The normal integration is followed by isolated real-process crash, adversarial-backup, partition/heal, and primary-failure scenarios. Transport unit tests cover directional blocking, both partition directions, same-group delivery, healing, unchanged signed wire bytes, and stale-signature exclusion. The fault integration queries persisted signer sets, QC evidence, batch status, and distinct committed roots rather than treating delivery acknowledgements as consensus.
 
 Normal and fault integrations share one process helper for startup, stop, restart, endpoint queries, signal handling, and the owned PID registry. Fault-scenario cleanup waits for the created validators to exit before closing transport/RPC proxies and port reservations, then closes database pools. RPC remains available while pending validator ticks finish. Recovery failures report each node's active view, pending target, progress revision, finalized state, quorum targets, signer sets, and source status before cleanup; a cleanup failure cannot replace the original recovery failure. The root script retains fallback cleanup and never targets unrelated user processes. The claimed safety/liveness boundaries are limited to the explicit four-members-per-epoch scenarios described above.
+
+## Committed Message Delivery Queue
+
+The queue subsystem lives in `indexer/src/delivery/` and shares the source operational database and existing `pg`/`viem` dependencies. It materializes one immutable READY job for every sealed message position in a cryptographically verified COMMITTED batch. BUILDING, SEALED and CONSENSUS_PENDING batches are ineligible. PostgreSQL status strings and QC row presence alone are insufficient: the projector reuses the strict committed lifecycle reader inside the same transaction as queue persistence, reconstructs canonical membership and the Merkle tree, recomputes message and batch identities, and verifies the persisted historical QC.
+
+### Portable delivery evidence
+
+`buildDeliveryPackages(snapshot, { validatorSets })` constructs destination-neutral protocol artifacts. `verifyDeliveryPackage(package, { validatorSets, sourceDomain, sourceGateway })` independently checks their message, batch, proof, root, historical committee and signatures without database access, a READY marker, private keys or chain RPC. Optional expected source fields constrain the package to a caller's configured source scope. Trusted public validator history comes from the caller, never from the package itself.
+
+Each package contains:
+
+- `deliveryJobId`: deterministic operational identity;
+- `message`: the complete canonical message, including source sender, destination domain/Gateway/receiver, exact payload bytes, payload hash, nonce, deadline and message ID;
+- `batchVersion`, `batchEpoch`, `batchId`, and ordered `batchMessageIds`;
+- `messageIndex`, `leafCount`, `messageRoot`, and `merkleProof` with its batch/message IDs, index, leaf count and ordered siblings;
+- `validatorEpoch`, `committeeDigest`, and the complete canonical `quorumCertificate`.
+
+Ordered batch message IDs let a fresh consumer recompute the existing batch commitment and authenticate the exact leaf count through the QC-bound batch ID. They are taken from immutable sealed membership, never resorted for delivery. Source and portable verification share the original Merkle algorithm, domains and ABI encoding, including ordered left/right nodes, odd-node duplication and single-leaf proofs. The queue persists each sibling path and rejects a corrupted path rather than silently substituting a regenerated one. Payload stays opaque and deadlines are preserved even when expired; queue construction performs no business interpretation or automatic job deletion.
+
+All protocol uint256 fields serialize as decimal strings; byte values use canonical `0x` hex. Array indices and leaf counts are bounded exact safe integers. Portable batch ID validation commits to ordered message IDs; source occurrence provenance and finality are additionally checked by the strict source lifecycle path, not established by the portable artifact alone.
+
+### Identity, persistence and atomic projection
+
+The job identity is the canonical composite `sourceDomain:sourceGateway:batchId:messageIndex`. It is operational idempotency data and introduces no additional hash or consensus domain. Timestamps never affect identity. Message ID, batch ID, Merkle Root and QC remain unchanged.
+
+`indexer/migrations/009_delivery_queue.sql` adds `delivery_batches` and `delivery_jobs`. One delivery batch references the immutable source batch and its canonical QC, retaining batch scope, epoch/version, root, leaf count, QC protocol, validator epoch, committee digest, QC digest and materialization time. Jobs reference immutable source members and retain position, message ID, explicit source/destination fields, proof siblings, READY state and creation time. Complete message bytes and QC signatures are reconstructed from the referenced canonical source tables; identical signatures are not copied for every message.
+
+Unique `(batch_record_id, message_index)` membership enforces one job per sealed position. Foreign keys and insert guards check source/QC relationships. Immutable guards reject queue evidence updates and deletions. Deferred constraint triggers require the entire projection to contain exactly the canonical number of positions before COMMIT. SQL protects structural persistence; application-level cryptographic checks remain mandatory.
+
+`createDeliveryProjector({ config, pool }).materializeBatch({ batchRecordId })` locks the existing source batch, strictly revalidates it and all packages, and persists the complete projection in one transaction. A failure rolls back the delivery batch and every job. Concurrent projectors serialize on the same batch row. Retrying an existing projection strictly verifies its complete stored contents and preserves its original jobs and timestamps; partial or conflicting data fails closed and is never patched into place.
+
+`projectCommittedBatches()` finds COMMITTED batches without a delivery projection through bounded, explicitly ordered database queries. It uses durable eligibility rather than a queue cursor or in-memory restart position. Failure before commit leaves no partial jobs; loss of the worker's report after commit leaves the canonical jobs discoverable without duplication. The `delivery:once` npm entry invokes this database-only worker against an already migrated schema. Configuration uses `DATABASE_URL`, `INDEXER_DB_SCHEMA`, `CHAIN_A_DOMAIN`, `SOURCE_GATEWAY_ADDRESS` and exactly one existing validator-history source. It requires no validator private key or destination RPC configuration.
+
+### Strict queue reads and historical committees
+
+`createDeliveryRepository({ config, pool })` exposes:
+
+| API | Behavior |
+| --- | --- |
+| `listReadyDeliveryJobs({ limit })` | Non-destructive strict listing, ordered by batch epoch, message index and job ID; default 100, maximum 1000 |
+| `getDeliveryJob(deliveryJobId)` | Read verified operational metadata for one job |
+| `getDeliveryPackage(deliveryJobId)` | Reconstruct and verify the complete portable package |
+
+Reads reject mismatched job identity, membership, destination fields, proof paths, roots, QC references or validator-epoch metadata. They also reverify underlying source message integrity and QC cryptography. Queue persistence is an operational projection and does not become cross-chain authority.
+
+Old packages retain their exact historical epoch and canonical first QC after rotation. Verification resolves the QC's historical committee and checks its activation schedule; it never uses the latest committee as a substitute or requests replacement signatures. Legacy v1/v2 certificates retain their original bytes and signatures, are verified using the explicitly configured initial committee, and expose `validatorEpoch: null` because those formats did not sign an epoch. No queue migration invents epoch-bound evidence.
+
+### READY boundary and integration
+
+READY means immutable delivery evidence was successfully materialized. It does not mean submitted, executed or confirmed. Source batch state remains COMMITTED. The queue provides no claim/lease, retry counter, transaction nonce, fee, hash or receipt, and never sends a Chain B transaction or encodes a future DestinationGateway ABI. Relayers remain untrusted transport; future destination verification and execution require their own security boundary.
+
+The unified verification preserves the existing source, ZK, Merkle, PBFT, fault, view-change and rotation checks, and adds queue unit/database tests. Real A/B/D produces three READY jobs with the original proofs and QC, while REORGED C produces none. The rotation integration also materializes real epoch-7 A/B/D and epoch-8 Message E, independently verifies packages in fresh processes, checks concurrent projection, injects deterministic interruption before commit and report loss after commit, and preserves all source lifecycle data and historical evidence. These are verification procedures; readiness for destination execution is not claimed.
 
 ## Local Two-Chain Environment
 
@@ -1384,7 +1445,12 @@ The script uses strict error handling and performs:
 107. validator-before-RPC shutdown ordering, cleanup failure propagation, and recovery diagnostics before resource cleanup;
 108. immutable validator-set history, future activation and batch consensus pinning;
 109. epoch-bound signatures, removed/future member rejection, mixed-quorum rejection and historical QC verification;
-110. five independent processes, real A/B/D and Message E rotation, rotated-primary recovery and old QC verification after V1 stops.
+110. five independent processes, real A/B/D and Message E rotation, rotated-primary recovery and old QC verification after V1 stops;
+111. strict COMMITTED-only delivery eligibility and independently verified portable message/batch/Merkle/QC packages;
+112. immutable queue schema, atomic complete-batch persistence, concurrent projection and rollback recovery;
+113. strict rejection of corrupted queue/source evidence, bounded deterministic listing and fresh-client package reads;
+114. real A/B/D READY jobs, REORGED C exclusion, epoch-8 Message E and preserved epoch-7 historical evidence;
+115. fresh worker recovery before and after commit without partial or duplicate jobs, without Chain B submission.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -1402,7 +1468,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-PBFT View Change
+Committed Message Delivery Queue
 ```
 
 ### Expected error output
@@ -1473,7 +1539,8 @@ Cross-Chain/
 │   │   ├── 005_batch_lifecycle.sql
 │   │   ├── 006_pbft_commit.sql
 │   │   ├── 007_view_bound_qc.sql
-│   │   └── 008_validator_epochs.sql
+│   │   ├── 008_validator_epochs.sql
+│   │   └── 009_delivery_queue.sql
 │   ├── scripts/
 │   │   └── generate-merkle-golden-vectors.mjs
 │   ├── src/
@@ -1484,6 +1551,12 @@ Cross-Chain/
 │   │   ├── check-database.mjs
 │   │   ├── config.mjs
 │   │   ├── db.mjs
+│   │   ├── delivery/
+│   │   │   ├── config.mjs
+│   │   │   ├── main.mjs
+│   │   │   ├── package.mjs
+│   │   │   ├── projector.mjs
+│   │   │   └── repository.mjs
 │   │   ├── finality-policy.mjs
 │   │   ├── finality-watcher.mjs
 │   │   ├── indexer.mjs
@@ -1501,10 +1574,16 @@ Cross-Chain/
 │   │   ├── canonical-message.test.mjs
 │   │   ├── config.test.mjs
 │   │   ├── database.test.mjs
+│   │   ├── delivery-config.test.mjs
+│   │   ├── delivery-package.test.mjs
+│   │   ├── delivery.database.test.mjs
 │   │   ├── finality-policy.test.mjs
 │   │   ├── finality-watcher.test.mjs
 │   │   ├── helpers/
-│   │   │   └── read-batch-lifecycle.mjs
+│   │   │   ├── delivery-fixtures.mjs
+│   │   │   ├── delivery-integration.mjs
+│   │   │   ├── read-batch-lifecycle.mjs
+│   │   │   └── read-delivery.mjs
 │   │   ├── indexer.test.mjs
 │   │   ├── integration.test.mjs
 │   │   ├── message-batch.test.mjs
@@ -1645,7 +1724,8 @@ Cross-Chain/
 - COMMIT votes bind the static committee and exact accepted proposal. One or two voters cannot commit; three distinct valid COMMIT signatures are required. QC submitters need no trusted identity, and persisted evidence is cryptographically reverified on committed reads.
 - The failure model retains progress with one unavailable non-primary and an honest available primary. A single conflicting backup cannot supply a conflicting QC. A 2|2 partition preserves safety and pauses progress until explicit retries restore delivery; connectivity changes do not reset vote locks or select a new primary.
 - Primary failure or withholding triggers progress timeouts; replacement still requires three valid VIEW_CHANGE votes and an available deterministic new primary. Process availability is not commit authority. PostgreSQL never substitutes for independent source and signature verification.
-- The repository does not provide decentralized validator governance, Delivery Queue, Transaction Manager, destination gateway integration or destination QC verification, exactly-once downstream batch consumption, relaying, destination execution, Application B, a cryptographic finality proof, multi-worker coordination, or a production cross-chain security model.
+- READY jobs contain verified immutable evidence and provide no destination permission or execution guarantee. Delivery projectors coordinate per batch through database locks and uniqueness; this does not add multi-instance Indexer/Finality Watcher coordination or exactly-once destination consumption.
+- The repository does not provide decentralized validator governance, Transaction Manager, destination gateway integration or destination QC verification, exactly-once downstream message execution, relaying, destination execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, message relay, and a destination-chain execution security design.
