@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Committed Message Delivery Queue"
+VERIFICATION_NAME="Single Relayer Direct RPC Submission"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -532,7 +532,17 @@ printf '112. Reject corrupted message, destination, proof, root, QC and validato
 printf '113. Roll back interrupted delivery inserts and recover after commit without duplicate jobs\n'
 printf '114. Run concurrent fresh delivery projectors and strict package readers\n'
 printf '115. Queue real A/B/D while excluding REORGED C and preserving source persistence\n'
-printf '116. Queue real Message E and retain epoch-7 and epoch-8 historical packages without Chain B submission\n'
+printf '116. Queue real Message E and retain epoch-7 and epoch-8 historical packages before Relayer submission\n'
+printf '117. Validate Single Relayer configuration and keep signer secrets out of public state\n'
+printf '118. Strictly re-read and independently verify READY packages immediately before submission\n'
+printf '119. ABI-encode versioned deterministic transport envelopes preserving original historical QC evidence\n'
+printf '120. Reject corrupt packages, wrong destinations, wrong-chain RPC and invalid returned hashes before recording submissions\n'
+printf '121. Submit real A/B/D from the development Relayer A to canonical Chain B gateway targets with zero value\n'
+printf '122. Persist one immutable minimal submission record only after the RPC returns a transaction hash\n'
+printf '123. Match exposed Chain B transaction sender, target, value and exact ABI package bytes without receipt tracking\n'
+printf '124. Re-run a fresh Relayer A process with no duplicate records or transactions\n'
+printf '125. Surface RPC failure and conflicting records while preserving READY/source/consensus evidence\n'
+printf '126. Transport real Message E with epoch-8 evidence and preserve historical epoch-7 packages\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -583,7 +593,10 @@ node --test \
     "$INDEXER_DIR/test/message-merkle-golden.test.mjs" \
     "$INDEXER_DIR/test/batch-lifecycle-policy.test.mjs" \
     "$INDEXER_DIR/test/delivery-config.test.mjs" \
-    "$INDEXER_DIR/test/delivery-package.test.mjs"
+    "$INDEXER_DIR/test/delivery-package.test.mjs" \
+    "$INDEXER_DIR/test/relayer-config.test.mjs" \
+    "$INDEXER_DIR/test/relayer-encoding.test.mjs" \
+    "$INDEXER_DIR/test/relayer-service.test.mjs"
 
 CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, lifecycle, fixed-initial-epoch rollover, consensus binding and atomic delivery queue tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -592,7 +605,8 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
     node --test \
         "$INDEXER_DIR/test/database.test.mjs" \
         "$INDEXER_DIR/test/batch-lifecycle.database.test.mjs" \
-        "$INDEXER_DIR/test/delivery.database.test.mjs"
+        "$INDEXER_DIR/test/delivery.database.test.mjs" \
+        "$INDEXER_DIR/test/relayer.database.test.mjs"
 
 CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1237,7 +1251,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source recovery, validator identity-bound recovery, normal consensus, fault safety, view recovery, validator rotation, historical QC and durable delivery queue integration"
+CURRENT_STEP="real source recovery, validator identity-bound recovery, consensus, fault/view/epoch recovery, historical QC, delivery queue and single Relayer Chain B submission integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \
@@ -1255,6 +1269,10 @@ INDEXER_INTEGRATION_DESTINATION_DOMAIN="$CHAIN_B_ID" \
 INDEXER_INTEGRATION_DESTINATION_GATEWAY="$DESTINATION_GATEWAY" \
 INDEXER_INTEGRATION_DESTINATION_RECEIVER="$DESTINATION_RECEIVER" \
 VALIDATOR_VERIFICATION_PID_FILE="$VALIDATOR_PID_FILE" \
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+CHAIN_B_CHAIN_ID="$CHAIN_B_ID" \
+RELAYER_A_PRIVATE_KEY="$ANVIL_DEV_KEY" \
+RELAYER_MAX_JOBS_PER_RUN="100" \
     node --test "$INDEXER_DIR/test/integration.test.mjs"
 
 CURRENT_STEP="complete"

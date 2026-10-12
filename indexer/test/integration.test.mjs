@@ -35,6 +35,7 @@ import { verifyValidatorRotation } from "../../validator/test/helpers/rotation-s
 import { verifyViewChanges } from "../../validator/test/helpers/view-change-scenarios.mjs";
 import { createValidatorSetResolver } from "../../validator/src/validator-sets.mjs";
 import { verifyDeliveryQueue } from "./helpers/delivery-integration.mjs";
+import { verifySingleRelayer } from "./helpers/relayer-integration.mjs";
 
 const IDENTITY_APPLICATION_ABI = parseAbi([
   "function sendCrossChainMessage(uint256 destinationDomain, address destinationGateway, address destinationReceiver, bytes payload, uint256 deadline) returns (bytes32 messageId, uint256 nonce)",
@@ -862,6 +863,9 @@ test("recovers source workers and seals durable batches from real finalized mess
     await verifyViewChanges({ sourceConfig: config, sourcePool: activePool, snapshot: consensus.snapshot,
       pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE") });
     await verifyDeliveryQueue({ config, pool: activePool, snapshots: [consensus.snapshot],
+      validatorSets: createValidatorSetResolver(consensus.history),
+      orphanMessageIds: afterNewMessage.filter((row) => row.status === "REORGED").map((row) => row.message_id) });
+    await verifySingleRelayer({ config, pool: activePool, snapshots: [consensus.snapshot],
       validatorSets: createValidatorSetResolver(consensus.history),
       orphanMessageIds: afterNewMessage.filter((row) => row.status === "REORGED").map((row) => row.message_id) });
     await verifyValidatorRotation({ sourceConfig: config, sourcePool: activePool, snapshot: consensus.snapshot,
