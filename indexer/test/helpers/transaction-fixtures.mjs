@@ -73,7 +73,7 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
       return Promise.all(selected.map(record => strict(record.intent.deliveryJobId)));
     },
     async listTrackingIntents({ limit }) {
-      return Promise.all([...records.values()].filter(r => r.intent.status === "PENDING" && r.attempts.some(a => BigInt(a.broadcastAttemptCount) > 0n))
+      return Promise.all([...records.values()].filter(r => r.intent.status === "PENDING" && r.attempts.some(a => BigInt(a.broadcastAttemptCount) > 0n || a.broadcastAt !== null))
         .slice(0,limit).map(r => strict(r.intent.deliveryJobId)));
     },
     async listDueIntents({ now,limit }) {
@@ -123,7 +123,7 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
           (r.intent.retryStoppedAt !== null || r.attempt.status === "SIGNED"))) throw new TransactionError("EARLIER_SIGNED_TRANSACTION_BLOCKS_BROADCAST");
       let errorClass = null; let errorMessage = null; let errorCode = null;
       try {
-        if (normalizeBytes32(await broadcast(stored.attempt.rawSignedTransaction)) !== stored.attempt.transactionHash) throw new TransactionError("RPC_TRANSACTION_HASH_MISMATCH");
+        if (normalizeBytes32(await broadcast(stored.attempt.rawSignedTransaction,stored.attempt.transactionHash)) !== stored.attempt.transactionHash) throw new TransactionError("RPC_TRANSACTION_HASH_MISMATCH");
       } catch (error) { errorClass = classifyBroadcastError(error); errorCode = error.code ?? errorClass; errorMessage = safeRelayerMessage(error,config); }
       record.attempt.broadcastAttemptCount = (BigInt(record.attempt.broadcastAttemptCount) + 1n).toString();
       record.attempt.lastBroadcastAttemptAt = timestamp(); record.attempt.lastErrorClass = errorClass;
@@ -192,6 +192,12 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
       return attempt.transactionHash;
     },
     async head() { calls.head++; return state.head; },
+    async readView() { return { head: await rpc.head(),endpoints: [{ endpointLabel: "rpc-0",head: state.head }] }; },
+    async receiptEvidence(hash) {
+      const receipt = await rpc.receipt(hash);
+      if (receipt === null) return null;
+      return { receipt,block: await rpc.block(BigInt(receipt.blockNumber)),transaction: await rpc.transaction(hash),endpointLabel: "rpc-0" };
+    },
     async receipt(hash) { return state.receipts.get(hash) ?? null; },
     async block(number) { return state.blocks.get(number.toString()) ?? null; },
     async transaction(hash) { return state.transactions.get(hash) ?? null; },

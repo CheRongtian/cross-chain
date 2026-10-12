@@ -19,7 +19,11 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
   const verification = { validatorSets: config.validatorSets,sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway };
   async function protect(operation) {
     try { return await operation(); }
-    catch (error) { const safe = new TransactionError(error?.code ?? "TRANSACTION_MANAGER_FAILED"); safe.message = safeRelayerMessage(error,config); throw safe; }
+    catch (error) {
+      const safe = new TransactionError(error?.code ?? "TRANSACTION_MANAGER_FAILED");
+      safe.message = safeRelayerMessage(error,config); safe.observations = error?.observations ?? [];
+      throw safe;
+    }
   }
   async function verifyChain() {
     if (await rpc.verifyChain() !== config.destinationDomain) throw new TransactionError("CHAIN_ID_MISMATCH");
@@ -36,7 +40,7 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
   }
   const store = repository ?? createTransactionRepository({ config,pool,resolveIntent,beforeSignedCommit,clock });
   const sign = (intent,fields) => signDeliveryTransaction(intent,fields,account);
-  const inspect = (stored,head,forceAll = false) => inspectIntentReceipts({ stored,rpc,store,config,head: protocolInteger(head,"head"),forceAll });
+  const inspect = (stored,view,forceAll = false) => inspectIntentReceipts({ stored,rpc,store,config,view,forceAll });
 
   async function prepare(id) {
     const intent = await resolveIntent(id);
@@ -75,9 +79,9 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     }
     return known;
   }
-  async function reconcile(stored,head) {
-    const [latest,pending] = await Promise.all([rpc.latestNonce(),rpc.pendingNonce()]);
-    const observation = await inspect(stored,head,true);
+  async function reconcile(stored,view) {
+    const [latest,pending] = await Promise.all([rpc.latestNonce(view),rpc.pendingNonce()]);
+    const observation = await inspect(stored,view,true);
     if (observation.mined) return observation;
     const known = await ownTransactions(stored);
     if (protocolInteger(latest) > BigInt(stored.intent.nonce) && !known.some(value => value.mined)) {
@@ -98,23 +102,27 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
   }
   async function send(id,options = {}) {
     await verifyChain();
-    const result = await store.broadcastPrepared(id,raw => rpc.broadcast(raw),options);
+    let rpcObservation;
+    const result = await store.broadcastPrepared(id,(raw,transactionHash) => rpc.broadcast(raw,transactionHash,value => { rpcObservation = value; }),options);
     if (["ALREADY_KNOWN","NONCE_TOO_LOW"].includes(result.errorClass)) {
-      const reconciled = await reconcile(result,options.receiptHead ?? await rpc.head());
-      if (reconciled.mined || reconciled.known) return Object.freeze({ ...reconciled.stored,broadcast: true,reconciled: true,errorClass: null,errorMessage: null,errorCode: null });
+      const reconciled = await reconcile(result,options.receiptView ?? await rpc.readView());
+      if (reconciled.mined || reconciled.known) return Object.freeze({ ...reconciled.stored,broadcast: true,reconciled: true,errorClass: null,errorMessage: null,errorCode: null,
+        acceptedEndpointLabel: rpcObservation?.acceptedEndpointLabel ?? null,rpcObservations: rpcObservation?.observations ?? [] });
     }
     if (result.errorClass === "DETERMINISTIC_REJECTION") {
-      const error = new TransactionError(result.errorCode ?? result.errorClass); error.message = result.errorMessage; throw error;
+      const error = new TransactionError(result.errorCode ?? result.errorClass);
+      error.message = result.errorMessage; error.observations = rpcObservation?.observations ?? []; throw error;
     }
-    return result;
+    return Object.freeze({ ...result,acceptedEndpointLabel: rpcObservation?.acceptedEndpointLabel ?? null,rpcObservations: rpcObservation?.observations ?? [] });
   }
   function reportBroadcast(result) {
     if (result.errorClass) {
-      const error = new TransactionError(result.errorCode ?? result.errorClass); error.message = result.errorMessage; throw error;
+      const error = new TransactionError(result.errorCode ?? result.errorClass);
+      error.message = result.errorMessage; error.observations = result.rpcObservations ?? []; throw error;
     }
     return result;
   }
-  async function replace(id,parentAttemptId,head) {
+  async function replace(id,parentAttemptId,view) {
     await verifyChain();
     let stored = await store.getTransaction(id);
     if (!stored) throw new TransactionError("TRANSACTION_NOT_PREPARED");
@@ -123,9 +131,9 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     const expectedParent = stored.attempt.attemptId;
     const now = operationTime(clock);
     if (new Date(stored.intent.nextActionAt).getTime() > now || !replacementDue(stored.attempt,now,config)) throw new TransactionError("REPLACEMENT_NOT_DUE");
-    const snapshotHead = head === undefined ? await rpc.head() : head;
-    const [latest,pending] = await Promise.all([rpc.latestNonce(),rpc.pendingNonce()]);
-    const observation = await inspect(stored,snapshotHead,true);
+    const snapshotView = view ?? await rpc.readView();
+    const [latest,pending] = await Promise.all([rpc.latestNonce(snapshotView),rpc.pendingNonce()]);
+    const observation = await inspect(stored,snapshotView,true);
     if (observation.mined) return Object.freeze({ ...observation.stored,created: false });
     const known = await ownTransactions(stored);
     if (known.some(value => value.mined)) return Object.freeze({ ...stored,created: false });
@@ -149,7 +157,7 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     if (stored.intent.status !== "PENDING" || stored.intent.retryStoppedAt !== null || stored.attempt.attemptId !== expectedParent) {
       return Object.freeze({ ...stored,created: false });
     }
-    const recheck = await inspect(stored,snapshotHead,true);
+    const recheck = await inspect(stored,snapshotView,true);
     if (recheck.mined) return Object.freeze({ ...recheck.stored,created: false });
     return store.persistReplacement({ id,parentAttemptId: expectedParent,fees,sign });
   }
@@ -184,10 +192,10 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     },
     async checkReceiptsOnce({ limit = config.maxJobs } = {}) {
       return protect(async () => {
-        await verifyChain(); const head = protocolInteger(await rpc.head(),"head");
+        await verifyChain(); const view = await rpc.readView(); const head = view.head;
         const records = await store.listTrackingIntents({ limit });
         const results = [];
-        for (const stored of records) results.push((await inspect(stored,head)).stored);
+        for (const stored of records) results.push((await inspect(stored,view)).stored);
         return Object.freeze({ head: head.toString(),checked: records.length,
           confirmed: results.filter(value => value.intent.status === "CONFIRMED").length,
           reverted: results.filter(value => value.intent.status === "REVERTED").length,results: Object.freeze(results) });

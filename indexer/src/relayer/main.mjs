@@ -22,5 +22,6 @@ try {
     nonce: record.attempt?.nonce ?? null, status: record.attempt?.status ?? "HISTORICAL", submitted: record.submitted })) }));
 } catch (error) {
   console.error(`Relayer A failed: ${safeRelayerMessage(error,config)}`);
+  if (error.observations?.length) console.error(`Destination RPC observations: ${deliveryJson(error.observations)}`);
   process.exitCode = 1;
 } finally { if (pool) await pool.end(); }

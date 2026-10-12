@@ -15,26 +15,32 @@ export function verifyRpcTransaction(intent, attempt, tx, receipt) {
   return tx;
 }
 
-export async function inspectIntentReceipts({ stored, rpc, store, config, head, forceAll = false }) {
+export async function inspectIntentReceipts({ stored, rpc, store, config, view, forceAll = false }) {
+  const head = view.head;
   const observations = [];
   for (const attempt of stored.attempts) {
     if (!forceAll && BigInt(attempt.broadcastAttemptCount) === 0n && attempt.broadcastAt === null) continue;
-    const receipt = await rpc.receipt(attempt.transactionHash);
-    if (receipt === null) continue;
+    const evidence = await rpc.receiptEvidence(attempt.transactionHash,view);
+    if (evidence === null) continue;
+    const { receipt,block,transaction } = evidence;
     if (!receipt || normalizeBytes32(receipt.transactionHash) !== attempt.transactionHash) throw new TransactionError("RECEIPT_TRANSACTION_HASH_MISMATCH");
     const blockNumber = rpcQuantity(receipt.blockNumber,"receipt block");
     const blockHash = normalizeBytes32(receipt.blockHash,"receipt block hash");
     const status = rpcQuantity(receipt.status,"receipt status");
     if (status !== 0n && status !== 1n) throw new TransactionError("INVALID_RECEIPT_STATUS");
-    const block = await rpc.block(blockNumber);
     if (!block || rpcQuantity(block.number,"canonical block") !== blockNumber || normalizeBytes32(block.hash) !== blockHash) throw new TransactionError("NONCANONICAL_TRANSACTION_RECEIPT");
-    verifyRpcTransaction(stored.intent,attempt,await rpc.transaction(attempt.transactionHash),receipt);
+    verifyRpcTransaction(stored.intent,attempt,transaction,receipt);
     observations.push({ attempt,blockNumber,blockHash,status: Number(status) });
   }
   if (observations.length > 1) throw new TransactionError("CONFLICTING_CANONICAL_NONCE_WINNERS");
   const winner = observations[0];
   if (!winner) return { stored,mined: false,finalized: false };
-  if (head < winner.blockNumber || head - winner.blockNumber + 1n < config.destinationConfirmations) return { stored,mined: true,finalized: false };
+  if (head < winner.blockNumber || head - winner.blockNumber + 1n < config.destinationConfirmations) {
+    // Full canonical evidence proves acceptance even when a lost response left
+    // SIGNED state. Confirmation still uses the original conservative snapshot.
+    const known = winner.attempt.broadcastAt === null ? await store.markKnownAttempt(stored.intent.deliveryJobId,winner.attempt.attemptId) : stored;
+    return { stored: known,mined: true,finalized: false };
+  }
   const finalized = await store.recordOutcome(stored.intent.deliveryJobId,{ transactionHash: winner.attempt.transactionHash,
     blockNumber: winner.blockNumber,blockHash: winner.blockHash,status: winner.status,head });
   return { stored: finalized,mined: true,finalized: true };

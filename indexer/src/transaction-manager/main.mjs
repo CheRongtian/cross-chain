@@ -24,5 +24,6 @@ try {
   console.log(deliveryJson(result));
 } catch (error) {
   console.error(`Transaction Manager failed: ${safeRelayerMessage(error, config)}`);
+  if (error.observations?.length) console.error(`Destination RPC observations: ${deliveryJson(error.observations)}`);
   process.exitCode = 1;
 } finally { if (pool) await pool.end(); }

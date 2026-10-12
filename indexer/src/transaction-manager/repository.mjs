@@ -223,7 +223,7 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         if (earlier) throw new TransactionError("EARLIER_SIGNED_TRANSACTION_BLOCKS_BROADCAST");
         let errorClass = null; let errorMessage = null; let errorCode = null;
         try {
-          const returned = normalizeBytes32(await broadcast(stored.attempt.rawSignedTransaction),"RPC transaction hash");
+          const returned = normalizeBytes32(await broadcast(stored.attempt.rawSignedTransaction,stored.attempt.transactionHash),"RPC transaction hash");
           if (returned !== stored.attempt.transactionHash) throw new TransactionError("RPC_TRANSACTION_HASH_MISMATCH");
         } catch (error) {
           errorClass = classifyBroadcastError(error); errorMessage = safeRelayerMessage(error,config); errorCode = error?.code ?? errorClass;

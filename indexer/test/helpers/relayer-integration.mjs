@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { createPublicClient, http, keccak256, toHex } from "viem";
-import { normalizeAddress } from "../../src/canonical-message.mjs";
+import { normalizeAddress, normalizeBytes32 } from "../../src/canonical-message.mjs";
 import { tableName } from "../../src/db.mjs";
 import { createDeliveryRepository } from "../../src/delivery/repository.mjs";
 import { deliveryJson } from "../../src/delivery/package.mjs";
@@ -14,6 +14,7 @@ import { createRelaySubmissionRepository } from "../../src/relayer/repository.mj
 import { sourceState } from "../../../validator/test/helpers/four-process.mjs";
 import { rpcObserver } from "../../../validator/test/helpers/process-cluster.mjs";
 import { verifyPendingReplacement } from "./transaction-retry-integration.mjs";
+import { destinationAccessPath } from "./rpc-failover-integration.mjs";
 
 const execFileAsync = promisify(execFile);
 const MAIN = fileURLToPath(new URL("../../src/relayer/main.mjs",import.meta.url));
@@ -27,6 +28,14 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
   const env = { ...process.env,DATABASE_URL: config.databaseUrl,INDEXER_DB_SCHEMA: config.databaseSchema,
     CHAIN_A_DOMAIN: config.chainDomain.toString(),SOURCE_GATEWAY_ADDRESS: config.sourceGateway,
     VALIDATOR_SET_HISTORY_FILE: "",VALIDATOR_SET_HISTORY: deliveryJson(validatorSets.history),RELAYER_MAX_JOBS_PER_RUN: "100" };
+  // Local verification always controls its own destination access paths.
+  env.CHAIN_B_RPC_URLS = JSON.stringify([process.env.CHAIN_B_RPC_URL]);
+  const bootstrap = createPublicClient({ transport: http(process.env.CHAIN_B_RPC_URL,{ retryCount: 0,timeout: 10000 }) });
+  const genesis = await bootstrap.request({ method: "eth_getBlockByNumber",params: ["0x0",false] },
+    { retryCount: 0,signal: AbortSignal.timeout(10000) });
+  assert.equal(genesis?.number,"0x0");
+  env.CHAIN_B_GENESIS_HASH = normalizeBytes32(genesis.hash,"local Chain B genesis");
+  console.log(`Chain B expected genesis hash: ${env.CHAIN_B_GENESIS_HASH}`);
   const relayConfig = loadTransactionConfig(env);
   const queue = createDeliveryRepository({ config: relayConfig,pool });
   const repository = createRelaySubmissionRepository({ config: relayConfig,pool,queue });
@@ -91,9 +100,19 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
       assert.equal(reply.result.toLowerCase(),keccak256(request.params[0]).toLowerCase());
     }
   } });
-  env.CHAIN_B_RPC_URL = observer.url;
-  manager = createTransactionManager({ config: loadTransactionConfig(env),pool,queue,legacy: repository });
+  let primary; let secondary;
   try {
+    primary = await destinationAccessPath(observer.url);
+    secondary = await destinationAccessPath(observer.url);
+  } catch (error) {
+    const cleanup = await Promise.allSettled([primary?.close(),observer.close()]);
+    for (const result of cleanup) if (result.status === "rejected") console.error(`Destination access initialization cleanup failed: ${result.reason.message}`);
+    throw error;
+  }
+  env.CHAIN_B_RPC_URLS = JSON.stringify([primary.url,secondary.url]);
+  env.CHAIN_B_RPC_URL = primary.url;
+  try {
+    manager = createTransactionManager({ config: loadTransactionConfig(env),pool,queue,legacy: repository });
     async function queueState() {
       return {
         batches: (await pool.query(`SELECT * FROM ${tableName(config.databaseSchema,"delivery_batches")} ORDER BY batch_record_id`)).rows,
@@ -113,9 +132,14 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
         return error.code === 1 && (error.stderr ?? "").includes(expected);
       });
     }
-    await failed(MAIN,{ ...env,CHAIN_B_RPC_URL: config.chainRpcUrl },"CHAIN_ID_MISMATCH");
+    await failed(MAIN,{ ...env,CHAIN_B_RPC_URLS: JSON.stringify([config.chainRpcUrl]) },"CHAIN_ID_MISMATCH");
     assert.equal(await nonce(source),sourceNonce); assert.equal(await nonce(destination),destinationNonce);
     assert.equal(await count(intents),0); assert.equal(await count(attempts),0);
+    primary.state.genesisOverride = `0x${"ab".repeat(32)}`;
+    await failed(MAIN,{ ...env,CHAIN_B_RPC_URLS: JSON.stringify([primary.url]) },"GENESIS_HASH_MISMATCH");
+    assert.equal(await count(intents),0); assert.equal(await count(attempts),0);
+    primary.state.genesisOverride = null;
+    console.log("VALID: wrong-chain and same-chain-ID/wrong-genesis paths were rejected before nonce reservation or signing");
     await failed(FAILURE,env,"expected injected Relayer RPC submission failure");
     assert.equal(await count(intents),1); assert.equal(await count(attempts),1); assert.equal(await nonce(destination),destinationNonce);
     const firstId = jobs[0].deliveryJobId;
@@ -136,6 +160,16 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     const feesBefore = observer.calls.filter(call => call.method === "eth_maxPriorityFeePerGas").length;
     await failed(MAIN,env,"SIGNED_TRANSACTION_REQUIRES_EXPLICIT_BROADCAST");
     assert.equal(await count(attempts),1); assert.equal(await nonce(destination),destinationNonce); assert.equal(observed.length,0);
+    const accountBeforeFailure = await manager.repository.getAccount();
+    primary.state.available = false; secondary.state.available = false;
+    await assert.rejects(manager.broadcastPreparedTransaction(firstId),{ code: "RPC_UNAVAILABLE" });
+    assert.deepEqual(await manager.repository.getTransaction(firstId),signed);
+    assert.deepEqual(await manager.repository.getAccount(),accountBeforeFailure);
+    assert.deepEqual(await run(MANAGER,["read",firstId]),signed);
+    assert.deepEqual(await queueState(),queueBefore); assert.deepEqual(await sourceState(pool,config.databaseSchema),sourceBefore);
+    primary.state.available = true; secondary.state.available = true;
+    primary.setFault("eth_sendRawTransaction","drop-after-forward");
+    secondary.setFault("eth_sendRawTransaction","already-known");
     const retryTime = Math.max(Date.now(),Date.parse(signed.intent.nextActionAt));
     const retryManager = createTransactionManager({ config: loadTransactionConfig(env),pool,queue,legacy: repository,clock: { now: () => retryTime } });
     const retryResult = await retryManager.processTransactionRetriesOnce();
@@ -149,9 +183,20 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     assert.equal(observer.calls.filter(call => call.method === "eth_estimateGas").length,estimatesBefore);
     assert.equal(observer.calls.filter(call => call.method === "eth_maxPriorityFeePerGas").length,feesBefore);
     assert.deepEqual(await run(MANAGER,["read",firstId]),firstBroadcast);
+    assert.equal(primary.calls.filter(call => call.method === "eth_sendRawTransaction")[0].params[0],signed.attempt.rawSignedTransaction);
+    assert.equal(secondary.calls.filter(call => call.method === "eth_sendRawTransaction")[0].params[0],signed.attempt.rawSignedTransaction);
     console.log("VALID: persistent retry recovered one failed SIGNED submission and rebroadcast identical bytes/hash without gas, fees, signing or nonce allocation");
-    await verifyPendingReplacement({ config: loadTransactionConfig(env),pool,queue,legacy: repository,destination,
-      jobId: jobs[1].deliveryJobId,run: args => run(MANAGER,args) });
+    const replaced = await verifyPendingReplacement({ config: loadTransactionConfig(env),pool,queue,legacy: repository,destination,
+      jobId: jobs[1].deliveryJobId,run: args => run(MANAGER,args),onReplacementPrepared: async () => { primary.state.available = false; } });
+    assert.ok(secondary.calls.some(call => call.method === "eth_sendRawTransaction" && call.params[0] === replaced.attempt.rawSignedTransaction));
+    assert.equal(replaced.attempts.length,2);
+    primary.state.available = true;
+    const secondaryBeforeRecovery = secondary.calls.length;
+    await manager.verifyChain();
+    assert.equal(secondary.calls.length,secondaryBeforeRecovery,"a recovered primary is preferred for the next independent operation");
+    primary.setFault("eth_estimateGas","unavailable");
+    primary.setFault("eth_maxPriorityFeePerGas","unavailable");
+    primary.setFault("eth_getTransactionCount","unavailable",{ when: request => request.params[1] === "pending" });
     const submitted = await run();
     assert.equal(submitted.selected,expectedCount - 2); assert.equal(submitted.submitted,expectedCount - 2);
     assert.equal(await count(intents),expectedCount); assert.equal(await count(attempts),expectedCount + 1);
@@ -191,6 +236,8 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     if (await destination.request({ method: "eth_getTransactionReceipt",params: [last.attempt.transactionHash] }) === null) {
       await destination.request({ method: "anvil_mine",params: ["0x1"] });
     }
+    primary.state.available = false;
+    const secondaryReceiptsBefore = secondary.calls.filter(call => call.method === "eth_getTransactionReceipt").length;
     const firstReceiptCheck = await run(MANAGER,["receipts"]);
     if (relayConfig.destinationConfirmations > 1n) {
       assert.ok(firstReceiptCheck.results.some(record => record.attempt.status === "BROADCAST"));
@@ -198,6 +245,8 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
       await destination.request({ method: "anvil_mine",params: [toHex(relayConfig.destinationConfirmations - 1n)] });
     }
     await run(MANAGER,["receipts"]);
+    assert.ok(secondary.calls.filter(call => call.method === "eth_getTransactionReceipt").length > secondaryReceiptsBefore);
+    primary.state.available = true;
     for (const job of jobs) {
       const record = await manager.repository.getTransaction(job.deliveryJobId);
       assert.equal(record.attempt.status,"CONFIRMED"); assert.equal(record.attempt.receiptStatus,1);
@@ -217,14 +266,22 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     assert.deepEqual(await sourceState(pool,config.databaseSchema),sourceBefore);
     assert.deepEqual(await queueState(),queueBefore);
     assert.equal(observer.errors.length,0);
+    assert.equal(primary.errors.length,0); assert.equal(secondary.errors.length,0);
+    console.log("VALID: two independently controlled access paths reached the same real Chain B; response loss, all-down persistence, pre-signing reads, replacement, receipt failover and primary recovery preserved transaction identity");
     console.log("VALID: canonical real receipts reached configured depth; fresh Relayer and Transaction Manager processes preserved exact attempts and nonce allocation");
     console.log("VALID: immutable READY/source/consensus/historical QC evidence survived transport; CONFIRMED is transaction inclusion, not Gateway authentication or Application B execution");
   } catch (error) {
     failedRun = true;
     for (const failure of observer.errors) console.error(`Transaction RPC observation failed: ${failure.message}`);
+    for (const failure of [...primary.errors,...secondary.errors]) console.error(`Destination access path failed: ${failure.message}`);
     throw error;
   } finally {
-    try { await observer.close(); }
+    try {
+      const paths = await Promise.allSettled([primary.close(),secondary.close()]);
+      await observer.close();
+      const failure = paths.find(result => result.status === "rejected");
+      if (failure) throw failure.reason;
+    }
     catch (error) { if (!failedRun) throw error; console.error(`Transaction RPC observer cleanup also failed: ${error.message}`); }
   }
 }

@@ -6,8 +6,8 @@ export async function processTransactionRetriesOnce({ config, store, rpc, verify
   const now = operationTime(clock);
   const due = await store.listDueIntents({ now,limit });
   if (!due.length) return Object.freeze({ processed: 0,replacements: 0,broadcasts: 0,results: [] });
-  let head;
-  try { await verifyChain(); head = await rpc.head(); }
+  let view;
+  try { await verifyChain(); view = await rpc.readView(); }
   catch (error) {
     const reason = classifyBroadcastError(error);
     if (!["TRANSIENT_RPC_ERROR","AMBIGUOUS_BROADCAST"].includes(reason)) throw error;
@@ -22,7 +22,7 @@ export async function processTransactionRetriesOnce({ config, store, rpc, verify
     let current = await store.getTransaction(id);
     if (current.intent.status !== "PENDING" || current.intent.retryStoppedAt !== null || new Date(current.intent.nextActionAt).getTime() > now) continue;
     try {
-      const observation = await inspect(current,head);
+      const observation = await inspect(current,view);
       current = observation.stored;
       if (observation.mined) {
         if (!observation.finalized) await store.scheduleRetry(id,{ parentAttemptId: current.attempt.attemptId });
@@ -30,12 +30,12 @@ export async function processTransactionRetriesOnce({ config, store, rpc, verify
         continue;
       }
       if (replacementDue(current.attempt,now,config)) {
-        const prepared = await replace(id,current.attempt.attemptId,head);
+        const prepared = await replace(id,current.attempt.attemptId,view);
         if (!prepared.created) { results.push({ deliveryJobId: id,action: prepared.intent.retryStoppedAt ? prepared.intent.retryStopReason : "NO_REPLACEMENT" }); continue; }
         replacements++;
         current = prepared;
       }
-      const result = await send(id,{ rebroadcast: true,expectedAttemptId: current.attempt.attemptId,receiptHead: head });
+      const result = await send(id,{ rebroadcast: true,expectedAttemptId: current.attempt.attemptId,receiptView: view });
       if (result.broadcast) broadcasts++;
       results.push({ deliveryJobId: id,action: result.errorClass ? "RETRY_SCHEDULED" : result.intent.status !== "PENDING" ? result.intent.status : result.broadcast ? "BROADCAST" : "ATTEMPT_CHANGED",
         errorClass: result.errorClass ?? null,attemptId: result.attempt.attemptId,transactionHash: result.attempt.transactionHash });

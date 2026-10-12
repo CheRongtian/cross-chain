@@ -9,6 +9,7 @@ export function createSingleRelayer({ config,queue,repository,transactionManager
     catch (error) {
       const safe = new Error(safeRelayerMessage(error,config));
       safe.code = error?.code ?? "RELAYER_RUN_FAILED";
+      safe.observations = error?.observations ?? [];
       throw safe;
     }
   }

@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Transaction Retry and Replacement"
+VERIFICATION_NAME="Destination RPC Failover"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -49,6 +49,7 @@ INDEXER_POLL_INTERVAL_MS="${INDEXER_POLL_INTERVAL_MS:-100}"
 FINALITY_BLOCK_DEPTH="${FINALITY_BLOCK_DEPTH:-2}"
 FINALITY_POLL_INTERVAL_MS="${FINALITY_POLL_INTERVAL_MS:-100}"
 DESTINATION_CONFIRMATIONS="${DESTINATION_CONFIRMATIONS:-3}"
+RPC_REQUEST_TIMEOUT_MS="${RPC_REQUEST_TIMEOUT_MS:-10000}"
 TX_REBROADCAST_INTERVAL_MS="${TX_REBROADCAST_INTERVAL_MS:-5000}"
 TX_REPLACEMENT_AFTER_MS="${TX_REPLACEMENT_AFTER_MS:-60000}"
 TX_FEE_BUMP_NUMERATOR="${TX_FEE_BUMP_NUMERATOR:-9}"
@@ -574,6 +575,18 @@ printf '146. Accept old or new canonical winners and stop every sibling after co
 printf '147. Preserve nonce ordering and fail closed for unknown external nonce consumption\n'
 printf '148. Keep a real Chain B transaction pending, recover its replacement in fresh processes and confirm it\n'
 printf '149. Restore the original Anvil automine setting after the controlled replacement scenario\n'
+printf '150. Configure two independent access paths to the same real Chain B\n'
+printf '151. Validate every destination endpoint against expected chain ID and genesis hash\n'
+printf '152. Reject duplicate, malformed, wrong-chain and wrong-genesis endpoint configurations\n'
+printf '153. Preserve exact persisted raw bytes, hash, fees and nonce across endpoint failover\n'
+printf '154. Recover accepted-but-lost primary responses through secondary already-known reconciliation\n'
+printf '155. Fail over gas and complete fee reads and conservatively aggregate pending nonces\n'
+printf '156. Keep durable nonce allocation ahead of stale provider observations\n'
+printf '157. Discover receipts across providers and use a fixed conservative confirmation view\n'
+printf '158. Reject same-height block conflicts without finalizing or deleting delivery state\n'
+printf '159. Send the exact pending replacement through secondary without another attempt\n'
+printf '160. Restore primary preference when its access path recovers\n'
+printf '161. Preserve signed history while all destination endpoints are unavailable\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -629,7 +642,8 @@ node --test \
     "$INDEXER_DIR/test/relayer-encoding.test.mjs" \
     "$INDEXER_DIR/test/relayer-service.test.mjs" \
     "$INDEXER_DIR/test/transaction-manager.test.mjs" \
-    "$INDEXER_DIR/test/transaction-retry.test.mjs"
+    "$INDEXER_DIR/test/transaction-retry.test.mjs" \
+    "$INDEXER_DIR/test/rpc-pool.test.mjs"
 
 CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, lifecycle, fixed-initial-epoch rollover, consensus binding and atomic delivery queue tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -641,7 +655,8 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
         "$INDEXER_DIR/test/delivery.database.test.mjs" \
         "$INDEXER_DIR/test/relayer.database.test.mjs" \
         "$INDEXER_DIR/test/transaction-manager.database.test.mjs" \
-        "$INDEXER_DIR/test/transaction-retry.database.test.mjs"
+        "$INDEXER_DIR/test/transaction-retry.database.test.mjs" \
+        "$INDEXER_DIR/test/rpc-failover.database.test.mjs"
 
 CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1306,6 +1321,7 @@ INDEXER_INTEGRATION_DESTINATION_RECEIVER="$DESTINATION_RECEIVER" \
 VALIDATOR_VERIFICATION_PID_FILE="$VALIDATOR_PID_FILE" \
 CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
 CHAIN_B_CHAIN_ID="$CHAIN_B_ID" \
+RPC_REQUEST_TIMEOUT_MS="$RPC_REQUEST_TIMEOUT_MS" \
 RELAYER_A_PRIVATE_KEY="$ANVIL_DEV_KEY" \
 RELAYER_MAX_JOBS_PER_RUN="100" \
 DESTINATION_CONFIRMATIONS="$DESTINATION_CONFIRMATIONS" \

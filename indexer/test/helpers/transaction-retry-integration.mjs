@@ -3,7 +3,7 @@ import { toHex } from "viem";
 import { createTransactionManager } from "../../src/transaction-manager/service.mjs";
 
 // Invoked by the existing real-chain integration; never by production workers.
-export async function verifyPendingReplacement({ config,pool,queue,legacy,destination,jobId,run }) {
+export async function verifyPendingReplacement({ config,pool,queue,legacy,destination,jobId,run,onReplacementPrepared = async () => {} }) {
   let now = Date.now();
   const clock = { now: () => now };
   const manager = createTransactionManager({ config,pool,queue,legacy,clock });
@@ -30,6 +30,7 @@ export async function verifyPendingReplacement({ config,pool,queue,legacy,destin
     assert.notEqual(replacement.attempt.transactionHash,first.attempt.transactionHash);
     assert.ok(BigInt(replacement.attempt.maxFeePerGas) > BigInt(first.attempt.maxFeePerGas));
     assert.ok(BigInt(replacement.attempt.maxPriorityFeePerGas) > BigInt(first.attempt.maxPriorityFeePerGas));
+    await onReplacementPrepared(replacement);
     now += config.rebroadcastIntervalMs;
     const result = await manager.processTransactionRetriesOnce();
     assert.equal(result.replacements,0);
