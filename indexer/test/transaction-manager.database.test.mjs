@@ -4,7 +4,7 @@ import { createDatabasePool, applyMigrations, resetIndexerTables, tableName } fr
 import { createDeliveryRepository } from "../src/delivery/repository.mjs";
 import { encodeDestinationSubmission } from "../src/relayer/encoding.mjs";
 import { createRelaySubmissionRepository } from "../src/relayer/repository.mjs";
-import { createSingleRelayer } from "../src/relayer/service.mjs";
+import { createRelayerWorker } from "../src/relayer/service.mjs";
 import { createTransactionManager } from "../src/transaction-manager/service.mjs";
 import { createTransactionRepository } from "../src/transaction-manager/repository.mjs";
 import { transactionConfig, transactionHarness, transientSendError } from "./helpers/transaction-fixtures.mjs";
@@ -134,13 +134,14 @@ test("migration reruns preserve historical direct submissions and production Rel
   const encoded = await encodeDestinationSubmission(await queue.getDeliveryPackage(id),{ validatorSets: config.validatorSets });
   const historical = await legacy.recordSubmission({ deliveryJobId: id,encoded,transactionHash: fixtureHash(888) });
   const migrations = await applyMigrations(pool,config.databaseSchema);
-  assert.equal(migrations.at(-1),"012_transaction_retry_replacement.sql"); await applyMigrations(pool,config.databaseSchema);
+  assert.equal(migrations.at(-1),"013_relayer_job_leases.sql"); await applyMigrations(pool,config.databaseSchema);
   const manager = managerFor();
   assert.deepEqual((await manager.prepareDeliveryTransaction(id)).historicalSubmission,historical);
   assert.deepEqual(await counts(),{ accounts: 0,intents: 0,attempts: 0 });
-  const relayer = createSingleRelayer({ config,queue,repository: legacy,transactionManager: manager });
+  const relayer = createRelayerWorker({ config,pool,queue,transactionManager: manager });
   assert.equal((await relayer.runOnce()).submitted,2);
-  assert.equal((await relayer.runOnce()).selected,0);
+  // Pending intents remain claimable, without another sign or immediate send.
+  assert.equal((await relayer.runOnce()).submitted,0);
   assert.deepEqual(await legacy.getSubmission(id),historical);
   assert.equal(await manager.repository.getTransactionAttempt(id),null);
   assert.deepEqual(await counts(),{ accounts: 1,intents: 2,attempts: 2 });

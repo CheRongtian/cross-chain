@@ -5,7 +5,7 @@ import { loadTransactionConfig } from "../../src/transaction-manager/config.mjs"
 import { createTransactionManager } from "../../src/transaction-manager/service.mjs";
 import { createTransactionRpc } from "../../src/transaction-manager/rpc.mjs";
 import { createRelaySubmissionRepository } from "../../src/relayer/repository.mjs";
-import { createSingleRelayer } from "../../src/relayer/service.mjs";
+import { createRelayerWorker } from "../../src/relayer/service.mjs";
 
 // Deterministic verification-only send failure. No production fault flag exists.
 const config = loadTransactionConfig();
@@ -17,7 +17,7 @@ try {
     throw Object.assign(new Error("expected injected Relayer RPC submission failure"),{ code: "ECONNREFUSED" });
   } };
   const transactionManager = createTransactionManager({ config,pool,queue,rpc,legacy: repository });
-  await createSingleRelayer({ config,queue,repository,transactionManager }).runOnce();
+  await createRelayerWorker({ config,pool,queue,transactionManager }).runOnce();
   throw new Error("injected submission failure unexpectedly succeeded");
 } catch (error) {
   console.error(safeRelayerMessage(error,config));

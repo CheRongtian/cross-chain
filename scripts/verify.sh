@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Destination RPC Failover"
+VERIFICATION_NAME="Multi-Relayer Delivery Coordination"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -50,6 +50,7 @@ FINALITY_BLOCK_DEPTH="${FINALITY_BLOCK_DEPTH:-2}"
 FINALITY_POLL_INTERVAL_MS="${FINALITY_POLL_INTERVAL_MS:-100}"
 DESTINATION_CONFIRMATIONS="${DESTINATION_CONFIRMATIONS:-3}"
 RPC_REQUEST_TIMEOUT_MS="${RPC_REQUEST_TIMEOUT_MS:-10000}"
+RELAYER_LEASE_MS="${RELAYER_LEASE_MS:-60000}"
 TX_REBROADCAST_INTERVAL_MS="${TX_REBROADCAST_INTERVAL_MS:-5000}"
 TX_REPLACEMENT_AFTER_MS="${TX_REPLACEMENT_AFTER_MS:-60000}"
 TX_FEE_BUMP_NUMERATOR="${TX_FEE_BUMP_NUMERATOR:-9}"
@@ -62,6 +63,7 @@ STARTED_CHAINS="false"
 CHAINS_PID=""
 TEMP_DIR=""
 VALIDATOR_PID_FILE=""
+RELAYER_PID_FILE=""
 CURRENT_STEP="initialization"
 LAST_TX_HASH=""
 
@@ -334,23 +336,25 @@ cleanup() {
     local validator_pid
     local validator_attempt
     local validators_alive
+    local worker_pid_file
 
     trap - EXIT INT TERM
     set +e
 
-    if [[ -n "$VALIDATOR_PID_FILE" ]] && [[ -f "$VALIDATOR_PID_FILE" ]]; then
+    for worker_pid_file in "$VALIDATOR_PID_FILE" "$RELAYER_PID_FILE"; do
+      if [[ -n "$worker_pid_file" ]] && [[ -f "$worker_pid_file" ]]; then
         while IFS= read -r validator_pid; do
             if [[ "$validator_pid" =~ ^[1-9][0-9]*$ ]]; then
                 kill "$validator_pid" 2>/dev/null || true
             fi
-        done < "$VALIDATOR_PID_FILE"
+        done < "$worker_pid_file"
         for validator_attempt in {1..50}; do
             validators_alive="false"
             while IFS= read -r validator_pid; do
                 if [[ "$validator_pid" =~ ^[1-9][0-9]*$ ]] && kill -0 "$validator_pid" 2>/dev/null; then
                     validators_alive="true"
                 fi
-            done < "$VALIDATOR_PID_FILE"
+            done < "$worker_pid_file"
             [[ "$validators_alive" == "true" ]] || break
             sleep 0.1
         done
@@ -358,8 +362,9 @@ cleanup() {
             if [[ "$validator_pid" =~ ^[1-9][0-9]*$ ]]; then
                 kill -KILL "$validator_pid" 2>/dev/null || true
             fi
-        done < "$VALIDATOR_PID_FILE"
-    fi
+        done < "$worker_pid_file"
+      fi
+    done
 
     if [[ "$STARTED_CHAINS" == "true" ]] && [[ -n "$CHAINS_PID" ]]; then
         printf '\nStopping the local chains started by this verification...\n'
@@ -371,7 +376,8 @@ cleanup() {
         rm -f -- \
             "$TEMP_DIR/deploy-output.log" \
             "$TEMP_DIR/deployment-addresses.env" \
-            "$TEMP_DIR/validator-pids"
+            "$TEMP_DIR/validator-pids" \
+            "$TEMP_DIR/relayer-pids"
         rmdir "$TEMP_DIR" 2>/dev/null || true
     fi
 
@@ -587,6 +593,17 @@ printf '158. Reject same-height block conflicts without finalizing or deleting d
 printf '159. Send the exact pending replacement through secondary without another attempt\n'
 printf '160. Restore primary preference when its access path recovers\n'
 printf '161. Preserve signed history while all destination endpoints are unavailable\n'
+printf '162. Start independent Relayer A/B processes with distinct worker IDs and a shared signer\n'
+printf '163. Atomically claim one job lease and exact monotonic fencing token using database time\n'
+printf '164. Verify renewal, release, expiry, restart and duplicate-worker rejection\n'
+printf '165. Reject stale ownership and intent mutations within their database transaction\n'
+printf '166. Race two OS processes for one job and retain exactly one current owner\n'
+printf '167. Stop A before intent creation and allow B takeover only after lease expiry\n'
+printf '168. Reject restarted A with its stale token without changing current ownership\n'
+printf '169. Stop A after committed SIGNED and let B broadcast the same nonce/raw bytes/hash\n'
+printf '170. Distribute separate READY jobs without duplicate intents or nonce spaces\n'
+printf '171. Preserve retry/replacement lineage, RPC failover and canonical confirmation\n'
+printf '172. Exclude final/stopped intents and preserve immutable queue/source/QC evidence\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -643,7 +660,8 @@ node --test \
     "$INDEXER_DIR/test/relayer-service.test.mjs" \
     "$INDEXER_DIR/test/transaction-manager.test.mjs" \
     "$INDEXER_DIR/test/transaction-retry.test.mjs" \
-    "$INDEXER_DIR/test/rpc-pool.test.mjs"
+    "$INDEXER_DIR/test/rpc-pool.test.mjs" \
+    "$INDEXER_DIR/test/relayer-leases.test.mjs"
 
 CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, lifecycle, fixed-initial-epoch rollover, consensus binding and atomic delivery queue tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -656,7 +674,8 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
         "$INDEXER_DIR/test/relayer.database.test.mjs" \
         "$INDEXER_DIR/test/transaction-manager.database.test.mjs" \
         "$INDEXER_DIR/test/transaction-retry.database.test.mjs" \
-        "$INDEXER_DIR/test/rpc-failover.database.test.mjs"
+        "$INDEXER_DIR/test/rpc-failover.database.test.mjs" \
+        "$INDEXER_DIR/test/relayer-leases.database.test.mjs"
 
 CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -831,7 +850,9 @@ TEMP_PARENT="${TMPDIR:-/tmp}"
 TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-verification.XXXXXX")"
 DEPLOYMENT_ADDRESSES_FILE="$TEMP_DIR/deployment-addresses.env"
 VALIDATOR_PID_FILE="$TEMP_DIR/validator-pids"
+RELAYER_PID_FILE="$TEMP_DIR/relayer-pids"
 : > "$VALIDATOR_PID_FILE"
+: > "$RELAYER_PID_FILE"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_EXPECTED_ID="$CHAIN_A_ID" \
 VERIFIER_DEPLOYER_KEY="$ANVIL_DEV_KEY" \
@@ -1319,10 +1340,13 @@ INDEXER_INTEGRATION_DESTINATION_DOMAIN="$CHAIN_B_ID" \
 INDEXER_INTEGRATION_DESTINATION_GATEWAY="$DESTINATION_GATEWAY" \
 INDEXER_INTEGRATION_DESTINATION_RECEIVER="$DESTINATION_RECEIVER" \
 VALIDATOR_VERIFICATION_PID_FILE="$VALIDATOR_PID_FILE" \
+RELAYER_VERIFICATION_PID_FILE="$RELAYER_PID_FILE" \
 CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
 CHAIN_B_CHAIN_ID="$CHAIN_B_ID" \
 RPC_REQUEST_TIMEOUT_MS="$RPC_REQUEST_TIMEOUT_MS" \
 RELAYER_A_PRIVATE_KEY="$ANVIL_DEV_KEY" \
+RELAYER_WORKER_ID="relayer-a" \
+RELAYER_LEASE_MS="$RELAYER_LEASE_MS" \
 RELAYER_MAX_JOBS_PER_RUN="100" \
 DESTINATION_CONFIRMATIONS="$DESTINATION_CONFIRMATIONS" \
 TX_REBROADCAST_INTERVAL_MS="$TX_REBROADCAST_INTERVAL_MS" \

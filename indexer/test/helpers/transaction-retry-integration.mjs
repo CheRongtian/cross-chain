@@ -3,7 +3,7 @@ import { toHex } from "viem";
 import { createTransactionManager } from "../../src/transaction-manager/service.mjs";
 
 // Invoked by the existing real-chain integration; never by production workers.
-export async function verifyPendingReplacement({ config,pool,queue,legacy,destination,jobId,run,onReplacementPrepared = async () => {} }) {
+export async function verifyPendingReplacement({ config,pool,queue,legacy,destination,jobId,run,onReplacementPrepared = async () => {},prepareAndBroadcast }) {
   let now = Date.now();
   const clock = { now: () => now };
   const manager = createTransactionManager({ config,pool,queue,legacy,clock });
@@ -12,9 +12,13 @@ export async function verifyPendingReplacement({ config,pool,queue,legacy,destin
   let failure;
   try {
     await destination.request({ method: "evm_setAutomine",params: [false] });
-    const prepared = await manager.prepareDeliveryTransaction(jobId);
-    assert.equal(prepared.created,true);
-    const first = await manager.broadcastPreparedTransaction(jobId);
+    let first;
+    if (prepareAndBroadcast) first = await prepareAndBroadcast();
+    else {
+      const prepared = await manager.prepareDeliveryTransaction(jobId);
+      assert.equal(prepared.created,true);
+      first = await manager.broadcastPreparedTransaction(jobId);
+    }
     assert.equal(first.attempt.status,"BROADCAST");
     assert.equal(await destination.request({ method: "eth_getTransactionReceipt",params: [first.attempt.transactionHash] }),null);
     now = Math.max(now,Date.parse(first.attempt.broadcastAt)) + config.replacementAfterMs;

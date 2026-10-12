@@ -8,6 +8,15 @@ export class RelayerError extends Error {
   constructor(code) { super(code); this.code = code; }
 }
 
+export function normalizeWorkerId(value) {
+  if (typeof value !== "string" || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(value)) throw new RelayerError("INVALID_RELAYER_WORKER_ID");
+  return value;
+}
+export function normalizeLeaseDuration(value) {
+  if (typeof value !== "string" || !/^[1-9][0-9]*$/.test(value) || BigInt(value) > 3600000n) throw new RelayerError("INVALID_RELAYER_LEASE_DURATION");
+  return Number(value);
+}
+
 export function loadRelayerConfig(environment = process.env) {
   const delivery = loadDeliveryConfig(environment);
   let configured;
@@ -43,14 +52,16 @@ export function loadRelayerConfig(environment = process.env) {
   const limit = environment.RELAYER_MAX_JOBS_PER_RUN ?? "100";
   if (typeof limit !== "string" || !/^[1-9][0-9]*$/.test(limit)) throw new RelayerError("INVALID_RELAYER_LIMIT");
   const maxJobs = deliveryLimit(Number(limit));
+  const workerId = normalizeWorkerId(environment.RELAYER_WORKER_ID ?? "relayer-a");
+  const leaseMs = normalizeLeaseDuration(environment.RELAYER_LEASE_MS ?? "30000");
   return { ...delivery,destinationRpcUrl,destinationRpcUrls: Object.freeze(destinationRpcUrls),destinationGenesisHash,
-    rpcRequestTimeoutMs,destinationDomain,privateKey,relayerAddress,maxJobs };
+    rpcRequestTimeoutMs,destinationDomain,privateKey,relayerAddress,maxJobs,workerId,leaseMs };
 }
 
 export function publicRelayerConfig(config) {
   return Object.freeze({ relayerAddress: config.relayerAddress,sourceDomain: config.chainDomain.toString(),
     sourceGateway: config.sourceGateway,destinationDomain: config.destinationDomain.toString(),maxJobs: config.maxJobs,
-    destinationGenesisHash: config.destinationGenesisHash,rpcRequestTimeoutMs: config.rpcRequestTimeoutMs,
+    workerId: config.workerId,leaseMs: config.leaseMs,destinationGenesisHash: config.destinationGenesisHash,rpcRequestTimeoutMs: config.rpcRequestTimeoutMs,
     rpcEndpoints: config.destinationRpcUrls.map((_,index) => ({ label: `rpc-${index}`,priority: index })) });
 }
 

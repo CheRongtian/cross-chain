@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { privateKeyToAccount } from "viem/accounts";
 import { keccak256 } from "viem";
-import { createSingleRelayer } from "../src/relayer/service.mjs";
+import { createRelayerWorker } from "../src/relayer/service.mjs";
+import { memoryLeaseFixture } from "./helpers/lease-fixtures.mjs";
 import { loadTransactionConfig, publicTransactionConfig } from "../src/transaction-manager/config.mjs";
 import { allocateNonce } from "../src/transaction-manager/nonce-policy.mjs";
 import { signDeliveryTransaction, verifySignedTransaction, unsignedTransaction, rpcQuantity } from "../src/transaction-manager/transaction.mjs";
@@ -203,13 +204,15 @@ test("receipt pass does not refresh its fixed head when RPC progresses during in
   assert.equal((await h.manager.checkReceiptsOnce()).confirmed,1); assert.equal(h.calls.head,2);
 });
 
-test("production Relayer delegates only verified job identities and skips existing intents before its limit", async () => {
+test("production Relayer delegates only verified job identities and excludes final intents before its limit", async () => {
   const h = await transactionHarness({ config: transactionConfig({ RELAYER_MAX_JOBS_PER_RUN: "2" }) });
-  const repository = { async withSingleton(operation) { return operation(() => {}); },
-    async listEligibleJobs({ limit }) { return h.jobs.filter(job => !h.records.has(job.deliveryJobId)).slice(0,limit); } };
-  const relayer = createSingleRelayer({ config: h.config,queue: h.queue,repository,transactionManager: h.manager });
+  const leases = memoryLeaseFixture(h).repository();
+  const relayer = createRelayerWorker({ config: h.config,queue: h.queue,leases,transactionManager: h.manager });
   assert.equal((await relayer.runOnce()).submitted,2);
+  h.mine(h.jobs[0].deliveryJobId); h.mine(h.jobs[1].deliveryJobId); h.state.head = 102n;
+  await h.manager.checkReceiptsOnce();
   assert.equal((await relayer.runOnce()).submitted,1);
+  h.mine(h.jobs[2].deliveryJobId); await h.manager.checkReceiptsOnce();
   assert.equal((await relayer.runOnce()).selected,0);
   assert.equal(h.calls.broadcast.length,3); assert.equal(h.records.size,3);
   assert.deepEqual(h.packets,h.original);

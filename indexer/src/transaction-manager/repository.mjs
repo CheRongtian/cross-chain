@@ -9,6 +9,7 @@ import { verifySignedTransaction } from "./transaction.mjs";
 import { actionDate, operationTime, replacementDue } from "./retry-policy.mjs";
 import { BROADCAST_ERROR_CLASSES, classifyBroadcastError } from "./rpc-errors.mjs";
 import { TransactionError } from "./config.mjs";
+import { assertLeaseFence } from "../relayer/leases.mjs";
 
 const iso = value => value == null ? null : value.toISOString();
 const final = status => status === "CONFIRMED" || status === "REVERTED";
@@ -124,6 +125,9 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
       intent.nonce,signed.gasLimit.toString(),signed.maxFeePerGas.toString(),signed.maxPriorityFeePerGas.toString(),signed.rawSignedTransaction,signed.transactionHash,actionDate(now)]);
   }
   return {
+    async assertFence(id,fence) {
+      return deliveryTransaction(pool,client => assertLeaseFence(client,config,id,fence));
+    },
     async getAccount() { return snapshot(accountRecord); },
     async getTransactionIntent(id) { return (await this.getTransaction(id))?.intent ?? null; },
     async getTransactionAttempt(id,attemptId) {
@@ -168,12 +172,18 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
       }
       return Object.freeze(records);
     },
-    async persistPrepared({ intent,pendingNonce,gasLimit,maxFeePerGas,maxPriorityFeePerGas,sign }) {
+    async persistPrepared({ intent,pendingNonce,gasLimit,maxFeePerGas,maxPriorityFeePerGas,sign,fence }) {
       const now = operationTime(clock);
       return deliveryTransaction(pool,async client => {
         const account = await lockAccount(client,pendingNonce);
+        if (fence) await assertLeaseFence(client,config,intent.deliveryJobId,fence);
         const existing = await read(client,intent.deliveryJobId,intent);
         if (existing) return Object.freeze({ ...existing,created: false,nonceAdvancedFromRpc: false });
+        if (fence && (await client.query(`SELECT 1 FROM ${intents} i WHERE chain_id = $1 AND sender_address = $2 AND status = 'PENDING'
+          AND (retry_stopped_at IS NOT NULL OR EXISTS (SELECT 1 FROM ${attempts} a WHERE a.delivery_job_id = i.delivery_job_id
+            AND a.status = 'SIGNED' AND a.attempt_number = (SELECT MAX(attempt_number) FROM ${attempts} WHERE delivery_job_id = i.delivery_job_id))) LIMIT 1`,accountKey)).rowCount) {
+          throw new TransactionError("SIGNED_TRANSACTION_REQUIRES_EXPLICIT_BROADCAST");
+        }
         const allocation = allocateNonce({ pendingNonce,nextNonce: account.nextNonce,highestReservedNonce: account.highestReservedNonce });
         const canonical = { ...intent,nonce: allocation.nonce.toString() };
         const signed = await sign(canonical,{ nonce: allocation.nonce,gasLimit,maxFeePerGas,maxPriorityFeePerGas });
@@ -184,13 +194,15 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
           canonical.destinationGateway,canonical.value,canonical.calldata,canonical.nonce,actionDate(now,config.rebroadcastIntervalMs),actionDate(now)]);
         await insertAttempt(client,canonical,signed,0,null,now);
         await beforeSignedCommit({ client,intent: canonical,attempt: signed });
+        if (fence) await assertLeaseFence(client,config,intent.deliveryJobId,fence);
         return Object.freeze({ ...await read(client,intent.deliveryJobId,intent),created: true,nonceAdvancedFromRpc: protocolInteger(pendingNonce) > protocolInteger(account.nextNonce) });
       });
     },
-    async persistReplacement({ id,parentAttemptId,fees,sign }) {
+    async persistReplacement({ id,parentAttemptId,fees,sign,fence }) {
       const expected = await resolveIntent(id); const now = operationTime(clock);
       return deliveryTransaction(pool,async client => {
         const stored = await locked(client,id,expected);
+        if (fence) await assertLeaseFence(client,config,id,fence);
         if (stored.intent.status !== "PENDING" || stored.intent.retryStoppedAt !== null || stored.attempt.attemptId !== parentAttemptId) return Object.freeze({ ...stored,created: false });
         if (new Date(stored.intent.nextActionAt).getTime() > now || !replacementDue(stored.attempt,now,config)) return Object.freeze({ ...stored,created: false });
         if (stored.attempts.length >= config.maxAttempts) {
@@ -205,13 +217,15 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         await client.query(`UPDATE ${attempts} SET status = 'REPLACED' WHERE attempt_id = $1`,[stored.attempt.attemptId]);
         await client.query(`UPDATE ${intents} SET next_action_at = $2 WHERE delivery_job_id = $1`,[id,actionDate(now,config.rebroadcastIntervalMs)]);
         await beforeSignedCommit({ client,intent: stored.intent,attempt: signed });
+        if (fence) await assertLeaseFence(client,config,id,fence);
         return Object.freeze({ ...await read(client,id,expected),created: true });
       });
     },
-    async broadcastPrepared(id,broadcast,{ rebroadcast = false,expectedAttemptId } = {}) {
+    async broadcastPrepared(id,broadcast,{ rebroadcast = false,expectedAttemptId,fence } = {}) {
       const expected = await resolveIntent(id); const now = operationTime(clock);
       return deliveryTransaction(pool,async client => {
         const stored = await locked(client,id,expected);
+        if (fence) await assertLeaseFence(client,config,id,fence);
         if (stored.intent.status !== "PENDING") return Object.freeze({ ...stored,broadcast: false });
         if (expectedAttemptId !== undefined && stored.attempt.attemptId !== expectedAttemptId) return Object.freeze({ ...stored,broadcast: false });
         if (stored.intent.retryStoppedAt !== null) throw new TransactionError(stored.intent.retryStopReason);
@@ -239,10 +253,11 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         return Object.freeze({ ...await read(client,id,expected),broadcast: errorClass === null,errorClass,errorMessage,errorCode });
       });
     },
-    async markKnownAttempt(id,attemptId) {
+    async markKnownAttempt(id,attemptId,{ fence } = {}) {
       const expected = await resolveIntent(id); const now = operationTime(clock);
       return deliveryTransaction(pool,async client => {
         const stored = await locked(client,id,expected);
+        if (fence) await assertLeaseFence(client,config,id,fence);
         if (stored.intent.status !== "PENDING") return stored;
         const attempt = stored.attempts.find(value => value.attemptId === attemptId);
         if (!attempt) throw new TransactionError("UNKNOWN_TRANSACTION_ATTEMPT");
@@ -251,10 +266,11 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         return read(client,id,expected);
       });
     },
-    async scheduleRetry(id,{ reason = null,parentAttemptId } = {}) {
+    async scheduleRetry(id,{ reason = null,parentAttemptId,fence } = {}) {
       const expected = await resolveIntent(id); const now = operationTime(clock);
       return deliveryTransaction(pool,async client => {
         const stored = await locked(client,id,expected);
+        if (fence) await assertLeaseFence(client,config,id,fence);
         if (stored.intent.status !== "PENDING" || stored.intent.retryStoppedAt !== null || (parentAttemptId !== undefined && stored.attempt.attemptId !== parentAttemptId)) return stored;
         if (reason) {
           if (!BROADCAST_ERROR_CLASSES.includes(reason)) throw new TransactionError("INVALID_RETRY_ERROR_CLASS");
@@ -264,10 +280,11 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         return read(client,id,expected);
       });
     },
-    async stopRetry(id,reason,{ parentAttemptId } = {}) {
+    async stopRetry(id,reason,{ parentAttemptId,fence } = {}) {
       const expected = await resolveIntent(id); const now = operationTime(clock);
       return deliveryTransaction(pool,async client => {
         const stored = await locked(client,id,expected);
+        if (fence) await assertLeaseFence(client,config,id,fence);
         if (parentAttemptId === undefined || stored.attempt.attemptId === parentAttemptId) await stop(client,stored,reason,now);
         return read(client,id,expected);
       });
@@ -280,6 +297,7 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
       const status = observation.status === 1 ? "CONFIRMED" : "REVERTED";
       return deliveryTransaction(pool,async client => {
         const stored = await locked(client,id,expected);
+        if (observation.fence) await assertLeaseFence(client,config,id,observation.fence);
         const winner = stored.attempts.find(value => value.transactionHash === normalizeBytes32(observation.transactionHash));
         if (!winner) throw new TransactionError("RECEIPT_TRANSACTION_HASH_MISMATCH");
         if (final(stored.intent.status)) {

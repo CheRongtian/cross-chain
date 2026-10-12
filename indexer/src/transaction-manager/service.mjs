@@ -40,9 +40,10 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
   }
   const store = repository ?? createTransactionRepository({ config,pool,resolveIntent,beforeSignedCommit,clock });
   const sign = (intent,fields) => signDeliveryTransaction(intent,fields,account);
-  const inspect = (stored,view,forceAll = false) => inspectIntentReceipts({ stored,rpc,store,config,view,forceAll });
+  const inspect = (stored,view,forceAll = false,fence) => inspectIntentReceipts({ stored,rpc,store,config,view,forceAll,fence });
 
-  async function prepare(id) {
+  async function prepare(id,fence) {
+    if (fence) await store.assertFence(id,fence);
     const intent = await resolveIntent(id);
     await verifyChain();
     const historicalSubmission = await legacy.getSubmission(id);
@@ -56,7 +57,7 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     if (gasLimit === 0n || maxFeePerGas < maxPriorityFeePerGas) throw new TransactionError("INVALID_TRANSACTION_FIELDS");
     if (maxFeePerGas > config.maxFeePerGasCap || maxPriorityFeePerGas > config.maxPriorityFeePerGasCap) throw new TransactionError("FEE_CAP_EXCEEDED");
     const pendingNonce = protocolInteger(await rpc.pendingNonce(),"pending nonce");
-    const stored = await store.persistPrepared({ intent,pendingNonce,gasLimit,maxFeePerGas,maxPriorityFeePerGas,sign });
+    const stored = await store.persistPrepared({ intent,pendingNonce,gasLimit,maxFeePerGas,maxPriorityFeePerGas,sign,fence });
     if (stored.nonceAdvancedFromRpc) console.log(`Transaction account advanced to RPC pending nonce ${stored.intent.nonce}; maintain account exclusivity`);
     return stored;
   }
@@ -79,23 +80,23 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     }
     return known;
   }
-  async function reconcile(stored,view) {
+  async function reconcile(stored,view,fence) {
     const [latest,pending] = await Promise.all([rpc.latestNonce(view),rpc.pendingNonce()]);
-    const observation = await inspect(stored,view,true);
+    const observation = await inspect(stored,view,true,fence);
     if (observation.mined) return observation;
     const known = await ownTransactions(stored);
     if (protocolInteger(latest) > BigInt(stored.intent.nonce) && !known.some(value => value.mined)) {
-      await store.stopRetry(stored.intent.deliveryJobId,"UNKNOWN_NONCE_CONSUMPTION",{ parentAttemptId: stored.attempt.attemptId });
+      await store.stopRetry(stored.intent.deliveryJobId,"UNKNOWN_NONCE_CONSUMPTION",{ parentAttemptId: stored.attempt.attemptId,fence });
       throw new TransactionError("UNKNOWN_NONCE_CONSUMPTION");
     }
     const current = known.find(value => value.attempt.attemptId === stored.attempt.attemptId);
     if (current) {
-      const record = await store.markKnownAttempt(stored.intent.deliveryJobId,current.attempt.attemptId);
+      const record = await store.markKnownAttempt(stored.intent.deliveryJobId,current.attempt.attemptId,{ fence });
       return { stored: record,mined: known.some(value => value.mined),finalized: false,known: true };
     }
     if (known.length) return { stored,mined: known.some(value => value.mined),finalized: false,known: false };
     if (protocolInteger(pending) > BigInt(stored.intent.nonce)) {
-      await store.stopRetry(stored.intent.deliveryJobId,"UNKNOWN_NONCE_CONSUMPTION",{ parentAttemptId: stored.attempt.attemptId });
+      await store.stopRetry(stored.intent.deliveryJobId,"UNKNOWN_NONCE_CONSUMPTION",{ parentAttemptId: stored.attempt.attemptId,fence });
       throw new TransactionError("UNKNOWN_NONCE_CONSUMPTION");
     }
     return { stored,mined: false,finalized: false,known: false };
@@ -105,7 +106,7 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     let rpcObservation;
     const result = await store.broadcastPrepared(id,(raw,transactionHash) => rpc.broadcast(raw,transactionHash,value => { rpcObservation = value; }),options);
     if (["ALREADY_KNOWN","NONCE_TOO_LOW"].includes(result.errorClass)) {
-      const reconciled = await reconcile(result,options.receiptView ?? await rpc.readView());
+      const reconciled = await reconcile(result,options.receiptView ?? await rpc.readView(),options.fence);
       if (reconciled.mined || reconciled.known) return Object.freeze({ ...reconciled.stored,broadcast: true,reconciled: true,errorClass: null,errorMessage: null,errorCode: null,
         acceptedEndpointLabel: rpcObservation?.acceptedEndpointLabel ?? null,rpcObservations: rpcObservation?.observations ?? [] });
     }
@@ -122,7 +123,7 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     }
     return result;
   }
-  async function replace(id,parentAttemptId,view) {
+  async function replace(id,parentAttemptId,view,fence) {
     await verifyChain();
     let stored = await store.getTransaction(id);
     if (!stored) throw new TransactionError("TRANSACTION_NOT_PREPARED");
@@ -133,23 +134,23 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     if (new Date(stored.intent.nextActionAt).getTime() > now || !replacementDue(stored.attempt,now,config)) throw new TransactionError("REPLACEMENT_NOT_DUE");
     const snapshotView = view ?? await rpc.readView();
     const [latest,pending] = await Promise.all([rpc.latestNonce(snapshotView),rpc.pendingNonce()]);
-    const observation = await inspect(stored,snapshotView,true);
+    const observation = await inspect(stored,snapshotView,true,fence);
     if (observation.mined) return Object.freeze({ ...observation.stored,created: false });
     const known = await ownTransactions(stored);
     if (known.some(value => value.mined)) return Object.freeze({ ...stored,created: false });
     if (protocolInteger(latest) > BigInt(stored.intent.nonce) || (!known.length && protocolInteger(pending) > BigInt(stored.intent.nonce))) {
-      await store.stopRetry(id,"UNKNOWN_NONCE_CONSUMPTION",{ parentAttemptId: stored.attempt.attemptId });
+      await store.stopRetry(id,"UNKNOWN_NONCE_CONSUMPTION",{ parentAttemptId: stored.attempt.attemptId,fence });
       throw new TransactionError("UNKNOWN_NONCE_CONSUMPTION");
     }
-    if (stored.attempts.length >= config.maxAttempts) return Object.freeze({ ...await store.stopRetry(id,"MAX_ATTEMPTS_REACHED",{ parentAttemptId: stored.attempt.attemptId }),created: false });
+    if (stored.attempts.length >= config.maxAttempts) return Object.freeze({ ...await store.stopRetry(id,"MAX_ATTEMPTS_REACHED",{ parentAttemptId: stored.attempt.attemptId,fence }),created: false });
     let fees;
     try { fees = replacementFees(stored.attempt,await rpc.fees(),config); }
     catch (error) {
       if (error.code === "INVALID_MAX_FEE") {
-        await store.stopRetry(id,"REPLACEMENT_FEE_OVERFLOW",{ parentAttemptId: expectedParent });
+        await store.stopRetry(id,"REPLACEMENT_FEE_OVERFLOW",{ parentAttemptId: expectedParent,fence });
         throw new TransactionError("REPLACEMENT_FEE_OVERFLOW");
       }
-      if (["FEE_CAP_EXCEEDED","REPLACEMENT_FEE_OVERFLOW"].includes(error.code)) await store.stopRetry(id,error.code,{ parentAttemptId: stored.attempt.attemptId });
+      if (["FEE_CAP_EXCEEDED","REPLACEMENT_FEE_OVERFLOW"].includes(error.code)) await store.stopRetry(id,error.code,{ parentAttemptId: stored.attempt.attemptId,fence });
       throw error;
     }
     // Recheck all candidate receipts after fee RPC, immediately before insertion.
@@ -157,16 +158,39 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     if (stored.intent.status !== "PENDING" || stored.intent.retryStoppedAt !== null || stored.attempt.attemptId !== expectedParent) {
       return Object.freeze({ ...stored,created: false });
     }
-    const recheck = await inspect(stored,snapshotView,true);
+    const recheck = await inspect(stored,snapshotView,true,fence);
     if (recheck.mined) return Object.freeze({ ...recheck.stored,created: false });
-    return store.persistReplacement({ id,parentAttemptId: expectedParent,fees,sign });
+    return store.persistReplacement({ id,parentAttemptId: expectedParent,fees,sign,fence });
   }
   return {
     repository: store,
     async resolveIntent(id) { return protect(() => resolveIntent(id)); },
     async verifyChain() { return protect(async () => { await verifyChain(); return config.destinationDomain; }); },
     async assertNoUnbroadcast() { return protect(assertNoUnbroadcast); },
-    async prepareDeliveryTransaction(id) { return protect(() => prepare(id)); },
+    async prepareDeliveryTransaction(id,{ fence } = {}) { return protect(() => prepare(id,fence)); },
+    // Fenced orchestration and independent durable manager passes share the same
+    // account/intent locks. A durable intent does not require a permanent owner.
+    async continueDeliveryTransactionOnce(id,{ fence } = {}) {
+      return protect(async () => {
+        if (!fence) throw new TransactionError("LEASE_FENCE_REQUIRED");
+        await store.assertFence(id,fence);
+        let stored = await store.getTransaction(id);
+        if (!stored) throw new TransactionError("TRANSACTION_NOT_PREPARED");
+        if (stored.intent.status !== "PENDING" || stored.intent.retryStoppedAt !== null) return Object.freeze({ ...stored,submitted: false });
+        if (stored.attempt.status === "SIGNED" && BigInt(stored.attempt.broadcastAttemptCount) === 0n) {
+          const result = reportBroadcast(await send(id,{ fence,expectedAttemptId: stored.attempt.attemptId }));
+          return Object.freeze({ ...result,submitted: result.broadcast });
+        }
+        await verifyChain();
+        const view = await rpc.readView();
+        const observation = await inspect(stored,view,false,fence);
+        if (observation.mined) return Object.freeze({ ...observation.stored,submitted: false });
+        const processed = await processTransactionRetriesOnce({ config,store,rpc,verifyChain,inspect,send,replace,clock,
+          limit: 1,deliveryJobId: id,fence });
+        stored = await store.getTransaction(id);
+        return Object.freeze({ ...stored,submitted: processed.broadcasts > 0,processing: processed });
+      });
+    },
     async broadcastPreparedTransaction(id) { return protect(async () => reportBroadcast(await send(id))); },
     async rebroadcastTransaction(id) { return protect(async () => reportBroadcast(await send(id,{ rebroadcast: true }))); },
     async prepareReplacement(id,parentAttemptId) { return protect(() => replace(id,parentAttemptId)); },

@@ -5,7 +5,8 @@ import { deliveryLimit } from "../delivery/package.mjs";
 import { encodeDestinationSubmission } from "./encoding.mjs";
 import { RelayerError } from "./config.mjs";
 
-// One Relayer A per database. A session lock is not a job lease or message authority.
+// Historical direct-submission adapter only. Production workers use leases.mjs;
+// this old adapter's session lock is not a job lease or message authority.
 const LOCK_NAMESPACE = 738201;
 const LOCK_INSTANCE = 1;
 

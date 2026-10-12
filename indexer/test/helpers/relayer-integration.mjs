@@ -15,6 +15,7 @@ import { sourceState } from "../../../validator/test/helpers/four-process.mjs";
 import { rpcObserver } from "../../../validator/test/helpers/process-cluster.mjs";
 import { verifyPendingReplacement } from "./transaction-retry-integration.mjs";
 import { destinationAccessPath } from "./rpc-failover-integration.mjs";
+import { createRelayerProcesses, verifyLeaseTakeover, verifySignedTakeover, verifyConcurrentRelayers } from "./multi-relayer-integration.mjs";
 
 const execFileAsync = promisify(execFile);
 const MAIN = fileURLToPath(new URL("../../src/relayer/main.mjs",import.meta.url));
@@ -100,7 +101,7 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
       assert.equal(reply.result.toLowerCase(),keccak256(request.params[0]).toLowerCase());
     }
   } });
-  let primary; let secondary;
+  let primary; let secondary; let processes;
   try {
     primary = await destinationAccessPath(observer.url);
     secondary = await destinationAccessPath(observer.url);
@@ -112,6 +113,7 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
   env.CHAIN_B_RPC_URLS = JSON.stringify([primary.url,secondary.url]);
   env.CHAIN_B_RPC_URL = primary.url;
   try {
+    processes = createRelayerProcesses({ environment: env,pidFile: process.env.RELAYER_VERIFICATION_PID_FILE });
     manager = createTransactionManager({ config: loadTransactionConfig(env),pool,queue,legacy: repository });
     async function queueState() {
       return {
@@ -140,7 +142,10 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     assert.equal(await count(intents),0); assert.equal(await count(attempts),0);
     primary.state.genesisOverride = null;
     console.log("VALID: wrong-chain and same-chain-ID/wrong-genesis paths were rejected before nonce reservation or signing");
-    await failed(FAILURE,env,"expected injected Relayer RPC submission failure");
+    const takeover = await verifyLeaseTakeover({ processes,pool,config: relayConfig,id: jobs[0].deliveryJobId });
+    await failed(FAILURE,{ ...env,RELAYER_WORKER_ID: "relayer-b" },"expected injected Relayer RPC submission failure");
+    const createdByB = (await pool.query(`SELECT owner_id,fencing_token FROM ${tableName(config.databaseSchema,"relayer_job_leases")} WHERE delivery_job_id = $1`,[jobs[0].deliveryJobId])).rows[0];
+    assert.equal(createdByB.owner_id,"relayer-b"); assert.ok(BigInt(createdByB.fencing_token) > BigInt(takeover.fencingToken));
     assert.equal(await count(intents),1); assert.equal(await count(attempts),1); assert.equal(await nonce(destination),destinationNonce);
     const firstId = jobs[0].deliveryJobId;
     const signed = await manager.repository.getTransaction(firstId);
@@ -158,7 +163,7 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     assert.deepEqual(recoveredSigned,signed);
     const estimatesBefore = observer.calls.filter(call => call.method === "eth_estimateGas").length;
     const feesBefore = observer.calls.filter(call => call.method === "eth_maxPriorityFeePerGas").length;
-    await failed(MAIN,env,"SIGNED_TRANSACTION_REQUIRES_EXPLICIT_BROADCAST");
+    await assert.rejects(manager.submitDelivery(jobs[1].deliveryJobId),{ code: "SIGNED_TRANSACTION_REQUIRES_EXPLICIT_BROADCAST" });
     assert.equal(await count(attempts),1); assert.equal(await nonce(destination),destinationNonce); assert.equal(observed.length,0);
     const accountBeforeFailure = await manager.repository.getAccount();
     primary.state.available = false; secondary.state.available = false;
@@ -187,7 +192,8 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     assert.equal(secondary.calls.filter(call => call.method === "eth_sendRawTransaction")[0].params[0],signed.attempt.rawSignedTransaction);
     console.log("VALID: persistent retry recovered one failed SIGNED submission and rebroadcast identical bytes/hash without gas, fees, signing or nonce allocation");
     const replaced = await verifyPendingReplacement({ config: loadTransactionConfig(env),pool,queue,legacy: repository,destination,
-      jobId: jobs[1].deliveryJobId,run: args => run(MANAGER,args),onReplacementPrepared: async () => { primary.state.available = false; } });
+      jobId: jobs[1].deliveryJobId,run: args => run(MANAGER,args),onReplacementPrepared: async () => { primary.state.available = false; },
+      prepareAndBroadcast: () => verifySignedTakeover({ processes,pool,config: relayConfig,manager,id: jobs[1].deliveryJobId }) });
     assert.ok(secondary.calls.some(call => call.method === "eth_sendRawTransaction" && call.params[0] === replaced.attempt.rawSignedTransaction));
     assert.equal(replaced.attempts.length,2);
     primary.state.available = true;
@@ -197,8 +203,7 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     primary.setFault("eth_estimateGas","unavailable");
     primary.setFault("eth_maxPriorityFeePerGas","unavailable");
     primary.setFault("eth_getTransactionCount","unavailable",{ when: request => request.params[1] === "pending" });
-    const submitted = await run();
-    assert.equal(submitted.selected,expectedCount - 2); assert.equal(submitted.submitted,expectedCount - 2);
+    await verifyConcurrentRelayers({ processes,pool,config: relayConfig,manager,jobs: jobs.slice(2) });
     assert.equal(await count(intents),expectedCount); assert.equal(await count(attempts),expectedCount + 1);
     assert.equal(await count(submissions),0);
     assert.equal(await nonce(destination),destinationNonce + BigInt(expectedCount));
@@ -277,9 +282,10 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     throw error;
   } finally {
     try {
+      const workers = await Promise.allSettled([processes?.close()]);
       const paths = await Promise.allSettled([primary.close(),secondary.close()]);
-      await observer.close();
-      const failure = paths.find(result => result.status === "rejected");
+      const observations = await Promise.allSettled([observer.close()]);
+      const failure = [...workers,...paths,...observations].find(result => result.status === "rejected");
       if (failure) throw failure.reason;
     }
     catch (error) { if (!failedRun) throw error; console.error(`Transaction RPC observer cleanup also failed: ${error.message}`); }

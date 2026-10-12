@@ -15,7 +15,7 @@ export function verifyRpcTransaction(intent, attempt, tx, receipt) {
   return tx;
 }
 
-export async function inspectIntentReceipts({ stored, rpc, store, config, view, forceAll = false }) {
+export async function inspectIntentReceipts({ stored, rpc, store, config, view, forceAll = false,fence }) {
   const head = view.head;
   const observations = [];
   for (const attempt of stored.attempts) {
@@ -38,10 +38,10 @@ export async function inspectIntentReceipts({ stored, rpc, store, config, view, 
   if (head < winner.blockNumber || head - winner.blockNumber + 1n < config.destinationConfirmations) {
     // Full canonical evidence proves acceptance even when a lost response left
     // SIGNED state. Confirmation still uses the original conservative snapshot.
-    const known = winner.attempt.broadcastAt === null ? await store.markKnownAttempt(stored.intent.deliveryJobId,winner.attempt.attemptId) : stored;
+    const known = winner.attempt.broadcastAt === null ? await store.markKnownAttempt(stored.intent.deliveryJobId,winner.attempt.attemptId,{ fence }) : stored;
     return { stored: known,mined: true,finalized: false };
   }
   const finalized = await store.recordOutcome(stored.intent.deliveryJobId,{ transactionHash: winner.attempt.transactionHash,
-    blockNumber: winner.blockNumber,blockHash: winner.blockHash,status: winner.status,head });
+    blockNumber: winner.blockNumber,blockHash: winner.blockHash,status: winner.status,head,fence });
   return { stored: finalized,mined: true,finalized: true };
 }

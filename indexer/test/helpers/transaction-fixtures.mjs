@@ -60,6 +60,7 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
     Object.assign(record.intent,{ retryStoppedAt: timestamp(),retryStopReason: reason,nextActionAt: null });
   }
   const repository = {
+    async assertFence() { throw new TransactionError("LEASE_FENCE_REQUIRED"); },
     async getTransaction(id,expected) { return strict(id,expected); },
     async getTransactionIntent(id) { return (await strict(id))?.intent ?? null; },
     async getTransactionAttempt(id,attemptId) {
@@ -81,22 +82,26 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
         .sort((a,b) => Date.parse(a.intent.nextActionAt) - Date.parse(b.intent.nextActionAt) || a.intent.deliveryJobId.localeCompare(b.intent.deliveryJobId))
         .slice(0,limit).map(r => strict(r.intent.deliveryJobId)));
     },
-    async persistPrepared({ intent,pendingNonce,gasLimit,maxFeePerGas,maxPriorityFeePerGas,sign }) {
+    async persistPrepared({ intent,pendingNonce,gasLimit,maxFeePerGas,maxPriorityFeePerGas,sign,fence }) {
+      if (fence) await this.assertFence(intent.deliveryJobId,fence);
       const existing = await strict(intent.deliveryJobId,intent);
       if (existing) return { ...existing,created: false };
+      if (fence && [...records.values()].some(r => r.intent.status === "PENDING" && (r.intent.retryStoppedAt !== null || r.attempt.status === "SIGNED"))) throw new TransactionError("SIGNED_TRANSACTION_REQUIRES_EXPLICIT_BROADCAST");
       const allocation = allocateNonce({ pendingNonce,nextNonce: nextNonce ?? pendingNonce });
       const canonical = { ...intent,nonce: allocation.nonce.toString() };
       calls.sign++;
       const signed = await sign(canonical,{ nonce: allocation.nonce,gasLimit,maxFeePerGas,maxPriorityFeePerGas });
       await verifySignedTransaction(canonical,signed);
       if (beforeCommit) await beforeCommit();
+      if (fence) await this.assertFence(intent.deliveryJobId,fence);
       const attempt = attemptRecord(canonical,signed,0,null);
       records.set(intent.deliveryJobId,{ intent: { ...canonical,intentId: intent.deliveryJobId,status: "PENDING",winningAttemptId: null,
         nextActionAt: nextAction(),retryStoppedAt: null,retryStopReason: null,createdAt: timestamp() },attempt,attempts: [attempt],winningAttempt: null });
       nextNonce = allocation.nextNonce;
       return { ...await strict(intent.deliveryJobId),created: true };
     },
-    async persistReplacement({ id,parentAttemptId,fees,sign }) {
+    async persistReplacement({ id,parentAttemptId,fees,sign,fence }) {
+      if (fence) await this.assertFence(id,fence);
       const record = records.get(id);
       if (record.intent.status !== "PENDING" || record.intent.retryStoppedAt !== null || record.attempt.attemptId !== parentAttemptId) return { ...await strict(id),created: false };
       if (Date.parse(record.intent.nextActionAt) > time || !replacementDue(record.attempt,time,config)) return { ...await strict(id),created: false };
@@ -109,11 +114,13 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
       await verifySignedTransaction(record.intent,signed);
       if (signed.gasLimit !== BigInt(parent.gasLimit)) throw new TransactionError("REPLACEMENT_GAS_CHANGED");
       if (beforeCommit) await beforeCommit();
+      if (fence) await this.assertFence(id,fence);
       const child = attemptRecord(record.intent,signed,parent.attemptNumber + 1,parent.attemptId);
       parent.status = "REPLACED"; record.attempts.push(child); record.attempt = child; record.intent.nextActionAt = nextAction();
       return { ...await strict(id),created: true };
     },
-    async broadcastPrepared(id,broadcast,{ rebroadcast = false,expectedAttemptId } = {}) {
+    async broadcastPrepared(id,broadcast,{ rebroadcast = false,expectedAttemptId,fence } = {}) {
+      if (fence) await this.assertFence(id,fence);
       const record = records.get(id);
       const stored = await strict(id);
       if (stored.intent.status !== "PENDING" || (expectedAttemptId !== undefined && stored.attempt.attemptId !== expectedAttemptId)) return { ...stored,broadcast: false };
@@ -132,26 +139,30 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
       else record.intent.nextActionAt = nextAction();
       return { ...await strict(id),broadcast: errorClass === null,errorClass,errorCode,errorMessage };
     },
-    async markKnownAttempt(id,attemptId) {
+    async markKnownAttempt(id,attemptId,{ fence } = {}) {
+      if (fence) await this.assertFence(id,fence);
       const record = records.get(id); const attempt = record.attempts.find(a => a.attemptId === attemptId);
       if (record.intent.status !== "PENDING") return strict(id);
       if (attempt.status === "SIGNED") attempt.status = "BROADCAST";
       attempt.broadcastAt ??= timestamp(); attempt.lastErrorClass = "ALREADY_KNOWN";
       return strict(id);
     },
-    async scheduleRetry(id,{ reason = null,parentAttemptId } = {}) {
+    async scheduleRetry(id,{ reason = null,parentAttemptId,fence } = {}) {
+      if (fence) await this.assertFence(id,fence);
       const record = records.get(id);
       if (record.intent.status === "PENDING" && record.intent.retryStoppedAt === null && (parentAttemptId === undefined || parentAttemptId === record.attempt.attemptId)) {
         record.intent.nextActionAt = nextAction(); if (reason) record.attempt.lastErrorClass = reason;
       }
       return strict(id);
     },
-    async stopRetry(id,reason,{ parentAttemptId } = {}) {
+    async stopRetry(id,reason,{ parentAttemptId,fence } = {}) {
+      if (fence) await this.assertFence(id,fence);
       const record = records.get(id);
       if (parentAttemptId === undefined || record.attempt.attemptId === parentAttemptId) stop(record,reason);
       return strict(id);
     },
     async recordOutcome(id,observation) {
+      if (observation.fence) await this.assertFence(id,observation.fence);
       const record = records.get(id); const winner = record.attempts.find(a => a.transactionHash === observation.transactionHash);
       if (!winner) throw new TransactionError("RECEIPT_TRANSACTION_HASH_MISMATCH");
       const status = observation.status === 1 ? "CONFIRMED" : "REVERTED";
