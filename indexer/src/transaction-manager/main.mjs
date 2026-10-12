@@ -14,13 +14,14 @@ try {
   console.log(`Transaction Manager: ${deliveryJson(publicTransactionConfig(config))}`);
   let result;
   if (operation === "receipts" && !jobId) result = await manager.checkReceiptsOnce();
+  else if (operation === "recover" && !jobId) result = await manager.recoverTransactionsOnce();
   else if (operation === "retries" && !jobId) result = await manager.processTransactionRetriesOnce();
   else if (operation === "prepare" && jobId) result = await manager.prepareDeliveryTransaction(jobId);
   else if (operation === "broadcast" && jobId) result = await manager.broadcastPreparedTransaction(jobId);
   else if (operation === "rebroadcast" && jobId) result = await manager.rebroadcastTransaction(jobId);
   else if (operation === "replace" && jobId) result = await manager.prepareReplacement(jobId);
   else if (operation === "read" && jobId) result = await manager.repository.getTransaction(jobId);
-  else throw new Error("Expected receipts, retries, prepare/broadcast/rebroadcast/replace/read <deliveryJobId>");
+  else throw new Error("Expected recover, receipts, retries, prepare/broadcast/rebroadcast/replace/read <deliveryJobId>");
   console.log(deliveryJson(result));
 } catch (error) {
   console.error(`Transaction Manager failed: ${safeRelayerMessage(error, config)}`);

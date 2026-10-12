@@ -14,6 +14,7 @@ import { authenticateNewView, authenticateViewChange, newViewDigest, selectSafeP
 import { createViewChangeService } from "../src/view-change-service.mjs";
 import { createValidatorServer } from "../src/server.mjs";
 import { createConsensusRuntime } from "../src/consensus-runtime.mjs";
+import { viewTimeoutDuration, viewTimeoutDeadline } from "../src/view-timeout.mjs";
 import { loadValidatorConfig } from "../src/config.mjs";
 import { environment } from "./helpers/fixtures.mjs";
 
@@ -160,9 +161,25 @@ test("progress timeout uses an injected clock and never individually advances cu
     } }, logger: { error() {} } });
   await runtime.tick(); assert.equal(timeouts, 0);
   now = 100; await runtime.tick(); assert.equal(timeouts, 1); assert.equal(state.current_view, "0");
-  now = 250; await runtime.tick(); assert.equal(timeouts, 2); assert.equal(state.current_view, "0");
+  now = 250; await runtime.tick(); assert.equal(timeouts, 1);
+  now = 300; await runtime.tick(); assert.equal(timeouts, 2); assert.equal(state.current_view, "0");
+  now = 699; await runtime.tick(); assert.equal(timeouts, 2);
+  now = 700; await runtime.tick(); assert.equal(timeouts, 3); assert.equal(state.current_view, "0");
   await runtime.close();
   for (const value of ["0", "-1", "1.5", "2147483648", "NaN"]) assert.throws(() => loadValidatorConfig(environment({ PBFT_VIEW_TIMEOUT_MS: value })));
+});
+
+test("timeout windows grow with durable active/pending views and remain bounded for uint256 views", () => {
+  const state = { current_view: "0",target_view: "0",changing_view: false,progress_at: new Date(10),view_change_at: new Date(20) };
+  assert.equal(viewTimeoutDuration(state,100),100); assert.equal(viewTimeoutDeadline(state,100),110);
+  Object.assign(state,{ current_view: "1",target_view: "2",changing_view: true });
+  assert.equal(viewTimeoutDuration(state,100),400); assert.equal(viewTimeoutDeadline(state,100),420);
+  assert.equal(viewTimeoutDeadline(structuredClone(state),100),420,"restart must derive the same deadline from durable fields");
+  state.changing_view = false;
+  assert.equal(viewTimeoutDuration(state,100),200); assert.equal(viewTimeoutDeadline(state,100),210);
+  state.current_view = "30"; assert.equal(viewTimeoutDuration(state,100),2147483647);
+  state.current_view = ((1n << 256n) - 1n).toString(); assert.equal(viewTimeoutDuration(state,100),2147483647);
+  state.current_view = "0"; assert.equal(viewTimeoutDuration(state,2147483647),2147483647);
 });
 
 test("startup awaits validation and registration without scheduling or broadcasting", async () => {
@@ -367,4 +384,56 @@ test("waiting for a later view still replays the durable NEW_VIEW to lagging pee
     viewChange: { async replay() { actions.push("NEW_VIEW"); }, async retryIntent() { actions.push("VIEW_CHANGE_RETRY"); } } });
   try { await runtime.tick(); assert.deepEqual(actions, ["NEW_VIEW", "VIEW_CHANGE_RETRY"]); }
   finally { await runtime.close(); }
+});
+
+test("replay and establishment refresh durable state before driving the certified voting round", async () => {
+  const { proposal } = await preparedFixture("1");
+  const primary = configs.find(c => c.validatorAddress === proposal.primaryIdentity);
+  for (const boundary of ["replay","establish"]) {
+    const state = { epoch: proposal.epoch,current_view: "0",target_view: "1",progress_revision: "0",
+      progress_at: new Date(0),view_change_at: new Date(0),changing_view: true,finalized: false,batch_id: proposal.batchId };
+    const actions = []; let now = 1000;
+    function enterCertifiedView() {
+      actions.push("NEW_VIEW"); now = 1100;
+      Object.assign(state,{ current_view: "1",changing_view: false,view_change_at: null,progress_at: new Date(now),progress_revision: "1" });
+    }
+    const runtime = createConsensusRuntime({ config: { ...primary,viewTimeoutMs: 100 },
+      clock: { now: () => now,schedule() {},cancel() {} },sourcePool: { async query() { return { rows: [] }; } },
+      store: { async readViewStates() { return [structuredClone(state)]; },
+        async readViewChangeTargets() { return state.current_view === "0" ? ["1"] : []; },
+        async readPrePrepare(_epoch,view) { assert.equal(view,"1"); return { envelope: proposal }; },
+        async readPrepareState(_epoch,view) { assert.equal(view,"1"); return { prepared: {} }; },
+        async readCommitState(_epoch,view) { assert.equal(view,"1"); return { certificate: {} }; } },
+      viewChange: { async replay() { if (boundary === "replay") enterCertifiedView(); },
+        async establish(_epoch,target) { assert.equal(target,"1"); enterCertifiedView(); },
+        async retryIntent() { assert.fail("certified active view retried a superseded intent"); },
+        async timeout() { assert.fail("old scheduler snapshot timed out a fresh certified view"); } },
+      prePrepare: { async propose() { actions.push("PRE-PREPARE"); return { result: "ACCEPTED" }; } },
+      prepare: { async cast() { actions.push("PREPARE"); } },
+      commit: { async cast() { actions.push("COMMIT"); },async submit() { actions.push("QC"); return { result: "ACCEPTED" }; } },
+    });
+    try { await runtime.tick(); assert.deepEqual(actions,["NEW_VIEW","PRE-PREPARE","PREPARE","COMMIT","QC"]); }
+    finally { await runtime.close(); }
+  }
+});
+
+test("a retained higher intent keeps its longer window after older NEW_VIEW replay", async () => {
+  const { proposal } = await preparedFixture("1");
+  const state = { epoch: proposal.epoch,current_view: "1",target_view: "2",progress_revision: "0",
+    progress_at: new Date(0),view_change_at: new Date(0),changing_view: true,finalized: false,batch_id: proposal.batchId };
+  let now = 150; let timeouts = 0; let retries = 0;
+  const runtime = createConsensusRuntime({ config: { ...config,viewTimeoutMs: 100 },
+    clock: { now: () => now,schedule() {},cancel() {} },sourcePool: { async query() { return { rows: [] }; } },
+    store: { async readViewStates() { return [structuredClone(state)]; },async readViewChangeTargets() { return []; } },
+    viewChange: { async replay() {},async retryIntent() { retries++; },async timeout(_epoch,expected) {
+      assert.equal(expected.targetView,"2"); timeouts++;
+      Object.assign(state,{ target_view: "3",view_change_at: new Date(now) }); return { envelope: { targetView: "3" } };
+    } },
+    prePrepare: { async propose() { assert.fail("voting resumed below an already signed higher target"); } },
+  });
+  try {
+    await runtime.tick(); now = 250; await runtime.tick(); now = 399; await runtime.tick();
+    assert.equal(retries,1); assert.equal(timeouts,0); assert.equal(state.target_view,"2");
+    now = 400; await runtime.tick(); assert.equal(timeouts,1); assert.equal(state.current_view,"1");
+  } finally { await runtime.close(); }
 });

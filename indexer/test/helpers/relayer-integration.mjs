@@ -16,6 +16,7 @@ import { rpcObserver } from "../../../validator/test/helpers/process-cluster.mjs
 import { verifyPendingReplacement } from "./transaction-retry-integration.mjs";
 import { destinationAccessPath } from "./rpc-failover-integration.mjs";
 import { createRelayerProcesses, verifyLeaseTakeover, verifySignedTakeover, verifyConcurrentRelayers } from "./multi-relayer-integration.mjs";
+import { verifyTransactionCrashes } from "./transaction-crash-integration.mjs";
 
 const execFileAsync = promisify(execFile);
 const MAIN = fileURLToPath(new URL("../../src/relayer/main.mjs",import.meta.url));
@@ -275,6 +276,11 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     console.log("VALID: two independently controlled access paths reached the same real Chain B; response loss, all-down persistence, pre-signing reads, replacement, receipt failover and primary recovery preserved transaction identity");
     console.log("VALID: canonical real receipts reached configured depth; fresh Relayer and Transaction Manager processes preserved exact attempts and nonce allocation");
     console.log("VALID: immutable READY/source/consensus/historical QC evidence survived transport; CONFIRMED is transaction inclusion, not Gateway authentication or Application B execution");
+    // The normal observer is intentionally bound to the original schema. Crash
+    // scenarios use their own committed journal checks against an isolated fixture.
+    await processes.close();
+    await verifyTransactionCrashes({ environment: { ...env,CHAIN_B_RPC_URLS: JSON.stringify([primary.url,secondary.url]) },
+      sourceConfig: config,sourcePool: pool,snapshot: snapshots[0],destination,upstream: process.env.CHAIN_B_RPC_URL });
   } catch (error) {
     failedRun = true;
     for (const failure of observer.errors) console.error(`Transaction RPC observation failed: ${failure.message}`);

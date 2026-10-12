@@ -84,6 +84,7 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
         observations.push(observation(endpoint,operation,"SUCCEEDED"));
         return { value,endpointLabel: endpoint.label,observations: Object.freeze(observations) };
       } catch (error) {
+        if (error.coordinationFailure) throw error;
         if (!temporary(classifyBroadcastError(error))) throw safeRejection(endpoint,operation,error,observations);
         unavailable(endpoint,error);
         observations.push(observation(endpoint,operation,"UNAVAILABLE",endpoint.lastErrorClass));
@@ -197,11 +198,23 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
         await raw(endpoint,"eth_getTransactionCount",[config.relayerAddress,tag]),"account nonce"),view ? selectedFor(view) : endpoints);
       return values.reduce((nonce,result) => result.value > nonce ? result.value : nonce,values[0].value);
     },
-    async broadcast(rawTransaction,transactionHash) {
+    async broadcast(rawTransaction,transactionHash,lifecycle) {
       const expected = normalizeBytes32(transactionHash);
       const result = await priority("broadcast",async endpoint => {
-        const hash = await raw(endpoint,"eth_sendRawTransaction",[rawTransaction]);
-        if (normalizeBytes32(hash) !== expected) throw new DestinationRpcError("RPC_TRANSACTION_HASH_MISMATCH");
+        const coordinated = async operation => {
+          try { return await operation(); }
+          catch (error) { error.coordinationFailure = true; throw error; }
+        };
+        const event = await coordinated(() => lifecycle?.beforeEndpoint(endpoint.label));
+        let hash;
+        try {
+          hash = await raw(endpoint,"eth_sendRawTransaction",[rawTransaction]);
+          if (normalizeBytes32(hash) !== expected) throw new DestinationRpcError("RPC_TRANSACTION_HASH_MISMATCH");
+        } catch (error) {
+          await coordinated(() => lifecycle?.afterEndpoint(event,{ resultClass: "ERROR",errorClass: classifyBroadcastError(error) }));
+          throw error;
+        }
+        await coordinated(() => lifecycle?.afterEndpoint(event,{ resultClass: "ACCEPTED",transactionHash: expected }));
         return expected;
       });
       return Object.freeze({ transactionHash: result.value,acceptedEndpointLabel: result.endpointLabel,observations: result.observations });

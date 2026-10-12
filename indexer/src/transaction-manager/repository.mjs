@@ -14,10 +14,11 @@ import { assertLeaseFence } from "../relayer/leases.mjs";
 const iso = value => value == null ? null : value.toISOString();
 const final = status => status === "CONFIRMED" || status === "REVERTED";
 
-export function createTransactionRepository({ config, pool, resolveIntent, beforeSignedCommit = async () => {}, clock = { now: Date.now } }) {
+export function createTransactionRepository({ config, pool, resolveIntent, beforeSignedCommit = async () => {},hooks = {}, clock = { now: Date.now } }) {
   const accounts = tableName(config.databaseSchema,"transaction_accounts");
   const intents = tableName(config.databaseSchema,"transaction_intents");
   const attempts = tableName(config.databaseSchema,"transaction_attempts");
+  const events = tableName(config.databaseSchema,"transaction_broadcast_events");
   const accountKey = [config.destinationDomain.toString(),normalizeAddress(config.relayerAddress)];
 
   function intentRecord(row,expected) {
@@ -124,7 +125,123 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
       VALUES ($1,$2,$3,$4,$5,'SIGNED',$6,$7,$8,$9,2,$10,$11,$12)`,[intent.deliveryJobId,number,parentId,intent.chainId,intent.senderAddress,
       intent.nonce,signed.gasLimit.toString(),signed.maxFeePerGas.toString(),signed.maxPriorityFeePerGas.toString(),signed.rawSignedTransaction,signed.transactionHash,actionDate(now)]);
   }
+  async function withRecoveryLock(id,operation,context) {
+    if (context) {
+      if (context.deliveryJobId !== id) throw new TransactionError("INVALID_RECOVERY_CONTEXT");
+      context.assertHeld(); return operation(context);
+    }
+    const client = await pool.connect(); let acquired = false; let lost = false; let ended = false; let key;
+    const onError = () => { lost = true; }; client.on("error",onError);
+    try {
+      const row = (await client.query(`SELECT ((tableoid::bigint << 32) | recovery_lock_id::bigint)::text AS key FROM ${intents} WHERE delivery_job_id = $1`,[id])).rows[0];
+      if (!row) throw new TransactionError("TRANSACTION_NOT_PREPARED"); key = row.key;
+      acquired = (await client.query("SELECT pg_try_advisory_lock($1::bigint) AS acquired",[key])).rows[0].acquired;
+      if (!acquired) throw new TransactionError("TRANSACTION_RECOVERY_BUSY");
+      return await operation(Object.freeze({ deliveryJobId: id,assertHeld() {
+        if (lost || ended) throw new TransactionError("TRANSACTION_RECOVERY_SESSION_LOST");
+      } }));
+    } finally {
+      ended = true;
+      try { if (acquired && !lost) await client.query("SELECT pg_advisory_unlock($1::bigint)",[key]); }
+      finally { client.removeListener("error",onError); client.release(lost ? new Error("recovery session connection lost") : undefined); }
+    }
+  }
+  const eventRecord = row => Object.freeze({ eventId: row.event_id,attemptId: row.attempt_id,broadcastSequence: row.broadcast_sequence,
+    parentEventId: row.parent_event_id,endpointLabel: row.endpoint_label,startedAt: iso(row.started_at),completedAt: iso(row.completed_at),
+    resultClass: row.result_class,errorClass: row.error_class,returnedTransactionHash: row.returned_tx_hash });
+  async function insertEvent(client,attemptId,parentId = null,label = null) {
+    return eventRecord((await client.query(`INSERT INTO ${events} (attempt_id,broadcast_sequence,parent_event_id,endpoint_label)
+      SELECT $1,COALESCE(MAX(broadcast_sequence),0) + 1,$2,$3 FROM ${events} WHERE attempt_id = $1 RETURNING *`,[attemptId,parentId,label])).rows[0]);
+  }
+  async function completeEvent(client,eventId,{ resultClass,errorClass = null,transactionHash = null }) {
+    const result = await client.query(`UPDATE ${events} SET completed_at = clock_timestamp(),result_class = $2,error_class = $3,returned_tx_hash = $4
+      WHERE event_id = $1 AND completed_at IS NULL RETURNING *`,[eventId,resultClass,errorClass,transactionHash]);
+    if (!result.rowCount) {
+      const old = (await client.query(`SELECT * FROM ${events} WHERE event_id = $1`,[eventId])).rows[0];
+      if (!old || old.result_class !== resultClass || old.error_class !== errorClass || old.returned_tx_hash !== transactionHash) throw new TransactionError("CONFLICTING_BROADCAST_RESULT");
+      return eventRecord(old);
+    }
+    return eventRecord(result.rows[0]);
+  }
+  async function verifyVersion(client,id,expectedVersion) {
+    if (expectedVersion === undefined) return;
+    const current = (await client.query(`SELECT recovery_version::text AS version FROM ${intents} WHERE delivery_job_id = $1`,[id])).rows[0];
+    if (current?.version !== expectedVersion) throw new TransactionError("RECOVERY_STATE_CHANGED");
+  }
+  async function finalize(client,stored,observation,now) {
+    const id = stored.intent.deliveryJobId;
+    const number = protocolInteger(observation.blockNumber); const head = protocolInteger(observation.head);
+    const hash = normalizeBytes32(observation.blockHash);
+    if (![0,1].includes(observation.status) || head < number || head - number + 1n < config.destinationConfirmations) throw new TransactionError("INSUFFICIENT_DESTINATION_CONFIRMATIONS");
+    const status = observation.status === 1 ? "CONFIRMED" : "REVERTED";
+    const winner = stored.attempts.find(a => a.transactionHash === normalizeBytes32(observation.transactionHash));
+    if (!winner) throw new TransactionError("RECEIPT_TRANSACTION_HASH_MISMATCH");
+    if (final(stored.intent.status)) {
+      if (stored.intent.winningAttemptId !== winner.attemptId || stored.intent.status !== status || winner.receiptBlockNumber !== number.toString() || winner.receiptBlockHash !== hash) throw new TransactionError("CONFLICTING_TRANSACTION_OUTCOME");
+      return;
+    }
+    await client.query(`UPDATE ${attempts} SET status = $2,broadcast_at = COALESCE(broadcast_at,$3),broadcast_attempt_count = GREATEST(broadcast_attempt_count,1),
+      last_broadcast_attempt_at = COALESCE(last_broadcast_attempt_at,$3),receipt_block_number = $4,receipt_block_hash = $5,receipt_status = $6,confirmed_head = $7,confirmed_at = $3 WHERE attempt_id = $1`,
+      [winner.attemptId,status,actionDate(now),number.toString(),hash,observation.status,head.toString()]);
+    await client.query(`UPDATE ${intents} SET status = $2,winning_attempt_id = $3,next_action_at = NULL WHERE delivery_job_id = $1`,[id,status,winner.attemptId]);
+    await client.query(`UPDATE ${attempts} SET status = 'REPLACED' WHERE delivery_job_id = $1 AND attempt_id <> $2 AND status <> 'REPLACED'`,[id,winner.attemptId]);
+    await hooks.beforeOutcomeCommit?.({ client,id,observation });
+  }
   return {
+    withRecoveryLock,
+    async getBroadcastEvents(id) {
+      return Object.freeze((await pool.query(`SELECT e.* FROM ${events} e JOIN ${attempts} a USING (attempt_id)
+        WHERE a.delivery_job_id = $1 ORDER BY e.event_id`,[id])).rows.map(eventRecord));
+    },
+    async getRecoverySnapshot(id) {
+      const expected = await resolveIntent(id);
+      return snapshot(async client => {
+        const stored = await read(client,id,expected);
+        if (!stored) return null;
+        const version = (await client.query(`SELECT recovery_version::text AS version FROM ${intents} WHERE delivery_job_id = $1`,[id])).rows[0].version;
+        const journal = (await client.query(`SELECT e.* FROM ${events} e JOIN ${attempts} a USING (attempt_id)
+          WHERE a.delivery_job_id = $1 ORDER BY e.event_id`,[id])).rows.map(eventRecord);
+        return Object.freeze({ ...stored,version,broadcastEvents: Object.freeze(journal) });
+      });
+    },
+    async listRecoveryIntents({ limit = config.maxJobs } = {}) {
+      deliveryLimit(limit);
+      return Object.freeze((await pool.query(`SELECT delivery_job_id FROM ${intents} WHERE chain_id = $1 AND sender_address = $2
+        AND status = 'PENDING' ORDER BY nonce,delivery_job_id LIMIT $3`,[...accountKey,limit])).rows.map(row => row.delivery_job_id));
+    },
+    async applyRecoveryObservation(snapshotValue,{ knownAttempts = [],receipt,fence } = {}) {
+      const id = snapshotValue.intent.deliveryJobId; const expected = await resolveIntent(id); const now = operationTime(clock);
+      const result = await deliveryTransaction(pool,async client => {
+        const stored = await locked(client,id,expected);
+        if (fence) await assertLeaseFence(client,config,id,fence);
+        if (final(stored.intent.status)) return stored;
+        await verifyVersion(client,id,snapshotValue.version);
+        if (receipt) await finalize(client,stored,receipt,now);
+        else for (const attemptId of knownAttempts) {
+          const attempt = stored.attempts.find(a => a.attemptId === attemptId);
+          if (!attempt) throw new TransactionError("UNKNOWN_TRANSACTION_ATTEMPT");
+          if (attempt.broadcastAt === null) await client.query(`UPDATE ${attempts} SET status = $2,broadcast_at = COALESCE(broadcast_at,$3)
+            WHERE attempt_id = $1`,[attemptId,attempt.status === "SIGNED" ? "BROADCAST" : attempt.status,actionDate(now)]);
+        }
+        const settled = new Set([...knownAttempts,...(receipt ? [stored.attempts.find(a => a.transactionHash === receipt.transactionHash).attemptId] : [])]);
+        for (const attemptId of settled) {
+          const candidate = stored.attempts.find(a => a.attemptId === attemptId);
+          const incomplete = (await client.query(`SELECT event_id FROM ${events} WHERE attempt_id = $1 AND completed_at IS NULL ORDER BY event_id`,[attemptId])).rows;
+          for (const event of incomplete) await completeEvent(client,event.event_id,{ resultClass: "RECONCILED",transactionHash: candidate.transactionHash });
+        }
+        return read(client,id,expected);
+      });
+      if (final(result.intent.status)) await hooks.afterOutcomeCommit?.({ id,stored: result });
+      return result;
+    },
+    async assertRecoverySnapshot(snapshotValue,{ fence } = {}) {
+      const id = snapshotValue.intent.deliveryJobId;
+      return deliveryTransaction(pool,async client => {
+        const stored = await locked(client,id,await resolveIntent(id));
+        if (fence) await assertLeaseFence(client,config,id,fence);
+        await verifyVersion(client,id,snapshotValue.version); return stored;
+      });
+    },
     async assertFence(id,fence) {
       return deliveryTransaction(pool,client => assertLeaseFence(client,config,id,fence));
     },
@@ -192,6 +309,7 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         await client.query(`INSERT INTO ${intents} (delivery_job_id,package_digest,chain_id,sender_address,destination_gateway,value,calldata,nonce,next_action_at,created_at)
           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,[canonical.deliveryJobId,canonical.packageDigest,canonical.chainId,canonical.senderAddress,
           canonical.destinationGateway,canonical.value,canonical.calldata,canonical.nonce,actionDate(now,config.rebroadcastIntervalMs),actionDate(now)]);
+        await hooks.afterIntentInsert?.({ client,intent: canonical });
         await insertAttempt(client,canonical,signed,0,null,now);
         await beforeSignedCommit({ client,intent: canonical,attempt: signed });
         if (fence) await assertLeaseFence(client,config,intent.deliveryJobId,fence);
@@ -221,37 +339,76 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         return Object.freeze({ ...await read(client,id,expected),created: true });
       });
     },
-    async broadcastPrepared(id,broadcast,{ rebroadcast = false,expectedAttemptId,fence } = {}) {
+    async broadcastPrepared(id,broadcast,{ rebroadcast = false,expectedAttemptId,expectedVersion,fence,recoveryContext } = {}) {
       const expected = await resolveIntent(id); const now = operationTime(clock);
-      return deliveryTransaction(pool,async client => {
-        const stored = await locked(client,id,expected);
-        if (fence) await assertLeaseFence(client,config,id,fence);
-        if (stored.intent.status !== "PENDING") return Object.freeze({ ...stored,broadcast: false });
-        if (expectedAttemptId !== undefined && stored.attempt.attemptId !== expectedAttemptId) return Object.freeze({ ...stored,broadcast: false });
-        if (stored.intent.retryStoppedAt !== null) throw new TransactionError(stored.intent.retryStopReason);
-        if (stored.attempt.status !== "SIGNED" && !rebroadcast) return Object.freeze({ ...stored,broadcast: false });
-        const earlier = (await client.query(`SELECT i.delivery_job_id FROM ${intents} i JOIN ${attempts} a USING (delivery_job_id)
-          WHERE i.chain_id = $1 AND i.sender_address = $2 AND i.status = 'PENDING' AND i.nonce < $3
-            AND (i.retry_stopped_at IS NOT NULL OR (a.status = 'SIGNED' AND a.attempt_number = (SELECT MAX(attempt_number) FROM ${attempts} WHERE delivery_job_id = i.delivery_job_id)))
-          ORDER BY i.nonce LIMIT 1`,[...accountKey,stored.intent.nonce])).rows[0];
-        if (earlier) throw new TransactionError("EARLIER_SIGNED_TRANSACTION_BLOCKS_BROADCAST");
+      return withRecoveryLock(id,async context => {
+        context.assertHeld();
+        const start = await deliveryTransaction(pool,async client => {
+          const stored = await locked(client,id,expected);
+          if (fence) await assertLeaseFence(client,config,id,fence);
+          await verifyVersion(client,id,expectedVersion);
+          if (stored.intent.status !== "PENDING" || (expectedAttemptId !== undefined && stored.attempt.attemptId !== expectedAttemptId)) return { stored };
+          if (stored.intent.retryStoppedAt !== null) throw new TransactionError(stored.intent.retryStopReason);
+          if (stored.attempt.status !== "SIGNED" && !rebroadcast) return { stored };
+          const earlier = (await client.query(`SELECT i.delivery_job_id FROM ${intents} i JOIN ${attempts} a USING (delivery_job_id)
+            WHERE i.chain_id = $1 AND i.sender_address = $2 AND i.status = 'PENDING' AND i.nonce < $3
+              AND (i.retry_stopped_at IS NOT NULL OR (a.status = 'SIGNED' AND a.attempt_number = (SELECT MAX(attempt_number) FROM ${attempts} WHERE delivery_job_id = i.delivery_job_id)))
+            ORDER BY i.nonce LIMIT 1`,[...accountKey,stored.intent.nonce])).rows[0];
+          if (earlier) throw new TransactionError("EARLIER_SIGNED_TRANSACTION_BLOCKS_BROADCAST");
+          const event = await insertEvent(client,stored.attempt.attemptId);
+          await client.query(`UPDATE ${attempts} SET broadcast_attempt_count = broadcast_attempt_count + 1,last_broadcast_attempt_at = $2 WHERE attempt_id = $1`,
+            [stored.attempt.attemptId,actionDate(now)]);
+          await client.query(`UPDATE ${intents} SET next_action_at = $2 WHERE delivery_job_id = $1`,[id,actionDate(now,config.rebroadcastIntervalMs)]);
+          return { stored: await read(client,id,expected),event };
+        });
+        if (!start.event) return Object.freeze({ ...start.stored,broadcast: false });
+        // This checkpoint runs after COMMIT. SIGKILL cannot erase the marker.
+        await hooks.afterBroadcastStart?.({ id,event: start.event,stored: start.stored });
+        const attempt = start.stored.attempt;
+        const lifecycle = {
+          async beforeEndpoint(endpointLabel) {
+            context.assertHeld();
+            return deliveryTransaction(pool,async client => {
+              const current = await locked(client,id,expected);
+              if (fence) await assertLeaseFence(client,config,id,fence);
+              if (current.intent.status !== "PENDING" || current.intent.retryStoppedAt !== null || current.attempt.attemptId !== attempt.attemptId) throw new TransactionError("BROADCAST_STATE_CHANGED");
+              return insertEvent(client,attempt.attemptId,start.event.eventId,endpointLabel);
+            });
+          },
+          async afterEndpoint(event,result) {
+            await hooks.afterEndpointResult?.({ id,event,result,stored: start.stored });
+            context.assertHeld();
+            return deliveryTransaction(pool,async client => {
+              await locked(client,id,expected);
+              if (fence) await assertLeaseFence(client,config,id,fence);
+              return completeEvent(client,event.eventId,result);
+            });
+          },
+        };
         let errorClass = null; let errorMessage = null; let errorCode = null;
         try {
-          const returned = normalizeBytes32(await broadcast(stored.attempt.rawSignedTransaction,stored.attempt.transactionHash),"RPC transaction hash");
-          if (returned !== stored.attempt.transactionHash) throw new TransactionError("RPC_TRANSACTION_HASH_MISMATCH");
+          const hash = normalizeBytes32(await broadcast(attempt.rawSignedTransaction,attempt.transactionHash,lifecycle),"RPC transaction hash");
+          if (hash !== attempt.transactionHash) throw new TransactionError("RPC_TRANSACTION_HASH_MISMATCH");
         } catch (error) {
+          // Storage/fencing failures leave the committed event unresolved.
+          if (error.coordinationFailure) throw error;
           errorClass = classifyBroadcastError(error); errorMessage = safeRelayerMessage(error,config); errorCode = error?.code ?? errorClass;
         }
-        const count = BigInt(stored.attempt.broadcastAttemptCount) + 1n;
-        protocolInteger(count,"broadcast count");
-        await client.query(`UPDATE ${attempts} SET status = $2,broadcast_at = $3,broadcast_attempt_count = $4,last_broadcast_attempt_at = $5,last_error_class = $6 WHERE attempt_id = $1`,
-          [stored.attempt.attemptId,errorClass ? stored.attempt.status : "BROADCAST",stored.attempt.broadcastAt ?? (errorClass ? null : actionDate(now)),count.toString(),actionDate(now),errorClass]);
-        if (errorClass === "DETERMINISTIC_REJECTION") await stop(client,stored,errorCode === "RPC_TRANSACTION_HASH_MISMATCH" ? errorCode : errorClass,now);
-        else await client.query(`UPDATE ${intents} SET next_action_at = $2 WHERE delivery_job_id = $1`,[id,actionDate(now,config.rebroadcastIntervalMs)]);
-        // Failure metadata commits too. The caller reports errors only after this
-        // transaction returns, so retries do not lose their durable schedule.
-        return Object.freeze({ ...await read(client,id,expected),broadcast: errorClass === null,errorClass,errorMessage,errorCode });
-      });
+        await hooks.beforeBroadcastResult?.({ id,event: start.event,stored: start.stored,errorClass });
+        context.assertHeld();
+        return deliveryTransaction(pool,async client => {
+          const current = await locked(client,id,expected);
+          if (fence) await assertLeaseFence(client,config,id,fence);
+          await completeEvent(client,start.event.eventId,errorClass ? { resultClass: "ERROR",errorClass } :
+            { resultClass: "ACCEPTED",transactionHash: attempt.transactionHash });
+          if (current.intent.status === "PENDING" && current.attempt.attemptId === attempt.attemptId) {
+            await client.query(`UPDATE ${attempts} SET status = $2,broadcast_at = $3,last_error_class = $4 WHERE attempt_id = $1`,
+              [attempt.attemptId,errorClass ? current.attempt.status : "BROADCAST",current.attempt.broadcastAt ?? (errorClass ? null : actionDate(now)),errorClass]);
+            if (errorClass === "DETERMINISTIC_REJECTION") await stop(client,current,errorCode === "RPC_TRANSACTION_HASH_MISMATCH" ? errorCode : errorClass,now);
+          }
+          return Object.freeze({ ...await read(client,id,expected),broadcast: errorClass === null,errorClass,errorMessage,errorCode });
+        });
+      },recoveryContext);
     },
     async markKnownAttempt(id,attemptId,{ fence } = {}) {
       const expected = await resolveIntent(id); const now = operationTime(clock);
@@ -280,37 +437,26 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         return read(client,id,expected);
       });
     },
-    async stopRetry(id,reason,{ parentAttemptId,fence } = {}) {
+    async stopRetry(id,reason,{ parentAttemptId,expectedVersion,fence } = {}) {
       const expected = await resolveIntent(id); const now = operationTime(clock);
       return deliveryTransaction(pool,async client => {
         const stored = await locked(client,id,expected);
         if (fence) await assertLeaseFence(client,config,id,fence);
+        await verifyVersion(client,id,expectedVersion);
         if (parentAttemptId === undefined || stored.attempt.attemptId === parentAttemptId) await stop(client,stored,reason,now);
         return read(client,id,expected);
       });
     },
     async recordOutcome(id,observation) {
       const expected = await resolveIntent(id); const now = operationTime(clock);
-      const number = protocolInteger(observation.blockNumber,"receipt block"); const head = protocolInteger(observation.head,"confirmed head");
-      const hash = normalizeBytes32(observation.blockHash,"receipt block hash");
-      if (![0,1].includes(observation.status) || head < number || head - number + 1n < config.destinationConfirmations) throw new TransactionError("INSUFFICIENT_DESTINATION_CONFIRMATIONS");
-      const status = observation.status === 1 ? "CONFIRMED" : "REVERTED";
-      return deliveryTransaction(pool,async client => {
+      const result = await deliveryTransaction(pool,async client => {
         const stored = await locked(client,id,expected);
         if (observation.fence) await assertLeaseFence(client,config,id,observation.fence);
-        const winner = stored.attempts.find(value => value.transactionHash === normalizeBytes32(observation.transactionHash));
-        if (!winner) throw new TransactionError("RECEIPT_TRANSACTION_HASH_MISMATCH");
-        if (final(stored.intent.status)) {
-          if (stored.intent.winningAttemptId !== winner.attemptId || stored.intent.status !== status || winner.receiptBlockNumber !== number.toString() || winner.receiptBlockHash !== hash) throw new TransactionError("CONFLICTING_TRANSACTION_OUTCOME");
-          return stored;
-        }
-        await client.query(`UPDATE ${attempts} SET status = $2,broadcast_at = COALESCE(broadcast_at,$3),broadcast_attempt_count = GREATEST(broadcast_attempt_count,1),
-          last_broadcast_attempt_at = COALESCE(last_broadcast_attempt_at,$3),receipt_block_number = $4,receipt_block_hash = $5,receipt_status = $6,confirmed_head = $7,confirmed_at = $3 WHERE attempt_id = $1`,
-          [winner.attemptId,status,actionDate(now),number.toString(),hash,observation.status,head.toString()]);
-        await client.query(`UPDATE ${intents} SET status = $2,winning_attempt_id = $3,next_action_at = NULL WHERE delivery_job_id = $1`,[id,status,winner.attemptId]);
-        await client.query(`UPDATE ${attempts} SET status = 'REPLACED' WHERE delivery_job_id = $1 AND attempt_id <> $2 AND status <> 'REPLACED'`,[id,winner.attemptId]);
+        await verifyVersion(client,id,observation.expectedVersion);
+        await finalize(client,stored,observation,now);
         return read(client,id,expected);
       });
+      await hooks.afterOutcomeCommit?.({ id,stored: result }); return result;
     },
   };
 }

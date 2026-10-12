@@ -4,7 +4,7 @@ import { normalizeWorkerId, normalizeLeaseDuration } from "../src/relayer/config
 import { normalizeLeaseFence } from "../src/relayer/leases.mjs";
 import { createRelayerWorker } from "../src/relayer/service.mjs";
 import { createTransactionManager } from "../src/transaction-manager/service.mjs";
-import { transactionHarness } from "./helpers/transaction-fixtures.mjs";
+import { transactionHarness,transientSendError } from "./helpers/transaction-fixtures.mjs";
 import { memoryLeaseFixture } from "./helpers/lease-fixtures.mjs";
 
 async function fixture() {
@@ -14,6 +14,26 @@ async function fixture() {
   const worker = (config,repository,manager,options = {}) => createRelayerWorker({ config,queue: h.queue,leases: repository,transactionManager: manager,...options });
   return { ...h,leases,a,b,bConfig,managerB,worker,id: h.jobs[0].deliveryJobId };
 }
+
+test("fenced recovery sends retain the injected RPC failure diagnostic through the worker boundary", async () => {
+  const h = await fixture();
+  const message = "expected injected Relayer RPC submission failure";
+  const observations = [{ endpointLabel: "rpc-0",operation: "broadcast",outcome: "UNAVAILABLE",errorClass: "TRANSIENT_RPC_ERROR" }];
+  h.rpc.broadcast = async (raw,_hash,observe) => {
+    h.calls.broadcast.push(raw); observe({ acceptedEndpointLabel: null,observations });
+    throw transientSendError(`${message} ${h.config.privateKey}`);
+  };
+  await assert.rejects(h.worker(h.config,h.a,h.manager).submitJob(h.id),error => {
+    assert.equal(error.code,"ECONNREFUSED"); assert.equal(error.message,`${message} <redacted>`);
+    assert.deepEqual(error.observations,observations); return true;
+  });
+  const stored = await h.repository.getTransaction(h.id);
+  assert.equal(stored.attempt.status,"SIGNED"); assert.equal(stored.attempts.length,1); assert.equal(h.records.size,1);
+  assert.equal(stored.attempt.broadcastAttemptCount,"1"); assert.equal(stored.intent.retryStoppedAt,null);
+  assert.equal((await h.repository.getAccount()).nextNonce,"10");
+  assert.equal(h.calls.sign,1); assert.equal(h.calls.broadcast.length,1);
+  assert.notEqual((await h.a.getLease(h.id)).releasedAt,null);
+});
 
 test("worker IDs and lease durations are strict, bounded and log-safe", () => {
   assert.equal(normalizeWorkerId("relayer-b"),"relayer-b"); assert.equal(normalizeLeaseDuration("30000"),30000);

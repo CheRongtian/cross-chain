@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Multi-Relayer Delivery Coordination"
+VERIFICATION_NAME="Durable Relayer and Transaction Recovery"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -526,9 +526,9 @@ printf ' 91. Advance through views 1 and 2 with an unavailable then stalled prim
 printf ' 92. Preserve version-one historical evidence and one committed root across all views\n'
 printf ' 93. Rebuild obsolete verification fixtures transactionally and preserve original source tables\n'
 printf ' 94. Validate evidence before signing, reject cased duplicates, and preserve canonical digests\n'
-printf ' 95. Bind timeout actions to the original view and durable progress revision\n'
-printf ' 96. Advance durable pending targets while a candidate primary cannot publish NEW_VIEW\n'
-printf ' 97. Require exact delayed NEW_VIEW replay and a verified later-view QC after healing\n'
+printf ' 95. Share bounded durable-view timeout backoff between scheduler and locked database checks\n'
+printf ' 96. Refresh recovered view/progress before timeout or voting; preserve signed higher targets\n'
+printf ' 97. Require exact delayed NEW_VIEW replay, retained intents and a verified later-view QC after healing\n'
 printf ' 98. Verify an existing final QC instead of halting on a concurrent COMMITTED transition\n'
 printf ' 99. Check fourth votes before finality and distinguish final QC recognition from active view\n'
 printf '100. Keep RPC available through validator shutdown and report recovery state before cleanup\n'
@@ -604,6 +604,24 @@ printf '169. Stop A after committed SIGNED and let B broadcast the same nonce/ra
 printf '170. Distribute separate READY jobs without duplicate intents or nonce spaces\n'
 printf '171. Preserve retry/replacement lineage, RPC failover and canonical confirmation\n'
 printf '172. Exclude final/stopped intents and preserve immutable queue/source/QC evidence\n'
+printf '173. Commit broadcast-start evidence before every external raw transaction send\n'
+printf '174. Preserve append-only journal identity, exact sequences and incomplete outcomes\n'
+printf '175. Recover from PostgreSQL and canonical Chain B state without worker memory\n'
+printf '176. Query historical transaction hashes before any recovery rebroadcast\n'
+printf '177. Preserve the atomic intent/nonce/initial-attempt boundary through process loss\n'
+printf '178. Stop after SIGNED or broadcast-start commit and resume identical bytes/hash\n'
+printf '179. Kill a real worker after Chain B accepts a transaction but before result storage\n'
+printf '180. Recover through B with higher fencing without another intent, nonce or signature\n'
+printf '181. Interrupt real RPC failover and reconcile through the remaining access path\n'
+printf '182. Preserve redacted recovery failure codes/messages/observations and all-path-down transaction state\n'
+printf '183. Recover ambiguous replacement history without creating another candidate\n'
+printf '184. Accept either a historical or replacement canonical winner\n'
+printf '185. Reobserve real receipts after a worker dies before persistence\n'
+printf '186. Roll back interrupted final writes and atomically persist the same winner\n'
+printf '187. Restore final truth after restart without rebroadcasting final intents\n'
+printf '188. Serialize concurrent recovery and reject stale post-RPC snapshots\n'
+printf '189. Reconcile stopped retries without resetting limits or exhaustion\n'
+printf '190. Preserve all source, queue, lease, nonce, signing, retry and RPC invariants\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -661,7 +679,8 @@ node --test \
     "$INDEXER_DIR/test/transaction-manager.test.mjs" \
     "$INDEXER_DIR/test/transaction-retry.test.mjs" \
     "$INDEXER_DIR/test/rpc-pool.test.mjs" \
-    "$INDEXER_DIR/test/relayer-leases.test.mjs"
+    "$INDEXER_DIR/test/relayer-leases.test.mjs" \
+    "$INDEXER_DIR/test/transaction-recovery.test.mjs"
 
 CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, lifecycle, fixed-initial-epoch rollover, consensus binding and atomic delivery queue tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -675,7 +694,8 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
         "$INDEXER_DIR/test/transaction-manager.database.test.mjs" \
         "$INDEXER_DIR/test/transaction-retry.database.test.mjs" \
         "$INDEXER_DIR/test/rpc-failover.database.test.mjs" \
-        "$INDEXER_DIR/test/relayer-leases.database.test.mjs"
+        "$INDEXER_DIR/test/relayer-leases.database.test.mjs" \
+        "$INDEXER_DIR/test/transaction-recovery.database.test.mjs"
 
 CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"

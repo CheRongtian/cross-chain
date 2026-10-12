@@ -17,7 +17,7 @@ export const cloneTransactionValue = value => JSON.parse(deliveryJson(value));
 export function transactionConfig(overrides = {}) { return loadTransactionConfig(relayerEnvironment(overrides)); }
 export const transientSendError = (message = "injected send failure") => Object.assign(new Error(message),{ code: "ECONNREFUSED" });
 
-export async function transactionHarness({ config = transactionConfig(),mutate,beforeCommit,account } = {}) {
+export async function transactionHarness({ config = transactionConfig(),mutate,beforeCommit,account,hooks = {} } = {}) {
   const packets = cloneTransactionValue(await buildDeliveryPackages(await deliveryFixture(),{ validatorSets: config.validatorSets }));
   const original = cloneTransactionValue(packets);
   if (mutate) mutate(packets[0]);
@@ -27,6 +27,8 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
     async getDeliveryPackage(id) { return packets.find(pack => pack.deliveryJobId === id); } };
   const records = new Map();
   const historical = new Map();
+  const journal = []; const versions = new Map(); const recoveryLocks = new Set(); let nextEvent = 1n;
+  const touch = id => versions.set(id,(versions.get(id) ?? 0n) + 1n);
   const calls = { gas: 0,fees: 0,pending: 0,latest: 0,sign: 0,broadcast: [],head: 0 };
   let nextNonce = null;
   let nextAttempt = 1;
@@ -34,6 +36,20 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
   const clock = { now: () => time };
   const timestamp = () => new Date(time).toISOString();
   const nextAction = () => new Date(time + config.rebroadcastIntervalMs).toISOString();
+  function appendEvent(attempt,parentEventId = null,endpointLabel = null) {
+    const sequence = journal.filter(event => event.attemptId === attempt.attemptId).reduce((max,event) => BigInt(event.broadcastSequence) > max ? BigInt(event.broadcastSequence) : max,0n) + 1n;
+    const event = { eventId: (nextEvent++).toString(),attemptId: attempt.attemptId,broadcastSequence: sequence.toString(),parentEventId,endpointLabel,
+      startedAt: timestamp(),completedAt: null,resultClass: null,errorClass: null,returnedTransactionHash: null };
+    journal.push(event); touch(attempt.deliveryJobId); return cloneTransactionValue(event);
+  }
+  function completeEvent(eventId,result,id) {
+    const event = journal.find(event => event.eventId === eventId);
+    if (event.completedAt !== null) {
+      if (event.resultClass !== result.resultClass || event.returnedTransactionHash !== (result.transactionHash ?? null)) throw new TransactionError("CONFLICTING_BROADCAST_RESULT");
+      return;
+    }
+    Object.assign(event,{ completedAt: timestamp(),resultClass: result.resultClass,errorClass: result.errorClass ?? null,returnedTransactionHash: result.transactionHash ?? null }); touch(id);
+  }
   const state = { pendingNonce: 9n,latestNonce: 9n,head: 100n,actualChain: config.destinationDomain,
     fees: { maxFeePerGas: 3000000000n,maxPriorityFeePerGas: 1000000000n },
     receipts: new Map(),transactions: new Map(),blocks: new Map() };
@@ -60,6 +76,36 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
     Object.assign(record.intent,{ retryStoppedAt: timestamp(),retryStopReason: reason,nextActionAt: null });
   }
   const repository = {
+    async withRecoveryLock(id,operation,context) {
+      if (context) { context.assertHeld(); return operation(context); }
+      if (!records.has(id)) throw new TransactionError("TRANSACTION_NOT_PREPARED");
+      if (recoveryLocks.has(id)) throw new TransactionError("TRANSACTION_RECOVERY_BUSY");
+      recoveryLocks.add(id); let ended = false;
+      try { return await operation({ deliveryJobId: id,assertHeld() { if (ended) throw new TransactionError("TRANSACTION_RECOVERY_SESSION_LOST"); } }); }
+      finally { ended = true; recoveryLocks.delete(id); }
+    },
+    async getBroadcastEvents(id) { return cloneTransactionValue(journal.filter(event => records.get(id).attempts.some(a => a.attemptId === event.attemptId))); },
+    async getRecoverySnapshot(id) {
+      const stored = await strict(id); return stored ? { ...stored,version: versions.get(id).toString(),broadcastEvents: await this.getBroadcastEvents(id) } : null;
+    },
+    async listRecoveryIntents({ limit }) { return [...records.values()].filter(r => r.intent.status === "PENDING").sort((a,b) => BigInt(a.intent.nonce) < BigInt(b.intent.nonce) ? -1 : 1).slice(0,limit).map(r => r.intent.deliveryJobId); },
+    async assertRecoverySnapshot(snapshot,{ fence } = {}) {
+      if (fence) await this.assertFence(snapshot.intent.deliveryJobId,fence);
+      if (snapshot.version !== versions.get(snapshot.intent.deliveryJobId).toString()) throw new TransactionError("RECOVERY_STATE_CHANGED");
+      return strict(snapshot.intent.deliveryJobId);
+    },
+    async applyRecoveryObservation(snapshot,{ knownAttempts = [],receipt,fence } = {}) {
+      const id = snapshot.intent.deliveryJobId;
+      if (records.get(id).intent.status !== "PENDING") return strict(id);
+      await this.assertRecoverySnapshot(snapshot,{ fence });
+      if (receipt) await this.recordOutcome(id,{ ...receipt,fence });
+      else for (const attemptId of knownAttempts) await this.markKnownAttempt(id,attemptId,{ fence });
+      const accepted = new Set([...knownAttempts,...(receipt ? [records.get(id).attempts.find(a => a.transactionHash === receipt.transactionHash).attemptId] : [])]);
+      for (const event of journal) if (accepted.has(event.attemptId) && event.completedAt === null) {
+        completeEvent(event.eventId,{ resultClass: "RECONCILED",transactionHash: records.get(id).attempts.find(a => a.attemptId === event.attemptId).transactionHash },id);
+      }
+      return strict(id);
+    },
     async assertFence() { throw new TransactionError("LEASE_FENCE_REQUIRED"); },
     async getTransaction(id,expected) { return strict(id,expected); },
     async getTransactionIntent(id) { return (await strict(id))?.intent ?? null; },
@@ -98,6 +144,7 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
       records.set(intent.deliveryJobId,{ intent: { ...canonical,intentId: intent.deliveryJobId,status: "PENDING",winningAttemptId: null,
         nextActionAt: nextAction(),retryStoppedAt: null,retryStopReason: null,createdAt: timestamp() },attempt,attempts: [attempt],winningAttempt: null });
       nextNonce = allocation.nextNonce;
+      touch(intent.deliveryJobId);
       return { ...await strict(intent.deliveryJobId),created: true };
     },
     async persistReplacement({ id,parentAttemptId,fees,sign,fence }) {
@@ -117,10 +164,13 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
       if (fence) await this.assertFence(id,fence);
       const child = attemptRecord(record.intent,signed,parent.attemptNumber + 1,parent.attemptId);
       parent.status = "REPLACED"; record.attempts.push(child); record.attempt = child; record.intent.nextActionAt = nextAction();
+      touch(id);
       return { ...await strict(id),created: true };
     },
-    async broadcastPrepared(id,broadcast,{ rebroadcast = false,expectedAttemptId,fence } = {}) {
+    async broadcastPrepared(id,broadcast,{ rebroadcast = false,expectedAttemptId,expectedVersion,fence,recoveryContext } = {}) {
+      return this.withRecoveryLock(id,async context => {
       if (fence) await this.assertFence(id,fence);
+      if (expectedVersion !== undefined && expectedVersion !== versions.get(id).toString()) throw new TransactionError("RECOVERY_STATE_CHANGED");
       const record = records.get(id);
       const stored = await strict(id);
       if (stored.intent.status !== "PENDING" || (expectedAttemptId !== undefined && stored.attempt.attemptId !== expectedAttemptId)) return { ...stored,broadcast: false };
@@ -128,16 +178,34 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
       if (stored.attempt.status !== "SIGNED" && !rebroadcast) return { ...stored,broadcast: false };
       if ([...records.values()].some(r => r.intent.status === "PENDING" && BigInt(r.intent.nonce) < BigInt(stored.intent.nonce) &&
           (r.intent.retryStoppedAt !== null || r.attempt.status === "SIGNED"))) throw new TransactionError("EARLIER_SIGNED_TRANSACTION_BLOCKS_BROADCAST");
+      const event = appendEvent(stored.attempt);
+      record.attempt.broadcastAttemptCount = (BigInt(record.attempt.broadcastAttemptCount) + 1n).toString();
+      record.attempt.lastBroadcastAttemptAt = timestamp(); record.intent.nextActionAt = nextAction(); touch(id);
+      await hooks.afterBroadcastStart?.({ id,event,stored: await strict(id) });
+      const lifecycle = {
+        beforeEndpoint: async label => {
+          context.assertHeld(); if (fence) await this.assertFence(id,fence);
+          return appendEvent(stored.attempt,event.eventId,label);
+        },
+        afterEndpoint: async (child,result) => {
+          await hooks.afterEndpointResult?.({ id,event: child,result,stored: await strict(id) });
+          if (fence) await this.assertFence(id,fence); completeEvent(child.eventId,result,id);
+        },
+      };
       let errorClass = null; let errorMessage = null; let errorCode = null;
       try {
-        if (normalizeBytes32(await broadcast(stored.attempt.rawSignedTransaction,stored.attempt.transactionHash)) !== stored.attempt.transactionHash) throw new TransactionError("RPC_TRANSACTION_HASH_MISMATCH");
-      } catch (error) { errorClass = classifyBroadcastError(error); errorCode = error.code ?? errorClass; errorMessage = safeRelayerMessage(error,config); }
-      record.attempt.broadcastAttemptCount = (BigInt(record.attempt.broadcastAttemptCount) + 1n).toString();
-      record.attempt.lastBroadcastAttemptAt = timestamp(); record.attempt.lastErrorClass = errorClass;
+        if (normalizeBytes32(await broadcast(stored.attempt.rawSignedTransaction,stored.attempt.transactionHash,lifecycle)) !== stored.attempt.transactionHash) throw new TransactionError("RPC_TRANSACTION_HASH_MISMATCH");
+      } catch (error) { if (error.coordinationFailure) throw error; errorClass = classifyBroadcastError(error); errorCode = error.code ?? errorClass; errorMessage = safeRelayerMessage(error,config); }
+      await hooks.beforeBroadcastResult?.({ id,event,stored: await strict(id),errorClass });
+      if (fence) await this.assertFence(id,fence);
+      completeEvent(event.eventId,errorClass ? { resultClass: "ERROR",errorClass } : { resultClass: "ACCEPTED",transactionHash: stored.attempt.transactionHash },id);
+      record.attempt.lastErrorClass = errorClass;
       if (errorClass === null) { record.attempt.status = "BROADCAST"; record.attempt.broadcastAt ??= timestamp(); }
       if (errorClass === "DETERMINISTIC_REJECTION") stop(record,errorCode === "RPC_TRANSACTION_HASH_MISMATCH" ? errorCode : errorClass);
       else record.intent.nextActionAt = nextAction();
+      touch(id);
       return { ...await strict(id),broadcast: errorClass === null,errorClass,errorCode,errorMessage };
+      },recoveryContext);
     },
     async markKnownAttempt(id,attemptId,{ fence } = {}) {
       if (fence) await this.assertFence(id,fence);
@@ -145,6 +213,7 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
       if (record.intent.status !== "PENDING") return strict(id);
       if (attempt.status === "SIGNED") attempt.status = "BROADCAST";
       attempt.broadcastAt ??= timestamp(); attempt.lastErrorClass = "ALREADY_KNOWN";
+      touch(id);
       return strict(id);
     },
     async scheduleRetry(id,{ reason = null,parentAttemptId,fence } = {}) {
@@ -152,13 +221,16 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
       const record = records.get(id);
       if (record.intent.status === "PENDING" && record.intent.retryStoppedAt === null && (parentAttemptId === undefined || parentAttemptId === record.attempt.attemptId)) {
         record.intent.nextActionAt = nextAction(); if (reason) record.attempt.lastErrorClass = reason;
+        touch(id);
       }
       return strict(id);
     },
-    async stopRetry(id,reason,{ parentAttemptId,fence } = {}) {
+    async stopRetry(id,reason,{ parentAttemptId,expectedVersion,fence } = {}) {
       if (fence) await this.assertFence(id,fence);
+      if (expectedVersion !== undefined && expectedVersion !== versions.get(id).toString()) throw new TransactionError("RECOVERY_STATE_CHANGED");
       const record = records.get(id);
       if (parentAttemptId === undefined || record.attempt.attemptId === parentAttemptId) stop(record,reason);
+      touch(id);
       return strict(id);
     },
     async recordOutcome(id,observation) {
@@ -176,6 +248,8 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
         receiptStatus: observation.status,confirmedHead: observation.head.toString(),confirmedAt: timestamp() });
       for (const other of record.attempts) if (other !== winner) other.status = "REPLACED";
       Object.assign(record.intent,{ status,winningAttemptId: winner.attemptId,nextActionAt: null }); record.winningAttempt = winner;
+      touch(id);
+      await hooks.afterOutcomeCommit?.({ id,stored: await strict(id) });
       return strict(id);
     },
   };
@@ -213,7 +287,7 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
     async block(number) { return state.blocks.get(number.toString()) ?? null; },
     async transaction(hash) { return state.transactions.get(hash) ?? null; },
   };
-  const options = { config,queue,repository,rpc,clock,account: account ?? privateKeyToAccount(config.privateKey),
+  const options = { config,queue,repository,rpc,clock,hooks,account: account ?? privateKeyToAccount(config.privateKey),
     legacy: { async getSubmission(id) { return historical.get(id) ?? null; } } };
   function mine(id,{ status = 1,blockNumber = 100n,attemptId } = {}) {
     const { intent,attempt,attempts } = records.get(id);
@@ -226,7 +300,7 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
     if (BigInt(intent.nonce) >= state.latestNonce) state.latestNonce = BigInt(intent.nonce) + 1n;
     return receipt;
   }
-  return { config,queue,jobs,packets,original,records,historical,calls,state,repository,rpc,options,clock,
+  return { config,queue,jobs,packets,original,records,historical,journal,versions,calls,state,repository,rpc,options,clock,
     advance: milliseconds => { time += milliseconds; },mine,
     manager: createTransactionManager(options),restart: () => createTransactionManager(options) };
 }

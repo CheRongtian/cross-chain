@@ -12,6 +12,7 @@ import { normalizeAddress } from "../../indexer/src/canonical-message.mjs";
 import { authenticateCommit, COMMIT_STATEMENT_FIELDS, CommitError, signCommit } from "./commit.mjs";
 import { buildPreparedCertificate, sameProposal, ViewChangeError } from "./prepared-certificate.mjs";
 import { authenticateNewView, authenticateViewChange, signViewChange } from "./view-change.mjs";
+import { viewTimeoutDeadline } from "./view-timeout.mjs";
 import { buildQuorumCertificate, expectedCommitStatement, qcDigest } from "./quorum-certificate.mjs";
 
 export function createValidatorPool(config) {
@@ -386,7 +387,7 @@ export function createValidatorStore({ pool, config }) {
         let targetView = state.changing_view ? state.target_view : protocolInteger(BigInt(state.current_view) + 1n).toString();
         if (expected.now !== undefined) {
           if (!Number.isFinite(expected.now)) throw new ViewChangeError("MALFORMED_TIMEOUT");
-          const deadline = new Date(state.changing_view ? state.view_change_at : state.progress_at).getTime() + config.viewTimeoutMs;
+          const deadline = viewTimeoutDeadline(state, config.viewTimeoutMs);
           if (expected.now < deadline) throw new ViewChangeError("SUPERSEDED_TIMEOUT");
           if (state.changing_view) targetView = protocolInteger(BigInt(targetView) + 1n).toString();
         }

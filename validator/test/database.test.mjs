@@ -16,6 +16,7 @@ import { signCommit } from "../src/commit.mjs";
 import { buildPreparedCertificate, proposalIdentity } from "../src/prepared-certificate.mjs";
 import { signNewView, signViewChange, selectSafeProposal } from "../src/view-change.mjs";
 import { expectedCommitStatement } from "../src/quorum-certificate.mjs";
+import { viewTimeoutDeadline } from "../src/view-timeout.mjs";
 
 assert.ok(process.env.DATABASE_URL, "DATABASE_URL is required for validator database tests");
 const prefix = process.env.VALIDATOR_DATABASE_TEST_SCHEMA ?? "cross_chain_validator_database_test";
@@ -698,8 +699,12 @@ test("pending view targets advance durably after another timeout without activat
   const prepared = await stores[0].preparedCertificate(statement.epoch);
   const first = await stores[0].castViewChange(statement.epoch);
   const state = (await stores[0].readViewStates())[0];
+  const expected = { view: state.current_view,targetView: state.target_view,progressRevision: state.progress_revision };
+  await assert.rejects(stores[0].castViewChange(statement.epoch,{ ...expected,
+    now: state.view_change_at.getTime() + configs[0].viewTimeoutMs }),/SUPERSEDED_TIMEOUT/);
+  assert.deepEqual(await stores[0].readViewChanges(statement.epoch,"2"),[]);
   const next = await stores[0].castViewChange(statement.epoch, { view: state.current_view, targetView: state.target_view,
-    progressRevision: state.progress_revision, now: state.view_change_at.getTime() + configs[0].viewTimeoutMs });
+    progressRevision: state.progress_revision, now: state.view_change_at.getTime() + configs[0].viewTimeoutMs * 2 });
   assert.equal(first.targetView, "1"); assert.equal(next.targetView, "2");
   assert.equal(await stores[0].currentView(statement.epoch), "0");
   assert.deepEqual((await stores[0].readViewChanges(statement.epoch, "1"))[0], first);
@@ -718,6 +723,46 @@ test("pending view targets advance durably after another timeout without activat
     assert.equal((await restored.readViewStates())[0].changing_view, false);
     assert.deepEqual(await restored.preparedCertificate(statement.epoch), prepared);
   } finally { await fresh.end(); }
+});
+
+test("skewed pending targets retain safety and converge through a higher three-signer NEW_VIEW", async () => {
+  const statement = await prepareProposal();
+  const prepared = await stores[0].preparedCertificate(statement.epoch);
+  for (const index of [1,2]) await acceptProposal(index);
+  for (const index of [0,1,2]) await stores[index].castViewChange(statement.epoch);
+  const ahead = (await stores[0].readViewStates())[0];
+  const retained = await stores[0].castViewChange(statement.epoch,{ view: ahead.current_view,targetView: ahead.target_view,
+    progressRevision: ahead.progress_revision,now: viewTimeoutDeadline(ahead,configs[0].viewTimeoutMs) });
+  const older = await transition("1",prepared);
+  for (const index of [0,1,2]) {
+    for (const vote of older.votes) await stores[index].saveViewChange(vote);
+    await stores[index].acceptNewView(older.message,proposalIdentity(prepared.proposal));
+  }
+  const blocked = (await stores[0].readViewStates())[0];
+  assert.equal(blocked.current_view,"1"); assert.equal(blocked.target_view,"2"); assert.equal(blocked.changing_view,true);
+  await assert.rejects(stores[0].castPrepareVote(statement.epoch),/VIEW_CHANGE_IN_PROGRESS/);
+  assert.deepEqual((await stores[0].readViewChanges(statement.epoch,"2"))[0],retained);
+  const votes = [retained];
+  for (const index of [1,2]) {
+    const state = (await stores[index].readViewStates())[0];
+    const expected = { view: state.current_view,targetView: state.target_view,progressRevision: state.progress_revision };
+    const deadline = viewTimeoutDeadline(state,configs[index].viewTimeoutMs);
+    await assert.rejects(stores[index].castViewChange(statement.epoch,{ ...expected,now: deadline - 1 }),/SUPERSEDED_TIMEOUT/);
+    votes.push(await stores[index].castViewChange(statement.epoch,{ ...expected,now: deadline }));
+  }
+  const primary = configs.find(c => c.validatorAddress === deterministicPrimary(configs[0].peers,statement.epoch,"2"));
+  const message = await signNewView(primary,{ epoch: statement.epoch,view: "2",viewChanges: votes,
+    selectedProposal: selectSafeProposal(votes,prepared.proposal) },proposalIdentity(prepared.proposal));
+  for (const index of [0,1,2]) {
+    for (const vote of votes) await stores[index].saveViewChange(vote);
+    await stores[index].acceptNewView(message,proposalIdentity(prepared.proposal));
+    const state = (await stores[index].readViewStates())[0];
+    assert.equal(state.current_view,"2"); assert.equal(state.target_view,"2"); assert.equal(state.changing_view,false);
+    const reloaded = createValidatorStore({ config: configs[index],pool: pools[index] });
+    assert.deepEqual(await reloaded.readNewView(statement.epoch,"2"),message);
+    assert.equal(viewTimeoutDeadline((await reloaded.readViewStates())[0],configs[index].viewTimeoutMs),viewTimeoutDeadline(state,configs[index].viewTimeoutMs));
+  }
+  assert.deepEqual((await stores[0].readViewChanges(statement.epoch,"2")).find(vote => vote.voterIdentity === configs[0].validatorAddress),retained);
 });
 
 test("one far-future VIEW_CHANGE cannot advance local target or current view", async () => {

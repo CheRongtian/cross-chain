@@ -7,6 +7,7 @@ import { authenticateNewView, newViewDigest } from "../../src/view-change.mjs";
 import { proposalIdentity } from "../../src/prepared-certificate.mjs";
 import { validatorAccount } from "../../src/identity.mjs";
 import { verifyQuorumCertificate } from "../../src/quorum-certificate.mjs";
+import { viewTimeoutDuration } from "../../src/view-timeout.mjs";
 
 // Poll observed durable conditions. The delay only spaces observations; it never
 // declares success. The deadline is a failure watchdog, not a consensus trigger.
@@ -193,7 +194,8 @@ async function lostNewView(ctx) {
     return rows.find((row) => row.epoch === epoch && row.current_view === "1" && row.changing_view && BigInt(row.target_view) >= 2n);
   });
   const intents = await ctx.states[one].store.readViewChanges(epoch, timedOut.target_view);
-  assert.ok(intents.some((vote) => vote.voterIdentity === ctx.peers[one].address), "timeout must have a durable signed local intent");
+  const durableIntent = intents.find(vote => vote.voterIdentity === ctx.peers[one].address);
+  assert.ok(durableIntent, "timeout must have a durable signed local intent");
   assert.equal(await ctx.states[lag].store.currentView(epoch), "0");
   ctx.gate.allowRoute(ctx.peers[one].address, ctx.peers[lag].address, "/pbft/new-view");
   const replayed = await until("persisted NEW_VIEW replay reached the lagging backup", () => {
@@ -206,6 +208,19 @@ async function lostNewView(ctx) {
     record.to === ctx.peers[lag].address && record.route === "/pbft/new-view" && record.delivery === "BLOCKED")),
   "the scenario must actually lose a NEW_VIEW delivery");
   assert.equal((await ctx.lifecycle.readBatch({ batchRecordId: ctx.pending.record.batchRecordId })).record.status, "CONSENSUS_PENDING");
+  const windows = await Promise.all(ctx.backups.map(async index => {
+    const state = (await ctx.states[index].store.readViewStates()).find(row => row.epoch === epoch);
+    if (index === one) {
+      assert.equal(state.current_view,"1"); assert.ok(state.changing_view);
+      assert.ok(BigInt(state.target_view) >= BigInt(durableIntent.targetView),"delayed replay cannot reset a signed higher target");
+    }
+    // armTimeout changes the restarted worker environment; the parent store
+    // retains its original long timeout and does not represent that worker.
+    const baseTimeoutMs = Number(ctx.environments[index].PBFT_VIEW_TIMEOUT_MS);
+    return { validator: ctx.peers[index].address,currentView: state.current_view,targetView: state.target_view,
+      changingView: state.changing_view,baseTimeoutMs,timeoutMs: viewTimeoutDuration(state,baseTimeoutMs) };
+  }));
+  console.log(`Recovery windows before transport healing: ${JSON.stringify(windows)}`);
   // Timers keep running while delivery is blocked. Healing must restore actual
   // consensus, without requiring every node to stop at the first target view.
   ctx.gate.heal();
@@ -220,6 +235,8 @@ async function lostNewView(ctx) {
     await authenticateNewView(ctx.states[index].config, evidence, proposalIdentity(ctx.statement));
   }
   assert.deepEqual(await ctx.states[lag].store.readNewView(epoch, "1"), original);
+  assert.deepEqual((await ctx.states[one].store.readViewChanges(epoch,durableIntent.targetView))
+    .find(vote => vote.voterIdentity === ctx.peers[one].address),durableIntent);
   console.log(`VALID: exact delayed NEW_VIEW replayed after timeout; healed live validators committed one safe root with a three-signer view ${qc.view} QC`);
 }
 

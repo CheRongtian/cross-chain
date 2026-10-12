@@ -18,9 +18,9 @@ export function createTransactionRpc(config,{ pool = createDestinationRpcPool({ 
       });
     },
     fees: () => pool.fees(),
-    async broadcast(raw,transactionHash,observe) {
+    async broadcast(raw,transactionHash,observe,lifecycle) {
       try {
-        const result = await pool.broadcast(raw,transactionHash);
+        const result = await pool.broadcast(raw,transactionHash,lifecycle);
         observe?.(result);
         return result.transactionHash;
       } catch (error) {

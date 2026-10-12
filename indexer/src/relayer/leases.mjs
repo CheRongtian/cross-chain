@@ -38,6 +38,7 @@ export function createRelayerLeaseRepository({ config,pool,queue }) {
   const batches = tableName(config.databaseSchema,"delivery_batches");
   const intents = tableName(config.databaseSchema,"transaction_intents");
   const attempts = tableName(config.databaseSchema,"transaction_attempts");
+  const events = tableName(config.databaseSchema,"transaction_broadcast_events");
   const submissions = tableName(config.databaseSchema,"relayer_submissions");
   const scope = normalizeSourceScope(config);
   const eligible = `b.source_domain = $1 AND b.source_gateway = $2 AND j.status = 'READY'
@@ -79,7 +80,9 @@ export function createRelayerLeaseRepository({ config,pool,queue }) {
           OR EXISTS (SELECT 1 FROM ${intents} i WHERE i.delivery_job_id = j.delivery_job_id AND
             (i.next_action_at <= clock_timestamp() OR EXISTS (SELECT 1 FROM ${attempts} a
               WHERE a.delivery_job_id = i.delivery_job_id AND a.status = 'SIGNED' AND a.broadcast_attempt_count = 0
-                AND a.attempt_number = (SELECT MAX(attempt_number) FROM ${attempts} WHERE delivery_job_id = i.delivery_job_id)))))
+                AND a.attempt_number = (SELECT MAX(attempt_number) FROM ${attempts} WHERE delivery_job_id = i.delivery_job_id))
+              OR EXISTS (SELECT 1 FROM ${events} e JOIN ${attempts} a USING (attempt_id)
+                WHERE a.delivery_job_id = i.delivery_job_id AND e.completed_at IS NULL))))
         ORDER BY b.batch_epoch,j.message_index,j.delivery_job_id LIMIT $5`,
         [scope.chainDomain,scope.sourceGateway,session.workerId,session.sessionId,limit])).rows;
       return Object.freeze(await Promise.all(rows.map(row => queue.getDeliveryJob(row.delivery_job_id))));

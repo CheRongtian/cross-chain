@@ -2,7 +2,7 @@ import { classifyBroadcastError } from "./rpc-errors.mjs";
 import { operationTime, replacementDue } from "./retry-policy.mjs";
 import { TransactionError } from "./config.mjs";
 
-export async function processTransactionRetriesOnce({ config, store, rpc, verifyChain, inspect, send, replace, clock, limit = config.maxJobs,deliveryJobId,fence }) {
+export async function processTransactionRetriesOnce({ config, store, rpc, verifyChain, inspect, send, replace, recover, clock, limit = config.maxJobs,deliveryJobId,fence }) {
   const now = operationTime(clock);
   const target = deliveryJobId === undefined ? null : await store.getTransaction(deliveryJobId);
   const due = deliveryJobId === undefined ? await store.listDueIntents({ now,limit }) :
@@ -24,6 +24,13 @@ export async function processTransactionRetriesOnce({ config, store, rpc, verify
     let current = await store.getTransaction(id);
     if (current.intent.status !== "PENDING" || current.intent.retryStoppedAt !== null || new Date(current.intent.nextActionAt).getTime() > now) continue;
     try {
+      const snapshot = await store.getRecoverySnapshot(id);
+      if (snapshot.broadcastEvents.some(event => event.completedAt === null)) {
+        const recovered = await recover(id,fence);
+        broadcasts += recovered.rebroadcast;
+        results.push({ deliveryJobId: id,action: "RECOVERY",recovery: recovered });
+        continue;
+      }
       const observation = await inspect(current,view,false,fence);
       current = observation.stored;
       if (observation.mined) {
@@ -42,6 +49,10 @@ export async function processTransactionRetriesOnce({ config, store, rpc, verify
       results.push({ deliveryJobId: id,action: result.errorClass ? "RETRY_SCHEDULED" : result.intent.status !== "PENDING" ? result.intent.status : result.broadcast ? "BROADCAST" : "ATTEMPT_CHANGED",
         errorClass: result.errorClass ?? null,attemptId: result.attempt.attemptId,transactionHash: result.attempt.transactionHash });
     } catch (error) {
+      if (error.code === "TRANSACTION_RECOVERY_BUSY" || error.code === "RECOVERY_STATE_CHANGED") {
+        results.push({ deliveryJobId: id,action: error.code });
+        continue;
+      }
       if (error.code === "EARLIER_SIGNED_TRANSACTION_BLOCKS_BROADCAST") {
         await store.scheduleRetry(id,{ parentAttemptId: current.attempt.attemptId,fence });
         results.push({ deliveryJobId: id,action: "BLOCKED_BY_EARLIER_NONCE" });

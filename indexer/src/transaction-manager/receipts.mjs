@@ -15,7 +15,7 @@ export function verifyRpcTransaction(intent, attempt, tx, receipt) {
   return tx;
 }
 
-export async function inspectIntentReceipts({ stored, rpc, store, config, view, forceAll = false,fence }) {
+export async function observeIntentReceipts({ stored,rpc,config,view,forceAll = false,hooks = {} }) {
   const head = view.head;
   const observations = [];
   for (const attempt of stored.attempts) {
@@ -34,14 +34,21 @@ export async function inspectIntentReceipts({ stored, rpc, store, config, view, 
   }
   if (observations.length > 1) throw new TransactionError("CONFLICTING_CANONICAL_NONCE_WINNERS");
   const winner = observations[0];
+  if (!winner) return { winner: null,mined: false,finalizable: false };
+  await hooks.afterReceiptObserved?.({ stored,winner,head });
+  return { winner,mined: true,finalizable: head >= winner.blockNumber && head - winner.blockNumber + 1n >= config.destinationConfirmations };
+}
+
+export async function inspectIntentReceipts({ stored,rpc,store,config,view,forceAll = false,fence,hooks = {} }) {
+  const { winner,finalizable } = await observeIntentReceipts({ stored,rpc,config,view,forceAll,hooks });
   if (!winner) return { stored,mined: false,finalized: false };
-  if (head < winner.blockNumber || head - winner.blockNumber + 1n < config.destinationConfirmations) {
+  if (!finalizable) {
     // Full canonical evidence proves acceptance even when a lost response left
     // SIGNED state. Confirmation still uses the original conservative snapshot.
     const known = winner.attempt.broadcastAt === null ? await store.markKnownAttempt(stored.intent.deliveryJobId,winner.attempt.attemptId,{ fence }) : stored;
     return { stored: known,mined: true,finalized: false };
   }
   const finalized = await store.recordOutcome(stored.intent.deliveryJobId,{ transactionHash: winner.attempt.transactionHash,
-    blockNumber: winner.blockNumber,blockHash: winner.blockHash,status: winner.status,head,fence });
+    blockNumber: winner.blockNumber,blockHash: winner.blockHash,status: winner.status,head: view.head,fence });
   return { stored: finalized,mined: true,finalized: true };
 }

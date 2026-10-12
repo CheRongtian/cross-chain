@@ -20,6 +20,17 @@ async function replacement(h,id) {
   return prepared;
 }
 
+test("concurrent replacement preparation keeps one child and returns existing evidence to the contender", async () => {
+  const { h,id,first } = await pending(); h.advance(h.config.replacementAfterMs);
+  const account = await h.repository.getAccount();
+  const results = await Promise.all([h.manager.prepareReplacement(id,first.attempt.attemptId),
+    h.restart().prepareReplacement(id,first.attempt.attemptId)]);
+  assert.equal(results.filter(result => result.created).length,1);
+  assert.equal((await h.repository.getTransaction(id)).attempts.length,2);
+  assert.deepEqual(await h.repository.getAccount(),account);
+  assert.equal(h.calls.sign,2); assert.equal(h.calls.broadcast.length,1);
+});
+
 test("retry defaults, exact fee ratios, bounds and public configuration", () => {
   const config = transactionConfig();
   assert.equal(config.rebroadcastIntervalMs,5000);

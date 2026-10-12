@@ -67,9 +67,9 @@ export function destinationRpcFixture({ config = transactionConfig({ CHAIN_B_RPC
   } };
 }
 
-export async function transactionFailoverHarness({ overrides = {} } = {}) {
+export async function transactionFailoverHarness({ overrides = {},hooks = {} } = {}) {
   const config = transactionConfig({ CHAIN_B_RPC_URLS: '["http://127.0.0.1:9545","http://127.0.0.1:9546"]',...overrides });
-  const h = await transactionHarness({ config });
+  const h = await transactionHarness({ config,hooks });
   const destination = destinationRpcFixture({ config,async onBroadcast(raw) {
     const record = [...h.records.values()].find(r => r.attempts.some(a => a.rawSignedTransaction === raw));
     const attempt = record?.attempts.find(a => a.rawSignedTransaction === raw);

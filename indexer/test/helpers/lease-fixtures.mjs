@@ -28,7 +28,8 @@ export function memoryLeaseFixture(h) {
           const attempt = h.records.get(job.deliveryJobId)?.attempt;
           const row = rows.get(job.deliveryJobId);
           return !h.historical.has(job.deliveryJobId) && (!intent || (intent.status === "PENDING" && intent.retryStoppedAt === null &&
-            (Date.parse(intent.nextActionAt) <= h.clock.now() || (attempt.status === "SIGNED" && attempt.broadcastAttemptCount === "0")))) &&
+            (Date.parse(intent.nextActionAt) <= h.clock.now() || (attempt.status === "SIGNED" && attempt.broadcastAttemptCount === "0") ||
+              h.journal.some(event => event.completedAt === null && h.records.get(job.deliveryJobId).attempts.some(a => a.attemptId === event.attemptId))))) &&
             (!row || Date.parse(row.leaseExpiresAt) <= h.clock.now() || (row.ownerId === session.workerId && row.ownerSessionId === session.sessionId));
         }).slice(0,limit);
       },

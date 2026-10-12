@@ -12,10 +12,11 @@ import { inspectIntentReceipts, verifyRpcTransaction } from "./receipts.mjs";
 import { operationTime, replacementDue, replacementFees } from "./retry-policy.mjs";
 import { processTransactionRetriesOnce } from "./retry.mjs";
 import { TransactionError } from "./config.mjs";
+import { recoverTransactionsOnce } from "./recovery.mjs";
 
 export function createTransactionManager({ config,pool,queue = createDeliveryRepository({ config,pool }),
   rpc = createTransactionRpc(config),account = privateKeyToAccount(config.privateKey),repository,
-  legacy = createRelaySubmissionRepository({ config,pool,queue }),beforeSignedCommit,clock = { now: Date.now } }) {
+  legacy = createRelaySubmissionRepository({ config,pool,queue }),beforeSignedCommit,hooks = {},clock = { now: Date.now } }) {
   const verification = { validatorSets: config.validatorSets,sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway };
   async function protect(operation) {
     try { return await operation(); }
@@ -38,9 +39,10 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     return Object.freeze({ deliveryJobId: id,packageDigest: encoded.packageDigest,chainId: message.destinationDomain,
       senderAddress: normalizeAddress(config.relayerAddress),destinationGateway: message.destinationGateway,value: "0",calldata: encoded.data });
   }
-  const store = repository ?? createTransactionRepository({ config,pool,resolveIntent,beforeSignedCommit,clock });
+  const store = repository ?? createTransactionRepository({ config,pool,resolveIntent,beforeSignedCommit,hooks,clock });
   const sign = (intent,fields) => signDeliveryTransaction(intent,fields,account);
-  const inspect = (stored,view,forceAll = false,fence) => inspectIntentReceipts({ stored,rpc,store,config,view,forceAll,fence });
+  const inspect = (stored,view,forceAll = false,fence) => inspectIntentReceipts({ stored,rpc,store,config,view,forceAll,fence,hooks });
+  const recover = (id,fence) => recoverTransactionsOnce({ store,rpc,config,send,hooks,deliveryJobId: id,fence });
 
   async function prepare(id,fence) {
     if (fence) await store.assertFence(id,fence);
@@ -102,9 +104,12 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     return { stored,mined: false,finalized: false,known: false };
   }
   async function send(id,options = {}) {
+    return store.withRecoveryLock(id,context => sendLocked(id,{ ...options,recoveryContext: context }),options.recoveryContext);
+  }
+  async function sendLocked(id,options = {}) {
     await verifyChain();
     let rpcObservation;
-    const result = await store.broadcastPrepared(id,(raw,transactionHash) => rpc.broadcast(raw,transactionHash,value => { rpcObservation = value; }),options);
+    const result = await store.broadcastPrepared(id,(raw,transactionHash,lifecycle) => rpc.broadcast(raw,transactionHash,value => { rpcObservation = value; },lifecycle),options);
     if (["ALREADY_KNOWN","NONCE_TOO_LOW"].includes(result.errorClass)) {
       const reconciled = await reconcile(result,options.receiptView ?? await rpc.readView(),options.fence);
       if (reconciled.mined || reconciled.known) return Object.freeze({ ...reconciled.stored,broadcast: true,reconciled: true,errorClass: null,errorMessage: null,errorCode: null,
@@ -124,6 +129,16 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     return result;
   }
   async function replace(id,parentAttemptId,view,fence) {
+    try { return await store.withRecoveryLock(id,() => replaceLocked(id,parentAttemptId,view,fence)); }
+    catch (error) {
+      if (error.code !== "TRANSACTION_RECOVERY_BUSY") throw error;
+      // Another recovery/send/replacement owns this intent. Return existing
+      // durable evidence without signing a competing candidate or waiting on RPC.
+      if (fence) await store.assertFence(id,fence);
+      return Object.freeze({ ...await store.getTransaction(id),created: false });
+    }
+  }
+  async function replaceLocked(id,parentAttemptId,view,fence) {
     await verifyChain();
     let stored = await store.getTransaction(id);
     if (!stored) throw new TransactionError("TRANSACTION_NOT_PREPARED");
@@ -174,18 +189,29 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
       return protect(async () => {
         if (!fence) throw new TransactionError("LEASE_FENCE_REQUIRED");
         await store.assertFence(id,fence);
+        const recovery = await recoverTransactionsOnce({ store,rpc,config,send,hooks,deliveryJobId: id,fence });
         let stored = await store.getTransaction(id);
         if (!stored) throw new TransactionError("TRANSACTION_NOT_PREPARED");
-        if (stored.intent.status !== "PENDING" || stored.intent.retryStoppedAt !== null) return Object.freeze({ ...stored,submitted: false });
-        if (stored.attempt.status === "SIGNED" && BigInt(stored.attempt.broadcastAttemptCount) === 0n) {
-          const result = reportBroadcast(await send(id,{ fence,expectedAttemptId: stored.attempt.attemptId }));
-          return Object.freeze({ ...result,submitted: result.broadcast });
+        const recoveryFailure = recovery.results.find(result => result.reason || result.errorClass);
+        if (recoveryFailure) {
+          const error = new TransactionError(recoveryFailure.errorCode ?? recoveryFailure.reason ?? recoveryFailure.errorClass);
+          error.message = recoveryFailure.errorMessage ?? error.message;
+          error.observations = recoveryFailure.rpcObservations ?? [];
+          throw error;
+        }
+        if (recovery.results.some(result => result.action === "RECEIPT_UNCONFIRMED") && stored.intent.retryStoppedAt === null) {
+          stored = await store.scheduleRetry(id,{ fence,parentAttemptId: stored.attempt.attemptId });
+        }
+        if (recovery.rebroadcast || recovery.finalized || recovery.reconciled || stored.intent.status !== "PENDING" || stored.intent.retryStoppedAt !== null) {
+          const sent = recovery.results.find(result => result.acceptedEndpointLabel);
+          return Object.freeze({ ...stored,submitted: recovery.rebroadcast > 0,recovery,
+            acceptedEndpointLabel: sent?.acceptedEndpointLabel ?? null,rpcObservations: sent?.rpcObservations ?? [] });
         }
         await verifyChain();
         const view = await rpc.readView();
         const observation = await inspect(stored,view,false,fence);
         if (observation.mined) return Object.freeze({ ...observation.stored,submitted: false });
-        const processed = await processTransactionRetriesOnce({ config,store,rpc,verifyChain,inspect,send,replace,clock,
+        const processed = await processTransactionRetriesOnce({ config,store,rpc,verifyChain,inspect,send,replace,recover,clock,
           limit: 1,deliveryJobId: id,fence });
         stored = await store.getTransaction(id);
         return Object.freeze({ ...stored,submitted: processed.broadcasts > 0,processing: processed });
@@ -195,7 +221,10 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     async rebroadcastTransaction(id) { return protect(async () => reportBroadcast(await send(id,{ rebroadcast: true }))); },
     async prepareReplacement(id,parentAttemptId) { return protect(() => replace(id,parentAttemptId)); },
     async processTransactionRetriesOnce({ limit = config.maxJobs } = {}) {
-      return protect(() => processTransactionRetriesOnce({ config,store,rpc,verifyChain,inspect,send,replace,clock,limit }));
+      return protect(() => processTransactionRetriesOnce({ config,store,rpc,verifyChain,inspect,send,replace,recover,clock,limit }));
+    },
+    async recoverTransactionsOnce({ limit = config.maxJobs,deliveryJobId,fence } = {}) {
+      return protect(() => recoverTransactionsOnce({ store,rpc,config,send,hooks,limit,deliveryJobId,fence }));
     },
     async submitDelivery(id) {
       return protect(async () => {

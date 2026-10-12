@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A/B independently verify each package and delegates its versioned ABI transport to a Persistent Transaction Manager. The manager atomically reserves nonces, estimates gas and resolves EIP-1559 fees, signs locally, persists exact raw bytes before broadcast, and tracks canonical receipts with configured confirmation depth. Bounded durable retries rebroadcast exact bytes, append same-nonce higher-fee candidates, enforce configured limits and accept any historical canonical winner. Ordered destination RPC access paths validate chain ID and genesis, preserve exact signed transactions across failover, and conservatively check multi-provider receipt views. Destination verification, replay protection and execution remain unimplemented.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A/B independently verify each package and delegate its versioned ABI transport to a Persistent Transaction Manager. The manager atomically reserves nonces, estimates gas and resolves EIP-1559 fees, signs locally, persists exact raw bytes before broadcast, and tracks canonical receipts with configured confirmation depth. Bounded durable retries rebroadcast exact bytes, append same-nonce higher-fee candidates, enforce configured limits and accept any historical canonical winner. Ordered destination RPC access paths validate chain ID and genesis, preserve exact signed transactions across failover, and conservatively check multi-provider receipt views. Destination verification, replay protection and execution remain unimplemented.
 
 The current implementation can:
 
@@ -1083,7 +1083,7 @@ Every scenario uses an independent source schema with the existing migrations an
 
 Normal flow is `CONSENSUS_PENDING → PRE-PREPARE → PREPARE → PREPARED → COMMIT → QC → COMMITTED` in an explicit view. Failure recovery is `progress timeout → VIEW_CHANGE → three-of-four quorum → NEW_VIEW → safe proposal → consensus in the next view`.
 
-`PBFT_VIEW_TIMEOUT_MS` defaults to 30000 and accepts a positive integer up to 2147483647. It is independent of the five-second HTTP timeout. A serialized scheduler discovers independently validated pending batches, restores durable view state on restart, and resets deadlines on new accepted proposals, votes, or NEW_VIEW. Duplicate deliveries do not extend deadlines. Timeout pauses local old-view voting and persists one signed VIEW_CHANGE for the next target. Active `current_view` and pending `target_view` are separate: failure to publish NEW_VIEW does not activate that target, and another full timeout can increment the durable target by one. Each target retains its own immutable signed intent; retries and the first replay after restart reuse it exactly. A valid higher-target NEW_VIEW with three distinct authenticated votes can activate that certified view directly. One caller or one vote cannot change the active view.
+`PBFT_VIEW_TIMEOUT_MS` defaults to 30000 and accepts a positive integer up to 2147483647. It is the base consensus timeout, independent of the five-second HTTP timeout. The active round uses `min(base * 2^current_view, 2147483647)` milliseconds; while waiting for NEW_VIEW, the pending round uses `target_view` instead. Scheduler and locked database timeout checks share this policy. The growing window gives restored peers time to converge and vote before signing another higher target. It derives from durable views and timestamps, survives restart, and handles uint256 views without unbounded exponentiation. A serialized scheduler discovers independently validated pending batches, restores durable view state on restart, and resets deadlines on new accepted proposals, votes, or NEW_VIEW. Duplicate deliveries do not extend deadlines. Timeout pauses local old-view voting and persists one signed VIEW_CHANGE for the next target. Active `current_view` and pending `target_view` are separate: failure to publish NEW_VIEW does not activate that target, and another full timeout can increment the durable target by one. Each target retains its own immutable signed intent; retries and the first replay after restart reuse it exactly. A valid higher-target NEW_VIEW with three distinct authenticated votes can activate that certified view directly. One caller or one vote cannot change the active view.
 
 VIEW_CHANGE binds version 3, its pinned validator epoch and committee digest, its independent `PBFTViewChange` domain, source context, epoch, target view, sender, accepted proposal digest, and prepared-certificate digest. It includes the complete accepted signed proposal when present and the highest durable Prepared Certificate when PREPARED. That certificate carries the signed PRE-PREPARE and three or four matching signed PREPARE envelopes sorted by committee identity. It is independently verified and is distinct from a final COMMIT QC.
 
@@ -1093,7 +1093,7 @@ The primary persists NEW_VIEW before broadcasting it. Acceptance atomically stor
 
 Before opening HTTP or reporting readiness, each validator completes initial pending-batch discovery, independent source validation, and local epoch registration. Discovery does not schedule timeouts, cast votes, or broadcast; existing durable views and safety evidence are retained. Startup storage failures propagate before the endpoint opens. The four-process verification captures these initialized observations as each node's baseline, then checks that explicit validation still performs independent RPC reads, remains idempotent, and leaves every other validator's baseline unchanged.
 
-After the listener opens, the scheduler retransmits each node's latest issued NEW_VIEW independently of whether it is waiting for another view. This lets a lagging peer recover after temporary delivery loss. It drives proposal/PREPARE/COMMIT/QC in active replacement views; view-zero initiation retains explicit proposal/cast interfaces. Timeout writes compare the original active view, target and durable progress revision under the metadata lock. A superseded timer cannot sign for a fresh view or erase new progress. The revision and timeout timestamps are operational state and never enter message IDs, batch IDs, roots or signatures.
+After the listener opens, the scheduler retransmits each node's latest issued NEW_VIEW independently of whether it is waiting for another view. This lets a lagging peer recover after temporary delivery loss. It rereads durable state after replay and establishment so concurrent HTTP acceptance cannot leave scheduling based on an obsolete view or progress timestamp. A newly established active view proceeds directly to proposal/PREPARE/COMMIT work in that same pass. It drives proposal/PREPARE/COMMIT/QC in active replacement views; view-zero initiation retains explicit proposal/cast interfaces. Timeout writes compare the original active view, target and durable progress revision under the metadata lock. A superseded timer cannot sign for a fresh view or erase new progress. The revision and timeout timestamps are operational state and never enter message IDs, batch IDs, roots or signatures.
 
 If another node commits between discovery and a pending-batch check, the existing lifecycle reader independently verifies the final QC and the local epoch is finalized. Corrupted or missing evidence still fails closed; ordinary COMMITTED convergence does not halt the scheduler. Recognizing a final QC never fabricates an accepted NEW_VIEW or forces local current view to equal the certificate's signing view. Storage or integrity failures remain fatal to scheduling and readiness.
 
@@ -1199,7 +1199,7 @@ Configuration combines the Delivery Queue scope and public validator history wit
 
 `.env.example` contains empty private-key and genesis placeholders. Production workers require the operator's intended destination genesis. Unified verification loads the ignored root `.env`, reads the actual local Chain B genesis, injects its development signer, and creates two temporary RPC access paths automatically. It never rewrites personal configuration. Keep secrets out of committed files, PostgreSQL records and logs. Public configuration and endpoint observations use `rpc-0`, `rpc-1` labels without full provider URLs, credentials or path/query API tokens. The existing npm worker entries read process environment against an already migrated database.
 
-Selection includes immutable READY jobs with absent or unfinished transaction intents, ordered by batch epoch, message index and job ID. Historical direct submissions, final intents, automatically stopped retries and leases actively held by another session are excluded before the per-worker limit. Pending intent takeover is allowed. Ordinary scans defer previously attempted intents until their durable next-action time, so they cannot fill the limit and starve new jobs; clean never-broadcast SIGNED candidates remain immediately claimable. Relayer and Transaction Manager each strictly read and independently verify the package at their boundary, including canonical message, payload hash, ordered batch commitment, Merkle path, root, QC signatures and exact historical committee. A queue status or database row cannot replace cryptographic verification. Invalid evidence or the wrong RPC chain creates no intent, reserved nonce or signed attempt.
+Selection includes immutable READY jobs with absent or unfinished transaction intents, ordered by batch epoch, message index and job ID. Historical direct submissions, final intents, automatically stopped retries and leases actively held by another session are excluded before the per-worker limit. Pending intent takeover is allowed. Ordinary scans defer previously attempted intents until their durable next-action time, so they cannot fill the limit and starve new jobs; clean SIGNED candidates and unresolved broadcast journals remain immediately claimable. Relayer and Transaction Manager each strictly read and independently verify the package at their boundary, including canonical message, payload hash, ordered batch commitment, Merkle path, root, QC signatures and exact historical committee. A queue status or database row cannot replace cryptographic verification. Invalid evidence or the wrong RPC chain creates no intent, reserved nonce or signed attempt.
 
 Every destination access path must match both the configured chain ID and genesis hash before use; the chain ID must also match the canonical message domain. Submission uses the canonical `destinationGateway`, never `destinationReceiver`, with `value = 0`. Payload bytes remain opaque and unchanged. New-job Relayer passes are fail-fast after bounded provider fallback. Durable Transaction Manager retries handle transaction-level failures separately; invalid evidence and malformed hashes remain failures. A shared earlier unbroadcast or stopped nonce can defer new work without creating another intent. Worker A becoming unavailable does not require a new Ethereum account.
 
@@ -1213,9 +1213,9 @@ Every destination access path must match both the configured chain ID and genesi
 
 Each takeover or reacquisition after release increments a PostgreSQL BIGINT fencing token, represented as an exact string/BigInt in JavaScript. Release retains the row and last token. Current release is idempotent; stale renewal, release and fenced transaction requests return `STALE_FENCE`. Graceful release helps availability, but expiry permits takeover after an unavailable process without a central monitor or force-steal API. No job has permanent worker affinity.
 
-Relayer-originated transaction mutations carry job ID, owner, session and fencing token. The repository checks the live lease in the same transaction as the account/intent/attempt mutation. Account locks precede lease locks consistently. An already-authorized mutation retains its lease row lock until COMMIT, so a successor token cannot be issued in the middle of that transaction. Preparation checks again before signed commit; sends use already committed exact bytes. A lease becoming stale never grants permission to mutate another owner.
+Relayer-originated transaction mutations carry job ID, owner, session and fencing token. The repository checks the live lease in the same transaction as the account/intent/attempt mutation. Account locks precede lease locks consistently. An already-authorized mutation retains its lease row lock until COMMIT, so a successor token cannot be issued in the middle of that transaction. Preparation checks again before signed commit; sends use already committed exact bytes. Broadcast markers and completion use separate short transactions, with RPC in between and fencing checked again before result mutation. A lease becoming stale never grants permission to mutate another owner.
 
-Takeover reuses the existing intent, sender, nonce, gas, calldata, package digest, attempts, signed bytes, hashes and retry/replacement history. A clean never-broadcast SIGNED candidate can be handed to the manager immediately. Previously attempted or BROADCAST candidates obey their durable due time and replacement policy; ownership change itself cannot create a replacement or reset exhaustion. CONFIRMED/REVERTED jobs are excluded. Independent Transaction Manager retry and receipt commands continue using account/intent locks without requiring a permanently living Relayer owner.
+Takeover reuses the existing intent, sender, nonce, gas, calldata, package digest, attempts, signed bytes, hashes and retry/replacement history. Before continuing a SIGNED candidate, the manager queries its known hashes. Unresolved journals trigger recovery independently of ordinary retry due time. Previously attempted or BROADCAST candidates obey their durable due time and replacement policy; ownership change itself cannot create a replacement or reset exhaustion. CONFIRMED/REVERTED jobs are excluded. Independent Transaction Manager retry and receipt commands continue using account/intent locks without requiring a permanently living Relayer owner.
 
 The worker core exposes bounded `runOnce()` and `submitJob()` operations with no hidden infinite loop. Independent scheduled invocations can continue pending work. Operators must deploy distinct worker IDs against the same queue, signer and destination RPC configuration. Coordination assumes honest but crashable workers using repository APIs; a lease does not defend against an arbitrary malicious database client.
 
@@ -1229,7 +1229,7 @@ Broadcast fallback sends exactly the same committed raw transaction. It never es
 
 Gas estimation uses the first successful endpoint's result. Base fee and priority fee are resolved together from one endpoint; a failed fee operation is retried as a whole through the next path. Pending nonce is the maximum successfully observed across available same-chain endpoints. The durable allocator still wins when every provider is behind, and never regresses after failover. Nonce-consumption reconciliation reads account state at the fixed conservative snapshot block and searches local hashes across providers before declaring an unknown consumer.
 
-Endpoint health and safe broadcast observations remain runtime operational data. No endpoint-health table, additional migration or dependency is required. The existing broadcast count measures one durable manager broadcast action; observations describe its individual provider attempts.
+Endpoint health remains runtime operational data and requires no endpoint-health table or dependency. Durable broadcast journals record committed manager-action starts and individual endpoint-send starts/results using safe endpoint labels. The broadcast count measures committed manager-action starts, including an action interrupted before its first wire send; it does not count individual fallback requests or prove node acceptance.
 
 Retry settings are optional in the ignored root `.env`; `.env.example` lists safe defaults:
 
@@ -1307,7 +1307,27 @@ Underpriced responses make a higher-fee candidate eligible after the persisted r
 
 `processTransactionRetriesOnce({ limit })` reads a bounded, deterministically ordered due set and one fixed conservative destination view. It has no sleep or infinite loop. A fresh invocation uses persisted scheduling, counts and lineage; the injected clock affects operational timing only. Separate receipt passes continue to observe stopped intents. Reaching a cap or maximum attempts preserves pending evidence and does not declare business failure or allocate another nonce. Automatic retry stops are not silently reset.
 
-The primitives include preparation, exact broadcast/rebroadcast, replacement preparation, bounded retries and bounded receipt inspection. The existing `transaction:once` CLI accepts `prepare`, `broadcast`, `rebroadcast`, `replace`, `read`, `retries` and `receipts`. Relayer workers can reselect an unfinished intent and request fenced bounded processing; the independent manager retry pass also remains available. An earlier unbroadcast SIGNED or stopped pending nonce blocks higher-nonce sends. Full crash-recovery orchestration remains deferred: acceptance followed by interruption can leave SIGNED state, but the stored bytes are recoverable and can be reconciled or exactly rebroadcast.
+The primitives include preparation, exact broadcast/rebroadcast, replacement preparation, bounded retries, recovery and bounded receipt inspection. The existing `transaction:once` CLI accepts `prepare`, `broadcast`, `rebroadcast`, `replace`, `read`, `retries`, `receipts` and `recover`. Relayer workers reselect unfinished intents and reconcile persisted hashes before requesting fenced processing. Ambiguous journals are eligible independently of ordinary retry due time. An earlier unbroadcast SIGNED or stopped pending nonce blocks higher-nonce sends.
+
+### Durable broadcast journal and recovery
+
+Intent creation, nonce reservation and the initial signed attempt commit atomically. A crash between their SQL statements rolls back the entire preparation; a committed intent without an attempt is corrupted state, not a normal recovery phase. Replacement preparation likewise commits an entire immutable next candidate or nothing. No migration reconstructs or re-signs old artifacts.
+
+`014_transaction_recovery.sql` adds operational recovery-lock IDs, exact monotonic revisions and `transaction_broadcast_events`. These fields never affect intent identity, package digest, raw bytes, nonce or transaction hash. Every manager broadcast action commits an unresolved parent event before contacting providers. Every actual endpoint send commits a child event first, using only its safe `rpc-N` label. Per-attempt sequences are exact PostgreSQL BIGINT values. Event identity/start fields cannot change; completion is allowed once and completed history cannot be overwritten or deleted.
+
+The sequence is `commit start → external RPC → commit result`. RPC execution holds no database transaction or row lock. A per-intent database session recovery lock coordinates normal sends, replacement and recovery across processes; it is separate from a job lease. Short mutation transactions recheck current intent/attempt state and any supplied owner/session/fencing token. An expired or lost owner cannot write a successor's state; a completion that cannot be stored remains unresolved for a fresh coordinator.
+
+An incomplete event proves only that a send was started operationally: the RPC may never have been called, may have accepted the transaction, or may have lost its response. Local SIGNED status alone cannot establish absence from Chain B. Broadcast attempt count and last-attempt time now record committed manager starts, including starts interrupted before RPC; successful endpoint acceptance and canonical chain evidence are recorded separately. Parent and child events do not represent additional signed candidates.
+
+`recoverTransactionsOnce()` scans a bounded non-final set in nonce/job order, using the existing worker limit. It strictly reads persisted signed history, then queries receipts and transactions for all candidate hashes through the destination RPC pool. It validates exact transaction context, canonical blocks and the fixed conservative confirmation view. Pending or mined evidence can recover BROADCAST; a canonical receipt at depth atomically records the winner, intent status and receipt fields as CONFIRMED or REVERTED. Older attempts remain eligible winners. Recovery never creates a replacement merely because a process died.
+
+When no known transaction is visible and safe recovery needs another send, only the exact committed raw transaction is rebroadcast. No gas refresh, fee refresh, signature, new intent or nonce is generated. A successful reconciliation may complete an old unresolved event as RECONCILED, which records present knowledge of that hash without pretending the original RPC request returned success. Legacy attempts without a journal are conservatively queried first; their unknown historical send counts are not invented.
+
+All RPC reads precede recovery writes. The coordinator rechecks the persisted revision inside its post-RPC mutation transaction. Concurrent advancement invalidates the snapshot and leaves further work to a fresh pass. All paths unavailable, inconsistent provider evidence or conflicting candidate receipts preserve transaction state and report an unchanged result. Definitively advanced canonical account nonce with no canonically mined candidate fails closed with `UNKNOWN_NONCE_CONSUMPTION` and requires operator attention; a stale pending hash cannot explain that consumption. The exclusive-signer assumption remains mandatory.
+
+Final intents are never automatically rebroadcast or replaced. Retry-stopped intents remain eligible for chain reconciliation and final receipt truth, but their stop reasons and limits are not reset and no additional candidate is created. Structured recovery output reports scanned, reconciled, rebroadcast, finalized, unchanged and manual-action counts. There is no required background loop, new dependency, signer service or production crash toggle. Worker memory is disposable; PostgreSQL, persisted signed identities and canonical Chain B observations are the recovery inputs.
+
+Recovery failures retain the original error code, redacted diagnostic message and safe endpoint observations through recovery results and fenced worker errors. A generic retry classification does not replace the underlying failure detail. Diagnostics never become transaction identity or signed evidence; configured private keys, database URLs and provider URLs are redacted from messages.
 
 ### Receipts, winner and restart boundary
 
@@ -1331,7 +1351,11 @@ A pending real transaction is replaced at the same nonce, recovered through fres
 
 Two real Relayer OS processes compete for the same actual job, reject duplicate worker IDs and stale tokens, and hold distinct job leases concurrently. Verification stops A after lease acquisition before intent creation, expires that lease through a test-only database helper, and observes B's higher token. A separate scenario stops A after committed SIGNED and before any external broadcast; B continues identical intent/nonce/raw bytes/hash, followed by the existing pending replacement and RPC-failover checks. PID registries, bounded IPC barriers and cleanup cover both workers. Unit/database tests additionally exercise renewal, atomic contention, commit-time fencing, fresh-client recovery and stopped/final job exclusion. The verification script alone executes these procedures.
 
-CONFIRMED means a successful canonical receipt was observed at configured depth, a heuristic rather than permanent finality. Provider redundancy supplies availability and basic identity/consistency checks, with no Byzantine RPC quorum or malicious-provider tolerance claim. It establishes no DestinationGateway QC authentication, replay rejection or Application B execution. Complete ambiguous crash-after-send reconciliation, replacement-send crash recovery, receipt-persistence crash recovery, confirmed destination transaction reorg recovery, Byzantine-relayer handling, Gateway authentication/replay protection and Application B remain deferred. Clean durable-boundary takeover does not establish recovery for every external-side-effect timing window.
+The crash verification extends the existing process/IPC harness with explicit SQL, marker, RPC-result, receipt and final-commit checkpoints. It kills actual worker processes after actual Chain B acceptance, observes missing local results, and resumes through a fresh worker and the other access path. It covers replacement rollback, persisted replacement before send, a historical winner, an accepted replacement with interrupted failover, real receipt reobservation, rollback before final COMMIT and restart after final COMMIT. Database lock-release barriers replace guessed delays. Isolated fixtures reuse real A/B/D evidence and its existing QC without generating new consensus. Their own RPC observer independently verifies committed endpoint markers before forwarding.
+
+Verification snapshots Chain B, controls automine and temporarily uses minimal reverting bytecode only to obtain a real status-0 receipt. It restores the original chain snapshot, bytecode and mining mode, and cleans up its own processes/proxies. These test fixtures implement no destination protocol and are separate from the normal durable deployment namespace. Unit/database tests also cover conflicts, corruption, exhaustion, exact identities, immutable journals, concurrent recovery and stale writeback.
+
+CONFIRMED means a successful canonical receipt was observed at configured depth, a heuristic rather than permanent finality. Provider redundancy supplies availability and basic identity/consistency checks, with no Byzantine RPC quorum or malicious-provider tolerance claim. Destination Gateway verification, remote/source gateway authorization, destination validator-set/QC verification, Merkle verification at the destination trust boundary, destination replay protection, Application B execution, post-confirmation destination reorg recovery, Byzantine-relayer handling and Byzantine RPC-provider consensus remain unimplemented. Durable transaction recovery does not establish cross-chain business execution or permanent chain finality.
 
 ## Local Two-Chain Environment
 
@@ -1651,7 +1675,15 @@ The script uses strict error handling and performs:
 142. takeover after A stops before intent creation, including rejection before expiry and stale A restart;
 143. takeover after committed SIGNED and before broadcast with unchanged intent/nonce/raw bytes/hash;
 144. concurrent ownership of distinct jobs, one logical intent per job and no retry-exhaustion reset;
-145. preservation of retry/replacement, RPC failover, confirmation and immutable source/queue/QC evidence.
+145. preservation of retry/replacement, RPC failover, confirmation and immutable source/queue/QC evidence;
+146. committed logical/endpoint broadcast markers, exact sequences and immutable completed history;
+147. durable-state classification, hash-first reconciliation and exact-byte recovery without another identity;
+148. interrupted intent/attempt transactions with no ghost nonce or partial signed artifact;
+149. real worker termination after Chain B acceptance and fresh B recovery through the other access path;
+150. ambiguous replacement recovery with historical/new winners and preserved same-nonce lineage;
+151. real receipt reobservation, pre-COMMIT rollback, atomic finalization and post-COMMIT restart;
+152. concurrent recovery locks, stale post-RPC revisions, stopped-policy preservation and all-path-down no mutation;
+153. crash-fixture source/QC preservation and restoration of test-owned chain/process resources.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -1669,7 +1701,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Multi-Relayer Delivery Coordination
+Durable Relayer and Transaction Recovery
 ```
 
 ### Expected error output
@@ -1745,7 +1777,8 @@ Cross-Chain/
 │   │   ├── 010_single_relayer.sql
 │   │   ├── 011_transaction_manager.sql
 │   │   ├── 012_transaction_retry_replacement.sql
-│   │   └── 013_relayer_job_leases.sql
+│   │   ├── 013_relayer_job_leases.sql
+│   │   └── 014_transaction_recovery.sql
 │   ├── scripts/
 │   │   └── generate-merkle-golden-vectors.mjs
 │   ├── src/
@@ -1785,6 +1818,7 @@ Cross-Chain/
 │   │       ├── main.mjs
 │   │       ├── nonce-policy.mjs
 │   │       ├── receipts.mjs
+│   │       ├── recovery.mjs
 │   │       ├── repository.mjs
 │   │       ├── retry-policy.mjs
 │   │       ├── retry.mjs
@@ -1820,6 +1854,7 @@ Cross-Chain/
 │   │   │   ├── relayer-process.mjs
 │   │   │   ├── rpc-failover-integration.mjs
 │   │   │   ├── transaction-database-fixtures.mjs
+│   │   │   ├── transaction-crash-integration.mjs
 │   │   │   ├── transaction-fixtures.mjs
 │   │   │   └── transaction-retry-integration.mjs
 │   │   ├── indexer.test.mjs
@@ -1840,7 +1875,9 @@ Cross-Chain/
 │   │   ├── transaction-manager.database.test.mjs
 │   │   ├── transaction-manager.test.mjs
 │   │   ├── transaction-retry.database.test.mjs
-│   │   └── transaction-retry.test.mjs
+│   │   ├── transaction-retry.test.mjs
+│   │   ├── transaction-recovery.database.test.mjs
+│   │   └── transaction-recovery.test.mjs
 │   ├── package.json
 │   └── package-lock.json
 ├── scripts/
@@ -1883,6 +1920,7 @@ Cross-Chain/
 │   │   ├── prepared-certificate.mjs
 │   │   ├── view-change.mjs
 │   │   ├── view-change-service.mjs
+│   │   ├── view-timeout.mjs
 │   │   └── consensus-runtime.mjs
 │   ├── test/
 │   │   ├── view-change.test.mjs
@@ -1977,7 +2015,7 @@ Cross-Chain/
 - READY jobs contain verified immutable evidence and provide no destination permission or execution guarantee. Delivery projectors coordinate per batch through database locks and uniqueness; this does not add multi-instance Indexer/Finality Watcher coordination or exactly-once destination consumption.
 - Relayer A/B delegate verified zero-value transport to the Persistent Transaction Manager. Their shared exclusive EOA is an untrusted transport account with no validator or destination permission. Exact signed bytes are durable before broadcast; bounded retry reuses them, and replacement only appends a higher-fee candidate at the same nonce. Any historical candidate may win. CONFIRMED supplies no Gateway authentication, business execution or permanent destination finality.
 - Destination RPC failover uses ordered, fingerprint-checked access paths. Provider URLs never identify a transaction or grant destination authority. Conservative cross-provider checks do not provide Byzantine RPC consensus.
-- The repository does not provide decentralized validator governance, Byzantine-relayer handling, complete transaction crash-recovery orchestration, destination-confirmed transaction reorg recovery, destination gateway/QC verification, exactly-once downstream execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
+- The repository does not provide decentralized validator governance, Byzantine-relayer handling, destination-confirmed transaction reorg recovery, destination gateway/QC verification, exactly-once downstream execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, production transaction recovery and destination reorganization handling, and a destination-chain execution security design.

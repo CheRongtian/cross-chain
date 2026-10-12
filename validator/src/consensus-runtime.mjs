@@ -1,6 +1,7 @@
 import { tableName } from "../../indexer/src/db.mjs";
 import { deterministicPrimary } from "./committee.mjs";
 import { ViewChangeError } from "./prepared-certificate.mjs";
+import { viewTimeoutDeadline } from "./view-timeout.mjs";
 
 // The clock is injectable. Production owns one bounded, serialized scheduler;
 // no HTTP route can set the view or directly fire its timeout.
@@ -21,21 +22,30 @@ export function createConsensusRuntime({ config, sourcePool, store, validation, 
     if (!config.validatorSets.resolveForBatchEpoch(state.epoch).validators.includes(config.validatorAddress)) return;
     const epoch = state.epoch;
     const committee = state.protocol_version === 2 ? config.validatorSets.history[0].validators : config.validatorSets.resolveForBatchEpoch(epoch).validators;
-    const view = state.current_view;
-    const key = `${epoch}:${view}`;
     // Recovery of an already certified view is independent of the next timeout.
     // A former primary can help a lagging node even while waiting for a new leader.
     if (due(`${epoch}:new-view-replay`)) await viewChange.replay(epoch, state.batch_id);
     if (stopped) return;
+    // Remote replay can overlap HTTP NEW_VIEW acceptance or finalization. Use
+    // a fresh durable state before selecting a target or considering a timeout.
+    state = (await store.readViewStates()).find(row => row.epoch === epoch);
+    if (!state || state.finalized) return;
 
     const candidates = await store.readViewChangeTargets(epoch);
     for (const target of candidates) {
-      if (BigInt(target) <= BigInt(view) || BigInt(target) < BigInt(state.target_view)) continue;
+      if (BigInt(target) <= BigInt(state.current_view) || BigInt(target) < BigInt(state.target_view)) continue;
       if (deterministicPrimary(committee, epoch, target) === config.validatorAddress) {
         await viewChange.establish(epoch, target, state.batch_id);
-        return;
+        if (stopped) return;
+        state = (await store.readViewStates()).find(row => row.epoch === epoch);
+        if (!state || state.finalized) return;
+        // Drive this certified round now, without another replay/timer tick
+        // between NEW_VIEW persistence and its PRE-PREPARE/PREPARE work.
+        break;
       }
     }
+    const view = state.current_view;
+    const key = `${epoch}:${view}`;
     const intentKey = `${epoch}:intent:${state.target_view}`;
     if (state.changing_view && !retryAt.has(intentKey)) {
       // First encounter after restart always replays the exact persisted intent.
@@ -43,7 +53,7 @@ export function createConsensusRuntime({ config, sourcePool, store, validation, 
       await viewChange.retryIntent(epoch, state.target_view);
       return;
     }
-    const deadline = new Date(state.changing_view ? state.view_change_at : state.progress_at).getTime() + config.viewTimeoutMs;
+    const deadline = viewTimeoutDeadline(state, config.viewTimeoutMs);
     if (clock.now() >= deadline) {
       const result = await viewChange.timeout(epoch, { view, targetView: state.target_view,
         progressRevision: state.progress_revision, now: clock.now() });
