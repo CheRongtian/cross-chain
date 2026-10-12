@@ -18,23 +18,31 @@ export async function reservePort() {
   } };
 }
 
-export async function rpcObserver(upstream) {
+export async function rpcObserver(upstream, { beforeForward = async () => {}, afterForward } = {}) {
   const calls = [];
+  const errors = [];
   const server = createHttpServer(async (request, response) => {
     try {
       const chunks = [];
       for await (const chunk of request) chunks.push(chunk);
       const body = Buffer.concat(chunks).toString("utf8");
       const parsed = JSON.parse(body);
-      calls.push(...(Array.isArray(parsed) ? parsed : [parsed]));
+      const messages = Array.isArray(parsed) ? parsed : [parsed];
+      calls.push(...messages);
+      for (const message of messages) await beforeForward(message);
       const remote = await fetch(upstream, { method: "POST", headers: { "content-type": "application/json" },
         body, signal: AbortSignal.timeout(5000) });
+      const replyBody = await remote.text();
+      if (afterForward) {
+        const reply = JSON.parse(replyBody);
+        for (const message of messages) await afterForward(message, Array.isArray(reply) ? reply.find(item => item.id === message.id) : reply);
+      }
       response.writeHead(remote.status, { "content-type": "application/json" });
-      response.end(await remote.text());
-    } catch { response.writeHead(502); response.end("RPC forwarding failed"); }
+      response.end(replyBody);
+    } catch (error) { errors.push(error); response.writeHead(502); response.end("RPC forwarding failed"); }
   });
   await new Promise((resolve, reject) => { server.once("error", reject); server.listen(0, "127.0.0.1", resolve); });
-  return { calls, url: `http://127.0.0.1:${server.address().port}`, async close() {
+  return { calls, errors, url: `http://127.0.0.1:${server.address().port}`, async close() {
     const closed = new Promise((resolve) => server.close(resolve)); server.closeAllConnections(); await closed;
   } };
 }

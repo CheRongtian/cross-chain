@@ -3,6 +3,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { normalizeAddress, normalizeBytes32 } from "../canonical-message.mjs";
 import { RelayerError } from "./config.mjs";
 
+// Historical direct-submission adapter. The production Relayer uses Transaction Manager.
 export function createDirectRpcSubmitter(config) {
   const chain = defineChain({ id: Number(config.destinationDomain),name: "Configured destination",
     nativeCurrency: { name: "Ether",symbol: "ETH",decimals: 18 },rpcUrls: { default: { http: [config.destinationRpcUrl] } } });

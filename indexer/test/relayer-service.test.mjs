@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { buildDeliveryPackages, deliveryJson } from "../src/delivery/package.mjs";
-import { createSingleRelayer } from "../src/relayer/service.mjs";
+import { createLegacyRelayer as createSingleRelayer } from "./helpers/legacy-relayer.mjs";
 import { deliveryFixture, fixtureHash } from "./helpers/delivery-fixtures.mjs";
 import { relayerConfig } from "./helpers/relayer-fixtures.mjs";
 

@@ -1,8 +1,8 @@
-import { normalizeAddress, normalizeBytes32 } from "../canonical-message.mjs";
+import { normalizeAddress } from "../canonical-message.mjs";
 import { encodeDestinationSubmission } from "./encoding.mjs";
 import { RelayerError, safeRelayerMessage } from "./config.mjs";
 
-export function createSingleRelayer({ config,queue,repository,submitter }) {
+export function createSingleRelayer({ config,queue,repository,transactionManager }) {
   const verification = { validatorSets: config.validatorSets,sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway };
   async function protectedOperation(operation) {
     try { return await operation(); }
@@ -20,22 +20,12 @@ export function createSingleRelayer({ config,queue,repository,submitter }) {
     const pack = encoded.package;
     if (pack.deliveryJobId !== deliveryJobId || pack.message.destinationDomain !== config.destinationDomain.toString() ||
         job.destinationDomain !== pack.message.destinationDomain || normalizeAddress(job.destinationGateway) !== pack.message.destinationGateway) throw new RelayerError("DESTINATION_CONTEXT_MISMATCH");
-    const previous = await repository.getSubmission(deliveryJobId,encoded);
-    if (previous) {
-      if (previous.deliveryJobId !== deliveryJobId || previous.packageDigest !== encoded.packageDigest ||
-          previous.destinationDomain !== pack.message.destinationDomain || normalizeAddress(previous.destinationGateway) !== pack.message.destinationGateway) throw new RelayerError("CONFLICTING_RELAY_SUBMISSION");
-      return Object.freeze({ ...previous,submitted: false });
-    }
     assertHeld();
-    const actualDomain = await submitter.verifyChain();
-    if (actualDomain !== config.destinationDomain) throw new RelayerError("CHAIN_ID_MISMATCH");
+    // The only transport input is canonical job identity. Transaction Manager
+    // independently verifies it and owns every Ethereum transaction operation.
+    const stored = await transactionManager.submitDelivery(deliveryJobId);
     assertHeld();
-    const transactionHash = normalizeBytes32(await submitter.submit({ to: pack.message.destinationGateway,data: encoded.data,value: 0n }),"transaction hash");
-    // Broadcast may already have happened if this session/persistence now fails.
-    // No automatic resend or recovery is attempted for that ambiguity.
-    assertHeld();
-    const stored = await repository.recordSubmission({ deliveryJobId,encoded,transactionHash });
-    return Object.freeze({ ...stored,submitted: true });
+    return stored;
   }
   return {
     async submitJob(deliveryJobId) {
@@ -44,7 +34,8 @@ export function createSingleRelayer({ config,queue,repository,submitter }) {
     async runOnce() {
       return protectedOperation(() => repository.withSingleton(async (assertHeld) => {
         assertHeld();
-        if (await submitter.verifyChain() !== config.destinationDomain) throw new RelayerError("CHAIN_ID_MISMATCH");
+        if (await transactionManager.verifyChain() !== config.destinationDomain) throw new RelayerError("CHAIN_ID_MISMATCH");
+        await transactionManager.assertNoUnbroadcast();
         const jobs = await repository.listEligibleJobs({ limit: config.maxJobs });
         const results = [];
         for (const job of jobs) results.push(await submitOne(job.deliveryJobId,assertHeld));

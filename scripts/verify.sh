@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Single Relayer Direct RPC Submission"
+VERIFICATION_NAME="Persistent Transaction Manager"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -48,6 +48,7 @@ INDEXER_BLOCK_RANGE="${INDEXER_BLOCK_RANGE:-2}"
 INDEXER_POLL_INTERVAL_MS="${INDEXER_POLL_INTERVAL_MS:-100}"
 FINALITY_BLOCK_DEPTH="${FINALITY_BLOCK_DEPTH:-2}"
 FINALITY_POLL_INTERVAL_MS="${FINALITY_POLL_INTERVAL_MS:-100}"
+DESTINATION_CONFIRMATIONS="${DESTINATION_CONFIRMATIONS:-3}"
 
 STARTED_CHAINS="false"
 CHAINS_PID=""
@@ -538,11 +539,22 @@ printf '118. Strictly re-read and independently verify READY packages immediatel
 printf '119. ABI-encode versioned deterministic transport envelopes preserving original historical QC evidence\n'
 printf '120. Reject corrupt packages, wrong destinations, wrong-chain RPC and invalid returned hashes before recording submissions\n'
 printf '121. Submit real A/B/D from the development Relayer A to canonical Chain B gateway targets with zero value\n'
-printf '122. Persist one immutable minimal submission record only after the RPC returns a transaction hash\n'
-printf '123. Match exposed Chain B transaction sender, target, value and exact ABI package bytes without receipt tracking\n'
+printf '122. Preserve immutable historical direct-submission records without inventing signed transaction fields\n'
+printf '123. Match exposed Chain B transaction sender, target, value and exact ABI package bytes\n'
 printf '124. Re-run a fresh Relayer A process with no duplicate records or transactions\n'
 printf '125. Surface RPC failure and conflicting records while preserving READY/source/consensus evidence\n'
 printf '126. Transport real Message E with epoch-8 evidence and preserve historical epoch-7 packages\n'
+printf '127. Persist immutable delivery intents and one exact type-2 signed attempt per intent\n'
+printf '128. Allocate persistent BigInt nonces atomically across independent database clients\n'
+printf '129. Estimate gas and resolve EIP-1559 fees from the configured real Chain B RPC\n'
+printf '130. Locally sign and persist raw transaction bytes and computed hash before broadcast\n'
+printf '131. Independently observe SIGNED database state before forwarding real raw RPC submissions\n'
+printf '132. Require the RPC hash to match and retain SIGNED state after broadcast failure\n'
+printf '133. Recover exact attempts in fresh processes without re-signing or nonce reuse\n'
+printf '134. Block automatic higher-nonce delivery behind an unbroadcast SIGNED transaction\n'
+printf '135. Check canonical receipts against one fixed destination head and required confirmation depth\n'
+printf '136. Persist immutable CONFIRMED and REVERTED outcomes without retry or business execution claims\n'
+printf '137. Reject signed-byte, nonce-state, receipt and package corruption while preserving all source evidence\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -596,7 +608,8 @@ node --test \
     "$INDEXER_DIR/test/delivery-package.test.mjs" \
     "$INDEXER_DIR/test/relayer-config.test.mjs" \
     "$INDEXER_DIR/test/relayer-encoding.test.mjs" \
-    "$INDEXER_DIR/test/relayer-service.test.mjs"
+    "$INDEXER_DIR/test/relayer-service.test.mjs" \
+    "$INDEXER_DIR/test/transaction-manager.test.mjs"
 
 CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, lifecycle, fixed-initial-epoch rollover, consensus binding and atomic delivery queue tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -606,7 +619,8 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
         "$INDEXER_DIR/test/database.test.mjs" \
         "$INDEXER_DIR/test/batch-lifecycle.database.test.mjs" \
         "$INDEXER_DIR/test/delivery.database.test.mjs" \
-        "$INDEXER_DIR/test/relayer.database.test.mjs"
+        "$INDEXER_DIR/test/relayer.database.test.mjs" \
+        "$INDEXER_DIR/test/transaction-manager.database.test.mjs"
 
 CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1251,7 +1265,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source recovery, validator identity-bound recovery, consensus, fault/view/epoch recovery, historical QC, delivery queue and single Relayer Chain B submission integration"
+CURRENT_STEP="real source recovery, validator identity-bound recovery, consensus, fault/view/epoch recovery, historical QC, delivery queue, Relayer and persistent Chain B transaction/confirmation integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \
@@ -1273,6 +1287,7 @@ CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
 CHAIN_B_CHAIN_ID="$CHAIN_B_ID" \
 RELAYER_A_PRIVATE_KEY="$ANVIL_DEV_KEY" \
 RELAYER_MAX_JOBS_PER_RUN="100" \
+DESTINATION_CONFIRMATIONS="$DESTINATION_CONFIRMATIONS" \
     node --test "$INDEXER_DIR/test/integration.test.mjs"
 
 CURRENT_STEP="complete"

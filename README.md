@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A independently verifies each package, sends a versioned ABI transport envelope directly to Chain B, and retains an immutable submission record after RPC returns a transaction hash. Destination verification, replay protection and execution remain unimplemented.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A independently verifies each package and delegates its versioned ABI transport to a Persistent Transaction Manager. The manager atomically reserves nonces, estimates gas and resolves EIP-1559 fees, signs locally, persists exact raw bytes before broadcast, and tracks canonical receipts with configured confirmation depth. Destination verification, replay protection and execution remain unimplemented.
 
 The current implementation can:
 
@@ -76,7 +76,10 @@ The current implementation can:
 - serialize concurrent queue projection and roll back interrupted batches without partial or duplicate jobs.
 - independently verify READY packages at submission time and transport their exact historical QC evidence through one Relayer A;
 - encode complete delivery evidence with a deterministic versioned ABI envelope and send it to the canonical destination gateway with zero value;
-- retain immutable minimal submission records after RPC returns a transaction hash and skip those jobs on a normal fresh-process rerun.
+- retain immutable historical direct-submission records and skip those jobs on a normal fresh-process rerun;
+- atomically reserve persistent nonces and retain one immutable locally signed type-2 attempt per logical delivery;
+- persist raw transaction bytes and their derived hash before sending to Chain B;
+- track canonical destination receipts to configured depth with distinct CONFIRMED and REVERTED outcomes.
 
 ## Architecture
 
@@ -177,7 +180,15 @@ Unknown EOA or contract ──────────────────�
                                               Relayer A: verify + versioned ABI envelope
                                                                │
                                                                v
-                                              Chain B RPC → hash → submission record
+                                              Persistent Transaction Manager
+                                              intent + nonce + fees + signed bytes
+                                                               │
+                                                               v
+                                              Chain B raw RPC broadcast
+                                                               │
+                                                               v
+                                              canonical receipt + configured depth
+                                              CONFIRMED / REVERTED
 ```
 
 `IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The Indexer persists emitted source events, and the Finality Watcher advances their database lifecycle; neither component adds proof-to-message binding. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
@@ -666,7 +677,7 @@ Given the same eligible source occurrences and context, reverse or shuffled inpu
 
 Standalone batch construction reads source data and returns an immutable value. It does not persist a batch record, reserve finalized rows, rotate epochs, or change finality state. If the finalized set grows, a new standalone construction may produce different membership and a different batch ID even when the caller reuses an epoch. The persistent lifecycle freezes membership at sealing; exactly-once downstream consumption remains outside the implementation.
 
-PostgreSQL provides durable operational state; Chain A remains the source history authority. Constructing or sealing a batch grants no Chain B authorization, validator approval, quorum certificate, or delivery guarantee. The batch feeds the off-chain Merkle commitment and subsequent PBFT vote/QC path. Relayer A transports independently verified committed packages; transaction reliability and destination execution remain outside the current implementation.
+PostgreSQL provides durable operational state; Chain A remains the source history authority. Constructing or sealing a batch grants no Chain B authorization, validator approval, quorum certificate, or delivery guarantee. The batch feeds the off-chain Merkle commitment and subsequent PBFT vote/QC path. Relayer A transports independently verified committed packages through the Persistent Transaction Manager; destination protocol verification and execution remain outside the current implementation.
 
 ## Merkle Message Commitment
 
@@ -1171,15 +1182,15 @@ READY means immutable delivery evidence was successfully materialized. It does n
 
 The unified verification preserves the existing source, ZK, Merkle, PBFT, fault, view-change and rotation checks, and adds queue unit/database tests. Real A/B/D produces three READY jobs with the original proofs and QC, while REORGED C produces none. The rotation integration also materializes real epoch-7 A/B/D and epoch-8 Message E, independently verifies packages in fresh processes, checks concurrent projection, injects deterministic interruption before commit and report loss after commit, and preserves all source lifecycle data and historical evidence. These are verification procedures; readiness for destination execution is not claimed.
 
-## Single Relayer Direct RPC Submission
+## Relayer and Persistent Transaction Manager
 
-`indexer/src/relayer/` implements one bounded, fail-fast Relayer A using the existing `pg` and `viem` dependencies. It is an untrusted transport component. Its account pays for an ordinary destination transaction; it provides no validator authority or destination acceptance guarantee.
+`indexer/src/relayer/` implements one bounded, fail-fast Relayer A. It orchestrates verified message transport and calls `submitDelivery(deliveryJobId)` on `indexer/src/transaction-manager/`. The Transaction Manager owns nonce allocation, gas, fees, local signing, durable raw transactions, broadcast and receipt tracking. Both use existing `pg` and `viem` dependencies. The account grants no validator authority or destination acceptance; the manager exposes no arbitrary-address wallet send API.
 
 ### Configuration and selection
 
-Configuration combines the existing Delivery Queue source scope and immutable public validator history with `CHAIN_B_RPC_URL`, `CHAIN_B_CHAIN_ID`, `RELAYER_A_PRIVATE_KEY` and `RELAYER_MAX_JOBS_PER_RUN` (default 100, maximum 1000). `.env.example` contains an empty private-key placeholder. Keep real secrets in ignored local configuration, never in committed source, fixtures or logs. The production `relayer:once` npm entry reads process environment against an already migrated database. The unified verification loads the local root `.env` and injects the existing funded Anvil development signer for its local integration.
+Configuration combines the existing Delivery Queue scope and public validator history with `CHAIN_B_RPC_URL`, `CHAIN_B_CHAIN_ID`, `RELAYER_A_PRIVATE_KEY`, `RELAYER_MAX_JOBS_PER_RUN` (default 100, maximum 1000) and `DESTINATION_CONFIRMATIONS` (default 3, exact positive integer). `.env.example` contains an empty private-key placeholder. Keep secrets in ignored local configuration, never in committed source, PostgreSQL records, fixtures or logs. The `relayer:once` and `transaction:once` npm entries read process environment against an already migrated database. Unified verification loads the local root `.env` and injects its funded Anvil development signer.
 
-Only READY jobs without a submission record are selected, ordered by batch epoch, message index and job ID. Already submitted rows are excluded before applying the limit. Each selected job is read again through the strict queue repository and independently checked with `verifyDeliveryPackage` at the submission boundary. Validation covers the canonical message and payload hash, ordered batch commitment, Merkle path, root, QC signatures and exact historical committee. A queue status or database row cannot replace cryptographic verification.
+Only READY jobs without a historical submission or transaction intent are selected, ordered by batch epoch, message index and job ID. Existing rows are excluded before applying the limit. Relayer and Transaction Manager each strictly read and independently verify the package at their boundary, including canonical message, payload hash, ordered batch commitment, Merkle path, root, QC signatures and exact historical committee. A queue status or database row cannot replace cryptographic verification. Invalid evidence or the wrong RPC chain creates no intent, reserved nonce or signed attempt.
 
 The actual destination RPC `eth_chainId` must match both configuration and the canonical message destination domain. Submission uses the canonical `destinationGateway`, never `destinationReceiver`, with `value = 0`. Payload bytes remain opaque and unchanged. An invalid package, mismatched destination, RPC error or malformed transaction hash stops the pass without automatic retry. A database session advisory lock allows one active Relayer A per operational database; this is not a multi-relayer lease or fencing system.
 
@@ -1207,24 +1218,51 @@ The batch encoding carries `batchVersion`, `batchEpoch`, `batchId` and ordered `
 
 `packageDigest = keccak256(encodedTransport)` binds the operational submission record to the exact bytes without storing another large payload copy. It is an operational integrity value, not a new message identity, consensus domain or authorization mechanism.
 
-### Persistence and restart boundary
+### Persistent transaction model
 
-`indexer/migrations/010_single_relayer.sql` adds immutable `relayer_submissions` with exactly these fields:
+`indexer/migrations/010_single_relayer.sql` retains immutable historical `relayer_submissions` with these fields:
 
 ```text
 delivery_job_id, relayer_address, destination_domain, destination_gateway,
 package_digest, transaction_hash, submitted_at
 ```
 
-The delivery job ID is the primary key. A row is inserted only after RPC returns a valid transaction hash. Conflict handling never overwrites the first record; reads reverify its package digest and destination context. Queue jobs stay READY, batches stay COMMITTED, and source messages, finality data, Merkle evidence and QC records remain unchanged. Normal reruns skip persisted submissions; a direct repeat of the same verified job returns its existing record without broadcasting again.
+Historical records were written after RPC returned a hash. They remain unchanged and block new delivery attempts for the same job. Their missing nonce, fees and raw bytes are never invented. New production transport uses the tables from `011_transaction_manager.sql`:
 
-There is an unresolved crash window between RPC accepting a transaction and PostgreSQL storing its record. A later manual rerun can submit again during that window. This implementation makes no exactly-once broadcast or delivery claim and adds no crash recovery journal. Ordinary wallet transaction preparation is delegated to `viem`; there is no persistent nonce allocator, fee manager, retry/replacement loop, receipt polling, confirmation tracking or RPC failover.
+- `transaction_accounts`: destination chain, sender and persistent next nonce;
+- `transaction_intents`: one immutable intent per job, binding existing job identity, package digest, chain, sender, canonical gateway, zero value and exact calldata;
+- `transaction_attempts`: one attempt numbered 0 per intent, with immutable nonce, gas, EIP-1559 fees, type 2, raw signed bytes and locally derived hash, plus explicit lifecycle and receipt fields.
+
+The existing delivery job ID is the logical intent ID; no new identity hash or consensus domain is introduced. Uniqueness protects one intent per job, one attempt per intent, one nonce per sender/chain and one transaction hash. SQL guards preserve intent and signed fields and permit only the defined forward lifecycle. Jobs stay READY, batches stay COMMITTED, and source messages, cursor, finality, membership, Merkle and historical QC evidence stay unchanged.
+
+### Nonce, gas, fees and signing
+
+The configured destination EOA must be exclusively managed by this Transaction Manager in one operational database namespace. Do not use another wallet or independent manager to consume its Chain B nonce space. Chain A has a separate nonce space.
+
+Preparation validates the actual RPC chain before allocation, estimates gas for exact sender/target/value/data, reads the latest base fee and RPC priority fee, and reads pending nonce. Gas uses the exact estimate. Fees use `maxFeePerGas = 2 * baseFeePerGas + maxPriorityFeePerGas`, with integer BigInt arithmetic, no legacy fallback and no fee bumping.
+
+A PostgreSQL account row lock serializes allocation. The nonce is the maximum of RPC pending nonce, durable next nonce and highest reserved nonce plus one. A higher RPC pending nonce can advance the allocator and is reported; local state never regresses. Concurrent preparations receive distinct nonces. Existing intents return the same attempt without fresh gas, fees, signing or nonce allocation. Preparation RPC prerequisites run outside allocation locks. Nonce advancement, intent and SIGNED attempt commit together; gas, fee, signing or pre-commit failure leaves no ghost reservation.
+
+The signer constructs a type-2 transaction with signed destination chain ID. Nonce, gas and fees remain exact, including RLP-based strict reads of large nonces. `transactionHash = keccak256(rawSignedTransaction)` is computed locally. Reads reconstruct and verify signed fields and recovered sender against the canonical intent and reject changed raw bytes, hash, calldata or destination.
+
+### Broadcast, receipts and restart boundary
+
+```text
+SIGNED → BROADCAST → CONFIRMED
+                   └→ REVERTED
+```
+
+Exact signed bytes and their hash are committed before `eth_sendRawTransaction`. Only a matching RPC hash permits BROADCAST and its timestamp. The bounded send is serialized under the account lock and never reconstructs the transaction. Failure or hash mismatch leaves SIGNED. An earlier SIGNED nonce blocks higher-nonce broadcasts and automatic Relayer progression. No automatic rebroadcast, replacement or retry interpretation of `already known` exists.
+
+Explicit primitives are `prepareDeliveryTransaction(jobId)`, `broadcastPreparedTransaction(intentId)` and `checkReceiptsOnce({ limit })`. The internal `transaction:once` CLI supports `prepare`, `broadcast`, `read` and `receipts`, with no retry scheduler. Fresh processes recover exact SIGNED, BROADCAST and terminal state without changing gas, fees, nonce, bytes or hash. RPC acceptance before its BROADCAST update can leave SIGNED with known recoverable bytes; normal reruns stop for explicit action. Full crash-recovery orchestration and exactly-once delivery guarantees remain unimplemented.
+
+Receipt tracking uses one fixed destination head per bounded pass. A missing receipt leaves BROADCAST. The manager verifies receipt hash, canonical block number/hash and transaction sender, target, nonce, input, value, type, chain and fees. Confirmation count is `head - receiptBlockNumber + 1`. Insufficient depth leaves BROADCAST. At configured depth, receipt status 1 records CONFIRMED; status 0 records REVERTED without retry. Typed block number/hash/status, observed head and confirmation time are durable and immutable. Arbitrary receipt JSON is not protocol state.
 
 ### Verification and destination boundary
 
-The unified script retains all previous checks and adds configuration/privacy, deterministic ABI encoding, legacy and rotated QC evidence, invalid-package zero-send cases, immutable submission persistence, singleton exclusion and fresh-process skip coverage. Its real-chain integration invokes the production Relayer CLI for existing A/B/D READY jobs and the rotated Message E; REORGED C stays excluded. It checks the RPC-visible transaction sender, target, zero value and exact input through `eth_getTransactionByHash`, then starts a fresh Relayer process and checks that hashes, records and account transaction count do not increase. Wrong-chain and injected RPC-failure cases preserve the queue and source state.
+Unified verification retains source, ZK, Merkle, PBFT, queue and historical direct-submission coverage and adds nonce concurrency, rollback, signed integrity, lifecycle guards and receipt cases. Real A/B/D and rotated E use the production manager and Chain B RPC; REORGED C gets no intent or nonce. The existing RPC observer checks committed SIGNED state before forwarding each real broadcast. Integration checks exact type-2 fields, original historical QC, actual canonical receipts and confirmation depth. Verification-only empty-block mining supplies depth when needed; production never mines. Fresh processes recover SIGNED/BROADCAST bytes and allocator state; ordinary reruns create no duplicate intent, attempt or transaction.
 
-A returned hash and RPC-visible transaction do not prove mining, confirmation, Gateway verification, replay rejection or Application B execution. No receipt or business result is used as an acceptance condition here. Persistent Transaction Manager, Relayer B, multi-relayer coordination, crash-after-send recovery, DestinationGateway verification/replay protection and Application B remain deferred.
+A hash alone proves no confirmation or business result. CONFIRMED means a canonical successful receipt was observed at configured depth, a heuristic rather than mathematical permanent finality. It establishes no DestinationGateway QC authentication, replay rejection or Application B execution. Automatic retry, same-nonce replacement, fee bumping, underpriced recovery, RPC failover, Relayer B, multi-relayer leasing/fencing, complete crash-recovery orchestration, destination transaction reorg recovery, Gateway verification/replay protection and Application B execution remain deferred.
 
 ## Local Two-Chain Environment
 
@@ -1520,7 +1558,11 @@ The script uses strict error handling and performs:
 118. invalid-package zero-send behavior, fail-fast RPC errors and immutable minimal submission records;
 119. production Relayer CLI submission of real A/B/D and rotated Message E to Chain B;
 120. RPC-visible transaction sender, canonical gateway target, zero value and exact transport data;
-121. fresh-process skipping of recorded jobs with unchanged transaction count, queue evidence and source state.
+121. fresh-process skipping of recorded jobs with unchanged transaction count, queue evidence and source state;
+122. persistent intents, unique concurrent nonces and one immutable type-2 attempt per delivery;
+123. exact local signing, real gas/fee data, persistence before broadcast and matching RPC hashes;
+124. broadcast-failure SIGNED recovery and explicit unchanged broadcast without automatic higher-nonce progression;
+125. real canonical receipts and configured depth, negative receipt cases and durable REVERTED outcomes.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -1538,7 +1580,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Single Relayer Direct RPC Submission
+Persistent Transaction Manager
 ```
 
 ### Expected error output
@@ -1611,7 +1653,8 @@ Cross-Chain/
 │   │   ├── 007_view_bound_qc.sql
 │   │   ├── 008_validator_epochs.sql
 │   │   ├── 009_delivery_queue.sql
-│   │   └── 010_single_relayer.sql
+│   │   ├── 010_single_relayer.sql
+│   │   └── 011_transaction_manager.sql
 │   ├── scripts/
 │   │   └── generate-merkle-golden-vectors.mjs
 │   ├── src/
@@ -1644,7 +1687,15 @@ Cross-Chain/
 │   │   │   ├── service.mjs
 │   │   │   └── submitter.mjs
 │   │   ├── source-event-identity.mjs
-│   │   └── source-gateway-event.mjs
+│   │   ├── source-gateway-event.mjs
+│   │   └── transaction-manager/
+│   │       ├── config.mjs
+│   │       ├── main.mjs
+│   │       ├── nonce-policy.mjs
+│   │       ├── repository.mjs
+│   │       ├── rpc.mjs
+│   │       ├── service.mjs
+│   │       └── transaction.mjs
 │   ├── test/
 │   │   ├── batch-lifecycle-policy.test.mjs
 │   │   ├── batch-lifecycle.database.test.mjs
@@ -1661,10 +1712,13 @@ Cross-Chain/
 │   │   │   ├── delivery-fixtures.mjs
 │   │   │   ├── delivery-integration.mjs
 │   │   │   ├── fail-relayer-rpc.mjs
+│   │   │   ├── legacy-relayer.mjs
 │   │   │   ├── read-batch-lifecycle.mjs
 │   │   │   ├── read-delivery.mjs
 │   │   │   ├── relayer-fixtures.mjs
-│   │   │   └── relayer-integration.mjs
+│   │   │   ├── relayer-integration.mjs
+│   │   │   ├── transaction-database-fixtures.mjs
+│   │   │   └── transaction-fixtures.mjs
 │   │   ├── indexer.test.mjs
 │   │   ├── integration.test.mjs
 │   │   ├── message-batch.test.mjs
@@ -1675,7 +1729,9 @@ Cross-Chain/
 │   │   ├── relayer-encoding.test.mjs
 │   │   ├── relayer-service.test.mjs
 │   │   ├── relayer.database.test.mjs
-│   │   └── source-event-identity.test.mjs
+│   │   ├── source-event-identity.test.mjs
+│   │   ├── transaction-manager.database.test.mjs
+│   │   └── transaction-manager.test.mjs
 │   ├── package.json
 │   └── package-lock.json
 ├── scripts/
@@ -1810,8 +1866,8 @@ Cross-Chain/
 - The failure model retains progress with one unavailable non-primary and an honest available primary. A single conflicting backup cannot supply a conflicting QC. A 2|2 partition preserves safety and pauses progress until explicit retries restore delivery; connectivity changes do not reset vote locks or select a new primary.
 - Primary failure or withholding triggers progress timeouts; replacement still requires three valid VIEW_CHANGE votes and an available deterministic new primary. Process availability is not commit authority. PostgreSQL never substitutes for independent source and signature verification.
 - READY jobs contain verified immutable evidence and provide no destination permission or execution guarantee. Delivery projectors coordinate per batch through database locks and uniqueness; this does not add multi-instance Indexer/Finality Watcher coordination or exactly-once destination consumption.
-- Relayer A verifies historical evidence and destination identity before zero-value transport. Its signing key is an untrusted transport account, not a validator signature or destination permission. RPC returning a hash does not establish execution or confirmation; a crash before submission persistence can cause a later duplicate broadcast.
-- The repository does not provide decentralized validator governance, Transaction Manager, destination gateway integration or destination QC verification, exactly-once downstream message execution, destination execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
+- Relayer A delegates verified zero-value transport to the Persistent Transaction Manager. The exclusive destination EOA is an untrusted transport account, not a validator signature or destination permission. Exact signed bytes and their hash are durable before broadcast; an ambiguous send leaves recoverable SIGNED state with no automatic resend. CONFIRMED supplies no Gateway authentication, business execution or permanent destination finality.
+- The repository does not provide decentralized validator governance, automatic transaction retry/replacement, destination gateway integration or destination QC verification, exactly-once downstream message execution, destination execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
-Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, reliable transaction management, and a destination-chain execution security design.
+Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, production transaction recovery and destination reorganization handling, and a destination-chain execution security design.

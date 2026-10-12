@@ -14,6 +14,7 @@ export function createRelaySubmissionRepository({ config,pool,queue = createDeli
   const jobs = tableName(config.databaseSchema,"delivery_jobs");
   const batches = tableName(config.databaseSchema,"delivery_batches");
   const submissions = tableName(config.databaseSchema,"relayer_submissions");
+  const intents = tableName(config.databaseSchema,"transaction_intents");
   const verification = { validatorSets: config.validatorSets,sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway };
 
   function matchingRecord(row,encoded) {
@@ -55,6 +56,7 @@ export function createRelaySubmissionRepository({ config,pool,queue = createDeli
       const rows = (await pool.query(`SELECT j.delivery_job_id FROM ${jobs} j JOIN ${batches} b USING (batch_record_id)
         WHERE b.source_domain = $1 AND b.source_gateway = $2 AND j.status = 'READY'
           AND NOT EXISTS (SELECT 1 FROM ${submissions} s WHERE s.delivery_job_id = j.delivery_job_id)
+          AND NOT EXISTS (SELECT 1 FROM ${intents} t WHERE t.delivery_job_id = j.delivery_job_id)
         ORDER BY b.batch_epoch,j.message_index,j.delivery_job_id LIMIT $3`,[scope.chainDomain,scope.sourceGateway,limit])).rows;
       const result = [];
       for (const row of rows) result.push(await queue.getDeliveryJob(row.delivery_job_id));

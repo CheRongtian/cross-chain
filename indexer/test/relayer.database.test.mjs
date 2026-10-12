@@ -6,7 +6,7 @@ import { createBatchLifecycle } from "../src/batch-lifecycle.mjs";
 import { createDeliveryProjector } from "../src/delivery/projector.mjs";
 import { createDeliveryRepository } from "../src/delivery/repository.mjs";
 import { createRelaySubmissionRepository } from "../src/relayer/repository.mjs";
-import { createSingleRelayer } from "../src/relayer/service.mjs";
+import { createLegacyRelayer as createSingleRelayer } from "./helpers/legacy-relayer.mjs";
 import { encodeDestinationSubmission } from "../src/relayer/encoding.mjs";
 import { deliveryFixture, fixtureHash } from "./helpers/delivery-fixtures.mjs";
 import { relayerConfig } from "./helpers/relayer-fixtures.mjs";
