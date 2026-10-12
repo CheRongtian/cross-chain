@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Persistent Transaction Manager"
+VERIFICATION_NAME="Transaction Retry and Replacement"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -49,6 +49,13 @@ INDEXER_POLL_INTERVAL_MS="${INDEXER_POLL_INTERVAL_MS:-100}"
 FINALITY_BLOCK_DEPTH="${FINALITY_BLOCK_DEPTH:-2}"
 FINALITY_POLL_INTERVAL_MS="${FINALITY_POLL_INTERVAL_MS:-100}"
 DESTINATION_CONFIRMATIONS="${DESTINATION_CONFIRMATIONS:-3}"
+TX_REBROADCAST_INTERVAL_MS="${TX_REBROADCAST_INTERVAL_MS:-5000}"
+TX_REPLACEMENT_AFTER_MS="${TX_REPLACEMENT_AFTER_MS:-60000}"
+TX_FEE_BUMP_NUMERATOR="${TX_FEE_BUMP_NUMERATOR:-9}"
+TX_FEE_BUMP_DENOMINATOR="${TX_FEE_BUMP_DENOMINATOR:-8}"
+TX_MAX_ATTEMPTS="${TX_MAX_ATTEMPTS:-4}"
+TX_MAX_FEE_PER_GAS="${TX_MAX_FEE_PER_GAS:-100000000000}"
+TX_MAX_PRIORITY_FEE_PER_GAS="${TX_MAX_PRIORITY_FEE_PER_GAS:-10000000000}"
 
 STARTED_CHAINS="false"
 CHAINS_PID=""
@@ -544,7 +551,7 @@ printf '123. Match exposed Chain B transaction sender, target, value and exact A
 printf '124. Re-run a fresh Relayer A process with no duplicate records or transactions\n'
 printf '125. Surface RPC failure and conflicting records while preserving READY/source/consensus evidence\n'
 printf '126. Transport real Message E with epoch-8 evidence and preserve historical epoch-7 packages\n'
-printf '127. Persist immutable delivery intents and one exact type-2 signed attempt per intent\n'
+printf '127. Persist immutable delivery intent bodies and an exact initial type-2 signed attempt\n'
 printf '128. Allocate persistent BigInt nonces atomically across independent database clients\n'
 printf '129. Estimate gas and resolve EIP-1559 fees from the configured real Chain B RPC\n'
 printf '130. Locally sign and persist raw transaction bytes and computed hash before broadcast\n'
@@ -555,6 +562,18 @@ printf '134. Block automatic higher-nonce delivery behind an unbroadcast SIGNED 
 printf '135. Check canonical receipts against one fixed destination head and required confirmation depth\n'
 printf '136. Persist immutable CONFIRMED and REVERTED outcomes without retry or business execution claims\n'
 printf '137. Reject signed-byte, nonce-state, receipt and package corruption while preserving all source evidence\n'
+printf '138. Upgrade existing transaction records in place without changing original signatures or receipts\n'
+printf '139. Persist retry counts, classifications and bounded next-action schedules across fresh clients\n'
+printf '140. Recover transient or ambiguous sends by broadcasting identical raw bytes and hash\n'
+printf '141. Append linear same-nonce attempts with immutable gas, calldata, target and historical evidence\n'
+printf '142. Bump both EIP-1559 fees with exact ceiling arithmetic and current market fees\n'
+printf '143. Enforce fee caps and maximum attempts without deleting pending delivery state\n'
+printf '144. Prevent competing clients from creating two replacements of the same parent\n'
+printf '145. Reconcile already-known and nonce-too-low errors against exact local transaction history\n'
+printf '146. Accept old or new canonical winners and stop every sibling after confirmation or revert\n'
+printf '147. Preserve nonce ordering and fail closed for unknown external nonce consumption\n'
+printf '148. Keep a real Chain B transaction pending, recover its replacement in fresh processes and confirm it\n'
+printf '149. Restore the original Anvil automine setting after the controlled replacement scenario\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -609,7 +628,8 @@ node --test \
     "$INDEXER_DIR/test/relayer-config.test.mjs" \
     "$INDEXER_DIR/test/relayer-encoding.test.mjs" \
     "$INDEXER_DIR/test/relayer-service.test.mjs" \
-    "$INDEXER_DIR/test/transaction-manager.test.mjs"
+    "$INDEXER_DIR/test/transaction-manager.test.mjs" \
+    "$INDEXER_DIR/test/transaction-retry.test.mjs"
 
 CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, lifecycle, fixed-initial-epoch rollover, consensus binding and atomic delivery queue tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -620,7 +640,8 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
         "$INDEXER_DIR/test/batch-lifecycle.database.test.mjs" \
         "$INDEXER_DIR/test/delivery.database.test.mjs" \
         "$INDEXER_DIR/test/relayer.database.test.mjs" \
-        "$INDEXER_DIR/test/transaction-manager.database.test.mjs"
+        "$INDEXER_DIR/test/transaction-manager.database.test.mjs" \
+        "$INDEXER_DIR/test/transaction-retry.database.test.mjs"
 
 CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1288,6 +1309,13 @@ CHAIN_B_CHAIN_ID="$CHAIN_B_ID" \
 RELAYER_A_PRIVATE_KEY="$ANVIL_DEV_KEY" \
 RELAYER_MAX_JOBS_PER_RUN="100" \
 DESTINATION_CONFIRMATIONS="$DESTINATION_CONFIRMATIONS" \
+TX_REBROADCAST_INTERVAL_MS="$TX_REBROADCAST_INTERVAL_MS" \
+TX_REPLACEMENT_AFTER_MS="$TX_REPLACEMENT_AFTER_MS" \
+TX_FEE_BUMP_NUMERATOR="$TX_FEE_BUMP_NUMERATOR" \
+TX_FEE_BUMP_DENOMINATOR="$TX_FEE_BUMP_DENOMINATOR" \
+TX_MAX_ATTEMPTS="$TX_MAX_ATTEMPTS" \
+TX_MAX_FEE_PER_GAS="$TX_MAX_FEE_PER_GAS" \
+TX_MAX_PRIORITY_FEE_PER_GAS="$TX_MAX_PRIORITY_FEE_PER_GAS" \
     node --test "$INDEXER_DIR/test/integration.test.mjs"
 
 CURRENT_STEP="complete"

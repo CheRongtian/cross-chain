@@ -12,6 +12,7 @@ export function createTransactionRpc(config) {
       return config.destinationDomain;
     },
     async pendingNonce() { return rpcQuantity(await request("eth_getTransactionCount", [config.relayerAddress, "pending"]), "pending nonce"); },
+    async latestNonce() { return rpcQuantity(await request("eth_getTransactionCount", [config.relayerAddress, "latest"]), "latest nonce"); },
     async estimateGas(intent) {
       const gas = rpcQuantity(await request("eth_estimateGas", [{ from: normalizeAddress(intent.senderAddress),
         to: intent.destinationGateway, value: "0x0", data: intent.calldata }]), "gas estimate");

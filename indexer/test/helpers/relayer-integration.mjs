@@ -13,6 +13,7 @@ import { encodeDestinationSubmission } from "../../src/relayer/encoding.mjs";
 import { createRelaySubmissionRepository } from "../../src/relayer/repository.mjs";
 import { sourceState } from "../../../validator/test/helpers/four-process.mjs";
 import { rpcObserver } from "../../../validator/test/helpers/process-cluster.mjs";
+import { verifyPendingReplacement } from "./transaction-retry-integration.mjs";
 
 const execFileAsync = promisify(execFile);
 const MAIN = fileURLToPath(new URL("../../src/relayer/main.mjs",import.meta.url));
@@ -62,19 +63,33 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     const hash = keccak256(raw).toLowerCase();
     const row = (await pool.query(`SELECT delivery_job_id,status,raw_signed_transaction,transaction_hash FROM ${attempts} WHERE transaction_hash = $1`,[hash])).rows[0];
     assert.ok(row,"exact signed transaction must already be visible in PostgreSQL before real RPC forwarding");
-    assert.equal(row.status,"SIGNED"); assert.equal(row.raw_signed_transaction,raw); assert.equal(row.transaction_hash,hash);
+    assert.ok(["SIGNED","BROADCAST"].includes(row.status)); assert.equal(row.raw_signed_transaction,raw); assert.equal(row.transaction_hash,hash);
     const stored = await manager.repository.getTransaction(row.delivery_job_id);
-    assert.equal(stored.attempt.rawSignedTransaction,raw); assert.equal(stored.attempt.transactionType,2);
-    assert.ok(BigInt(stored.attempt.gasLimit) > 0n);
-    assert.equal(BigInt(stored.attempt.gasLimit),estimates.get(stored.intent.calldata));
-    assert.equal(BigInt(stored.attempt.maxPriorityFeePerGas),latestPriorityFee);
-    assert.equal(BigInt(stored.attempt.maxFeePerGas),2n * latestBaseFee + latestPriorityFee);
-    observed.push({ deliveryJobId: row.delivery_job_id,transactionHash: hash,nonce: stored.attempt.nonce });
+    const attempt = stored.attempts.find(a => a.transactionHash === hash);
+    assert.ok(attempt); assert.equal(attempt.rawSignedTransaction,raw); assert.equal(attempt.transactionType,2);
+    assert.ok(BigInt(attempt.gasLimit) > 0n);
+    assert.equal(BigInt(attempt.gasLimit),estimates.get(stored.intent.calldata));
+    if (attempt.attemptNumber === 0) {
+      assert.equal(BigInt(attempt.maxPriorityFeePerGas),latestPriorityFee);
+      assert.equal(BigInt(attempt.maxFeePerGas),2n * latestBaseFee + latestPriorityFee);
+    } else {
+      const parent = stored.attempts[attempt.attemptNumber - 1];
+      assert.equal(attempt.nonce,stored.intent.nonce); assert.equal(attempt.gasLimit,parent.gasLimit);
+      assert.ok(BigInt(attempt.maxPriorityFeePerGas) > BigInt(parent.maxPriorityFeePerGas));
+      assert.ok(BigInt(attempt.maxFeePerGas) > BigInt(parent.maxFeePerGas));
+      assert.ok(BigInt(attempt.maxPriorityFeePerGas) >= latestPriorityFee);
+      assert.ok(BigInt(attempt.maxFeePerGas) >= 2n * latestBaseFee + latestPriorityFee);
+    }
+    observed.push({ deliveryJobId: row.delivery_job_id,transactionHash: hash,nonce: attempt.nonce });
   },async afterForward(request,reply) {
     if (request.method === "eth_estimateGas") estimates.set(request.params[0].data,BigInt(reply.result));
     if (request.method === "eth_maxPriorityFeePerGas") latestPriorityFee = BigInt(reply.result);
     if (request.method === "eth_getBlockByNumber" && request.params[0] === "latest") latestBaseFee = BigInt(reply.result.baseFeePerGas);
-    if (request.method === "eth_sendRawTransaction") assert.equal(reply.result.toLowerCase(),keccak256(request.params[0]).toLowerCase());
+    if (request.method === "eth_sendRawTransaction") {
+      if (reply.error) throw new Error(`Chain B rejected persisted raw transaction: ${reply.error.code} ${reply.error.message}`);
+      assert.equal(typeof reply.result,"string","Chain B must return the submitted transaction hash");
+      assert.equal(reply.result.toLowerCase(),keccak256(request.params[0]).toLowerCase());
+    }
   } });
   env.CHAIN_B_RPC_URL = observer.url;
   manager = createTransactionManager({ config: loadTransactionConfig(env),pool,queue,legacy: repository });
@@ -121,17 +136,25 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     const feesBefore = observer.calls.filter(call => call.method === "eth_maxPriorityFeePerGas").length;
     await failed(MAIN,env,"SIGNED_TRANSACTION_REQUIRES_EXPLICIT_BROADCAST");
     assert.equal(await count(attempts),1); assert.equal(await nonce(destination),destinationNonce); assert.equal(observed.length,0);
-    const firstBroadcast = await run(MANAGER,["broadcast",firstId]);
+    const retryTime = Math.max(Date.now(),Date.parse(signed.intent.nextActionAt));
+    const retryManager = createTransactionManager({ config: loadTransactionConfig(env),pool,queue,legacy: repository,clock: { now: () => retryTime } });
+    const retryResult = await retryManager.processTransactionRetriesOnce();
+    assert.equal(retryResult.replacements,0); assert.equal(retryResult.broadcasts,1);
+    const firstBroadcast = await manager.repository.getTransaction(firstId);
     assert.equal(firstBroadcast.attempt.status,"BROADCAST");
+    assert.equal(firstBroadcast.attempt.broadcastAttemptCount,"2");
     for (const field of ["nonce","gasLimit","maxFeePerGas","maxPriorityFeePerGas","rawSignedTransaction","transactionHash"]) {
       assert.equal(firstBroadcast.attempt[field],signed.attempt[field]);
     }
     assert.equal(observer.calls.filter(call => call.method === "eth_estimateGas").length,estimatesBefore);
     assert.equal(observer.calls.filter(call => call.method === "eth_maxPriorityFeePerGas").length,feesBefore);
-    assert.deepEqual(await run(MANAGER,["read",firstId]),{ intent: firstBroadcast.intent,attempt: firstBroadcast.attempt });
+    assert.deepEqual(await run(MANAGER,["read",firstId]),firstBroadcast);
+    console.log("VALID: persistent retry recovered one failed SIGNED submission and rebroadcast identical bytes/hash without gas, fees, signing or nonce allocation");
+    await verifyPendingReplacement({ config: loadTransactionConfig(env),pool,queue,legacy: repository,destination,
+      jobId: jobs[1].deliveryJobId,run: args => run(MANAGER,args) });
     const submitted = await run();
-    assert.equal(submitted.selected,expectedCount - 1); assert.equal(submitted.submitted,expectedCount - 1);
-    assert.equal(await count(intents),expectedCount); assert.equal(await count(attempts),expectedCount);
+    assert.equal(submitted.selected,expectedCount - 2); assert.equal(submitted.submitted,expectedCount - 2);
+    assert.equal(await count(intents),expectedCount); assert.equal(await count(attempts),expectedCount + 1);
     assert.equal(await count(submissions),0);
     assert.equal(await nonce(destination),destinationNonce + BigInt(expectedCount));
     for (const job of jobs) {
@@ -157,13 +180,17 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
       assert.deepEqual(pack.quorumCertificate,snapshot.quorumCertificate);
       console.log(`VALID: Chain B exposed exact persisted type-2 delivery for ${job.deliveryJobId}; nonce=${record.attempt.nonce}; hash=${record.attempt.transactionHash}`);
     }
-    assert.equal(observed.length,expectedCount);
-    assert.deepEqual(observed.map(record => BigInt(record.nonce)).sort((a,b) => a < b ? -1 : 1),
+    assert.equal(observed.length,expectedCount + 1);
+    assert.deepEqual([...new Set(observed.map(record => record.nonce))].map(BigInt).sort((a,b) => a < b ? -1 : 1),
       Array.from({ length: expectedCount },(_,index) => destinationNonce + BigInt(index)));
     assert.equal(observer.calls.filter(call => call.method === "eth_estimateGas").length,expectedCount);
-    assert.equal(observer.calls.filter(call => call.method === "eth_maxPriorityFeePerGas").length,expectedCount);
+    assert.equal(observer.calls.filter(call => call.method === "eth_maxPriorityFeePerGas").length,expectedCount + 1);
     assert.equal(observer.calls.filter(call => call.method === "eth_sendTransaction").length,0);
-    console.log("VALID: independent RPC observer proved SIGNED persistence before every real raw broadcast; nonces were unique and consecutive");
+    console.log("VALID: independent RPC observer proved signed persistence before every real raw broadcast; intents reserved consecutive unique nonces and replacement reused its parent's nonce");
+    const last = await manager.repository.getTransaction(jobs.at(-1).deliveryJobId);
+    if (await destination.request({ method: "eth_getTransactionReceipt",params: [last.attempt.transactionHash] }) === null) {
+      await destination.request({ method: "anvil_mine",params: ["0x1"] });
+    }
     const firstReceiptCheck = await run(MANAGER,["receipts"]);
     if (relayConfig.destinationConfirmations > 1n) {
       assert.ok(firstReceiptCheck.results.some(record => record.attempt.status === "BROADCAST"));
@@ -178,15 +205,15 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
       const canonical = await destination.request({ method: "eth_getBlockByNumber",params: [toHex(BigInt(record.attempt.receiptBlockNumber)),false] });
       assert.equal(canonical.hash.toLowerCase(),record.attempt.receiptBlockHash);
     }
-    const hashesBefore = (await pool.query(`SELECT delivery_job_id,nonce,raw_signed_transaction,transaction_hash FROM ${attempts} ORDER BY delivery_job_id`)).rows;
+    const hashesBefore = (await pool.query(`SELECT delivery_job_id,nonce,raw_signed_transaction,transaction_hash FROM ${attempts} ORDER BY delivery_job_id,attempt_number`)).rows;
     const accountBefore = await manager.repository.getAccount();
     assert.equal(accountBefore.nextNonce,(destinationNonce + BigInt(expectedCount)).toString());
     const repeated = await run();
     assert.equal(repeated.selected,0); assert.equal(repeated.submitted,0);
-    assert.equal(await count(intents),expectedCount); assert.equal(await count(attempts),expectedCount);
+    assert.equal(await count(intents),expectedCount); assert.equal(await count(attempts),expectedCount + 1);
     assert.equal(await nonce(destination),destinationNonce + BigInt(expectedCount));
-    assert.deepEqual((await pool.query(`SELECT delivery_job_id,nonce,raw_signed_transaction,transaction_hash FROM ${attempts} ORDER BY delivery_job_id`)).rows,hashesBefore);
-    assert.deepEqual(await manager.repository.getAccount(),accountBefore); assert.equal(observed.length,expectedCount);
+    assert.deepEqual((await pool.query(`SELECT delivery_job_id,nonce,raw_signed_transaction,transaction_hash FROM ${attempts} ORDER BY delivery_job_id,attempt_number`)).rows,hashesBefore);
+    assert.deepEqual(await manager.repository.getAccount(),accountBefore); assert.equal(observed.length,expectedCount + 1);
     assert.deepEqual(await sourceState(pool,config.databaseSchema),sourceBefore);
     assert.deepEqual(await queueState(),queueBefore);
     assert.equal(observer.errors.length,0);

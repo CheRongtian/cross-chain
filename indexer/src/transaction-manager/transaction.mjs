@@ -7,7 +7,8 @@ export function unsignedTransaction(intent, fields) {
   const gas = protocolInteger(fields.gasLimit, "gas limit");
   const maxFeePerGas = protocolInteger(fields.maxFeePerGas, "max fee");
   const maxPriorityFeePerGas = protocolInteger(fields.maxPriorityFeePerGas, "priority fee");
-  if (gas === 0n || maxFeePerGas < maxPriorityFeePerGas || protocolInteger(intent.value, "value") !== 0n) {
+  if (gas === 0n || maxFeePerGas < maxPriorityFeePerGas || protocolInteger(intent.value, "value") !== 0n ||
+      (intent.nonce !== undefined && protocolInteger(intent.nonce,"intent nonce") !== protocolInteger(fields.nonce,"nonce"))) {
     throw new TransactionError("INVALID_TRANSACTION_FIELDS");
   }
   return { type: "eip1559", chainId: protocolInteger(intent.chainId, "chain ID"),

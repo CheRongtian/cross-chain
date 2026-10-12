@@ -7,7 +7,7 @@ import { createRelaySubmissionRepository } from "../src/relayer/repository.mjs";
 import { createSingleRelayer } from "../src/relayer/service.mjs";
 import { createTransactionManager } from "../src/transaction-manager/service.mjs";
 import { createTransactionRepository } from "../src/transaction-manager/repository.mjs";
-import { transactionConfig, transactionHarness } from "./helpers/transaction-fixtures.mjs";
+import { transactionConfig, transactionHarness, transientSendError } from "./helpers/transaction-fixtures.mjs";
 import { persistReadyTransactionFixture } from "./helpers/transaction-database-fixtures.mjs";
 import { fixtureHash } from "./helpers/delivery-fixtures.mjs";
 import { sourceState } from "../../validator/test/helpers/four-process.mjs";
@@ -102,7 +102,7 @@ test("durable allocator wins over RPC, safely advances to higher RPC pending, an
 
 test("SIGNED survives broadcast failure, blocks later nonces, and can be explicitly broadcast unchanged", async () => {
   const original = await sourceState(pool,config.databaseSchema);
-  const rpc = { ...h.rpc, async broadcast() { throw new Error("injected unavailable broadcaster"); } };
+  const rpc = { ...h.rpc, async broadcast() { throw transientSendError("injected unavailable broadcaster"); } };
   const failure = managerFor(pool,{ rpc });
   await assert.rejects(failure.submitDelivery(jobs[0].deliveryJobId),/injected unavailable broadcaster/);
   const signed = await failure.repository.getTransactionAttempt(jobs[0].deliveryJobId);
@@ -134,7 +134,7 @@ test("migration reruns preserve historical direct submissions and production Rel
   const encoded = await encodeDestinationSubmission(await queue.getDeliveryPackage(id),{ validatorSets: config.validatorSets });
   const historical = await legacy.recordSubmission({ deliveryJobId: id,encoded,transactionHash: fixtureHash(888) });
   const migrations = await applyMigrations(pool,config.databaseSchema);
-  assert.equal(migrations.at(-1),"011_transaction_manager.sql"); await applyMigrations(pool,config.databaseSchema);
+  assert.equal(migrations.at(-1),"012_transaction_retry_replacement.sql"); await applyMigrations(pool,config.databaseSchema);
   const manager = managerFor();
   assert.deepEqual((await manager.prepareDeliveryTransaction(id)).historicalSubmission,historical);
   assert.deepEqual(await counts(),{ accounts: 0,intents: 0,attempts: 0 });
@@ -156,7 +156,7 @@ test("SQL guards signed fields and terminal outcomes; fresh clients recover all 
     `transaction_hash = '${fixtureHash(99)}'`,"attempt_number = 1"]) {
     await assert.rejects(pool.query(`UPDATE ${attempts} SET ${assignment} WHERE delivery_job_id = $1`,[id]),/immutable/);
   }
-  for (const assignment of ["calldata = '0xffff'",`destination_gateway = '${jobs[0].destinationGateway}'`,
+  for (const assignment of ["calldata = '0xffff'",`destination_gateway = '0x${"33".repeat(20)}'`,
     "chain_id = 3001",`sender_address = '0x${"22".repeat(20)}'`,`package_digest = '${fixtureHash(99)}'`]) {
     await assert.rejects(pool.query(`UPDATE ${intents} SET ${assignment} WHERE delivery_job_id = $1`,[id]),/immutable/);
   }
@@ -197,7 +197,7 @@ test("strict reads reject corrupted raw bytes, hashes and nonce state even when 
       const transactionPool = { async connect() { return { query: client.query.bind(client),release() {} }; },query: client.query.bind(client) };
       // Query inside the already-open fixture transaction without nesting BEGIN/COMMIT.
       const fixturePool = { ...transactionPool,async connect() { return { async query(sql,values) {
-        if (["BEGIN","COMMIT","ROLLBACK"].includes(sql)) return { rows: [] };
+        if (["BEGIN","COMMIT","ROLLBACK","SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"].includes(sql)) return { rows: [] };
         return client.query(sql,values);
       },release() {} }; } };
       const repository = createTransactionRepository({ config,pool: fixturePool,resolveIntent: jobId => manager.resolveIntent(jobId) });

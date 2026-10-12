@@ -14,7 +14,7 @@ try {
   const queue = createDeliveryRepository({ config,pool });
   const repository = createRelaySubmissionRepository({ config,pool,queue });
   const rpc = { ...createTransactionRpc(config),async broadcast() {
-    throw new Error("expected injected Relayer RPC submission failure");
+    throw Object.assign(new Error("expected injected Relayer RPC submission failure"),{ code: "ECONNREFUSED" });
   } };
   const transactionManager = createTransactionManager({ config,pool,queue,rpc,legacy: repository });
   await createSingleRelayer({ config,queue,repository,transactionManager }).runOnce();

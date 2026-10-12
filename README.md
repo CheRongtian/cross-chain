@@ -1,6 +1,6 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A independently verifies each package and delegates its versioned ABI transport to a Persistent Transaction Manager. The manager atomically reserves nonces, estimates gas and resolves EIP-1559 fees, signs locally, persists exact raw bytes before broadcast, and tracks canonical receipts with configured confirmation depth. Destination verification, replay protection and execution remain unimplemented.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A independently verifies each package and delegates its versioned ABI transport to a Persistent Transaction Manager. The manager atomically reserves nonces, estimates gas and resolves EIP-1559 fees, signs locally, persists exact raw bytes before broadcast, and tracks canonical receipts with configured confirmation depth. Bounded durable retries rebroadcast exact bytes, append same-nonce higher-fee candidates, enforce configured limits and accept any historical canonical winner. Destination verification, replay protection and execution remain unimplemented.
 
 The current implementation can:
 
@@ -1192,7 +1192,20 @@ Configuration combines the existing Delivery Queue scope and public validator hi
 
 Only READY jobs without a historical submission or transaction intent are selected, ordered by batch epoch, message index and job ID. Existing rows are excluded before applying the limit. Relayer and Transaction Manager each strictly read and independently verify the package at their boundary, including canonical message, payload hash, ordered batch commitment, Merkle path, root, QC signatures and exact historical committee. A queue status or database row cannot replace cryptographic verification. Invalid evidence or the wrong RPC chain creates no intent, reserved nonce or signed attempt.
 
-The actual destination RPC `eth_chainId` must match both configuration and the canonical message destination domain. Submission uses the canonical `destinationGateway`, never `destinationReceiver`, with `value = 0`. Payload bytes remain opaque and unchanged. An invalid package, mismatched destination, RPC error or malformed transaction hash stops the pass without automatic retry. A database session advisory lock allows one active Relayer A per operational database; this is not a multi-relayer lease or fencing system.
+The actual destination RPC `eth_chainId` must match both configuration and the canonical message destination domain. Submission uses the canonical `destinationGateway`, never `destinationReceiver`, with `value = 0`. Payload bytes remain opaque and unchanged. New-job Relayer passes are fail-fast. Durable Transaction Manager retries handle classified send failures separately; invalid evidence and malformed hashes remain failures. A database session advisory lock permits one active Relayer A per operational database and supplies no multi-relayer lease or fencing.
+
+Retry settings are optional in the ignored root `.env`; `.env.example` lists safe defaults:
+
+| Setting | Default | Meaning |
+| --- | ---: | --- |
+| `TX_REBROADCAST_INTERVAL_MS` | `5000` | Delay before another bounded action |
+| `TX_REPLACEMENT_AFTER_MS` | `60000` | Minimum accepted pending age for replacement |
+| `TX_FEE_BUMP_NUMERATOR` / `TX_FEE_BUMP_DENOMINATOR` | `9` / `8` | Exact ceiling fee multiplier |
+| `TX_MAX_ATTEMPTS` | `4` | Total signed candidates, including attempt 0 |
+| `TX_MAX_FEE_PER_GAS` | `100000000000` | Max fee cap, in wei |
+| `TX_MAX_PRIORITY_FEE_PER_GAS` | `10000000000` | Priority fee cap, in wei |
+
+Intervals and counts are bounded positive integers; replacement age cannot be shorter than the rebroadcast interval, the multiplier must exceed one, and priority cap cannot exceed max fee cap. The real replacement verification requires at least two allowed attempts and fee caps that accommodate its development transactions.
 
 ### Versioned transport encoding
 
@@ -1227,42 +1240,53 @@ delivery_job_id, relayer_address, destination_domain, destination_gateway,
 package_digest, transaction_hash, submitted_at
 ```
 
-Historical records were written after RPC returned a hash. They remain unchanged and block new delivery attempts for the same job. Their missing nonce, fees and raw bytes are never invented. New production transport uses the tables from `011_transaction_manager.sql`:
+Historical records were written after RPC returned a hash. They remain unchanged and block new delivery attempts for the same job. Their missing nonce, fees and raw bytes are never invented. Production transport extends the existing `011_transaction_manager.sql` tables in place through `012_transaction_retry_replacement.sql`:
 
 - `transaction_accounts`: destination chain, sender and persistent next nonce;
-- `transaction_intents`: one immutable intent per job, binding existing job identity, package digest, chain, sender, canonical gateway, zero value and exact calldata;
-- `transaction_attempts`: one attempt numbered 0 per intent, with immutable nonce, gas, EIP-1559 fees, type 2, raw signed bytes and locally derived hash, plus explicit lifecycle and receipt fields.
+- `transaction_intents`: one intent per job, binding immutable package digest, chain, sender, canonical gateway, zero value, calldata and one permanently reserved nonce; operational status, next-action time, retry-stop reason and winning attempt are stored alongside that immutable body;
+- `transaction_attempts`: append-only signed candidates numbered 0, 1, 2, and so on, each with immutable nonce, gas, EIP-1559 fees, type 2, raw bytes, transaction hash and parent; mutable operational fields record broadcast count/time, error class and typed receipt outcome.
 
-The existing delivery job ID is the logical intent ID; no new identity hash or consensus domain is introduced. Uniqueness protects one intent per job, one attempt per intent, one nonce per sender/chain and one transaction hash. SQL guards preserve intent and signed fields and permit only the defined forward lifecycle. Jobs stay READY, batches stay COMMITTED, and source messages, cursor, finality, membership, Merkle and historical QC evidence stay unchanged.
+The delivery job ID remains the intent ID. Unique constraints protect one intent per job, one nonce per chain/sender/intent, one ordinal per intent, one child per parent and one transaction hash. Replacement never changes delivery data or allocates another nonce. SQL guards enforce linear lineage, immutable signed fields, higher fees, unchanged gas and a winning attempt belonging to the intent. Jobs remain READY, batches remain COMMITTED, and source messages, cursor, finality, membership, Merkle proofs and historical QC evidence remain unchanged.
+
+Migration backfills the original attempt's existing nonce and final outcome without re-signing or reconstructing any artifact. A historical accepted transaction proves at least one broadcast; an old SIGNED row has no invented send count. Existing direct-submission records remain outside this model.
 
 ### Nonce, gas, fees and signing
 
-The configured destination EOA must be exclusively managed by this Transaction Manager in one operational database namespace. Do not use another wallet or independent manager to consume its Chain B nonce space. Chain A has a separate nonce space.
+The destination EOA must be exclusively managed by this manager in one operational database namespace. Another wallet must not consume its Chain B nonce space. Chain A has a separate nonce space.
 
-Preparation validates the actual RPC chain before allocation, estimates gas for exact sender/target/value/data, reads the latest base fee and RPC priority fee, and reads pending nonce. Gas uses the exact estimate. Fees use `maxFeePerGas = 2 * baseFeePerGas + maxPriorityFeePerGas`, with integer BigInt arithmetic, no legacy fallback and no fee bumping.
+Initial preparation verifies the RPC chain, estimates gas for exact sender/target/value/data, resolves `maxFeePerGas = 2 * baseFeePerGas + maxPriorityFeePerGas` from current RPC data, and reads pending nonce. A PostgreSQL account row lock serializes allocation. The nonce is the maximum of RPC pending nonce, durable next nonce and highest reserved intent nonce plus one. Higher pending state may advance the allocator; local state never regresses. Account advancement, intent and initial SIGNED attempt commit together. Gas, fee, signing or pre-commit failures leave no ghost reservation.
 
-A PostgreSQL account row lock serializes allocation. The nonce is the maximum of RPC pending nonce, durable next nonce and highest reserved nonce plus one. A higher RPC pending nonce can advance the allocator and is reported; local state never regresses. Concurrent preparations receive distinct nonces. Existing intents return the same attempt without fresh gas, fees, signing or nonce allocation. Preparation RPC prerequisites run outside allocation locks. Nonce advancement, intent and SIGNED attempt commit together; gas, fee, signing or pre-commit failure leaves no ghost reservation.
+Fees and nonces use exact BigInt arithmetic. A replacement retains the original gas limit and uses the maximum of current market fees, the ceiling of the prior fee multiplied by the configured ratio, and the prior fee plus one wei. Both fee fields strictly increase, and max fee remains at least priority fee. Caps are checked before signing; uint256 overflow fails closed. No legacy transaction fallback or gas re-estimation occurs on replacement.
 
-The signer constructs a type-2 transaction with signed destination chain ID. Nonce, gas and fees remain exact, including RLP-based strict reads of large nonces. `transactionHash = keccak256(rawSignedTransaction)` is computed locally. Reads reconstruct and verify signed fields and recovered sender against the canonical intent and reject changed raw bytes, hash, calldata or destination.
+Each candidate is signed locally as type 2. `transactionHash = keccak256(rawSignedTransaction)` is computed locally. Strict reads validate every historical candidate's RLP, recovered sender, immutable body, nonce and fee lineage. Existing intents return the durable history without estimating, signing or reserving again.
 
-### Broadcast, receipts and restart boundary
+### Exact rebroadcast and replacement
 
-```text
-SIGNED → BROADCAST → CONFIRMED
-                   └→ REVERTED
-```
+Exact rebroadcast sends the same stored bytes, hash, nonce, gas and fees. It updates operational broadcast metadata without creating an attempt. A replacement creates a new signed candidate with strictly higher fees and a different hash, persists it before RPC submission, and marks its parent REPLACED as local history. That label does not prove the old transaction was dropped or cancelled: the old attempt may still win.
 
-Exact signed bytes and their hash are committed before `eth_sendRawTransaction`. Only a matching RPC hash permits BROADCAST and its timestamp. The bounded send is serialized under the account lock and never reconstructs the transaction. Failure or hash mismatch leaves SIGNED. An earlier SIGNED nonce blocks higher-nonce broadcasts and automatic Relayer progression. No automatic rebroadcast, replacement or retry interpretation of `already known` exists.
+Transient and ambiguous send failures retain signed evidence and schedule exact rebroadcast first. A timeout does not establish rejection. The manager checks receipts before acting and never immediately increases fees for a transport failure. Already-known responses require the exact persisted transaction hash and matching RPC body or canonical receipt before being treated as acceptance. Nonce-too-low responses query all local candidates and latest/pending nonce. A known canonical candidate is reconciled; consumed nonce with no matching local evidence stops with `UNKNOWN_NONCE_CONSUMPTION`.
 
-Explicit primitives are `prepareDeliveryTransaction(jobId)`, `broadcastPreparedTransaction(intentId)` and `checkReceiptsOnce({ limit })`. The internal `transaction:once` CLI supports `prepare`, `broadcast`, `read` and `receipts`, with no retry scheduler. Fresh processes recover exact SIGNED, BROADCAST and terminal state without changing gas, fees, nonce, bytes or hash. RPC acceptance before its BROADCAST update can leave SIGNED with known recoverable bytes; normal reruns stop for explicit action. Full crash-recovery orchestration and exactly-once delivery guarantees remain unimplemented.
+Underpriced responses make a higher-fee candidate eligible after the persisted retry interval. Otherwise, an accepted pending transaction becomes a replacement candidate only after the configured age threshold. Receipt and transaction queries are repeated before insertion; a mined candidate awaiting depth suppresses replacement. Account and intent row locks recheck the active parent, limits and final status atomically. Competing clients cannot create two children of the same parent, and a stale worker cannot broadcast a newer candidate unintentionally.
 
-Receipt tracking uses one fixed destination head per bounded pass. A missing receipt leaves BROADCAST. The manager verifies receipt hash, canonical block number/hash and transaction sender, target, nonce, input, value, type, chain and fees. Confirmation count is `head - receiptBlockNumber + 1`. Insufficient depth leaves BROADCAST. At configured depth, receipt status 1 records CONFIRMED; status 0 records REVERTED without retry. Typed block number/hash/status, observed head and confirmation time are durable and immutable. Arbitrary receipt JSON is not protocol state.
+`processTransactionRetriesOnce({ limit })` reads a bounded, deterministically ordered due set and one destination head. It has no sleep or infinite loop. A fresh invocation uses persisted scheduling, counts and lineage; the injected clock affects operational timing only. Receipt inspection continues even for an intent whose automatic replacement has stopped. Reaching a cap or maximum attempts preserves pending evidence and does not declare business failure or allocate another nonce. Automatic retry stops are not silently reset.
+
+The primitives include preparation, exact broadcast/rebroadcast, replacement preparation, bounded retries and bounded receipt inspection. The existing `transaction:once` CLI accepts `prepare`, `broadcast`, `rebroadcast`, `replace`, `read`, `retries` and `receipts`. Normal Relayer selection never reselects an existing intent; an operator must invoke the retry pass separately. An earlier unbroadcast SIGNED or stopped pending nonce blocks higher-nonce sends. Full crash-recovery orchestration remains deferred: acceptance followed by interruption can leave SIGNED state, but the stored bytes are recoverable and can be reconciled or exactly rebroadcast.
+
+### Receipts, winner and restart boundary
+
+An intent is PENDING until one canonical attempt reaches confirmation depth, then CONFIRMED or REVERTED. Receipt tracking checks every historical candidate with evidence of possible submission, including REPLACED parents; reconciliation before replacement also checks all stored hashes. It validates receipt hash, canonical block number/hash and exact sender, target, nonce, input, value, type, chain, gas and fees.
+
+Confirmation count is `head - receiptBlockNumber + 1` against the pass's fixed head. Insufficient depth preserves PENDING and suppresses replacement when a transaction is mined. At depth, status 1 records CONFIRMED and status 0 records REVERTED. The canonical winner is persisted on its intent, every sibling stops, and final intents cannot receive another attempt. Conflicting canonical same-nonce receipts fail closed. Typed receipt block/status, observed head and confirmation time are immutable; arbitrary receipt JSON is not protocol state.
+
+Fresh processes recover intent status, exact signed history, broadcast counts, latest candidate, next-action time, stop reason, winner and allocator state. Recovery does not change the delivery package, gas, nonce or historical signatures.
 
 ### Verification and destination boundary
 
-Unified verification retains source, ZK, Merkle, PBFT, queue and historical direct-submission coverage and adds nonce concurrency, rollback, signed integrity, lifecycle guards and receipt cases. Real A/B/D and rotated E use the production manager and Chain B RPC; REORGED C gets no intent or nonce. The existing RPC observer checks committed SIGNED state before forwarding each real broadcast. Integration checks exact type-2 fields, original historical QC, actual canonical receipts and confirmation depth. Verification-only empty-block mining supplies depth when needed; production never mines. Fresh processes recover SIGNED/BROADCAST bytes and allocator state; ordinary reruns create no duplicate intent, attempt or transaction.
+The unified flow preserves source, ZK, Merkle, PBFT, queue and direct-submission checks. Additional unit/database cases cover exact retries, error classification, fee arithmetic and limits, concurrent replacement, rollback, migration of old artifacts, old/new winners, canonical reverts and stopped-state recovery.
 
-A hash alone proves no confirmation or business result. CONFIRMED means a canonical successful receipt was observed at configured depth, a heuristic rather than mathematical permanent finality. It establishes no DestinationGateway QC authentication, replay rejection or Application B execution. Automatic retry, same-nonce replacement, fee bumping, underpriced recovery, RPC failover, Relayer B, multi-relayer leasing/fencing, complete crash-recovery orchestration, destination transaction reorg recovery, Gateway verification/replay protection and Application B execution remain deferred.
+Real A/B/D and rotated E use the production manager and Chain B RPC; REORGED C receives no intent or nonce. The existing RPC observer proves durable signed bytes before forwarding. A controlled initial send failure exercises exact retry. Another real transaction is kept pending by temporarily disabling Anvil automine, replaced at the same nonce with higher fees, recovered through fresh CLI processes, mined and confirmed at configured depth. The original automine setting is restored in a `finally` block. Production never changes mining behavior.
+
+CONFIRMED means a successful canonical receipt was observed at configured depth, a heuristic rather than permanent finality. It establishes no DestinationGateway QC authentication, replay rejection or Application B execution. RPC failover, Relayer B, multi-relayer leases/fencing, complete crash-recovery orchestration, recovery after an already confirmed destination transaction is reorganized, Gateway authentication/replay protection and Application B remain deferred.
 
 ## Local Two-Chain Environment
 
@@ -1559,10 +1583,16 @@ The script uses strict error handling and performs:
 119. production Relayer CLI submission of real A/B/D and rotated Message E to Chain B;
 120. RPC-visible transaction sender, canonical gateway target, zero value and exact transport data;
 121. fresh-process skipping of recorded jobs with unchanged transaction count, queue evidence and source state;
-122. persistent intents, unique concurrent nonces and one immutable type-2 attempt per delivery;
+122. persistent intents, unique concurrent nonces and an immutable initial type-2 attempt per delivery;
 123. exact local signing, real gas/fee data, persistence before broadcast and matching RPC hashes;
 124. broadcast-failure SIGNED recovery and explicit unchanged broadcast without automatic higher-nonce progression;
-125. real canonical receipts and configured depth, negative receipt cases and durable REVERTED outcomes.
+125. real canonical receipts and configured depth, negative receipt cases and durable REVERTED outcomes;
+126. in-place upgrade preserving original raw bytes, hashes, timestamps, receipts, allocator and direct submissions;
+127. durable retry counts, classified errors, scheduling and exact rebroadcast through fresh clients;
+128. append-only same-nonce replacement, strict fee ceilings, current market fees, caps and attempt limits;
+129. concurrent replacement, parent/nonce/gas guards, interrupted commits and winner membership;
+130. old/new canonical winners, terminal sibling suppression and fail-closed unknown nonce consumption;
+131. real pending Chain B replacement, fresh-process recovery, canonical confirmation and automine restoration.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -1580,7 +1610,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Persistent Transaction Manager
+Transaction Retry and Replacement
 ```
 
 ### Expected error output
@@ -1654,7 +1684,8 @@ Cross-Chain/
 │   │   ├── 008_validator_epochs.sql
 │   │   ├── 009_delivery_queue.sql
 │   │   ├── 010_single_relayer.sql
-│   │   └── 011_transaction_manager.sql
+│   │   ├── 011_transaction_manager.sql
+│   │   └── 012_transaction_retry_replacement.sql
 │   ├── scripts/
 │   │   └── generate-merkle-golden-vectors.mjs
 │   ├── src/
@@ -1692,7 +1723,11 @@ Cross-Chain/
 │   │       ├── config.mjs
 │   │       ├── main.mjs
 │   │       ├── nonce-policy.mjs
+│   │       ├── receipts.mjs
 │   │       ├── repository.mjs
+│   │       ├── retry-policy.mjs
+│   │       ├── retry.mjs
+│   │       ├── rpc-errors.mjs
 │   │       ├── rpc.mjs
 │   │       ├── service.mjs
 │   │       └── transaction.mjs
@@ -1718,7 +1753,8 @@ Cross-Chain/
 │   │   │   ├── relayer-fixtures.mjs
 │   │   │   ├── relayer-integration.mjs
 │   │   │   ├── transaction-database-fixtures.mjs
-│   │   │   └── transaction-fixtures.mjs
+│   │   │   ├── transaction-fixtures.mjs
+│   │   │   └── transaction-retry-integration.mjs
 │   │   ├── indexer.test.mjs
 │   │   ├── integration.test.mjs
 │   │   ├── message-batch.test.mjs
@@ -1731,7 +1767,9 @@ Cross-Chain/
 │   │   ├── relayer.database.test.mjs
 │   │   ├── source-event-identity.test.mjs
 │   │   ├── transaction-manager.database.test.mjs
-│   │   └── transaction-manager.test.mjs
+│   │   ├── transaction-manager.test.mjs
+│   │   ├── transaction-retry.database.test.mjs
+│   │   └── transaction-retry.test.mjs
 │   ├── package.json
 │   └── package-lock.json
 ├── scripts/
@@ -1866,8 +1904,8 @@ Cross-Chain/
 - The failure model retains progress with one unavailable non-primary and an honest available primary. A single conflicting backup cannot supply a conflicting QC. A 2|2 partition preserves safety and pauses progress until explicit retries restore delivery; connectivity changes do not reset vote locks or select a new primary.
 - Primary failure or withholding triggers progress timeouts; replacement still requires three valid VIEW_CHANGE votes and an available deterministic new primary. Process availability is not commit authority. PostgreSQL never substitutes for independent source and signature verification.
 - READY jobs contain verified immutable evidence and provide no destination permission or execution guarantee. Delivery projectors coordinate per batch through database locks and uniqueness; this does not add multi-instance Indexer/Finality Watcher coordination or exactly-once destination consumption.
-- Relayer A delegates verified zero-value transport to the Persistent Transaction Manager. The exclusive destination EOA is an untrusted transport account, not a validator signature or destination permission. Exact signed bytes and their hash are durable before broadcast; an ambiguous send leaves recoverable SIGNED state with no automatic resend. CONFIRMED supplies no Gateway authentication, business execution or permanent destination finality.
-- The repository does not provide decentralized validator governance, automatic transaction retry/replacement, destination gateway integration or destination QC verification, exactly-once downstream message execution, destination execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
+- Relayer A delegates verified zero-value transport to the Persistent Transaction Manager. Its exclusive EOA is an untrusted transport account with no validator or destination permission. Exact signed bytes are durable before broadcast; bounded retry reuses them, and replacement only appends a higher-fee candidate at the same nonce. Any historical candidate may win. CONFIRMED supplies no Gateway authentication, business execution or permanent destination finality.
+- The repository does not provide decentralized validator governance, RPC failover, Relayer B, multi-relayer leases/fencing, complete transaction crash-recovery orchestration, destination-confirmed transaction reorg recovery, destination gateway/QC verification, exactly-once downstream execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
 - ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, production transaction recovery and destination reorganization handling, and a destination-chain execution security design.
