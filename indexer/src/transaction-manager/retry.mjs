@@ -25,8 +25,9 @@ export async function processTransactionRetriesOnce({ config, store, rpc, verify
     if (current.intent.status !== "PENDING" || current.intent.retryStoppedAt !== null || new Date(current.intent.nextActionAt).getTime() > now) continue;
     try {
       const snapshot = await store.getRecoverySnapshot(id);
-      if (snapshot.broadcastEvents.some(event => event.completedAt === null)) {
-        const recovered = await recover(id,fence);
+      if ((snapshot.attempt.status === "SIGNED" && BigInt(snapshot.attempt.broadcastAttemptCount) === 0n) ||
+          snapshot.broadcastEvents.some(event => event.attemptId === snapshot.attempt.attemptId && event.completedAt === null)) {
+        const recovered = await recover(id,fence,view);
         broadcasts += recovered.rebroadcast;
         results.push({ deliveryJobId: id,action: "RECOVERY",recovery: recovered });
         continue;

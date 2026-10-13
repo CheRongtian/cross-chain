@@ -13,26 +13,30 @@ export function classifyRecovery(snapshot) {
   return snapshot.attempt.attemptNumber ? "REPLACEMENT_PENDING" : "BROADCAST_PENDING";
 }
 
-export async function recoverTransaction({ id,store,rpc,config,send,hooks = {},fence,context }) {
-  const snapshot = await store.getRecoverySnapshot(id);
+export async function recoverTransaction({ id,store,rpc,config,send,hooks = {},fence,context,receiptView }) {
+  let snapshot = await store.getRecoverySnapshot(id);
   const classification = classifyRecovery(snapshot);
   if (!snapshot || snapshot.intent.status !== "PENDING") return { deliveryJobId: id,action: "UNCHANGED",classification };
   context.assertHeld();
-  // All remote reads precede recovery mutation. A missing response is not proof
-  // of non-submission, and an unavailable/conflicting view writes nothing.
+  // Receipt and visibility evidence reads precede recovery mutation. A missing
+  // response is not proof of non-submission; unavailable/conflicting evidence
+  // does not authorize a write or a send.
   if (await rpc.verifyChain() !== config.destinationDomain) throw new TransactionError("CHAIN_ID_MISMATCH");
-  const view = await rpc.readView();
+  // A retry pass already owns its confirmation snapshot. Keep that view when
+  // it delegates recovery; standalone recovery captures one view of its own.
+  const view = receiptView ?? await rpc.readView();
   const observation = await observeIntentReceipts({ stored: snapshot,rpc,config,view,forceAll: true,hooks });
   context.assertHeld();
-  if (observation.winner) {
-    const winner = observation.winner;
-    const stored = await store.applyRecoveryObservation(snapshot,observation.finalizable ? {
+  async function settleWinner(evidence) {
+    const winner = evidence.winner;
+    const stored = await store.applyRecoveryObservation(snapshot,evidence.finalizable ? {
       fence,receipt: { transactionHash: winner.attempt.transactionHash,blockNumber: winner.blockNumber,
         blockHash: winner.blockHash,status: winner.status,head: view.head },
     } : { fence,knownAttempts: [winner.attempt.attemptId] });
-    return { deliveryJobId: id,action: observation.finalizable ? "FINALIZED" : "RECEIPT_UNCONFIRMED",classification,
+    return { deliveryJobId: id,action: evidence.finalizable ? "FINALIZED" : "RECEIPT_UNCONFIRMED",classification,
       transactionHash: winner.attempt.transactionHash,status: stored.intent.status };
   }
+  if (observation.winner) return settleWinner(observation);
   const known = []; let knownMined = false;
   for (const attempt of snapshot.attempts) {
     const tx = await rpc.transaction(attempt.transactionHash);
@@ -48,25 +52,49 @@ export async function recoverTransaction({ id,store,rpc,config,send,hooks = {},f
   }
   const latest = await rpc.latestNonce(view);
   context.assertHeld();
+  const activeId = snapshot.attempt.attemptId;
+  const activeKnown = known.includes(activeId);
+  const activeUnresolved = snapshot.broadcastEvents.some(event => event.attemptId === activeId && event.completedAt === null);
+  const needsMutation = snapshot.broadcastEvents.some(event => event.completedAt === null && known.includes(event.attemptId)) ||
+    snapshot.attempts.some(attempt => known.includes(attempt.attemptId) && attempt.broadcastAt === null);
+  const needsSend = !activeKnown && !knownMined && snapshot.intent.retryStoppedAt === null &&
+    (activeUnresolved || BigInt(snapshot.attempt.broadcastAttemptCount) === 0n);
+
+  // A parent can mine during the visibility reads. Check all candidate receipts
+  // again before progressing a replacement, still before any recovery writes.
+  // Keep the original conservative confirmation head for this entire pass.
+  if (needsSend && snapshot.attempt.attemptNumber > 0) {
+    const current = await observeIntentReceipts({ stored: snapshot,rpc,config,view,forceAll: true,hooks });
+    context.assertHeld();
+    if (current.winner) return settleWinner(current);
+  }
   if (latest > BigInt(snapshot.intent.nonce) && !knownMined) {
-    // A stale pending body cannot explain nonce consumption in the canonical
-    // snapshot. Keep the signed identity and stop for operator investigation.
+    // Check replacement winner evidence first: a parent can mine after its
+    // pending body was read and legitimately consume this nonce. Unexplained
+    // consumption still stops recovery without changing signed identity.
     await store.stopRetry(id,"UNKNOWN_NONCE_CONSUMPTION",{ fence,parentAttemptId: snapshot.attempt.attemptId,expectedVersion: snapshot.version });
     return { deliveryJobId: id,action: "MANUAL_ACTION_REQUIRED",reason: "UNKNOWN_NONCE_CONSUMPTION",classification };
   }
-  if (known.length) {
-    const needsMutation = snapshot.broadcastEvents.some(event => event.completedAt === null && known.includes(event.attemptId)) ||
-      snapshot.attempts.some(attempt => known.includes(attempt.attemptId) && attempt.broadcastAt === null);
-    if (needsMutation) await store.applyRecoveryObservation(snapshot,{ fence,knownAttempts: known });
+  if (needsMutation) {
+    await store.applyRecoveryObservation(snapshot,{ fence,knownAttempts: known });
+    // Reconciliation advances the optimistic version. Use its coherent fresh
+    // snapshot, never the pre-mutation version, for the existing send path.
+    snapshot = await store.getRecoverySnapshot(id);
+    context.assertHeld();
+    if (snapshot.intent.status !== "PENDING") return { deliveryJobId: id,action: "RECONCILED",classification };
+    if (snapshot.attempt.attemptId !== activeId) throw new TransactionError("RECOVERY_STATE_CHANGED");
+  }
+  if (activeKnown || knownMined) {
     return { deliveryJobId: id,action: needsMutation ? "RECONCILED" : "UNCHANGED",classification };
   }
   await store.assertRecoverySnapshot(snapshot,{ fence });
   if (snapshot.intent.retryStoppedAt !== null) return { deliveryJobId: id,action: "MANUAL_ACTION_REQUIRED",reason: snapshot.intent.retryStopReason,classification };
   // A crash never creates a new candidate. Once a started send has completed
   // and its due time is in the future, leave ordinary retry policy in control.
-  const unresolved = snapshot.broadcastEvents.some(event => event.completedAt === null);
+  const unresolved = snapshot.broadcastEvents.some(event => event.attemptId === activeId && event.completedAt === null);
   if (!unresolved && BigInt(snapshot.attempt.broadcastAttemptCount) > 0n) return { deliveryJobId: id,action: "UNCHANGED",classification };
-  const sent = await send(id,{ fence,recoveryContext: context,rebroadcast: true,expectedAttemptId: snapshot.attempt.attemptId,expectedVersion: snapshot.version });
+  const sent = await send(id,{ fence,recoveryContext: context,rebroadcast: true,receiptView: view,
+    expectedAttemptId: snapshot.attempt.attemptId,expectedVersion: snapshot.version });
   if (sent.errorClass) return { deliveryJobId: id,action: "UNCHANGED",classification,errorClass: sent.errorClass,
     errorCode: sent.errorCode ?? sent.errorClass,
     errorMessage: safeRelayerMessage({ message: sent.errorMessage ?? sent.errorCode ?? sent.errorClass },config),
@@ -80,12 +108,12 @@ export async function recoverTransaction({ id,store,rpc,config,send,hooks = {},f
     acceptedEndpointLabel: sent.acceptedEndpointLabel ?? null,rpcObservations: sent.rpcObservations ?? [] };
 }
 
-export async function recoverTransactionsOnce({ store,rpc,config,send,hooks,limit = config.maxJobs,deliveryJobId,fence }) {
+export async function recoverTransactionsOnce({ store,rpc,config,send,hooks,limit = config.maxJobs,deliveryJobId,fence,receiptView }) {
   const ids = deliveryJobId === undefined ? await store.listRecoveryIntents({ limit }) : [deliveryJobId];
   const results = [];
   for (const id of ids) {
     try {
-      results.push(await store.withRecoveryLock(id,context => recoverTransaction({ id,store,rpc,config,send,hooks,fence,context })));
+      results.push(await store.withRecoveryLock(id,context => recoverTransaction({ id,store,rpc,config,send,hooks,fence,context,receiptView })));
     } catch (error) {
       if (["TRANSACTION_RECOVERY_BUSY","RECOVERY_STATE_CHANGED"].includes(error.code)) results.push({ deliveryJobId: id,action: "UNCHANGED",reason: error.code });
       else if (["RPC_UNAVAILABLE","INCONSISTENT_RPC_VIEW","RPC_VIEW_INCOMPLETE","NONCANONICAL_TRANSACTION_RECEIPT","CONFLICTING_CANONICAL_NONCE_WINNERS"].includes(error.code)) {

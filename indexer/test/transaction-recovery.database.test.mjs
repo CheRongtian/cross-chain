@@ -6,7 +6,7 @@ import { createTransactionManager } from "../src/transaction-manager/service.mjs
 import { verifySignedTransaction } from "../src/transaction-manager/transaction.mjs";
 import { transactionConfig,transactionHarness } from "./helpers/transaction-fixtures.mjs";
 import { persistReadyTransactionFixture } from "./helpers/transaction-database-fixtures.mjs";
-import { destinationRpcFixture,transactionBody } from "./helpers/destination-rpc-fixtures.mjs";
+import { destinationRpcFixture,transactionBody,rpcTimeout } from "./helpers/destination-rpc-fixtures.mjs";
 import { fixtureHash } from "./helpers/delivery-fixtures.mjs";
 import { sourceState } from "../../validator/test/helpers/four-process.mjs";
 
@@ -31,8 +31,8 @@ beforeEach(async () => {
   } }); reader = manager();
 });
 after(async () => { await pool.end(); });
-function manager({ db = pool,hooks = {},rpc = destination.rpc } = {}) {
-  return createTransactionManager({ config,pool: db,queue: createDeliveryRepository({ config,pool: db }),rpc,hooks,clock: h.clock });
+function manager({ db = pool,hooks = {},rpc = destination.rpc,account } = {}) {
+  return createTransactionManager({ config,pool: db,queue: createDeliveryRepository({ config,pool: db }),rpc,hooks,account,clock: h.clock });
 }
 function crashOnce() { let active = true; return async () => { if (active) { active = false; throw Object.assign(new Error("controlled database checkpoint"),{ code: "TEST_CHECKPOINT" }); } }; }
 async function mine(id,attemptId,status = 1) {
@@ -41,6 +41,190 @@ async function mine(id,attemptId,status = 1) {
   destination.transactions.set(winner.transactionHash,transactionBody(stored.intent,winner,100n,fixtureHash(1100)));
   destination.nodes.forEach(node => { node.head = 102n; node.latestNonce = BigInt(stored.intent.nonce) + 1n; });
 }
+
+const immutableAttemptFields = ["attemptId","attemptNumber","replacementOfAttemptId","nonce","gasLimit",
+  "maxFeePerGas","maxPriorityFeePerGas","rawSignedTransaction","transactionHash","createdAt"];
+function sameSignedAttempt(before,after) {
+  for (const field of immutableAttemptFields) assert.equal(after[field],before[field]);
+}
+async function replacementWithPendingParent() {
+  const id = jobs[0].deliveryJobId;
+  const parent = await reader.submitDelivery(id); h.advance(config.replacementAfterMs);
+  const replacement = await reader.prepareReplacement(id);
+  assert.equal(replacement.created,true); assert.equal(replacement.attempt.status,"SIGNED");
+  assert.equal(replacement.attempt.broadcastAttemptCount,"0");
+  assert.equal((await destination.rpc.transaction(parent.attempt.transactionHash)).blockNumber,null);
+  assert.equal(destination.receipts.has(parent.attempt.transactionHash),false);
+  return { id,parent,replacement,account: await reader.repository.getAccount() };
+}
+
+test("a fresh client broadcasts the exact persisted replacement through failover while its parent remains pending", async () => {
+  const sourceBefore = await sourceState(pool,config.databaseSchema);
+  const { id,parent,replacement,account } = await replacementWithPendingParent();
+  assert.ok(Date.parse(replacement.intent.nextActionAt) > h.clock.now());
+  assert.equal((await reader.repository.getBroadcastEvents(id)).filter(event => event.attemptId === replacement.attempt.attemptId).length,0);
+  const fresh = createDatabasePool(config); destination.nodes[0].available = false;
+  try {
+    const rpc = { ...destination.restart().rpc,
+      async estimateGas() { assert.fail("durable replacement recovery must not estimate gas"); },
+      async fees() { assert.fail("durable replacement recovery must not resolve fees"); } };
+    const recovered = manager({ db: fresh,rpc,account: { address: config.relayerAddress,
+      async signTransaction() { assert.fail("durable replacement recovery must not re-sign"); } } });
+    const persisted = await recovered.repository.getTransaction(id);
+    sameSignedAttempt(replacement.attempt,persisted.attempt);
+    const result = await recovered.recoverTransactionsOnce({ deliveryJobId: id });
+    assert.equal(result.rebroadcast,1); assert.equal(result.results[0].acceptedEndpointLabel,"rpc-1");
+    const stored = await recovered.repository.getTransaction(id);
+    assert.equal(stored.attempt.status,"BROADCAST");
+    assert.deepEqual(stored.attempts.map(attempt => attempt.attemptNumber),[0,1]);
+    sameSignedAttempt(replacement.attempt,stored.attempt); sameSignedAttempt(parent.attempt,stored.attempts[0]);
+    assert.deepEqual(await recovered.repository.getAccount(),account);
+    assert.deepEqual(destination.nodes[0].broadcasts,[parent.attempt.rawSignedTransaction]);
+    assert.deepEqual(destination.nodes[1].broadcasts,[replacement.attempt.rawSignedTransaction]);
+    assert.equal((await recovered.recoverTransactionsOnce({ deliveryJobId: id })).rebroadcast,0);
+    assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,2);
+    await mine(id,replacement.attempt.attemptId);
+    assert.equal((await recovered.recoverTransactionsOnce({ deliveryJobId: id })).finalized,1);
+    const final = await recovered.repository.getTransaction(id);
+    assert.equal(final.intent.winningAttemptId,replacement.attempt.attemptId);
+    assert.equal(final.intent.status,"CONFIRMED"); assert.equal(final.attempts.length,2);
+    assert.deepEqual(await sourceState(pool,config.databaseSchema),sourceBefore);
+    assert.deepEqual(await queue.listReadyDeliveryJobs(),jobs);
+  } finally { await fresh.end(); }
+});
+
+test("a replacement's pre-send marker recovers without confusing the visible pending parent", async () => {
+  const { id,replacement,account } = await replacementWithPendingParent();
+  const stopped = manager({ hooks: { afterBroadcastStart: crashOnce() } });
+  await assert.rejects(stopped.broadcastPreparedTransaction(id),{ code: "TEST_CHECKPOINT" });
+  const marker = (await reader.repository.getBroadcastEvents(id)).find(event => event.attemptId === replacement.attempt.attemptId);
+  assert.equal(marker.completedAt,null); assert.equal(destination.transactions.has(replacement.attempt.transactionHash),false);
+  const fresh = createDatabasePool(config);
+  try {
+    const recovered = manager({ db: fresh,rpc: destination.restart().rpc });
+    assert.equal((await recovered.recoverTransactionsOnce({ deliveryJobId: id })).rebroadcast,1);
+    sameSignedAttempt(replacement.attempt,(await recovered.repository.getTransaction(id)).attempt);
+    assert.equal((await recovered.repository.getBroadcastEvents(id)).find(event => event.eventId === marker.eventId).resultClass,"RECONCILED");
+    assert.deepEqual(await recovered.repository.getAccount(),account);
+    assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,2);
+  } finally { await fresh.end(); }
+});
+
+test("historical journal reconciliation advances the version before sending a persisted replacement", async () => {
+  const id = jobs[0].deliveryJobId; await reader.submitDelivery(id); h.advance(config.replacementAfterMs);
+  await assert.rejects(manager({ hooks: { afterBroadcastStart: crashOnce() } }).rebroadcastTransaction(id),{ code: "TEST_CHECKPOINT" });
+  h.advance(config.rebroadcastIntervalMs); const replacement = await reader.prepareReplacement(id);
+  const before = await reader.repository.getRecoverySnapshot(id); const account = await reader.repository.getAccount();
+  const fresh = createDatabasePool(config);
+  try {
+    const recovered = manager({ db: fresh,rpc: destination.restart().rpc });
+    assert.equal((await recovered.recoverTransactionsOnce({ deliveryJobId: id })).rebroadcast,1);
+    const after = await recovered.repository.getRecoverySnapshot(id);
+    assert.ok(BigInt(after.version) > BigInt(before.version));
+    assert.ok(after.broadcastEvents.filter(event => event.attemptId === replacement.attempts[0].attemptId).every(event => event.completedAt !== null));
+    sameSignedAttempt(replacement.attempt,after.attempt); assert.equal(after.attempts.length,2);
+    assert.deepEqual(await recovered.repository.getAccount(),account);
+  } finally { await fresh.end(); }
+});
+
+for (const confirmed of [false,true]) {
+  test(`a fresh client suppresses the replacement for an old ${confirmed ? "confirmed" : "unconfirmed"} canonical receipt`, async () => {
+    const { id,parent,replacement,account } = await replacementWithPendingParent();
+    await mine(id,parent.attempt.attemptId); destination.nodes.forEach(node => { node.head = confirmed ? 102n : 100n; });
+    const fresh = createDatabasePool(config);
+    try {
+      const recovered = manager({ db: fresh,rpc: destination.restart().rpc });
+      const result = await recovered.recoverTransactionsOnce({ deliveryJobId: id });
+      assert.equal(result.results[0].action,confirmed ? "FINALIZED" : "RECEIPT_UNCONFIRMED");
+      const stored = await recovered.repository.getTransaction(id);
+      assert.equal(stored.intent.status,confirmed ? "CONFIRMED" : "PENDING");
+      if (confirmed) { assert.equal(stored.intent.winningAttemptId,parent.attempt.attemptId); assert.equal(stored.winningAttempt.receiptBlockNumber,"100"); }
+      sameSignedAttempt(replacement.attempt,stored.attempt); assert.equal(stored.attempt.broadcastAttemptCount,"0");
+      assert.equal((await recovered.repository.getBroadcastEvents(id)).some(event => event.attemptId === replacement.attempt.attemptId),false);
+      assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,1);
+      assert.deepEqual(await recovered.repository.getAccount(),account);
+    } finally { await fresh.end(); }
+  });
+}
+
+test("a parent mined during visibility reads is reconciled before nonce consumption can stop replacement recovery", async () => {
+  const { id,parent,replacement,account } = await replacementWithPendingParent();
+  const fresh = createDatabasePool(config); const rpc = destination.restart().rpc;
+  let advanced = false;
+  try {
+    const recoveringRpc = { ...rpc,async transaction(hash) {
+      const transaction = await rpc.transaction(hash);
+      if (!advanced && hash === parent.attempt.transactionHash) {
+        advanced = true; await mine(id,parent.attempt.attemptId);
+      }
+      return transaction;
+    } };
+    const recovered = manager({ db: fresh,rpc: recoveringRpc });
+    const result = await recovered.recoverTransactionsOnce({ deliveryJobId: id });
+    assert.equal(result.results[0].action,"RECEIPT_UNCONFIRMED","receipt recheck must use the original confirmation head");
+    const observed = await recovered.repository.getTransaction(id);
+    assert.equal(observed.intent.status,"PENDING"); assert.equal(observed.intent.retryStoppedAt,null);
+    sameSignedAttempt(replacement.attempt,observed.attempt);
+    assert.equal((await recovered.repository.getBroadcastEvents(id)).some(event => event.attemptId === replacement.attempt.attemptId),false);
+    assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,1);
+    assert.equal((await recovered.recoverTransactionsOnce({ deliveryJobId: id })).finalized,1);
+    assert.equal((await recovered.repository.getTransaction(id)).intent.winningAttemptId,parent.attempt.attemptId);
+    assert.deepEqual(await recovered.repository.getAccount(),account);
+  } finally { await fresh.end(); }
+});
+
+test("a fresh client's replacement response-loss recovery keeps its fixed head and defers finalization", async () => {
+  const sourceBefore = await sourceState(pool,config.databaseSchema);
+  const { id,parent,replacement,account } = await replacementWithPendingParent();
+  const fresh = createDatabasePool(config); const rpc = destination.restart().rpc; const heads = [];
+  destination.nodes[0].faults.set("eth_sendRawTransaction",async ({ forward }) => {
+    await forward(); await mine(id,replacement.attempt.attemptId); throw rpcTimeout();
+  });
+  destination.nodes[1].alreadyKnown = true;
+  const readView = rpc.readView; let viewReads = 0;
+  rpc.readView = async () => { viewReads++; return readView(); };
+  rpc.estimateGas = async () => assert.fail("response-loss recovery must not estimate gas");
+  rpc.fees = async () => assert.fail("response-loss recovery must not resolve fees");
+  try {
+    const recovered = manager({ db: fresh,rpc,hooks: { afterReceiptObserved: ({ head }) => { heads.push(head); } },
+      account: { address: config.relayerAddress,async signTransaction() { assert.fail("response-loss recovery must not re-sign"); } } });
+    const result = await recovered.recoverTransactionsOnce({ deliveryJobId: id });
+    assert.equal(result.rebroadcast,1); assert.equal(result.finalized,0);
+    assert.equal(viewReads,1); assert.deepEqual(heads,[100n]);
+    const observed = await recovered.repository.getTransaction(id);
+    assert.equal(observed.intent.status,"PENDING"); assert.equal(observed.intent.winningAttemptId,null);
+    assert.equal(observed.attempt.status,"BROADCAST"); assert.equal(observed.attempt.receiptBlockNumber,null);
+    assert.equal(observed.attempts.length,2); sameSignedAttempt(replacement.attempt,observed.attempt);
+    sameSignedAttempt(parent.attempt,observed.attempts[0]);
+    assert.deepEqual(destination.nodes[0].broadcasts,[parent.attempt.rawSignedTransaction,replacement.attempt.rawSignedTransaction]);
+    assert.deepEqual(destination.nodes[1].broadcasts,[replacement.attempt.rawSignedTransaction]);
+    assert.deepEqual(await recovered.repository.getAccount(),account);
+    assert.equal((await recovered.recoverTransactionsOnce({ deliveryJobId: id })).finalized,1);
+    assert.equal(viewReads,2); assert.deepEqual(heads,[100n,102n]);
+    const final = await recovered.repository.getTransaction(id);
+    assert.equal(final.intent.status,"CONFIRMED"); assert.equal(final.intent.winningAttemptId,replacement.attempt.attemptId);
+    assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,3);
+    assert.deepEqual(await recovered.repository.getAccount(),account);
+    assert.deepEqual(await sourceState(pool,config.databaseSchema),sourceBefore);
+    assert.deepEqual(await queue.listReadyDeliveryJobs(),jobs);
+  } finally { await fresh.end(); }
+});
+
+test("independent clients serialize recovery of a pending-parent replacement without branching", async () => {
+  const { id,replacement,account } = await replacementWithPendingParent(); const fresh = createDatabasePool(config);
+  const reached = Promise.withResolvers(); const resume = Promise.withResolvers();
+  const stopped = manager({ hooks: { afterBroadcastStart: async () => { reached.resolve(); await resume.promise; } } });
+  const active = stopped.recoverTransactionsOnce({ deliveryJobId: id });
+  try {
+    await Promise.race([reached.promise,active.then(() => assert.fail("recovery did not reach its committed marker barrier"))]);
+    const other = await manager({ db: fresh,rpc: destination.restart().rpc }).recoverTransactionsOnce({ deliveryJobId: id });
+    assert.equal(other.results[0].reason,"TRANSACTION_RECOVERY_BUSY");
+    resume.resolve(); assert.equal((await active).rebroadcast,1);
+    const stored = await reader.repository.getTransaction(id); sameSignedAttempt(replacement.attempt,stored.attempt);
+    assert.deepEqual(stored.attempts.map(attempt => attempt.attemptNumber),[0,1]);
+    assert.deepEqual(await reader.repository.getAccount(),account); assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,2);
+  } finally { resume.resolve(); await active.catch(() => {}); await fresh.end(); }
+});
 
 test("journal markers survive restart, sequence is unique, history is immutable and migration preserves artifacts", async () => {
   const id = jobs[0].deliveryJobId; const before = await sourceState(pool,config.databaseSchema);

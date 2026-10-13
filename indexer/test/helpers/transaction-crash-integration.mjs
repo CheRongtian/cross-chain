@@ -8,6 +8,7 @@ import { createDeliveryProjector } from "../../src/delivery/projector.mjs";
 import { createDeliveryRepository } from "../../src/delivery/repository.mjs";
 import { loadTransactionConfig } from "../../src/transaction-manager/config.mjs";
 import { createTransactionManager } from "../../src/transaction-manager/service.mjs";
+import { verifyRpcTransaction } from "../../src/transaction-manager/receipts.mjs";
 import { createRelayerProcesses } from "./multi-relayer-integration.mjs";
 import { destinationAccessPath } from "./rpc-failover-integration.mjs";
 import { rpcObserver } from "../../../validator/test/helpers/process-cluster.mjs";
@@ -86,13 +87,28 @@ export async function verifyTransactionCrashes({ environment,sourceConfig,source
       const child = processes.start(workerId,request); await child.started;
       const result = (await child.wait("result")).result; await child.finish(); return result;
     }
-    async function crash(workerId,request) {
-      const child = processes.start(workerId,request); await child.started;
+    async function finishCrash(child,workerId,request) {
       const point = await child.wait("checkpoint"); assert.equal(point.name,request.checkpoint);
+      if (point.name === "replacement-persisted") {
+        const stored = await get(request.id); const parent = stored.attempts.at(-2); const replacement = stored.attempt;
+        assert.equal(stored.attempts.length,2); assert.equal(replacement.replacementOfAttemptId,parent.attemptId);
+        assert.equal(replacement.status,"SIGNED"); assert.equal(replacement.broadcastAttemptCount,"0");
+        const parentTx = await destination.request({ method: "eth_getTransactionByHash",params: [parent.transactionHash] });
+        assert.ok(parentTx,"parent must remain genuinely present before the replacement persistence crash");
+        assert.equal(parentTx.blockNumber,null);
+        assert.equal(await destination.request({ method: "eth_getTransactionReceipt",params: [parent.transactionHash] }),null);
+        assert.equal(await destination.request({ method: "eth_getTransactionByHash",params: [replacement.transactionHash] }),null);
+        assert.equal((await manager.repository.getBroadcastEvents(request.id)).some(event => event.attemptId === replacement.attemptId),false);
+        console.log(`Replacement crash state: Attempt 0 pending (${parent.transactionHash}); Attempt 1 persisted (${replacement.transactionHash}); broadcast count 0; no broadcast journal`);
+      }
       await processes.stop(child,"SIGKILL");
       await waitForBackendRelease(pool,config,request.id,workerId); await expire(request.id);
       console.log(`VALID: real worker ${workerId} stopped at ${point.name} for ${request.id}`);
       return point;
+    }
+    async function crash(workerId,request) {
+      const child = processes.start(workerId,request); await child.started;
+      return finishCrash(child,workerId,request);
     }
     async function get(id) { return manager.repository.getTransaction(id); }
     async function identity(id,expected) {
@@ -146,16 +162,58 @@ export async function verifyTransactionCrashes({ environment,sourceConfig,source
     await mineDepth(); await run("relayer-b",{ id: oldId,mode: "job" });
     const oldFinal = await get(oldId); assert.equal(oldFinal.intent.winningAttemptId,old.attempt.attemptId);
     assert.equal(oldFinal.attempt.rawSignedTransaction,replacement.attempt.rawSignedTransaction); assert.equal(oldFinal.attempts.length,2);
+    assert.equal(oldFinal.intent.status,"CONFIRMED");
+    assert.equal(primary.calls.concat(secondary.calls).filter(call => call.method === "eth_sendRawTransaction" &&
+      call.params[0] === replacement.attempt.rawSignedTransaction).length,0,"canonical old winner must suppress the unbroadcast sibling");
+    console.log("VALID: old parent became canonical before fresh recovery; its persisted replacement stayed unsent and retained in history");
 
     const newId = jobs[2].deliveryJobId; await run("relayer-a",{ id: newId,mode: "job" }); const initial = await get(newId);
-    await run("relayer-b",{ id: newId,mode: "transaction",operation: "replace",now: Date.parse(initial.attempt.broadcastAt) + config.replacementAfterMs });
+    const leaseRow = (await pool.query(`SELECT owner_id,owner_session_id,fencing_token FROM ${tableName(config.databaseSchema,"relayer_job_leases")}
+      WHERE delivery_job_id = $1`,[newId])).rows[0];
+    const oldFence = { deliveryJobId: newId,ownerId: leaseRow.owner_id,ownerSessionId: leaseRow.owner_session_id,fencingToken: leaseRow.fencing_token };
+    const replacementRequest = { id: newId,mode: "transaction",operation: "replace",
+      now: Date.parse(initial.attempt.broadcastAt) + config.replacementAfterMs,checkpoint: "replacement-persisted" };
+    const persistedPoint = await crash("relayer-a",replacementRequest);
     const candidate = await get(newId); assert.equal(candidate.attempts.length,2);
-    primary.setFault("eth_sendRawTransaction","drop-after-forward");
-    await crash("relayer-a",{ id: newId,mode: "transaction",operation: "broadcast",checkpoint: "endpoint-result" });
-    assert.ok(await destination.request({ method: "eth_getTransactionByHash",params: [candidate.attempt.transactionHash] }));
-    primary.state.available = false;
-    const recovered = await run("relayer-b",{ id: newId,mode: "job" }); assert.equal(recovered.attempt.status,"BROADCAST");
+    const candidateAccount = await manager.repository.getAccount();
+    const preparationCount = () => primary.calls.concat(secondary.calls).filter(call =>
+      ["eth_estimateGas","eth_maxPriorityFeePerGas"].includes(call.method)).length;
+    const preparationBefore = preparationCount();
+    // The parent stays pending during the fresh worker's recovery. The primary
+    // is unavailable, and the secondary loses its response only after acceptance.
+    primary.state.available = false; secondary.setFault("eth_sendRawTransaction","drop-after-forward");
+    const takeoverRequest = { id: newId,mode: "job",pause: "signed",checkpoint: "endpoint-result" };
+    const takeover = processes.start("relayer-b",takeoverRequest); await takeover.started;
+    const loaded = await takeover.wait("signed");
+    assert.notEqual(loaded.pid,persistedPoint.pid);
+    assert.equal(loaded.stored.attempt.transactionHash,candidate.attempt.transactionHash);
+    assert.ok(BigInt(loaded.fence.fencingToken) > BigInt(oldFence.fencingToken));
+    console.log(`Fresh Relayer B loaded persisted Attempt 1 ${candidate.attempt.transactionHash}; parent receipt absent; fencing token ${loaded.fence.fencingToken}`);
+    const stale = processes.start("relayer-a",{ id: newId,mode: "stale",operation: "recover",fence: oldFence });
+    await stale.started; assert.equal((await stale.wait("result")).action,"STALE_FENCE"); await stale.finish();
+    const pendingParent = await destination.request({ method: "eth_getTransactionByHash",params: [initial.attempt.transactionHash] });
+    assert.ok(pendingParent); assert.equal(pendingParent.blockNumber,null);
+    assert.equal(await destination.request({ method: "eth_getTransactionReceipt",params: [initial.attempt.transactionHash] }),null);
+    assert.equal(await destination.request({ method: "eth_getTransactionByHash",params: [candidate.attempt.transactionHash] }),null);
+    await takeover.send({ type: "continue" });
+    await finishCrash(takeover,"relayer-b",takeoverRequest);
+    const accepted = await destination.request({ method: "eth_getTransactionByHash",params: [candidate.attempt.transactionHash] });
+    assert.ok(accepted,"fresh recovery must send the persisted replacement while no parent is canonical");
+    assert.equal(accepted.blockNumber,null); verifyRpcTransaction(candidate.intent,candidate.attempt,accepted);
+    assert.equal(await destination.request({ method: "eth_getTransactionReceipt",params: [initial.attempt.transactionHash] }),null);
+    assert.equal(primary.calls.filter(call => call.method === "eth_sendRawTransaction" && call.params[0] === candidate.attempt.rawSignedTransaction).length,0);
+    assert.equal(secondary.calls.filter(call => call.method === "eth_sendRawTransaction" && call.params[0] === candidate.attempt.rawSignedTransaction).length,1);
+    assert.equal((await get(newId)).attempt.status,"SIGNED","accepted-but-lost local result remains an independently covered crash boundary");
+    console.log(`VALID: fresh B recovery broadcast exact persisted Attempt 1 ${candidate.attempt.transactionHash} through rpc-1; same nonce, gas, fees, calldata and target; no old canonical winner`);
+    primary.state.available = true; secondary.state.available = false;
+    const recovered = await run("relayer-a",{ id: newId,mode: "job" }); assert.equal(recovered.attempt.status,"BROADCAST");
     await identity(newId,candidate); assert.equal((await get(newId)).attempts.length,2);
+    assert.deepEqual((await get(newId)).attempts.map(attempt => attempt.attemptNumber),[0,1]);
+    assert.deepEqual(await manager.repository.getAccount(),candidateAccount);
+    assert.equal(preparationCount(),preparationBefore,"existing replacement recovery must not estimate gas or fees again");
+    assert.equal(primary.calls.concat(secondary.calls).filter(call => call.method === "eth_sendRawTransaction" &&
+      call.params[0] === candidate.attempt.rawSignedTransaction).length,1,"accepted replacement must be reconciled without another send");
+    console.log("VALID: interrupted replacement acceptance recovered by its own hash; no Attempt 2, nonce allocation, repricing or signature change");
     // Test-only bytecode exercises a real status-0 receipt, without implementing
     // a destination protocol. Snapshot restoration removes this local fixture.
     codeAddress = candidate.intent.destinationGateway;

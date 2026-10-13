@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { classifyRecovery } from "../src/transaction-manager/recovery.mjs";
-import { transactionHarness,transientSendError } from "./helpers/transaction-fixtures.mjs";
+import { transactionConfig,transactionHarness,transientSendError } from "./helpers/transaction-fixtures.mjs";
+import { createTransactionManager } from "../src/transaction-manager/service.mjs";
 import { transactionFailoverHarness, rpcTimeout } from "./helpers/destination-rpc-fixtures.mjs";
 
 function crashOnce() {
@@ -10,6 +11,252 @@ function crashOnce() {
 }
 const rawFields = ["nonce","rawSignedTransaction","transactionHash","gasLimit","maxFeePerGas","maxPriorityFeePerGas"];
 function sameAttempt(first,second) { for (const field of rawFields) assert.equal(second[field],first[field]); }
+
+const preparationCalls = h => ({ gas: h.calls.gas,fees: h.calls.fees,sign: h.calls.sign,pendingNonce: h.calls.pending });
+async function persistedReplacement(h) {
+  const id = h.jobs[0].deliveryJobId;
+  const parent = await h.manager.submitDelivery(id);
+  h.advance(h.config.replacementAfterMs);
+  const replacement = await h.manager.prepareReplacement(id);
+  assert.equal(replacement.created,true);
+  assert.equal(replacement.attempt.status,"SIGNED");
+  assert.equal(replacement.attempt.broadcastAttemptCount,"0");
+  assert.equal(await h.options.rpc.receiptEvidence(parent.attempt.transactionHash,await h.options.rpc.readView()),null);
+  assert.ok(await h.options.rpc.transaction(parent.attempt.transactionHash));
+  return { id,parent,replacement,account: await h.repository.getAccount(),preparation: preparationCalls(h) };
+}
+
+test("persisted replacement is recovered immediately despite a pending parent and a future retry time", async () => {
+  const h = await transactionHarness();
+  const { id,parent,replacement,account,preparation } = await persistedReplacement(h);
+  assert.ok(Date.parse(replacement.intent.nextActionAt) > h.clock.now());
+  assert.equal(h.journal.filter(event => event.attemptId === replacement.attempt.attemptId).length,0);
+  const result = await h.restart().recoverTransactionsOnce();
+  assert.equal(result.rebroadcast,1);
+  assert.deepEqual(h.calls.broadcast,[parent.attempt.rawSignedTransaction,replacement.attempt.rawSignedTransaction]);
+  const stored = await h.repository.getTransaction(id);
+  assert.equal(stored.attempt.status,"BROADCAST");
+  assert.deepEqual(stored.attempts.map(attempt => attempt.attemptNumber),[0,1]);
+  assert.equal(stored.attempt.replacementOfAttemptId,parent.attempt.attemptId);
+  sameAttempt(replacement.attempt,stored.attempt);
+  sameAttempt(parent.attempt,stored.attempts[0]);
+  assert.deepEqual(await h.repository.getAccount(),account);
+  assert.deepEqual(preparationCalls(h),preparation);
+  assert.equal((await h.restart().recoverTransactionsOnce()).rebroadcast,0);
+  assert.equal(h.calls.broadcast.length,2);
+});
+
+test("an unresolved replacement marker is recovered even while the parent hash remains visible", async () => {
+  const crash = crashOnce();
+  const h = await transactionHarness({ hooks: { afterBroadcastStart: async ({ stored }) => {
+    if (stored.attempt.attemptNumber === 1) await crash();
+  } } });
+  const { id,parent,replacement,account,preparation } = await persistedReplacement(h);
+  await assert.rejects(h.manager.broadcastPreparedTransaction(id),{ code: "TEST_CHECKPOINT" });
+  assert.equal(h.calls.broadcast.length,1);
+  assert.ok(h.state.transactions.has(parent.attempt.transactionHash));
+  const marker = h.journal.find(event => event.attemptId === replacement.attempt.attemptId);
+  assert.equal(marker.completedAt,null);
+  assert.equal((await h.restart().recoverTransactionsOnce()).rebroadcast,1);
+  const stored = await h.repository.getTransaction(id);
+  sameAttempt(replacement.attempt,stored.attempt);
+  assert.equal(stored.attempts.length,2);
+  assert.equal(marker.resultClass,"RECONCILED");
+  assert.deepEqual(preparationCalls(h),preparation);
+  assert.deepEqual(await h.repository.getAccount(),account);
+});
+
+test("replacement recovery reconciles a parent's unresolved journal then uses the fresh version", async () => {
+  let interrupt = false; const crash = crashOnce();
+  const h = await transactionHarness({ hooks: { afterBroadcastStart: async () => { if (interrupt) await crash(); } } });
+  const id = h.jobs[0].deliveryJobId; const parent = await h.manager.submitDelivery(id);
+  h.advance(h.config.replacementAfterMs); interrupt = true;
+  await assert.rejects(h.manager.rebroadcastTransaction(id),{ code: "TEST_CHECKPOINT" });
+  interrupt = false; h.advance(h.config.rebroadcastIntervalMs);
+  const replacement = await h.manager.prepareReplacement(id);
+  const before = preparationCalls(h); const account = await h.repository.getAccount();
+  assert.equal((await h.restart().recoverTransactionsOnce()).rebroadcast,1);
+  assert.equal(h.journal.find(event => event.attemptId === parent.attempt.attemptId && event.broadcastSequence === "2").resultClass,"RECONCILED");
+  sameAttempt(replacement.attempt,(await h.repository.getTransaction(id)).attempt);
+  assert.deepEqual(preparationCalls(h),before); assert.deepEqual(await h.repository.getAccount(),account);
+});
+
+for (const confirmed of [false,true]) {
+  test(`an old canonical ${confirmed ? "confirmed" : "unconfirmed"} receipt suppresses the unbroadcast replacement`, async () => {
+    const h = await transactionHarness();
+    const { id,parent,replacement,account,preparation } = await persistedReplacement(h);
+    h.mine(id,{ attemptId: parent.attempt.attemptId });
+    h.state.head = confirmed ? 102n : 100n;
+    const result = await h.restart().recoverTransactionsOnce();
+    assert.equal(result.results[0].action,confirmed ? "FINALIZED" : "RECEIPT_UNCONFIRMED");
+    const stored = await h.repository.getTransaction(id);
+    assert.equal(stored.intent.status,confirmed ? "CONFIRMED" : "PENDING");
+    if (confirmed) assert.equal(stored.intent.winningAttemptId,parent.attempt.attemptId);
+    sameAttempt(replacement.attempt,stored.attempt);
+    assert.equal(stored.attempt.broadcastAttemptCount,"0");
+    assert.equal(h.journal.filter(event => event.attemptId === replacement.attempt.attemptId).length,0);
+    assert.equal(h.calls.broadcast.length,1); assert.deepEqual(preparationCalls(h),preparation);
+    assert.deepEqual(await h.repository.getAccount(),account);
+  });
+}
+
+test("a canonical parent body without available receipt evidence still suppresses replacement send", async () => {
+  const h = await transactionHarness(); const { id,parent } = await persistedReplacement(h);
+  h.mine(id,{ attemptId: parent.attempt.attemptId }); h.state.receipts.clear();
+  const result = await h.restart().recoverTransactionsOnce();
+  assert.equal(result.rebroadcast,0); assert.equal(h.calls.broadcast.length,1);
+  h.advance(h.config.rebroadcastIntervalMs);
+  assert.equal((await h.manager.processTransactionRetriesOnce()).broadcasts,0);
+  assert.equal(h.calls.broadcast.length,1); assert.equal((await h.repository.getTransaction(id)).attempts.length,2);
+});
+
+test("a parent mined during visibility reads is checked again before replacement send", async () => {
+  const h = await transactionHarness(); const { id,parent } = await persistedReplacement(h);
+  const transaction = h.rpc.transaction;
+  h.rpc.transaction = async hash => {
+    const tx = await transaction(hash);
+    if (hash === parent.attempt.transactionHash) { h.mine(id,{ attemptId: parent.attempt.attemptId }); h.state.head = 102n; }
+    return tx;
+  };
+  const observed = await h.restart().recoverTransactionsOnce();
+  assert.equal(observed.results[0].action,"RECEIPT_UNCONFIRMED","receipt recheck must retain the original confirmation head");
+  assert.equal(h.calls.broadcast.length,1);
+  assert.equal((await h.restart().recoverTransactionsOnce()).finalized,1);
+  assert.equal((await h.repository.getTransaction(id)).intent.winningAttemptId,parent.attempt.attemptId);
+});
+
+test("an accepted replacement with missing result is recovered by its own hash without another send", async () => {
+  const crash = crashOnce();
+  const h = await transactionHarness({ hooks: { beforeBroadcastResult: async ({ stored }) => {
+    if (stored.attempt.attemptNumber === 1) await crash();
+  } } });
+  const { id,replacement,account,preparation } = await persistedReplacement(h);
+  await assert.rejects(h.manager.broadcastPreparedTransaction(id),{ code: "TEST_CHECKPOINT" });
+  assert.equal((await h.repository.getTransaction(id)).attempt.status,"SIGNED");
+  assert.equal((await h.restart().recoverTransactionsOnce()).reconciled,1);
+  const stored = await h.repository.getTransaction(id);
+  assert.equal(stored.attempt.status,"BROADCAST"); sameAttempt(replacement.attempt,stored.attempt);
+  assert.equal(h.calls.broadcast.length,2); assert.equal(stored.attempts.length,2);
+  assert.deepEqual(preparationCalls(h),preparation); assert.deepEqual(await h.repository.getAccount(),account);
+  assert.equal((await h.restart().recoverTransactionsOnce()).rebroadcast,0);
+});
+
+test("a replacement receipt restores the outcome even while its local state is SIGNED", async () => {
+  const h = await transactionHarness(); const { id,replacement } = await persistedReplacement(h);
+  h.mine(id,{ attemptId: replacement.attempt.attemptId }); h.state.head = 102n;
+  assert.equal((await h.restart().recoverTransactionsOnce()).finalized,1);
+  assert.equal((await h.repository.getTransaction(id)).intent.winningAttemptId,replacement.attempt.attemptId);
+  assert.equal(h.calls.broadcast.length,1); assert.equal(h.calls.sign,2);
+});
+
+test("an existing replacement at the attempt limit recovers without repricing under new market or cap settings", async () => {
+  const h = await transactionHarness({ config: transactionConfig({ TX_MAX_ATTEMPTS: "2" }) });
+  const { id,replacement,account,preparation } = await persistedReplacement(h);
+  h.rpc.fees = async () => assert.fail("recovery must not estimate replacement fees");
+  h.rpc.estimateGas = async () => assert.fail("recovery must not estimate gas");
+  const manager = createTransactionManager({ ...h.options,config: { ...h.config,maxFeePerGasCap: 1n,maxPriorityFeePerGasCap: 1n },
+    account: { address: h.config.relayerAddress,async signTransaction() { assert.fail("recovery must not re-sign"); } } });
+  assert.equal((await manager.recoverTransactionsOnce()).rebroadcast,1);
+  sameAttempt(replacement.attempt,(await h.repository.getTransaction(id)).attempt);
+  assert.deepEqual(preparationCalls(h),preparation); assert.deepEqual(await h.repository.getAccount(),account);
+});
+
+test("retry-stopped replacement stays unsent but historical canonical outcomes remain recoverable", async () => {
+  const h = await transactionHarness(); const { id,parent,account } = await persistedReplacement(h);
+  await h.repository.stopRetry(id,"MAX_ATTEMPTS_REACHED"); const stopped = await h.repository.getTransaction(id);
+  assert.equal((await h.restart().recoverTransactionsOnce()).manualActionRequired,1);
+  assert.deepEqual(await h.repository.getTransaction(id),stopped); assert.equal(h.calls.broadcast.length,1);
+  h.mine(id,{ attemptId: parent.attempt.attemptId,status: 0 }); h.state.head = 102n;
+  assert.equal((await h.restart().recoverTransactionsOnce()).finalized,1);
+  const final = await h.repository.getTransaction(id);
+  assert.equal(final.intent.retryStopReason,"MAX_ATTEMPTS_REACHED"); assert.equal(final.intent.status,"REVERTED");
+  assert.equal(final.attempts.length,2); assert.equal(h.calls.sign,2); assert.deepEqual(await h.repository.getAccount(),account);
+});
+
+test("concurrent replacement recovery holds one decision and sends no new candidate or nonce", async () => {
+  const h = await transactionHarness(); const { id,replacement,account } = await persistedReplacement(h);
+  const reached = Promise.withResolvers(); const resume = Promise.withResolvers();
+  const broadcast = h.rpc.broadcast; h.rpc.broadcast = async raw => { reached.resolve(); await resume.promise; return broadcast(raw); };
+  const active = h.manager.recoverTransactionsOnce();
+  try {
+    await Promise.race([reached.promise,active.then(() => assert.fail("recovery did not reach the send barrier"))]);
+    const other = await h.restart().recoverTransactionsOnce();
+    assert.equal(other.results[0].reason,"TRANSACTION_RECOVERY_BUSY");
+    resume.resolve(); assert.equal((await active).rebroadcast,1);
+    assert.equal(h.calls.broadcast.length,2); assert.equal((await h.repository.getTransaction(id)).attempts.length,2);
+    sameAttempt(replacement.attempt,(await h.repository.getTransaction(id)).attempt);
+    assert.deepEqual(await h.repository.getAccount(),account);
+  } finally { resume.resolve(); await active.catch(() => {}); }
+});
+
+test("an unbroadcast replacement fails over using the same bytes while its parent is pending", async () => {
+  const h = await transactionFailoverHarness(); const { id,parent,replacement,account } = await persistedReplacement(h);
+  const preparationRequests = () => h.destination.nodes.flatMap(node => node.calls)
+    .filter(call => ["eth_estimateGas","eth_maxPriorityFeePerGas"].includes(call.method)).length;
+  const before = preparationRequests(); h.destination.nodes[0].available = false;
+  const result = await h.restart().recoverTransactionsOnce();
+  assert.equal(result.rebroadcast,1); assert.equal(result.results[0].acceptedEndpointLabel,"rpc-1");
+  assert.deepEqual(h.destination.nodes[0].broadcasts,[parent.attempt.rawSignedTransaction]);
+  assert.deepEqual(h.destination.nodes[1].broadcasts,[replacement.attempt.rawSignedTransaction]);
+  sameAttempt(replacement.attempt,(await h.repository.getTransaction(id)).attempt);
+  assert.equal(preparationRequests(),before); assert.equal(h.calls.sign,2);
+  assert.deepEqual(await h.repository.getAccount(),account);
+});
+
+test("retry delegation retains its view when a pending parent mines after head capture", async () => {
+  const heads = [];
+  const h = await transactionFailoverHarness({ hooks: { afterReceiptObserved: ({ head }) => { heads.push(head); } } });
+  const { id,parent,replacement,account,preparation } = await persistedReplacement(h);
+  h.advance(h.config.rebroadcastIntervalMs);
+  const readView = h.options.rpc.readView; let viewReads = 0;
+  h.options.rpc.readView = async () => {
+    const view = await readView();
+    if (++viewReads === 1) h.mine(id,{ attemptId: parent.attempt.attemptId,blockNumber: 101n });
+    return view;
+  };
+  const result = await h.manager.processTransactionRetriesOnce();
+  assert.equal(result.broadcasts,0); assert.equal(result.replacements,0);
+  assert.equal(result.results[0].recovery.results[0].action,"RECEIPT_UNCONFIRMED");
+  assert.equal(viewReads,1); assert.deepEqual(heads,[100n]);
+  const observed = await h.repository.getTransaction(id);
+  assert.equal(observed.intent.status,"PENDING"); assert.equal(observed.intent.winningAttemptId,null);
+  assert.equal(observed.intent.retryStoppedAt,null); assert.equal(observed.attempts.length,2);
+  sameAttempt(replacement.attempt,observed.attempt);
+  assert.equal(observed.attempt.broadcastAttemptCount,"0");
+  assert.equal(h.journal.some(event => event.attemptId === replacement.attempt.attemptId),false);
+  assert.equal(h.destination.nodes.flatMap(node => node.broadcasts).length,1);
+  assert.deepEqual(preparationCalls(h),preparation); assert.deepEqual(await h.repository.getAccount(),account);
+  assert.equal((await h.manager.recoverTransactionsOnce({ deliveryJobId: id })).finalized,1);
+  assert.equal(viewReads,2); assert.deepEqual(heads,[100n,103n]);
+  assert.equal((await h.repository.getTransaction(id)).intent.winningAttemptId,parent.attempt.attemptId);
+  assert.equal(h.destination.nodes.flatMap(node => node.broadcasts).length,1);
+});
+
+test("replacement response-loss reconciliation preserves the recovery head until a fresh receipt pass", async () => {
+  const heads = [];
+  const h = await transactionFailoverHarness({ hooks: { afterReceiptObserved: ({ head }) => { heads.push(head); } } });
+  const { id,parent,replacement,account,preparation } = await persistedReplacement(h);
+  h.destination.nodes[0].faults.set("eth_sendRawTransaction",async ({ forward }) => {
+    await forward(); h.mine(id,{ attemptId: replacement.attempt.attemptId,blockNumber: 101n }); throw rpcTimeout();
+  });
+  h.destination.nodes[1].alreadyKnown = true;
+  const readView = h.options.rpc.readView; let viewReads = 0;
+  h.options.rpc.readView = async () => { viewReads++; return readView(); };
+  const result = await h.manager.recoverTransactionsOnce({ deliveryJobId: id });
+  assert.equal(result.rebroadcast,1); assert.equal(result.finalized,0);
+  assert.equal(viewReads,1); assert.deepEqual(heads,[100n]);
+  const observed = await h.repository.getTransaction(id);
+  assert.equal(observed.intent.status,"PENDING"); assert.equal(observed.intent.winningAttemptId,null);
+  assert.equal(observed.attempt.status,"BROADCAST"); assert.equal(observed.attempt.receiptBlockNumber,null);
+  assert.equal(observed.attempts.length,2); sameAttempt(replacement.attempt,observed.attempt);
+  assert.deepEqual(h.destination.nodes[0].broadcasts,[parent.attempt.rawSignedTransaction,replacement.attempt.rawSignedTransaction]);
+  assert.deepEqual(h.destination.nodes[1].broadcasts,[replacement.attempt.rawSignedTransaction]);
+  assert.deepEqual(preparationCalls(h),preparation); assert.deepEqual(await h.repository.getAccount(),account);
+  assert.equal((await h.manager.checkReceiptsOnce()).confirmed,1);
+  assert.equal(viewReads,2); assert.deepEqual(heads,[100n,103n]);
+  assert.equal((await h.repository.getTransaction(id)).intent.winningAttemptId,replacement.attempt.attemptId);
+  assert.equal(h.destination.nodes.flatMap(node => node.broadcasts).length,3);
+});
 
 test("a failed recovery send preserves its code, redacted diagnostic and endpoint observations", async () => {
   const h = await transactionHarness(); const id = h.jobs[0].deliveryJobId;

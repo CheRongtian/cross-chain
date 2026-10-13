@@ -41,11 +41,13 @@ try {
   }
   if (request.mode === "stale") {
     try {
-      await manager.prepareDeliveryTransaction(request.id,{ fence: request.fence });
-      throw new Error("stale intent preparation unexpectedly succeeded");
+      if (request.operation === "recover") await manager.recoverTransactionsOnce({ deliveryJobId: request.id,fence: request.fence });
+      else await manager.prepareDeliveryTransaction(request.id,{ fence: request.fence });
+      throw new Error("stale fenced transaction orchestration unexpectedly succeeded");
     } catch (error) {
       if (error.code !== "STALE_FENCE") throw error;
-      console.log("EXPECTED FAILURE: restarted worker's stale fence rejected before intent mutation");
+      console.log(request.operation === "recover" ? "EXPECTED FAILURE: stale replacement recovery fence rejected before any protected send" :
+        "EXPECTED FAILURE: restarted worker's stale fence rejected before intent mutation");
       await notify({ type: "result",action: "STALE_FENCE",pid: process.pid,workerId: config.workerId });
     }
   } else if (request.mode === "transaction") {

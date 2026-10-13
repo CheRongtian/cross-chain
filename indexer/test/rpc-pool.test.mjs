@@ -203,9 +203,18 @@ test("canonical evidence after response loss establishes BROADCAST without raisi
   });
   h.destination.nodes[1].alreadyKnown = true;
   const signed = await h.manager.prepareDeliveryTransaction(id);
+  const readView = h.options.rpc.readView; let viewReads = 0;
+  h.options.rpc.readView = async () => { viewReads++; return readView(); };
   h.advance(h.config.rebroadcastIntervalMs);
   const retry = await h.manager.processTransactionRetriesOnce();
   assert.equal(retry.broadcasts,1); assert.equal(retry.replacements,0);
+  const recovered = retry.results.find(result => result.deliveryJobId === id);
+  assert.ok(recovered); assert.equal(recovered.action,"RECOVERY");
+  assert.equal(recovered.recovery.rebroadcast,1);
+  const broadcast = recovered.recovery.results.find(result => result.deliveryJobId === id);
+  assert.ok(broadcast); assert.equal(broadcast.action,"REBROADCAST");
+  assert.equal(broadcast.transactionHash,signed.attempt.transactionHash);
+  assert.equal(viewReads,1,"retry, delegated recovery and lost-response reconciliation must share one view");
   const record = await h.repository.getTransaction(id);
   assert.equal(record.attempt.transactionHash,signed.attempt.transactionHash);
   assert.equal(record.attempt.status,"BROADCAST"); assert.equal(record.intent.status,"PENDING");

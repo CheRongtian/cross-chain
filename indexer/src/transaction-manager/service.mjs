@@ -42,7 +42,7 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
   const store = repository ?? createTransactionRepository({ config,pool,resolveIntent,beforeSignedCommit,hooks,clock });
   const sign = (intent,fields) => signDeliveryTransaction(intent,fields,account);
   const inspect = (stored,view,forceAll = false,fence) => inspectIntentReceipts({ stored,rpc,store,config,view,forceAll,fence,hooks });
-  const recover = (id,fence) => recoverTransactionsOnce({ store,rpc,config,send,hooks,deliveryJobId: id,fence });
+  const recover = (id,fence,receiptView) => recoverTransactionsOnce({ store,rpc,config,send,hooks,deliveryJobId: id,fence,receiptView });
 
   async function prepare(id,fence) {
     if (fence) await store.assertFence(id,fence);

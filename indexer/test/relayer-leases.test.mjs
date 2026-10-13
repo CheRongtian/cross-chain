@@ -139,6 +139,34 @@ test("pending broadcast and replacement lineage remain durable across owner chan
   assert.equal(reverted.intent.status,"REVERTED"); assert.equal(reverted.intent.winningAttemptId,first.attempt.attemptId);
 });
 
+test("replacement recovery rejects the old fence and lets the new owner send exactly the existing candidate", async () => {
+  const h = await fixture();
+  await h.worker(h.config,h.a,h.manager).submitJob(h.id);
+  h.advance(h.config.replacementAfterMs);
+  const replacement = await h.manager.prepareReplacement(h.id);
+  const account = await h.repository.getAccount();
+  const counts = { gas: h.calls.gas,fees: h.calls.fees,sign: h.calls.sign };
+  let stale;
+  await h.a.withWorker(async a => { stale = await h.a.tryAcquireLease(h.id,a); });
+  h.advance(h.config.leaseMs);
+  await h.b.withWorker(async b => {
+    const current = await h.b.tryAcquireLease(h.id,b);
+    const before = await h.repository.getRecoverySnapshot(h.id);
+    await assert.rejects(h.manager.recoverTransactionsOnce({ deliveryJobId: h.id,fence: stale }),{ code: "STALE_FENCE" });
+    assert.deepEqual(await h.repository.getRecoverySnapshot(h.id),before); assert.equal(h.calls.broadcast.length,1);
+    const recovered = await h.managerB.continueDeliveryTransactionOnce(h.id,{ fence: current });
+    assert.equal(recovered.submitted,true); assert.equal(recovered.attempts.length,2);
+    assert.ok(BigInt(current.fencingToken) > BigInt(stale.fencingToken));
+    for (const field of ["nonce","rawSignedTransaction","transactionHash","gasLimit","maxFeePerGas","maxPriorityFeePerGas"]) {
+      assert.equal(recovered.attempt[field],replacement.attempt[field]);
+    }
+    assert.equal(h.calls.broadcast.length,2);
+    await h.b.releaseLease(current);
+  });
+  assert.deepEqual({ gas: h.calls.gas,fees: h.calls.fees,sign: h.calls.sign },counts);
+  assert.deepEqual(await h.repository.getAccount(),account);
+});
+
 test("distinct workers can claim different jobs; final and retry-stopped intents cannot be reclaimed or reset", async () => {
   const h = await fixture();
   await h.a.withWorker(async a => h.b.withWorker(async b => {

@@ -170,6 +170,30 @@ test("replacement is append-only, same-nonce and fixed-gas with strictly higher 
   assert.equal(sent.attempt.broadcastAttemptCount,"1");
 });
 
+test("an unresolved historical marker cannot monopolize the active candidate's ordinary retry", async () => {
+  let interrupt = false;
+  const { h,id,first } = await pending({ hooks: { afterBroadcastStart: async () => {
+    if (interrupt) { interrupt = false; throw Object.assign(new Error("controlled historical marker crash"),{ code: "TEST_CHECKPOINT" }); }
+  } } });
+  h.advance(h.config.replacementAfterMs); interrupt = true;
+  await assert.rejects(h.manager.rebroadcastTransaction(id),{ code: "TEST_CHECKPOINT" });
+  h.advance(h.config.rebroadcastIntervalMs);
+  const replacement = await h.manager.prepareReplacement(id);
+  await h.manager.broadcastPreparedTransaction(id);
+  h.state.transactions.delete(first.attempt.transactionHash);
+  const marker = h.journal.find(event => event.attemptId === first.attempt.attemptId && event.completedAt === null);
+  assert.ok(marker);
+  assert.equal((await h.restart().recoverTransactionsOnce()).rebroadcast,0);
+  assert.equal(marker.completedAt,null,"a sibling's visibility must not settle an unknown parent's journal");
+  h.advance(h.config.rebroadcastIntervalMs);
+  const result = await h.restart().processTransactionRetriesOnce();
+  assert.equal(result.broadcasts,1); assert.equal(result.replacements,0);
+  const stored = await h.repository.getTransaction(id);
+  assert.equal(stored.attempts.length,2); assert.equal(stored.attempt.transactionHash,replacement.attempt.transactionHash);
+  assert.equal(h.calls.broadcast.at(-1),replacement.attempt.rawSignedTransaction);
+  assert.equal(marker.completedAt,null); assert.equal(h.calls.sign,2);
+});
+
 test("underpriced replacement schedules a further bounded fee increase", async () => {
   const { h,id } = await pending(); await replacement(h,id);
   const broadcast = h.rpc.broadcast;
