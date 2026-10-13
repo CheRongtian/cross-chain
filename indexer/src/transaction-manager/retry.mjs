@@ -11,7 +11,7 @@ export async function processTransactionRetriesOnce({ config, store, rpc, verify
   let view;
   try { await verifyChain(); view = await rpc.readView(); }
   catch (error) {
-    const reason = classifyBroadcastError(error);
+    const reason = classifyBroadcastError(error,{ operation: "read" });
     if (!["TRANSIENT_RPC_ERROR","AMBIGUOUS_BROADCAST"].includes(reason)) throw error;
     for (const record of due) await store.scheduleRetry(record.intent.deliveryJobId,{ reason,parentAttemptId: record.attempt.attemptId,fence });
     return Object.freeze({ processed: due.length,replacements: 0,broadcasts: 0,results: due.map(record => ({ deliveryJobId: record.intent.deliveryJobId,action: "RETRY_SCHEDULED",errorClass: reason })) });

@@ -1,51 +1,68 @@
-import { createPublicClient, http, toHex } from "viem";
+import { createPublicClient, http, HttpRequestError, toHex } from "viem";
 import { normalizeBytes32 } from "../canonical-message.mjs";
 import { rpcQuantity } from "./transaction.mjs";
-import { classifyBroadcastError } from "./rpc-errors.mjs";
+import { classifyBroadcastError, normalizeRpcError } from "./rpc-errors.mjs";
 
 const temporary = classification => ["TRANSIENT_RPC_ERROR","AMBIGUOUS_BROADCAST"].includes(classification);
 export class DestinationRpcError extends Error {
-  constructor(code,{ errorClass = "DETERMINISTIC_REJECTION",observations = [] } = {}) {
+  constructor(code,{ errorClass = "RPC_RESPONSE_ERROR",observations = [],httpStatus,rpcCode } = {}) {
     super(code); this.name = "DestinationRpcError"; this.code = code; this.errorClass = errorClass;
+    if (httpStatus !== undefined) this.httpStatus = httpStatus;
+    if (rpcCode !== undefined) this.rpcCode = rpcCode;
     this.observations = Object.freeze(observations.map(value => Object.freeze({ ...value })));
   }
 }
 
 export function createDestinationRpcPool({ config,createClient = url => createPublicClient({
-  transport: http(url,{ retryCount: 0,timeout: config.rpcRequestTimeoutMs }),
+  transport: http(url,{ retryCount: 0,timeout: config.rpcRequestTimeoutMs,async onFetchResponse(response) {
+    // viem otherwise promotes JSON-RPC bodies on non-2xx responses and loses
+    // their HTTP status. Keep availability/timeout evidence before parsing.
+    if (response.status === 408 || response.status === 429 || response.status >= 500) {
+      const error = new HttpRequestError({ status: response.status,url,details: "Destination HTTP availability failure" });
+      try { await response.body?.cancel(); } finally { throw error; }
+    }
+  } }),
 }) }) {
   const endpoints = config.destinationRpcUrls.map((url,index) => ({
     label: `rpc-${index}`,client: createClient(url),status: "UNAVAILABLE",reason: null,lastErrorClass: null,
   }));
   async function raw(endpoint,method,params = []) {
+    const operation = method === "eth_sendRawTransaction" ? "broadcast" : "read";
     // Cover the complete response body too: the installed HTTP transport's
     // internal fetch timer ends when response headers arrive.
     const controller = new AbortController();
     let timer;
     const deadline = new Promise((_,reject) => {
       timer = setTimeout(() => {
-        const error = new DestinationRpcError("RPC_REQUEST_TIMEOUT",{ errorClass: "AMBIGUOUS_BROADCAST" });
+        const error = new DestinationRpcError("RPC_REQUEST_TIMEOUT",{ errorClass: operation === "broadcast" ? "AMBIGUOUS_BROADCAST" : "TRANSIENT_RPC_ERROR" });
         reject(error); controller.abort(error);
       },config.rpcRequestTimeoutMs);
     });
     try {
-      return await Promise.race([endpoint.client.request({ method,params },{ retryCount: 0,signal: controller.signal }),deadline]);
+      const value = await Promise.race([endpoint.client.request({ method,params },{ retryCount: 0,signal: controller.signal }),deadline]);
+      if (value === undefined) throw new DestinationRpcError("RPC_INVALID_RESPONSE");
+      return value;
+    } catch (error) {
+      const normalized = normalizeRpcError(error,{ operation });
+      throw new DestinationRpcError(normalized.errorCode,normalized);
     } finally { clearTimeout(timer); }
   }
-  const observation = (endpoint,operation,outcome,errorClass = null) => ({
+  const observation = (endpoint,operation,outcome,errorClass = null,error) => ({
     endpointLabel: endpoint.label,operation,outcome,errorClass,
+    ...(error?.httpStatus === undefined ? {} : { httpStatus: error.httpStatus }),
+    ...(error?.rpcCode === undefined ? {} : { rpcCode: error.rpcCode }),
   });
   function unavailable(endpoint,error) {
     endpoint.status = "UNAVAILABLE"; endpoint.lastErrorClass = classifyBroadcastError(error); endpoint.reason = "RPC_ENDPOINT_UNAVAILABLE";
+    endpoint.lastFailure = error;
   }
   function inconsistent(code = "INCONSISTENT_RPC_VIEW") {
     return new DestinationRpcError(code,{ errorClass: "TRANSIENT_RPC_ERROR" });
   }
   function safeRejection(endpoint,operation,error,observations) {
-    const errorClass = classifyBroadcastError(error);
-    const code = typeof error?.code === "string" && /^[A-Z][A-Z0-9_]*$/.test(error.code) ? error.code : errorClass;
-    return new DestinationRpcError(code,{
-      errorClass,observations: [...observations,observation(endpoint,operation,"REJECTED",errorClass)],
+    const normalized = normalizeRpcError(error,{ operation: operation === "broadcast" ? "broadcast" : "read" });
+    return new DestinationRpcError(normalized.errorCode,{
+      ...normalized,observations: [...observations,observation(endpoint,operation,"REJECTED",normalized.errorClass,normalized)],
     });
   }
   async function probe(endpoint) {
@@ -54,7 +71,10 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
     try {
       chainId = await raw(endpoint,"eth_chainId");
       genesis = await raw(endpoint,"eth_getBlockByNumber",["0x0",false]);
-    } catch (error) { unavailable(endpoint,error); return false; }
+    } catch (error) {
+      if (!temporary(classifyBroadcastError(error,{ operation: "read" }))) throw safeRejection(endpoint,"identity",error,[]);
+      unavailable(endpoint,error); return false;
+    }
     let reason = null;
     try {
       if (rpcQuantity(chainId,"chain ID") !== config.destinationDomain) reason = "CHAIN_ID_MISMATCH";
@@ -62,6 +82,7 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
       else if (normalizeBytes32(genesis.hash) !== config.destinationGenesisHash) reason = "GENESIS_HASH_MISMATCH";
     } catch { reason = "INVALID_DESTINATION_IDENTITY"; }
     endpoint.reason = reason; endpoint.lastErrorClass = reason ? "DETERMINISTIC_REJECTION" : null;
+    endpoint.lastFailure = null;
     endpoint.status = reason ? "IDENTITY_MISMATCH" : "HEALTHY";
     return reason === null;
   }
@@ -77,7 +98,7 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
     const observations = [];
     for (const endpoint of endpoints) {
       if (!await probe(endpoint)) {
-        observations.push(observation(endpoint,operation,endpoint.status,endpoint.lastErrorClass)); continue;
+        observations.push(observation(endpoint,operation,endpoint.status,endpoint.lastErrorClass,endpoint.lastFailure)); continue;
       }
       try {
         const value = await execute(endpoint);
@@ -87,19 +108,19 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
         if (error.coordinationFailure) throw error;
         if (!temporary(classifyBroadcastError(error))) throw safeRejection(endpoint,operation,error,observations);
         unavailable(endpoint,error);
-        observations.push(observation(endpoint,operation,"UNAVAILABLE",endpoint.lastErrorClass));
+        observations.push(observation(endpoint,operation,"UNAVAILABLE",endpoint.lastErrorClass,error));
       }
     }
     throw exhausted(observations);
   }
   async function collect(operation,execute,selected = endpoints) {
     const results = await Promise.all(selected.map(async endpoint => {
-      if (!await probe(endpoint)) return { observation: observation(endpoint,operation,endpoint.status,endpoint.lastErrorClass) };
+      if (!await probe(endpoint)) return { observation: observation(endpoint,operation,endpoint.status,endpoint.lastErrorClass,endpoint.lastFailure) };
       try { return { endpoint,value: await execute(endpoint),observation: observation(endpoint,operation,"SUCCEEDED") }; }
       catch (error) {
         if (!temporary(classifyBroadcastError(error))) throw safeRejection(endpoint,operation,error,[]);
         unavailable(endpoint,error);
-        return { observation: observation(endpoint,operation,"UNAVAILABLE",endpoint.lastErrorClass) };
+        return { observation: observation(endpoint,operation,"UNAVAILABLE",endpoint.lastErrorClass,error) };
       }
     }));
     const available = results.filter(result => result.endpoint);
@@ -209,7 +230,10 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
         let hash;
         try {
           hash = await raw(endpoint,"eth_sendRawTransaction",[rawTransaction]);
-          if (normalizeBytes32(hash) !== expected) throw new DestinationRpcError("RPC_TRANSACTION_HASH_MISMATCH");
+          let returned;
+          try { returned = normalizeBytes32(hash); }
+          catch { throw new DestinationRpcError("RPC_INVALID_RESPONSE"); }
+          if (returned !== expected) throw new DestinationRpcError("RPC_TRANSACTION_HASH_MISMATCH");
         } catch (error) {
           await coordinated(() => lifecycle?.afterEndpoint(event,{ resultClass: "ERROR",errorClass: classifyBroadcastError(error) }));
           throw error;

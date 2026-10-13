@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { classifyBroadcastError } from "../src/transaction-manager/rpc-errors.mjs";
+import { classifyBroadcastError,normalizeRpcError } from "../src/transaction-manager/rpc-errors.mjs";
 import { replacementFees } from "../src/transaction-manager/retry-policy.mjs";
 import { publicTransactionConfig } from "../src/transaction-manager/config.mjs";
 import { signDeliveryTransaction } from "../src/transaction-manager/transaction.mjs";
@@ -71,22 +71,48 @@ test("fee bumps use BigInt ceiling, strict growth, market fees and caps", () => 
     { maxFeePerGas: 1n,maxPriorityFeePerGas: 2n },config),{ code: "INVALID_REPLACEMENT_FEES" });
 });
 
-test("broadcast classification prefers structured transport errors and controlled node details", () => {
-  for (const [error,classification] of [
-    [transientSendError(),"TRANSIENT_RPC_ERROR"],
-    [Object.assign(new Error("timed out"),{ name: "TimeoutError" }),"AMBIGUOUS_BROADCAST"],
-    [{ cause: { code: "ECONNRESET" } },"AMBIGUOUS_BROADCAST"],
-    [{ cause: { cause: { code: "UND_ERR_SOCKET" } } },"AMBIGUOUS_BROADCAST"],
-    [{ name: "HttpRequestError",status: 503 },"TRANSIENT_RPC_ERROR"],
-    [{ code: -32005 },"TRANSIENT_RPC_ERROR"],
-    [{ name: "NonceTooLowError",details: "already known" },"ALREADY_KNOWN"],
-    [{ code: -32000,data: { message: "replacement transaction underpriced" } },"REPLACEMENT_UNDERPRICED"],
-    [{ name: "FeeCapTooLowError" },"REPLACEMENT_UNDERPRICED"],
-    [{ name: "NonceTooLowError" },"NONCE_TOO_LOW"],
-    [{ code: -32000,message: "nonce too low" },"NONCE_TOO_LOW"],
-    [{ code: -32000,message: "insufficient funds" },"DETERMINISTIC_REJECTION"],
-    [new Error("unclassified rejection"),"DETERMINISTIC_REJECTION"],
-  ]) assert.equal(classifyBroadcastError(error),classification);
+test("central RPC classification matrix uses structured metadata and operation-aware timeout semantics", () => {
+  for (const [error,operation,classification] of [
+    [transientSendError(),"broadcast","TRANSIENT_RPC_ERROR"],
+    [{ status: 429,message: "invalid sender: transaction rejected" },"read","TRANSIENT_RPC_ERROR"],
+    [{ name: "HttpRequestError",status: 429,message: "transaction rejected" },"broadcast","TRANSIENT_RPC_ERROR"],
+    [{ status: 429,cause: { code: -32003,message: "invalid signature" } },"broadcast","TRANSIENT_RPC_ERROR"],
+    [{ status: 408,message: "transaction rejected" },"read","TRANSIENT_RPC_ERROR"],
+    [{ cause: { name: "HttpRequestError",status: 408 } },"broadcast","AMBIGUOUS_BROADCAST"],
+    [{ name: "DestinationRpcError",code: "RPC_REQUEST_TIMEOUT",httpStatus: 408,errorClass: "TRANSIENT_RPC_ERROR" },"broadcast","TRANSIENT_RPC_ERROR"],
+    ...[500,502,503,504].flatMap(status => ["read","broadcast"].map(operation => [{ name: "HttpRequestError",status },operation,"TRANSIENT_RPC_ERROR"])),
+    [{ name: "TimeoutError" },"read","TRANSIENT_RPC_ERROR"],
+    [Object.assign(new Error("timed out"),{ name: "TimeoutError" }),"broadcast","AMBIGUOUS_BROADCAST"],
+    [{ cause: { code: "ECONNRESET" } },"read","TRANSIENT_RPC_ERROR"],
+    [{ cause: { code: "ECONNRESET" } },"broadcast","AMBIGUOUS_BROADCAST"],
+    [{ cause: { cause: { code: "UND_ERR_SOCKET" } } },"broadcast","AMBIGUOUS_BROADCAST"],
+    [{ code: "ECONNREFUSED" },"read","TRANSIENT_RPC_ERROR"],
+    [{ code: "ENOTFOUND" },"broadcast","TRANSIENT_RPC_ERROR"],
+    ...[429,-32007,-32005,-32002,-32603].flatMap(code => ["read","broadcast"].map(operation => [{ code,message: "transaction rejected" },operation,"TRANSIENT_RPC_ERROR"])),
+    [{ name: "UnknownRpcError",code: -1,cause: { code: -32007 } },"broadcast","TRANSIENT_RPC_ERROR"],
+    [{ code: -32003,message: "timeout while reporting invalid transaction" },"broadcast","DETERMINISTIC_REJECTION"],
+    [{ name: "InvalidSignatureError",message: "timeout" },"broadcast","DETERMINISTIC_REJECTION"],
+    [{ name: "NonceTooLowError",details: "ALREADY KNOWN" },"broadcast","ALREADY_KNOWN"],
+    [{ code: -32000,data: { message: "replacement transaction underpriced" } },"broadcast","REPLACEMENT_UNDERPRICED"],
+    [{ name: "FeeCapTooLowError" },"broadcast","REPLACEMENT_UNDERPRICED"],
+    [{ name: "NonceTooLowError" },"broadcast","NONCE_TOO_LOW"],
+    [{ code: -32000,message: "nonce too low" },"broadcast","NONCE_TOO_LOW"],
+    [{ code: -32000,message: "insufficient funds" },"broadcast","DETERMINISTIC_REJECTION"],
+    [{ code: -32000,message: "invalid sender" },"broadcast","DETERMINISTIC_REJECTION"],
+    [{ code: -32000,message: "intrinsic gas too low" },"broadcast","DETERMINISTIC_REJECTION"],
+    [{ code: -32000,message: "unsupported transaction type" },"broadcast","DETERMINISTIC_REJECTION"],
+    [{ name: "HttpRequestError",cause: new SyntaxError("Unexpected end of JSON input") },"broadcast","RPC_RESPONSE_ERROR"],
+    [{ code: -32602,message: "timeout" },"read","RPC_RESPONSE_ERROR"],
+    [{ code: -32008,message: "unclassified provider state" },"broadcast","RPC_RESPONSE_ERROR"],
+    [new Error("unclassified rejection"),"broadcast","RPC_RESPONSE_ERROR"],
+  ]) {
+    assert.equal(normalizeRpcError(error,{ operation }).errorClass,classification);
+    assert.equal(classifyBroadcastError(error,{ operation }),classification);
+  }
+  assert.equal(normalizeRpcError(new Error("unclassified rejection")).errorCode,"RPC_UNKNOWN_ERROR");
+  assert.equal(normalizeRpcError(new SyntaxError("bad JSON")).errorCode,"RPC_INVALID_RESPONSE");
+  assert.equal(normalizeRpcError({ status: 408 },{ operation: "read" }).httpStatus,408);
+  assert.equal(normalizeRpcError({ code: -32007 }).rpcCode,-32007);
 });
 
 test("transient failure survives restart and retries exact bytes without new nonce, fee or signature", async () => {
@@ -365,6 +391,26 @@ test("deterministic rejection retains signed evidence and disables automatic act
   assert.equal(record.attempt.broadcastAttemptCount,"1");
   h.advance(h.config.replacementAfterMs);
   assert.equal((await h.restart().processTransactionRetriesOnce()).processed,0);
+});
+
+test("unknown and malformed responses stop for manual attention without claiming deterministic transaction rejection", async () => {
+  for (const [failure,reason] of [[new Error("unclassified provider result"),"RPC_UNKNOWN_ERROR"],
+    [new SyntaxError("invalid JSON response"),"RPC_INVALID_RESPONSE"]]) {
+    const h = await transactionHarness(); const id = h.jobs[0].deliveryJobId;
+    const signed = await h.manager.prepareDeliveryTransaction(id); const account = await h.repository.getAccount();
+    h.rpc.broadcast = async () => { throw failure; };
+    await assert.rejects(h.manager.broadcastPreparedTransaction(id),{ code: reason });
+    const stopped = await h.repository.getTransaction(id);
+    assert.equal(stopped.attempt.lastErrorClass,"RPC_RESPONSE_ERROR");
+    assert.equal(stopped.intent.retryStopReason,reason); assert.equal(stopped.intent.status,"PENDING");
+    assert.equal(stopped.attempt.status,"SIGNED"); assert.equal(stopped.attempt.transactionHash,signed.attempt.transactionHash);
+    h.advance(h.config.replacementAfterMs);
+    assert.equal((await h.restart().processTransactionRetriesOnce()).processed,0);
+    h.mine(id); h.state.head = 102n;
+    assert.equal((await h.restart().recoverTransactionsOnce()).finalized,1);
+    assert.equal((await h.repository.getTransaction(id)).intent.retryStopReason,reason);
+    assert.deepEqual(await h.repository.getAccount(),account); assert.equal(h.calls.sign,1);
+  }
 });
 
 test("receipt-RPC failure schedules exact retry without signing and bounded empty passes are valid", async () => {

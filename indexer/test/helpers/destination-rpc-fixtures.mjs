@@ -10,6 +10,10 @@ import { fixtureHash } from "./delivery-fixtures.mjs";
 export const rpcUnavailable = () => Object.assign(new Error("injected endpoint unavailable"),{ code: "ECONNREFUSED" });
 export const rpcTimeout = () => Object.assign(new Error("injected ambiguous timeout"),{ name: "TimeoutError" });
 export const rpcRejection = message => Object.assign(new Error(message),{ code: -32000 });
+export const rpcHttpError = (status,message = "controlled destination HTTP failure") =>
+  Object.assign(new Error(message),{ name: "HttpRequestError",status });
+export const rpcProviderLimit = (code = -32007) =>
+  Object.assign(new Error("controlled provider request limit"),{ name: "RpcRequestError",code });
 export function transactionBody(intent,attempt,blockNumber = null,blockHash = null) {
   return { hash: attempt.transactionHash,from: intent.senderAddress,to: intent.destinationGateway,input: intent.calldata,
     nonce: toHex(BigInt(attempt.nonce)),value: "0x0",type: "0x2",chainId: toHex(BigInt(intent.chainId)),

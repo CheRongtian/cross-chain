@@ -633,6 +633,13 @@ printf '187. Restore final truth after restart without rebroadcasting final inte
 printf '188. Serialize concurrent recovery and reject stale post-RPC snapshots\n'
 printf '189. Reconcile stopped retries without resetting limits or exhaustion\n'
 printf '190. Preserve all source, queue, lease, nonce, signing, retry and RPC invariants\n'
+printf '191. Classify structured HTTP/provider errors; verify read/broadcast deadline cancellation and exact-byte fallback\n'
+printf '192. Fail over exact persisted bytes after primary HTTP 429 or configured JSON-RPC 429/-32007\n'
+printf '193. Recover actual primary acceptance followed by HTTP 408 through a fresh process and secondary hash evidence\n'
+printf '194. Retain all-path transient retry schedules across PostgreSQL clients without another nonce or signature\n'
+printf '195. Preserve already-known, underpriced, nonce-too-low and deterministic rejection policy without blind fan-out\n'
+printf '196. Stop unknown/malformed responses separately; verify migration sequence/reruns and preserve historical upgrade state\n'
+printf '197. Keep identity, wrong-hash, fixed-head receipt, pending-parent replacement and secret-redaction regressions intact\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -667,7 +674,7 @@ CURRENT_STEP="committed Merkle golden fixture drift check"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node "$INDEXER_DIR/scripts/generate-merkle-golden-vectors.mjs" --check
 
-CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, recovery, batch, Merkle, golden compatibility, lifecycle and portable delivery package unit tests"
+CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, recovery, RPC error classification, batch, Merkle, golden compatibility, lifecycle and portable delivery package unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$INDEXER_DIR/test/config.test.mjs" \
@@ -693,7 +700,7 @@ node --test \
     "$INDEXER_DIR/test/relayer-leases.test.mjs" \
     "$INDEXER_DIR/test/transaction-recovery.test.mjs"
 
-CURRENT_STEP="Chain A Indexer database, deterministic fixed-snapshot concurrency, conditional reorg recovery, batch eligibility, Merkle, lifecycle, fixed-initial-epoch rollover, consensus binding and atomic delivery queue tests"
+CURRENT_STEP="Chain A Indexer database, current migration sequence/reruns, fixed-snapshot concurrency, conditional reorg recovery, RPC retry/restart and response-class upgrade, batch eligibility, Merkle, lifecycle, epoch rollover, consensus binding and atomic delivery queue tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
@@ -1353,7 +1360,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source fixed-snapshot concurrency and fork recovery, validator identity-bound recovery, consensus, fault/view/epoch recovery, historical QC, delivery queue, Relayer and persistent Chain B transaction/confirmation integration"
+CURRENT_STEP="real source fixed-snapshot and fork recovery, validator identity-bound consensus/view/epoch recovery, historical QC, delivery queue, Relayer, persistent Chain B recovery and HTTP 429/408/provider-limit integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

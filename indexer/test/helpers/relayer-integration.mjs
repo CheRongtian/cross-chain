@@ -17,6 +17,7 @@ import { verifyPendingReplacement } from "./transaction-retry-integration.mjs";
 import { destinationAccessPath } from "./rpc-failover-integration.mjs";
 import { createRelayerProcesses, verifyLeaseTakeover, verifySignedTakeover, verifyConcurrentRelayers } from "./multi-relayer-integration.mjs";
 import { verifyTransactionCrashes } from "./transaction-crash-integration.mjs";
+import { verifyTransientRpcFailures } from "./rpc-transient-integration.mjs";
 
 const execFileAsync = promisify(execFile);
 const MAIN = fileURLToPath(new URL("../../src/relayer/main.mjs",import.meta.url));
@@ -281,6 +282,8 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     await processes.close();
     await verifyTransactionCrashes({ environment: { ...env,CHAIN_B_RPC_URLS: JSON.stringify([primary.url,secondary.url]) },
       sourceConfig: config,sourcePool: pool,snapshot: snapshots[0],destination,upstream: process.env.CHAIN_B_RPC_URL });
+    await verifyTransientRpcFailures({ environment: env,sourceConfig: config,sourcePool: pool,
+      snapshot: snapshots[0],destination,upstream: process.env.CHAIN_B_RPC_URL });
   } catch (error) {
     failedRun = true;
     for (const failure of observer.errors) console.error(`Transaction RPC observation failed: ${failure.message}`);

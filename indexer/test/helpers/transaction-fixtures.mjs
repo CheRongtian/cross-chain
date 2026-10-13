@@ -6,7 +6,7 @@ import { createTransactionManager } from "../../src/transaction-manager/service.
 import { loadTransactionConfig, TransactionError } from "../../src/transaction-manager/config.mjs";
 import { allocateNonce } from "../../src/transaction-manager/nonce-policy.mjs";
 import { verifySignedTransaction } from "../../src/transaction-manager/transaction.mjs";
-import { classifyBroadcastError } from "../../src/transaction-manager/rpc-errors.mjs";
+import { normalizeRpcError } from "../../src/transaction-manager/rpc-errors.mjs";
 import { replacementDue } from "../../src/transaction-manager/retry-policy.mjs";
 import { safeRelayerMessage } from "../../src/relayer/config.mjs";
 import { normalizeBytes32 } from "../../src/canonical-message.mjs";
@@ -195,13 +195,18 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
       let errorClass = null; let errorMessage = null; let errorCode = null;
       try {
         if (normalizeBytes32(await broadcast(stored.attempt.rawSignedTransaction,stored.attempt.transactionHash,lifecycle)) !== stored.attempt.transactionHash) throw new TransactionError("RPC_TRANSACTION_HASH_MISMATCH");
-      } catch (error) { if (error.coordinationFailure) throw error; errorClass = classifyBroadcastError(error); errorCode = error.code ?? errorClass; errorMessage = safeRelayerMessage(error,config); }
+      } catch (error) {
+        if (error.coordinationFailure) throw error;
+        const normalized = normalizeRpcError(error,{ operation: "broadcast" });
+        errorClass = normalized.errorClass; errorCode = normalized.errorCode; errorMessage = safeRelayerMessage(error,config);
+      }
       await hooks.beforeBroadcastResult?.({ id,event,stored: await strict(id),errorClass });
       if (fence) await this.assertFence(id,fence);
       completeEvent(event.eventId,errorClass ? { resultClass: "ERROR",errorClass } : { resultClass: "ACCEPTED",transactionHash: stored.attempt.transactionHash },id);
       record.attempt.lastErrorClass = errorClass;
       if (errorClass === null) { record.attempt.status = "BROADCAST"; record.attempt.broadcastAt ??= timestamp(); }
       if (errorClass === "DETERMINISTIC_REJECTION") stop(record,errorCode === "RPC_TRANSACTION_HASH_MISMATCH" ? errorCode : errorClass);
+      else if (errorClass === "RPC_RESPONSE_ERROR") stop(record,errorCode);
       else record.intent.nextActionAt = nextAction();
       touch(id);
       return { ...await strict(id),broadcast: errorClass === null,errorClass,errorCode,errorMessage };

@@ -5,7 +5,7 @@ import { loadRelayerConfig, publicRelayerConfig, safeRelayerMessage } from "../s
 import { relayerEnvironment } from "./helpers/relayer-fixtures.mjs";
 import { fixtureHash } from "./helpers/delivery-fixtures.mjs";
 import { transactionConfig } from "./helpers/transaction-fixtures.mjs";
-import { destinationRpcFixture, transactionFailoverHarness, rpcUnavailable, rpcTimeout, rpcRejection } from "./helpers/destination-rpc-fixtures.mjs";
+import { destinationRpcFixture, transactionFailoverHarness, rpcUnavailable, rpcTimeout, rpcRejection, rpcHttpError, rpcProviderLimit } from "./helpers/destination-rpc-fixtures.mjs";
 
 test("ordered endpoints, normalized duplicates, fingerprint and timeout configuration", () => {
   const env = relayerEnvironment({ CHAIN_B_RPC_URLS: '["http://localhost:9545","http://localhost:9546"]' });
@@ -55,7 +55,7 @@ test("temporary primary failure recovers and later operations prefer it again", 
   assert.equal(f.nodes[1].calls.length,before);
 });
 
-test("the complete request deadline aborts a stalled operation and continues through secondary", async () => {
+test("the complete read deadline aborts a stalled operation and fails over as a transient error", async () => {
   const f = destinationRpcFixture({ config: transactionConfig({
     CHAIN_B_RPC_URLS: '["http://localhost:9545","http://localhost:9546"]',RPC_REQUEST_TIMEOUT_MS: "25",
   }) });
@@ -64,7 +64,34 @@ test("the complete request deadline aborts a stalled operation and continues thr
     signal.addEventListener("abort",() => { aborted = true; reject(signal.reason); },{ once: true });
   }));
   assert.equal(await f.rpc.verifyChain(),2001n);
-  assert.equal(aborted,true); assert.equal(f.pool.health()[0].lastErrorClass,"AMBIGUOUS_BROADCAST");
+  assert.equal(aborted,true); assert.equal(f.pool.health()[0].lastErrorClass,"TRANSIENT_RPC_ERROR");
+  assert.equal(f.pool.health()[0].status,"UNAVAILABLE");
+  assert.equal(f.pool.health()[1].status,"HEALTHY");
+  assert.ok(f.nodes.every(node => node.calls.every(call => call.method !== "eth_sendRawTransaction")));
+});
+
+test("the complete broadcast deadline aborts a stalled send and fails over exact bytes as ambiguous", async () => {
+  const f = destinationRpcFixture({ config: transactionConfig({
+    CHAIN_B_RPC_URLS: '["http://localhost:9545","http://localhost:9546"]',RPC_REQUEST_TIMEOUT_MS: "25",
+  }) });
+  const raw = "0x0201"; const hash = keccak256(raw);
+  let aborted = false;
+  f.nodes[0].faults.set("eth_sendRawTransaction",({ signal }) => new Promise((_,reject) => {
+    signal.addEventListener("abort",() => { aborted = true; reject(signal.reason); },{ once: true });
+  }));
+  const result = await f.pool.broadcast(raw,hash);
+  assert.equal(aborted,true);
+  assert.equal(result.transactionHash,hash); assert.equal(result.acceptedEndpointLabel,"rpc-1");
+  assert.deepEqual(result.observations,[
+    { endpointLabel: "rpc-0",operation: "broadcast",outcome: "UNAVAILABLE",errorClass: "AMBIGUOUS_BROADCAST" },
+    { endpointLabel: "rpc-1",operation: "broadcast",outcome: "SUCCEEDED",errorClass: null },
+  ]);
+  for (const node of f.nodes) {
+    assert.deepEqual(node.calls.filter(call => call.method === "eth_sendRawTransaction").map(call => call.params[0]),[raw]);
+  }
+  assert.deepEqual(f.nodes[1].broadcasts,[raw]);
+  assert.equal(f.pool.health()[0].lastErrorClass,"AMBIGUOUS_BROADCAST");
+  assert.equal(f.pool.health()[0].status,"UNAVAILABLE");
   assert.equal(f.pool.health()[1].status,"HEALTHY");
 });
 
@@ -152,6 +179,73 @@ test("accepted primary timeout followed by secondary already-known reconciles on
   assert.equal(sent.reconciled,true); assert.equal(sent.attempt.status,"BROADCAST");
   assert.equal(sent.attempts.length,1); assert.equal(h.calls.sign,1);
   assert.equal(h.destination.transactions.size,1); assert.equal((await h.repository.getAccount()).nextNonce,"10");
+});
+
+test("HTTP and known provider rate limits fail over exact persisted bytes without stopping retries", async () => {
+  for (const failure of [rpcHttpError(429,"transaction rejected"),rpcProviderLimit(429),rpcProviderLimit(-32007)]) {
+    const h = await transactionFailoverHarness(); const id = h.jobs[0].deliveryJobId;
+    const signed = await h.manager.prepareDeliveryTransaction(id); const account = await h.repository.getAccount();
+    const preparation = () => h.destination.nodes.flatMap(node => node.calls)
+      .filter(call => ["eth_estimateGas","eth_maxPriorityFeePerGas"].includes(call.method)).length;
+    const before = preparation();
+    h.destination.nodes[0].faults.set("eth_sendRawTransaction",() => { throw failure; });
+    const sent = await h.manager.broadcastPreparedTransaction(id);
+    assert.equal(sent.acceptedEndpointLabel,"rpc-1"); assert.equal(sent.intent.retryStoppedAt,null);
+    assert.equal(sent.rpcObservations[0].errorClass,"TRANSIENT_RPC_ERROR");
+    if (failure.status) assert.equal(sent.rpcObservations[0].httpStatus,429);
+    else assert.equal(sent.rpcObservations[0].rpcCode,failure.code);
+    assert.deepEqual(h.destination.nodes[0].broadcasts,[]);
+    assert.deepEqual(h.destination.nodes[1].broadcasts,[signed.attempt.rawSignedTransaction]);
+    for (const node of h.destination.nodes) assert.equal(node.calls.find(call => call.method === "eth_sendRawTransaction").params[0],signed.attempt.rawSignedTransaction);
+    for (const field of ["nonce","gasLimit","maxFeePerGas","maxPriorityFeePerGas","rawSignedTransaction","transactionHash"]) assert.equal(sent.attempt[field],signed.attempt[field]);
+    assert.equal(sent.attempts.length,1); assert.equal(h.calls.sign,1); assert.equal(preparation(),before);
+    assert.deepEqual(await h.repository.getAccount(),account);
+  }
+});
+
+test("HTTP 408 after primary acceptance reconciles the same hash through secondary", async () => {
+  const h = await transactionFailoverHarness(); const id = h.jobs[0].deliveryJobId;
+  const signed = await h.manager.prepareDeliveryTransaction(id); const account = await h.repository.getAccount();
+  h.destination.nodes[0].faults.set("eth_sendRawTransaction",async ({ forward }) => { await forward(); throw rpcHttpError(408); });
+  h.destination.nodes[1].alreadyKnown = true;
+  const sent = await h.manager.broadcastPreparedTransaction(id);
+  assert.equal(sent.reconciled,true); assert.equal(sent.attempt.status,"BROADCAST");
+  assert.equal(sent.intent.retryStoppedAt,null); assert.equal(sent.rpcObservations[0].httpStatus,408);
+  assert.equal(sent.rpcObservations[0].errorClass,"AMBIGUOUS_BROADCAST");
+  assert.equal(sent.attempt.transactionHash,signed.attempt.transactionHash);
+  assert.equal(sent.attempt.rawSignedTransaction,signed.attempt.rawSignedTransaction);
+  assert.equal(sent.attempts.length,1); assert.equal(h.calls.sign,1);
+  assert.deepEqual(await h.repository.getAccount(),account); assert.equal(h.destination.transactions.size,1);
+});
+
+test("a primary receipt HTTP 408 is a transient read and another sampled source supplies canonical evidence", async () => {
+  const h = await transactionFailoverHarness(); const id = h.jobs[0].deliveryJobId;
+  await h.manager.submitDelivery(id); h.mine(id);
+  h.destination.nodes[0].faults.set("eth_getTransactionReceipt",() => { throw rpcHttpError(408); });
+  const hash = (await h.repository.getTransaction(id)).attempt.transactionHash;
+  const receipt = await h.destination.pool.request("eth_getTransactionReceipt",[hash]);
+  assert.equal(receipt.transactionHash,hash);
+  assert.equal(h.destination.pool.health()[0].lastErrorClass,"TRANSIENT_RPC_ERROR");
+  assert.equal((await h.manager.checkReceiptsOnce()).confirmed,1);
+  assert.ok(h.destination.nodes[1].calls.some(call => call.method === "eth_getTransactionReceipt"));
+});
+
+test("unknown, invalid JSON and missing results fail closed separately from transaction rejection", async () => {
+  for (const [failure,code] of [[new Error("unclassified provider state"),"RPC_UNKNOWN_ERROR"],
+    [new SyntaxError("invalid JSON response"),"RPC_INVALID_RESPONSE"],[null,"RPC_INVALID_RESPONSE"]]) {
+    const h = await transactionFailoverHarness(); const id = h.jobs[0].deliveryJobId;
+    const signed = await h.manager.prepareDeliveryTransaction(id); const account = await h.repository.getAccount();
+    h.destination.nodes[0].faults.set("eth_sendRawTransaction",() => { if (failure) throw failure; return undefined; });
+    await assert.rejects(h.manager.broadcastPreparedTransaction(id),{ code });
+    const stopped = await h.repository.getTransaction(id);
+    assert.equal(stopped.attempt.lastErrorClass,"RPC_RESPONSE_ERROR");
+    assert.equal(stopped.intent.retryStopReason,code); assert.equal(stopped.attempt.transactionHash,signed.attempt.transactionHash);
+    assert.equal(stopped.attempts.length,1);
+    assert.equal(h.destination.nodes[1].calls.some(call => call.method === "eth_sendRawTransaction"),false);
+    h.advance(h.config.replacementAfterMs);
+    assert.equal((await h.restart().processTransactionRetriesOnce()).processed,0);
+    assert.deepEqual(await h.repository.getAccount(),account); assert.equal(h.calls.sign,1);
+  }
 });
 
 test("transaction rejection never blind-hops to another endpoint", async () => {

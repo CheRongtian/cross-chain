@@ -7,7 +7,7 @@ import { protocolInteger } from "../../../validator/src/committee.mjs";
 import { allocateNonce } from "./nonce-policy.mjs";
 import { verifySignedTransaction } from "./transaction.mjs";
 import { actionDate, operationTime, replacementDue } from "./retry-policy.mjs";
-import { BROADCAST_ERROR_CLASSES, classifyBroadcastError } from "./rpc-errors.mjs";
+import { BROADCAST_ERROR_CLASSES, normalizeRpcError } from "./rpc-errors.mjs";
 import { TransactionError } from "./config.mjs";
 import { assertLeaseFence } from "../relayer/leases.mjs";
 
@@ -392,7 +392,8 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         } catch (error) {
           // Storage/fencing failures leave the committed event unresolved.
           if (error.coordinationFailure) throw error;
-          errorClass = classifyBroadcastError(error); errorMessage = safeRelayerMessage(error,config); errorCode = error?.code ?? errorClass;
+          const normalized = normalizeRpcError(error,{ operation: "broadcast" });
+          errorClass = normalized.errorClass; errorMessage = safeRelayerMessage(error,config); errorCode = normalized.errorCode;
         }
         await hooks.beforeBroadcastResult?.({ id,event: start.event,stored: start.stored,errorClass });
         context.assertHeld();
@@ -405,6 +406,7 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
             await client.query(`UPDATE ${attempts} SET status = $2,broadcast_at = $3,last_error_class = $4 WHERE attempt_id = $1`,
               [attempt.attemptId,errorClass ? current.attempt.status : "BROADCAST",current.attempt.broadcastAt ?? (errorClass ? null : actionDate(now)),errorClass]);
             if (errorClass === "DETERMINISTIC_REJECTION") await stop(client,current,errorCode === "RPC_TRANSACTION_HASH_MISMATCH" ? errorCode : errorClass,now);
+            if (errorClass === "RPC_RESPONSE_ERROR") await stop(client,current,errorCode,now);
           }
           return Object.freeze({ ...await read(client,id,expected),broadcast: errorClass === null,errorClass,errorMessage,errorCode });
         });

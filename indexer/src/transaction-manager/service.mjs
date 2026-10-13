@@ -13,6 +13,7 @@ import { operationTime, replacementDue, replacementFees } from "./retry-policy.m
 import { processTransactionRetriesOnce } from "./retry.mjs";
 import { TransactionError } from "./config.mjs";
 import { recoverTransactionsOnce } from "./recovery.mjs";
+import { BROADCAST_ERROR_CLASSES } from "./rpc-errors.mjs";
 
 export function createTransactionManager({ config,pool,queue = createDeliveryRepository({ config,pool }),
   rpc = createTransactionRpc(config),account = privateKeyToAccount(config.privateKey),repository,
@@ -23,6 +24,7 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     catch (error) {
       const safe = new TransactionError(error?.code ?? "TRANSACTION_MANAGER_FAILED");
       safe.message = safeRelayerMessage(error,config); safe.observations = error?.observations ?? [];
+      if (BROADCAST_ERROR_CLASSES.includes(error?.errorClass)) safe.errorClass = error.errorClass;
       throw safe;
     }
   }
@@ -115,8 +117,9 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
       if (reconciled.mined || reconciled.known) return Object.freeze({ ...reconciled.stored,broadcast: true,reconciled: true,errorClass: null,errorMessage: null,errorCode: null,
         acceptedEndpointLabel: rpcObservation?.acceptedEndpointLabel ?? null,rpcObservations: rpcObservation?.observations ?? [] });
     }
-    if (result.errorClass === "DETERMINISTIC_REJECTION") {
+    if (["DETERMINISTIC_REJECTION","RPC_RESPONSE_ERROR"].includes(result.errorClass)) {
       const error = new TransactionError(result.errorCode ?? result.errorClass);
+      error.errorClass = result.errorClass;
       error.message = result.errorMessage; error.observations = rpcObservation?.observations ?? []; throw error;
     }
     return Object.freeze({ ...result,acceptedEndpointLabel: rpcObservation?.acceptedEndpointLabel ?? null,rpcObservations: rpcObservation?.observations ?? [] });
@@ -124,6 +127,7 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
   function reportBroadcast(result) {
     if (result.errorClass) {
       const error = new TransactionError(result.errorCode ?? result.errorClass);
+      error.errorClass = result.errorClass;
       error.message = result.errorMessage; error.observations = result.rpcObservations ?? []; throw error;
     }
     return result;

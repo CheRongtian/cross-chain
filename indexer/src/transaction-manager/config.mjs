@@ -2,7 +2,7 @@ import { loadRelayerConfig, publicRelayerConfig } from "../relayer/config.mjs";
 import { protocolInteger } from "../../../validator/src/committee.mjs";
 
 export class TransactionError extends Error {
-  constructor(code) { super(code); this.code = code; }
+  constructor(code) { super(code); this.name = "TransactionError"; this.code = code; }
 }
 
 export function loadTransactionConfig(environment = process.env) {
