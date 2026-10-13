@@ -451,6 +451,9 @@ printf ' 17. Abruptly stop and restart the Finality Watcher from FINALIZING\n'
 printf ' 18. Verify exact-depth FINALIZED transitions and unique batch eligibility\n'
 printf ' 19. Re-scan a FINALIZED event and preserve lifecycle metadata\n'
 printf ' 20. Persist canonical metadata for event-bearing and empty source blocks\n'
+printf '     Hold a fixed-head Watcher while an independent Indexer commits canonical H+1/H+N; preserve blocks, messages and cursor\n'
+printf '     Bound finality candidates to H and process deferred H+1 on later fixed snapshots\n'
+printf '     Reject stale recovery state and preserve genuine fork, terminal REORGED and finalized-fork regression checks\n'
 printf ' 21. Replace a real Anvil branch and recover from its common ancestor\n'
 printf ' 22. Preserve the old occurrence as terminal REORGED\n'
 printf ' 23. Restart indexing from the reorg-rewound cursor and finalize the replacement\n'
@@ -656,7 +659,7 @@ CURRENT_STEP="committed Merkle golden fixture drift check"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node "$INDEXER_DIR/scripts/generate-merkle-golden-vectors.mjs" --check
 
-CURRENT_STEP="Chain A Indexer, recovery, batch, Merkle, golden compatibility, lifecycle and portable delivery package unit tests"
+CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, recovery, batch, Merkle, golden compatibility, lifecycle and portable delivery package unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$INDEXER_DIR/test/config.test.mjs" \
@@ -682,7 +685,7 @@ node --test \
     "$INDEXER_DIR/test/relayer-leases.test.mjs" \
     "$INDEXER_DIR/test/transaction-recovery.test.mjs"
 
-CURRENT_STEP="Chain A Indexer database, recovery, batch eligibility, Merkle, lifecycle, fixed-initial-epoch rollover, consensus binding and atomic delivery queue tests"
+CURRENT_STEP="Chain A Indexer database, deterministic fixed-snapshot concurrency, conditional reorg recovery, batch eligibility, Merkle, lifecycle, fixed-initial-epoch rollover, consensus binding and atomic delivery queue tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
@@ -1342,7 +1345,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source recovery, validator identity-bound recovery, consensus, fault/view/epoch recovery, historical QC, delivery queue, Relayer and persistent Chain B transaction/confirmation integration"
+CURRENT_STEP="real source fixed-snapshot concurrency and fork recovery, validator identity-bound recovery, consensus, fault/view/epoch recovery, historical QC, delivery queue, Relayer and persistent Chain B transaction/confirmation integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

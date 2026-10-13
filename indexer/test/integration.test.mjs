@@ -36,6 +36,7 @@ import { verifyViewChanges } from "../../validator/test/helpers/view-change-scen
 import { createValidatorSetResolver } from "../../validator/src/validator-sets.mjs";
 import { verifyDeliveryQueue } from "./helpers/delivery-integration.mjs";
 import { verifySingleRelayer } from "./helpers/relayer-integration.mjs";
+import { verifySourceSnapshotConcurrency } from "./helpers/source-snapshot-integration.mjs";
 
 const IDENTITY_APPLICATION_ABI = parseAbi([
   "function sendCrossChainMessage(uint256 destinationDomain, address destinationGateway, address destinationReceiver, bytes payload, uint256 deadline) returns (bytes32 messageId, uint256 nonce)",
@@ -220,6 +221,7 @@ test("recovers source workers and seals durable batches from real finalized mess
 
   let activePool = createDatabasePool(config);
   try {
+    await verifySourceSnapshotConcurrency({ config, publicClient, produceMessage });
     await applyMigrations(activePool, config.databaseSchema);
     await resetIndexerTables(activePool, config.databaseSchema);
     await activePool.end();

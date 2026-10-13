@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { NoCommonAncestorError } from "../src/canonical-block.mjs";
+import { CanonicalHistoryChangedError, NoCommonAncestorError } from "../src/canonical-block.mjs";
 import { createCanonicalReconciler } from "../src/reorg-detector.mjs";
 
 const CONFIG = {
@@ -19,8 +19,12 @@ function block(number, hashValue = number + 1n, parentHashValue = number) {
   return { number, hash: hash(hashValue), parentHash: hash(parentHashValue) };
 }
 
-function publicClientFor(blocks) {
+function publicClientFor(blocks, head = [...blocks.keys()].reduce((highest, number) => number > highest ? number : highest, 0n)) {
   return {
+    async request({ method }) {
+      assert.equal(method, "eth_blockNumber");
+      return `0x${head.toString(16)}`;
+    },
     async getBlock({ blockNumber }) {
       const result = blocks.get(blockNumber);
       assert.ok(result, `missing mocked block ${blockNumber}`);
@@ -107,13 +111,13 @@ test("finds a common ancestor and delegates one atomic recovery", async () => {
   assert.equal(recoveryCalls[0].recovery.forkBlock, 11n);
 });
 
-test("treats current head regression as divergence even when the probe matches", async () => {
+test("confirms actual head regression even when the snapshot prefix matches", async () => {
   const canonicalStore = {
     async readCanonicalHistoryState() {
       return { count: 4, firstBlock: 9n, lastBlock: 12n };
     },
-    async readCanonicalBlock() {
-      return block(10n, 10n, 9n);
+    async readCanonicalBlock(_scope, number) {
+      return block(number, number, number - 1n);
     },
     async readCanonicalBlocksDescending() {
       return [block(10n, 10n, 9n), block(9n, 9n, 8n)];
@@ -138,6 +142,169 @@ test("treats current head regression as divergence even when the probe matches",
 
   assert.equal(result.detected, true);
   assert.equal(result.commonAncestor, 10n);
+});
+
+for (const advancement of [1n, 4n]) {
+  test(`preserves canonical history ${advancement} block(s) beyond a fixed snapshot`, async () => {
+    const head = 10n + advancement;
+    const recoveryCalls = [];
+    const reads = [];
+    const result = await createCanonicalReconciler({
+      config: CONFIG,
+      publicClient: publicClientFor(new Map([[10n, block(10n)]]), head),
+      canonicalStore: {
+        async readCanonicalHistoryState() { return { count: advancement === 1n ? 3 : 6, firstBlock: 9n, lastBlock: head }; },
+        async readCanonicalBlock(_scope, number) { reads.push(number); return block(number); },
+        async recoverCanonicalReorg(...args) { recoveryCalls.push(args); },
+      },
+      cursorStore: { async loadOrInitializeCursor() { return head + 1n; } },
+      logger: { log() {}, error() {} },
+    }).reconcile({ headBlock: 10n });
+    assert.equal(result.detected, false);
+    assert.equal(result.headBlock, 10n);
+    assert.equal(result.commonAncestor, 10n);
+    assert.equal(result.rewoundNextBlock, head + 1n);
+    assert.deepEqual(reads, [10n]);
+    assert.deepEqual(recoveryCalls, []);
+  });
+}
+
+test("detects snapshot-prefix divergence even when durable history is ahead", async () => {
+  const recoveries = [];
+  const result = await createCanonicalReconciler({
+    config: CONFIG,
+    publicClient: publicClientFor(new Map([[10n, block(10n, 211n, 10n)], [9n, block(9n)]]), 12n),
+    canonicalStore: {
+      async readCanonicalHistoryState() { return { count: 4, firstBlock: 9n, lastBlock: 12n }; },
+      async readCanonicalBlock(_scope, number) { return block(number); },
+      async readCanonicalBlocksDescending() { return [block(10n), block(9n)]; },
+      async recoverCanonicalReorg(_scope, recovery) {
+        recoveries.push(recovery);
+        return { reorgedMessages: 1, deletedCanonicalBlocks: 3, rewoundNextBlock: 10n };
+      },
+    },
+    cursorStore: { async loadOrInitializeCursor() { return 13n; } },
+    logger: { log() {}, error() {} },
+  }).reconcile({ headBlock: 10n });
+  assert.equal(result.detected, true);
+  assert.equal(result.commonAncestor, 9n);
+  assert.equal(result.headBlock, 10n);
+  assert.equal(recoveries[0].expectedState.nextBlock, 13n);
+  assert.equal(recoveries[0].expectedState.head.number, 12n);
+  assert.equal(recoveries[0].expectedState.probe.number, 10n);
+});
+
+test("confirmed rollback preserves the canonical suffix above the older snapshot", async () => {
+  const result = await createCanonicalReconciler({
+    config: CONFIG,
+    publicClient: publicClientFor(new Map([[10n, block(10n)], [11n, block(11n)]]), 11n),
+    canonicalStore: {
+      async readCanonicalHistoryState() { return { count: 5, firstBlock: 9n, lastBlock: 13n }; },
+      async readCanonicalBlock(_scope, number) { return block(number); },
+      async readCanonicalBlocksDescending(_scope, through) {
+        assert.equal(through, 11n);
+        return [block(11n), block(10n), block(9n)];
+      },
+      async recoverCanonicalReorg(_scope, recovery) {
+        assert.equal(recovery.forkBlock, 12n);
+        return { reorgedMessages: 1, deletedCanonicalBlocks: 2, rewoundNextBlock: 12n };
+      },
+    },
+    cursorStore: { async loadOrInitializeCursor() { return 14n; } },
+    logger: { log() {}, error() {} },
+  }).reconcile({ headBlock: 10n });
+  assert.equal(result.detected, true);
+  assert.equal(result.headBlock, 10n);
+  assert.equal(result.commonAncestor, 11n);
+  assert.equal(result.rewoundNextBlock, 12n);
+});
+
+test("does not mutate history when rollback evidence disappears before recovery", async () => {
+  let headReads = 0;
+  const publicClient = publicClientFor(new Map([[10n, block(10n)]]));
+  publicClient.request = async ({ method }) => {
+    assert.equal(method, "eth_blockNumber");
+    headReads += 1;
+    return headReads === 1 ? "0xa" : "0xc";
+  };
+  const result = await createCanonicalReconciler({ config: CONFIG, publicClient,
+    canonicalStore: {
+      async readCanonicalHistoryState() { return { count: 4, firstBlock: 9n, lastBlock: 12n }; },
+      async readCanonicalBlock(_scope, number) { return block(number); },
+      async readCanonicalBlocksDescending() { return [block(10n), block(9n)]; },
+      async recoverCanonicalReorg() { assert.fail("unconfirmed rollback must not mutate history"); },
+    },
+    cursorStore: { async loadOrInitializeCursor() { return 13n; } },
+    logger: { log() {}, error() {} },
+  }).reconcile({ headBlock: 10n });
+  assert.equal(result.detected, false);
+  assert.equal(result.headBlock, 10n);
+  assert.equal(result.rewoundNextBlock, 13n);
+  assert.equal(headReads, 3);
+});
+
+test("rechecks a changed durable recovery premise without moving the fixed snapshot", async () => {
+  let branchChanged = false;
+  let recoveries = 0;
+  const result = await createCanonicalReconciler({
+    config: CONFIG,
+    publicClient: publicClientFor(new Map([[10n, block(10n, 211n, 10n)], [9n, block(9n)]])),
+    canonicalStore: {
+      async readCanonicalHistoryState() { return { count: 2, firstBlock: 9n, lastBlock: 10n }; },
+      async readCanonicalBlock(_scope, number) {
+        return branchChanged && number === 10n ? block(10n, 211n, 10n) : block(number);
+      },
+      async readCanonicalBlocksDescending() { return [block(10n), block(9n)]; },
+      async recoverCanonicalReorg() {
+        recoveries += 1;
+        branchChanged = true;
+        throw new CanonicalHistoryChangedError();
+      },
+    },
+    cursorStore: { async loadOrInitializeCursor() { return 11n; } },
+    logger: { log() {}, error() {} },
+  }).reconcile({ headBlock: 10n });
+  assert.equal(result.detected, false);
+  assert.equal(result.headBlock, 10n);
+  assert.equal(recoveries, 1);
+});
+
+test("rechecks history another worker recovered during ancestor search", async () => {
+  let recoveredElsewhere = false;
+  const result = await createCanonicalReconciler({ config: CONFIG,
+    publicClient: publicClientFor(new Map([[10n, block(10n, 211n, 10n)], [9n, block(9n)]]), 11n),
+    canonicalStore: {
+      async readCanonicalHistoryState() {
+        return recoveredElsewhere ? { count: 1, firstBlock: 9n, lastBlock: 9n } : { count: 3, firstBlock: 9n, lastBlock: 11n };
+      },
+      async readCanonicalBlock(_scope, number) { return recoveredElsewhere && number > 9n ? undefined : block(number); },
+      async readCanonicalBlocksDescending() { recoveredElsewhere = true; return [block(9n)]; },
+      async recoverCanonicalReorg() { assert.fail("the other worker already recovered this branch"); },
+    },
+    cursorStore: { async loadOrInitializeCursor() { return recoveredElsewhere ? 10n : 12n; } },
+    logger: { log() {}, error() {} },
+  }).reconcile({ headBlock: 10n });
+  assert.equal(result.detected, false);
+  assert.equal(result.headBlock, 10n);
+  assert.equal(result.rewoundNextBlock, 10n);
+});
+
+test("large block heights remain exact when shared history advances", async () => {
+  const snapshot = (1n << 80n) + 7n;
+  const head = snapshot + 4n;
+  const result = await createCanonicalReconciler({
+    config: CONFIG,
+    publicClient: publicClientFor(new Map([[snapshot, block(snapshot)]]), head),
+    canonicalStore: {
+      async readCanonicalHistoryState() { return { count: 5, firstBlock: snapshot, lastBlock: head }; },
+      async readCanonicalBlock(_scope, number) { assert.equal(number, snapshot); return block(number); },
+      async recoverCanonicalReorg() { assert.fail("canonical advancement must not recover a fork"); },
+    },
+    cursorStore: { async loadOrInitializeCursor() { return head + 1n; } },
+    logger: { log() {}, error() {} },
+  }).reconcile({ headBlock: snapshot });
+  assert.equal(result.headBlock, snapshot);
+  assert.equal(result.rewoundNextBlock, head + 1n);
 });
 
 test("fails closed when persisted history contains no common ancestor", async () => {

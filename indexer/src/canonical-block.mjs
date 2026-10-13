@@ -7,6 +7,13 @@ export class CanonicalDivergenceError extends Error {
   }
 }
 
+export class CanonicalHistoryChangedError extends Error {
+  constructor(message = "canonical history changed while source reconciliation was in progress") {
+    super(message);
+    this.name = "CanonicalHistoryChangedError";
+  }
+}
+
 export class CanonicalHistoryBootstrapError extends Error {
   constructor(message) {
     super(message);

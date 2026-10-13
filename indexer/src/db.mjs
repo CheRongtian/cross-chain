@@ -6,6 +6,7 @@ import pg from "pg";
 import {
   CanonicalDivergenceError,
   CanonicalHistoryBootstrapError,
+  CanonicalHistoryChangedError,
   FinalizedSourceReorgError,
   normalizeCanonicalBlock,
   validateCanonicalBlockSequence,
@@ -654,13 +655,18 @@ export function createCanonicalStore(pool, schema) {
       }
     },
 
-    async recoverCanonicalReorg(scope, { commonAncestor, forkBlock }) {
+    async recoverCanonicalReorg(scope, { commonAncestor, forkBlock, expectedState }) {
       const normalizedScope = normalizeSourceScope(scope);
       const normalizedAncestor = normalizeCanonicalBlock(commonAncestor);
       const normalizedFork = toUint256(forkBlock, "canonical fork block");
       if (normalizedFork !== normalizedAncestor.number + 1n) {
         throw new Error("canonical fork block must immediately follow the common ancestor");
       }
+      const expected = expectedState === undefined ? undefined : {
+        nextBlock: toUint256(expectedState.nextBlock, "recovery expected cursor"),
+        head: normalizeCanonicalBlock(expectedState.head),
+        probe: normalizeCanonicalBlock(expectedState.probe),
+      };
       const client = await pool.connect();
 
       try {
@@ -674,6 +680,35 @@ export function createCanonicalStore(pool, schema) {
         );
         if (cursor.rowCount !== 1) {
           throw new Error("indexer cursor is missing during source reorg recovery");
+        }
+
+        // persistRange and recovery both lock this cursor before writing history.
+        // No source RPC is called inside this short conditional transaction.
+        if (expected !== undefined) {
+          if (BigInt(cursor.rows[0].next_block) !== expected.nextBlock) {
+            throw new CanonicalHistoryChangedError("cursor advanced or rewound before source reorg recovery");
+          }
+          const headResult = await client.query(
+            `SELECT block_number, block_hash, parent_hash
+               FROM ${canonicalBlocks}
+              WHERE source_domain = $1 AND source_gateway = $2
+              ORDER BY block_number DESC LIMIT 1`,
+            [normalizedScope.chainDomain, normalizedScope.sourceGateway],
+          );
+          const probeResult = await client.query(
+            `SELECT block_number, block_hash, parent_hash
+               FROM ${canonicalBlocks}
+              WHERE source_domain = $1 AND source_gateway = $2 AND block_number = $3`,
+            [normalizedScope.chainDomain, normalizedScope.sourceGateway, expected.probe.number.toString()],
+          );
+          const head = storedCanonicalBlock(headResult.rows[0]);
+          const probe = storedCanonicalBlock(probeResult.rows[0]);
+          if (head === undefined || probe === undefined ||
+              head.number !== expected.head.number || head.hash !== expected.head.hash ||
+              head.parentHash !== expected.head.parentHash || probe.hash !== expected.probe.hash ||
+              probe.parentHash !== expected.probe.parentHash) {
+            throw new CanonicalHistoryChangedError("canonical head or probe changed before source reorg recovery");
+          }
         }
 
         const storedAncestor = await client.query(
@@ -690,6 +725,7 @@ export function createCanonicalStore(pool, schema) {
           ],
         );
         if (storedAncestor.rowCount !== 1) {
+          if (expected !== undefined) throw new CanonicalHistoryChangedError("common ancestor changed before source reorg recovery");
           throw new Error("persisted common ancestor is missing during source reorg recovery");
         }
         const lockedAncestor = storedCanonicalBlock(storedAncestor.rows[0]);
@@ -697,6 +733,7 @@ export function createCanonicalStore(pool, schema) {
           lockedAncestor.hash !== normalizedAncestor.hash ||
           lockedAncestor.parentHash !== normalizedAncestor.parentHash
         ) {
+          if (expected !== undefined) throw new CanonicalHistoryChangedError("common ancestor changed before source reorg recovery");
           throw new CanonicalDivergenceError(
             "persisted common ancestor changed before source reorg recovery",
           );
@@ -801,9 +838,10 @@ export function createFinalityStore(pool, schema) {
             WHERE source_domain = $1
               AND source_gateway = $2
               AND status IN ('OBSERVED', 'FINALIZING')
+              AND source_block_number <= $3::numeric
             ORDER BY source_block_number ASC, source_log_index ASC, id ASC
             FOR UPDATE`,
-          [normalizedScope.chainDomain, normalizedScope.sourceGateway],
+          [normalizedScope.chainDomain, normalizedScope.sourceGateway, normalizedHead.toString()],
         );
 
         const result = {

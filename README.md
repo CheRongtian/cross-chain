@@ -539,7 +539,7 @@ The `indexed_source_blocks` table stores the number, hash, and parent hash of ev
 
 ### Finality lifecycle
 
-The independent Finality Watcher reads the Chain A head exactly once per pass and reconciles canonical block history before evaluating any message. It then evaluates every `OBSERVED` or `FINALIZING` message scoped to the configured chain domain and source Gateway inside one PostgreSQL transaction. Every candidate in the pass is evaluated against the same fixed head.
+The independent Finality Watcher captures one fixed Chain A head per pass and reconciles canonical block history before evaluating any message. It then evaluates `OBSERVED` or `FINALIZING` messages in the configured chain domain and source Gateway whose source block is at or below that captured head, inside one PostgreSQL transaction. Every candidate uses the same fixed head. Separate current-head reads used to confirm a suspected source rollback do not move this evaluation snapshot.
 
 The configured policy is:
 
@@ -566,7 +566,7 @@ Before either the Indexer scans a new range or the Finality Watcher advances lif
 
 Recovery from a fork is atomic under the configured source scope:
 
-1. lock the source cursor and the persisted common ancestor;
+1. lock the source cursor, recheck the observed cursor, indexed head and probe, and lock the persisted common ancestor;
 2. lock message occurrences from the fork block onward;
 3. abort if any affected occurrence is already `FINALIZED`;
 4. mark affected `OBSERVED` and `FINALIZING` occurrences as `REORGED` while preserving their message data, provenance, observation time, and any `finalizing_at` timestamp;
@@ -585,7 +585,9 @@ For each range, canonical block inserts, message inserts, duplicate consistency 
 
 Indexer one-shot mode reads the chain head once at startup, scans only through that fixed snapshot, and exits. Continuous mode repeatedly catches up to a new snapshot and waits for `INDEXER_POLL_INTERVAL_MS` between polls. Every new Indexer process reads the stored cursor, reconciles canonical source history, and continues without resetting to the deployment block. Events emitted while the Indexer is offline are discovered during this catch-up as long as they remain in available canonical source history. If a retry or deliberate rescan encounters an already stored event, database uniqueness prevents a duplicate row.
 
-The Finality Watcher runs independently from the Indexer. Its one-shot mode performs one fixed-head reconciliation and finality pass, while continuous mode repeats passes with `FINALITY_POLL_INTERVAL_MS` between them. A restarted watcher queries persisted `OBSERVED` and `FINALIZING` rows again after canonical reconciliation. It does not depend on an in-memory pending-message list. The runtime assumes one active Indexer and one active Finality Watcher.
+The Finality Watcher runs independently from the Indexer, and one active instance of each may run concurrently. Its one-shot mode captures one Chain A head `H` for reconciliation and finality evaluation, while continuous mode repeats passes with `FINALITY_POLL_INTERVAL_MS` between them. Each pass queries only persisted `OBSERVED` and `FINALIZING` occurrences at or below `H`. An Indexer may commit blocks and messages above that snapshot while the watcher is running; a matching canonical snapshot prefix preserves those blocks, messages, and the advanced cursor. Newer occurrences remain available for a later watcher snapshot. A restarted watcher uses the same durable queries and does not depend on an in-memory pending-message list.
+
+A stored indexed head above `H` does not by itself establish a source reorganization. The reconciler obtains separate current-head evidence to distinguish a stale caller snapshot from an actual chain rollback; this does not change `H` for scanning, block-depth calculations, or lifecycle decisions. Only verified canonical divergence or a confirmed rollback triggers destructive recovery. A confirmed rollback retains the still-canonical suffix through its actual head, even when that head is above the caller's older snapshot. Before mutation, the existing cursor-locked transaction checks the observed cursor, indexed head, probe, and common ancestor. If another worker has changed that recovery premise, reconciliation rechecks the same fixed snapshot. Source RPC calls remain outside the write transaction.
 
 ### Crash recovery
 
@@ -1994,7 +1996,7 @@ Cross-Chain/
 - A fork that reaches a `FINALIZED` occurrence fails closed and requires operator investigation; configured block depth therefore remains a policy choice with real reorganization risk.
 - Transactional block, message, cursor, reorganization, and finality writes support single-node worker restart recovery after graceful or abrupt process loss. Database-enforced source-event uniqueness makes exact-log retries and rescans idempotent without overwriting first-observation data or lifecycle status.
 - PostgreSQL client errors fail the active pass. Recovery requires a fresh client or worker process connected to the same durable database; the project does not manage PostgreSQL server availability, replication, or automatic failover.
-- The runtime assumes one active Indexer and one active Finality Watcher. Multi-instance coordination, distributed locking, active-active failover, and zero-downtime orchestration remain unimplemented.
+- The runtime supports one active Indexer and one active Finality Watcher concurrently. Each watcher pass evaluates a fixed head snapshot, preserves canonical Indexer progress beyond it, and leaves newer occurrences for a later pass. Multi-instance coordination, distributed locking, active-active failover, and zero-downtime orchestration remain unimplemented.
 - The current message binds its protocol type, source domain, source gateway, source sender, destination domain, destination gateway, destination receiver, nonce, payload hash, and deadline.
 - A committed destination gateway is caller-selected. `SourceGateway` does not validate remote deployment, domain ownership, or trust, and no remote-gateway registry exists.
 - The batcher consumes only the existing `FINALIZED` eligibility boundary. `REORGED` occurrences remain terminal and are excluded from every batch.

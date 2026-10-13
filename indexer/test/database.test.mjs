@@ -6,6 +6,7 @@ import { loadDatabaseConfig } from "../src/config.mjs";
 import {
   CanonicalDivergenceError,
   CanonicalHistoryBootstrapError,
+  CanonicalHistoryChangedError,
   FinalizedSourceReorgError,
 } from "../src/canonical-block.mjs";
 import {
@@ -23,6 +24,8 @@ import {
 import { computeCanonicalMessageId, computePayloadHash } from "../src/canonical-message.mjs";
 import { createMessageBatcher } from "../src/message-batch.mjs";
 import { buildMessageMerkleTree, verifyMessageMerkleProof } from "../src/message-merkle.mjs";
+import { createCanonicalReconciler } from "../src/reorg-detector.mjs";
+import { createFinalityWatcher } from "../src/finality-watcher.mjs";
 
 assert.ok(process.env.DATABASE_URL, "DATABASE_URL is required for PostgreSQL tests");
 
@@ -822,6 +825,11 @@ test("recovers an unfinalized fork and preserves old and replacement occurrences
   const recovery = await canonicalStore.recoverCanonicalReorg(scope, {
     commonAncestor: canonicalBlock(9n),
     forkBlock: 10n,
+    expectedState: {
+      nextBlock: 12n,
+      head: canonicalBlock(11n, { hash: oldBlock11Hash, parentHash: oldBlock10Hash }),
+      probe: canonicalBlock(11n, { hash: oldBlock11Hash, parentHash: oldBlock10Hash }),
+    },
   });
   const afterRecovery = await readMessages(pool, config.databaseSchema);
   const firstReorgedAt = afterRecovery[0].reorged_at.getTime();
@@ -926,6 +934,7 @@ test("fails closed without any recovery mutation when a fork reaches FINALIZED",
     canonicalStore.recoverCanonicalReorg(scope, {
       commonAncestor: canonicalBlock(9n),
       forkBlock: 10n,
+      expectedState: { nextBlock: 12n, head: canonicalBlock(11n), probe: canonicalBlock(11n) },
     }),
     FinalizedSourceReorgError,
   );
@@ -1113,7 +1122,7 @@ test("evaluates messages independently and exposes only FINALIZED rows for batch
   assert.deepEqual(eligible.map((row) => row.message_id), [`0x${"11".repeat(32)}`]);
 });
 
-test("rolls back every lifecycle update when a candidate is ahead of the head", async () => {
+test("defers above-snapshot rows without rolling back eligible lifecycle updates", async () => {
   await initializeCursor();
   await store.persistRange(scope, {
     fromBlock: 10n,
@@ -1130,18 +1139,206 @@ test("rolls back every lifecycle update when a candidate is ahead of the head", 
     ],
   });
 
-  await assert.rejects(
-    finalityStore.advanceFinality(scope, {
-      headBlock: 15n,
-      finalityBlockDepth: 2n,
-    }),
-    /source block 20 is greater than the finality head 15/,
-  );
+  const result = await finalityStore.advanceFinality(scope, {
+    headBlock: 15n,
+    finalityBlockDepth: 2n,
+  });
 
   const messages = await readMessages(pool, config.databaseSchema);
-  assert.deepEqual(messages.map((row) => row.status), ["OBSERVED", "OBSERVED"]);
+  assert.equal(result.candidatesChecked, 1);
+  assert.deepEqual(messages.map((row) => row.status), ["FINALIZED", "OBSERVED"]);
   assert.ok(messages.every((row) => row.finalizing_at === null));
-  assert.ok(messages.every((row) => row.finalized_at === null));
+  assert.equal(messages[1].finalized_at, null);
+  const next = await finalityStore.advanceFinality(scope, { headBlock: 20n, finalityBlockDepth: 2n });
+  assert.equal(next.observedToFinalizing, 1);
+  assert.deepEqual((await readMessages(pool, config.databaseSchema)).map(row => row.status), ["FINALIZED", "FINALIZING"]);
+});
+
+test("a storage failure still rolls back every eligible lifecycle update", async () => {
+  await initializeCursor();
+  await store.persistRange(scope, { fromBlock: 10n, toBlock: 11n, rows: [
+    messageRow({ sourceLogIndex: "0" }),
+    messageRow({ sourceBlockNumber: "11", sourceLogIndex: "0", sourceTransactionHash: `0x${"49".repeat(32)}` }),
+  ] });
+  const before = await readMessages(pool, config.databaseSchema);
+  const failingStore = createFinalityStore({
+    async connect() {
+      const client = await pool.connect();
+      return {
+        async query(sql, parameters) {
+          if (sql.includes("UPDATE") && parameters[0] === before[1].id) {
+            throw new Error("controlled finality write failure");
+          }
+          return client.query(sql, parameters);
+        },
+        release() { client.release(); },
+      };
+    },
+  }, config.databaseSchema);
+  await assert.rejects(failingStore.advanceFinality(scope, { headBlock: 20n, finalityBlockDepth: 2n }), /controlled finality write failure/);
+  assert.deepEqual(await readMessages(pool, config.databaseSchema), before);
+});
+
+for (const snapshot of [11n, (1n << 80n) + 11n]) {
+  test(`bounds OBSERVED and FINALIZING candidates at exact snapshot ${snapshot}`, async () => {
+    await initializeCursor(snapshot - 1n);
+    const rows = [snapshot - 1n, snapshot, snapshot + 1n, snapshot + 2n].map((number, index) => messageRow({
+      sourceBlockNumber: number.toString(), nonce: String(index), sourceLogIndex: "0",
+      sourceTransactionHash: `0x${(70 + index).toString(16).repeat(32)}`,
+    }));
+    await store.persistRange(scope, { fromBlock: snapshot - 1n, toBlock: snapshot + 2n, rows });
+    await pool.query(`UPDATE ${schemaIdentifier}."source_messages"
+      SET status = 'FINALIZING', finalizing_at = CURRENT_TIMESTAMP
+      WHERE source_block_number IN ($1::numeric, $2::numeric)`, [snapshot.toString(), (snapshot + 2n).toString()]);
+    const before = await readMessages(pool, config.databaseSchema);
+    const pass = await finalityStore.advanceFinality(scope, { headBlock: snapshot, finalityBlockDepth: 1n });
+    const afterPass = await readMessages(pool, config.databaseSchema);
+    assert.equal(pass.candidatesChecked, 2);
+    assert.deepEqual(afterPass.map(row => row.status), ["FINALIZED", "FINALIZING", "OBSERVED", "FINALIZING"]);
+    assert.deepEqual(afterPass.slice(2), before.slice(2));
+    assert.equal(afterPass[0].finalized_at_head, snapshot.toString());
+    const later = await finalityStore.advanceFinality(scope, { headBlock: snapshot + 3n, finalityBlockDepth: 1n });
+    assert.equal(later.candidatesChecked, 3);
+    assert.ok((await readMessages(pool, config.databaseSchema)).every(row => row.status === "FINALIZED"));
+  });
+}
+
+for (const phase of ["after-head", "after-reconciliation"]) {
+  test(`independent database clients preserve forward progress ${phase}`, { timeout: 30_000 }, async () => {
+    await initializeCursor();
+    await store.persistRange(scope, { fromBlock: 10n, toBlock: 10n, rows: [messageRow({ sourceLogIndex: "0" })] });
+    const watcherPool = createDatabasePool(config);
+    const indexerPool = createDatabasePool(config);
+    const reached = Promise.withResolvers();
+    const resume = Promise.withResolvers();
+    let liveHead = 10n;
+    let captured = false;
+    let reconciliation;
+    let recoveryCalls = 0;
+    let pending;
+    const liveClient = {
+      async request({ method }) {
+        assert.equal(method, "eth_blockNumber");
+        const head = liveHead;
+        if (phase === "after-head" && !captured) {
+          captured = true;
+          reached.resolve();
+          await resume.promise;
+        }
+        return `0x${head.toString(16)}`;
+      },
+      async getBlock({ blockNumber }) { return canonicalBlock(blockNumber); },
+    };
+    const watcherConfig = { ...config, ...scope, sourceGatewayStartBlock: 10n, finalityBlockDepth: 2n };
+    const watcherCanonicalStore = createCanonicalStore(watcherPool, config.databaseSchema);
+    const recover = watcherCanonicalStore.recoverCanonicalReorg.bind(watcherCanonicalStore);
+    watcherCanonicalStore.recoverCanonicalReorg = (...args) => { recoveryCalls += 1; return recover(...args); };
+    const reconciler = createCanonicalReconciler({ config: watcherConfig, pool: watcherPool, publicClient: liveClient,
+      canonicalStore: watcherCanonicalStore, logger: { log() {}, error() {} } });
+    const watcher = createFinalityWatcher({ config: watcherConfig, pool: watcherPool, publicClient: liveClient,
+      reconciler: { async reconcile(input) {
+        reconciliation = await reconciler.reconcile(input);
+        if (phase === "after-reconciliation") { reached.resolve(); await resume.promise; }
+        return reconciliation;
+      } }, logger: { log() {} } });
+    try {
+      const watcherPid = (await watcherPool.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+      const indexerPid = (await indexerPool.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+      assert.notEqual(watcherPid, indexerPid);
+      pending = watcher.runFinalityPass();
+      await Promise.race([reached.promise, pending.then(() => assert.fail("watcher did not reach the controlled barrier"))]);
+      await createDatabaseStore(indexerPool, config.databaseSchema).persistRange(scope, {
+        fromBlock: 11n, toBlock: 13n, blocks: canonicalBlockRange(11n, 13n),
+        rows: [messageRow({ sourceBlockNumber: "11", sourceLogIndex: "0", sourceTransactionHash: `0x${"50".repeat(32)}` })],
+      });
+      liveHead = 13n;
+      const blocksBefore = await readIndexedSourceBlocks(pool, config.databaseSchema, scope);
+      const cursorBefore = await readCursor(pool, config.databaseSchema, scope);
+      const futureBefore = (await readMessages(pool, config.databaseSchema))[1];
+      assert.equal(cursorBefore.next_block, "14");
+      resume.resolve();
+      const pass = await pending;
+      assert.equal(pass.headBlock, 10n);
+      assert.equal(pass.candidatesChecked, 1);
+      assert.equal(reconciliation.detected, false);
+      assert.equal(recoveryCalls, 0);
+      assert.deepEqual(await readIndexedSourceBlocks(pool, config.databaseSchema, scope), blocksBefore);
+      assert.deepEqual(await readCursor(pool, config.databaseSchema, scope), cursorBefore);
+      assert.deepEqual((await readMessages(pool, config.databaseSchema))[1], futureBefore);
+      const later = await watcher.runFinalityPass();
+      assert.equal(later.headBlock, 13n);
+      assert.ok((await readMessages(pool, config.databaseSchema)).every(row => row.status === "FINALIZED"));
+      console.log(`VALID: fixed snapshot 10, independent Indexer durable head 13 (${phase}); no recovery, H+1 message/blocks and cursor 14 preserved; later snapshot finalized the deferred row`);
+    } finally {
+      resume.resolve();
+      if (pending) await pending.catch(() => {});
+      await Promise.all([watcherPool.end(), indexerPool.end()]);
+    }
+  });
+}
+
+test("conditional reorg recovery refuses a cursor advanced by another client", async () => {
+  await initializeCursor();
+  await store.persistRange(scope, { fromBlock: 10n, toBlock: 10n, rows: [messageRow()] });
+  const expectedState = { nextBlock: 11n, head: canonicalBlock(10n), probe: canonicalBlock(10n) };
+  const otherPool = createDatabasePool(config);
+  try {
+    await createDatabaseStore(otherPool, config.databaseSchema).persistRange(scope, {
+      fromBlock: 11n, toBlock: 11n, blocks: [canonicalBlock(11n)], rows: [],
+    });
+    const messagesBefore = await readMessages(pool, config.databaseSchema);
+    const blocksBefore = await readIndexedSourceBlocks(pool, config.databaseSchema, scope);
+    const cursorBefore = await readCursor(pool, config.databaseSchema, scope);
+    await assert.rejects(canonicalStore.recoverCanonicalReorg(scope, {
+      commonAncestor: canonicalBlock(9n), forkBlock: 10n, expectedState,
+    }), CanonicalHistoryChangedError);
+    assert.deepEqual(await readMessages(pool, config.databaseSchema), messagesBefore);
+    assert.deepEqual(await readIndexedSourceBlocks(pool, config.databaseSchema, scope), blocksBefore);
+    assert.deepEqual(await readCursor(pool, config.databaseSchema, scope), cursorBefore);
+  } finally { await otherPool.end(); }
+});
+
+test("confirmed real head regression still recovers through the conditional transaction", async () => {
+  await initializeCursor();
+  await store.persistRange(scope, { fromBlock: 10n, toBlock: 11n, rows: [messageRow({ sourceBlockNumber: "11" })] });
+  const result = await createCanonicalReconciler({
+    config: { ...config, ...scope, sourceGatewayStartBlock: 10n }, pool,
+    publicClient: {
+      async request({ method }) { assert.equal(method, "eth_blockNumber"); return "0xa"; },
+      async getBlock({ blockNumber }) { assert.ok(blockNumber <= 10n); return canonicalBlock(blockNumber); },
+    }, logger: { log() {}, error() {} },
+  }).reconcile({ headBlock: 10n });
+  assert.equal(result.detected, true);
+  assert.equal(result.commonAncestor, 10n);
+  assert.equal(result.rewoundNextBlock, 11n);
+  assert.equal((await readCursor(pool, config.databaseSchema, scope)).next_block, "11");
+  assert.deepEqual((await readIndexedSourceBlocks(pool, config.databaseSchema, scope)).map(row => row.block_number), ["9", "10"]);
+  assert.equal((await readMessages(pool, config.databaseSchema))[0].status, "REORGED");
+});
+
+test("conditional recovery refuses replaced history even when cursor and height match", async () => {
+  await initializeCursor();
+  const old = messageRow();
+  await store.persistRange(scope, { fromBlock: 10n, toBlock: 10n, rows: [old] });
+  const expectedState = { nextBlock: 11n, head: canonicalBlock(10n), probe: canonicalBlock(10n) };
+  await canonicalStore.recoverCanonicalReorg(scope, { commonAncestor: canonicalBlock(9n), forkBlock: 10n });
+  const replacementBlock = canonicalBlock(10n, { hash: blockHash(10n, 1_000n) });
+  await store.persistRange(scope, { fromBlock: 10n, toBlock: 10n, blocks: [replacementBlock],
+    rows: [messageRow({ sourceBlockHash: replacementBlock.hash })] });
+  const messagesBefore = await readMessages(pool, config.databaseSchema);
+  const blocksBefore = await readIndexedSourceBlocks(pool, config.databaseSchema, scope);
+  await assert.rejects(canonicalStore.recoverCanonicalReorg(scope, {
+    commonAncestor: canonicalBlock(9n), forkBlock: 10n, expectedState,
+  }), CanonicalHistoryChangedError);
+  assert.deepEqual(await readMessages(pool, config.databaseSchema), messagesBefore);
+  assert.deepEqual(await readIndexedSourceBlocks(pool, config.databaseSchema, scope), blocksBefore);
+  assert.equal((await readCursor(pool, config.databaseSchema, scope)).next_block, "11");
+  // Exact old occurrences stay terminal even if a later canonical view returns
+  // to those bytes. Conditional recovery must not be repaired by revival.
+  await canonicalStore.recoverCanonicalReorg(scope, { commonAncestor: canonicalBlock(9n), forkBlock: 10n });
+  const repeated = await store.persistRange(scope, { fromBlock: 10n, toBlock: 10n, rows: [old] });
+  assert.equal(repeated.duplicates, 1);
+  assert.ok((await readMessages(pool, config.databaseSchema)).every(row => row.status === "REORGED"));
 });
 
 test("duplicate re-ingestion preserves FINALIZED state and metadata", async () => {

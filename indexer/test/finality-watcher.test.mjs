@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createFinalityWatcher } from "../src/finality-watcher.mjs";
+import { createCanonicalReconciler } from "../src/reorg-detector.mjs";
 
 const CONFIG = {
   chainDomain: 10_011n,
@@ -63,6 +64,41 @@ test("uses one fixed head snapshot for a finality pass", async () => {
   assert.deepEqual(result, expected);
   assert.ok(logs.includes("Finality head: 123"));
   assert.ok(logs.includes("Configured block depth: 2"));
+});
+
+test("a recovery-specific head confirmation never moves the finality snapshot", async () => {
+  let headReads = 0;
+  const hash = `0x${"11".repeat(32)}`;
+  const publicClient = {
+    async request({ method }) {
+      assert.equal(method, "eth_blockNumber");
+      headReads += 1;
+      return headReads === 1 ? "0x7b" : "0x7c";
+    },
+    async getBlock({ blockNumber }) {
+      assert.equal(blockNumber, 123n);
+      return { number: blockNumber, hash, parentHash: `0x${"10".repeat(32)}` };
+    },
+  };
+  const config = { ...CONFIG, sourceGatewayStartBlock: 123n };
+  const reconciler = createCanonicalReconciler({ config, publicClient,
+    canonicalStore: {
+      async readCanonicalHistoryState() { return { count: 3, firstBlock: 122n, lastBlock: 124n }; },
+      async readCanonicalBlock(_scope, number) { return { number, hash, parentHash: `0x${"10".repeat(32)}` }; },
+      async recoverCanonicalReorg() { assert.fail("matching fixed prefix must not recover"); },
+    },
+    cursorStore: { async loadOrInitializeCursor() { return 125n; } },
+    logger: { log() {}, error() {} },
+  });
+  const result = await createFinalityWatcher({ config, publicClient, reconciler,
+    store: { async advanceFinality(_scope, policy) {
+      assert.equal(policy.headBlock, 123n);
+      return { headBlock: 123n, candidatesChecked: 0, observedToFinalizing: 0, observedToFinalized: 0,
+        finalizingToFinalized: 0, unchangedFinalizing: 0 };
+    } }, logger: { log() {} },
+  }).runFinalityPass();
+  assert.equal(headReads, 2);
+  assert.equal(result.headBlock, 123n);
 });
 
 test("continuous mode stops cleanly after an aborted pass", async () => {
