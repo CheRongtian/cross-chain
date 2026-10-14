@@ -1,13 +1,15 @@
 {
-  "nullifierVersion": 1,
+  "nullifierVersion": 2,
   "algorithm": "Poseidon",
-  "arity": 5,
+  "arity": 7,
   "inputOrder": [
     "nullifierVersion",
     "credentialIdField",
     "applicationDomain",
     "policyEpoch",
-    "actionContext"
+    "actionContext",
+    "forwardIntentDigestHi",
+    "forwardIntentDigestLo"
   ],
   "privateIdentitySource": "credentialIdField",
   "outputRepresentation": "unsigned decimal BN254 field element",
@@ -32,6 +34,7 @@
   },
   "actionContexts": {
     "VERIFY_SUPPLIER": 1,
-    "OTHER_TEST_ACTION": 2
+    "OTHER_TEST_ACTION": 2,
+    "FORWARD_MESSAGE": 3
   }
 }

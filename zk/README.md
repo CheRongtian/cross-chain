@@ -18,7 +18,7 @@ The prover demonstrates all of the following in one circuit:
 - the active leaf derived from `credentialCommitment` belongs to the public
   `credentialStateRoot` through the private Merkle path;
 - the public `nullifier` is derived from the private credential identifier and
-  the public application, policy epoch, and action context.
+  the public application, policy epoch, action context and both forwarding intent limbs.
 
 Issuer trust is an external policy decision. Equality with `trustedIssuer`
 shows that the committed issuer matches that policy value; this circuit does
@@ -47,6 +47,8 @@ Public inputs, in circuit order:
 - `policyEpoch`
 - `actionContext`
 - `nullifier`
+- `forwardIntentDigestHi`
+- `forwardIntentDigestLo`
 
 The circuit range-constrains `expiry` and `currentTimestamp` to unsigned
 64-bit values before applying the strict comparison.
@@ -74,7 +76,7 @@ inputs are serialized as unsigned decimal field elements in generated JSON.
 [`nullifier.json`](nullifier.json) defines the context-bound nullifier:
 
 ```text
-Poseidon(1, credentialIdField, applicationDomain, policyEpoch, actionContext)
+Poseidon(2, credentialIdField, applicationDomain, policyEpoch, actionContext, forwardIntentDigestHi, forwardIntentDigestLo)
 ```
 
 `credentialIdField` remains private. The other values and the resulting
@@ -88,9 +90,11 @@ keccak256(abi.encode(namespaceHash, chainId, applicationAddress))
 where `namespaceHash` is the Keccak-256 hash of
 `cross-chain:identity-application-domain:v1`. Policy epoch `1` is the initial
 application authorization context and is unrelated to a validator or consensus
-epoch. Action `1` means supplier verification. Equal contexts produce an
-equal nullifier. A different application, epoch, or action produces a separate
-nullifier. Shared relation cases live in
+epoch. Action `1` means standalone verification with both limbs constrained to zero.
+Action `3` authorizes one exact forwarding intent. Equal complete contexts produce an
+equal nullifier; changing application, epoch, action or intent changes that context.
+Both limbs fit uint128 and preserve the full domain-separated ABI/Keccak digest.
+Shared relation cases live in
 [`../test-vectors/nullifiers.json`](../test-vectors/nullifiers.json); concrete
 Poseidon outputs are generated under `build/nullifier-vectors.json`.
 
@@ -151,6 +155,8 @@ The Solidity public-signal order is:
 [6] policyEpoch
 [7] actionContext
 [8] nullifier
+[9] forwardIntentDigestHi
+[10] forwardIntentDigestLo
 ```
 
 `contracts/src/CredentialVerifier.sol` converts its named public-input struct
@@ -167,6 +173,22 @@ advance the policy epoch, rotate the root, and mark commitments revoked.
 Consumed nullifiers are retained across both operations. The circuit does not
 bind its private subject to an EVM account, so application authorization is not
 keyed by the transaction submitter.
+
+## Exact authorized forwarding
+
+The application recomputes the intent from its chain, own address and immutable
+Gateway, plus destination domain/Gateway/receiver, payload hash, deadline,
+message version, action and actual executor. The public limbs must match it.
+Proof verification, nullifier consumption and the Gateway call share one
+transaction; a revert restores the nullifier. Standalone verification grants no
+subsequent forwarding capability.
+
+The generated `authorized-forward-valid` fixture checks the eleven-signal
+mapping. Fixed ABI words and full-width limb cases are shared with Solidity.
+Runtime preparation reads the current deployed policy/root/epoch and block
+time, uses the active secondary synthetic credential and reuses the existing
+WASM/zkey. The existing snarkjs CLI owns its temporary proving workers; input
+and proof files are cleaned up. Private witnesses and proofs stay out of messages.
 
 ## Running verification
 
@@ -195,4 +217,3 @@ production trusted setup.
   public proof signals
 - automatic expiry of stored application authorization
 - decentralized credential-state root publication or governance
-- SourceGateway authorization integration

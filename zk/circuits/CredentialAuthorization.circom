@@ -6,7 +6,7 @@ include "circomlib/circuits/comparators.circom";
 template CredentialAuthorization() {
     var CREDENTIAL_STATE_TREE_DEPTH = 8;
     var CREDENTIAL_STATE_LEAF_VERSION = 1;
-    var NULLIFIER_VERSION = 1;
+    var NULLIFIER_VERSION = 2;
 
     signal input subject;
     signal input issuer;
@@ -23,6 +23,8 @@ template CredentialAuthorization() {
     signal input policyEpoch;
     signal input actionContext;
     signal input nullifier;
+    signal input forwardIntentDigestHi;
+    signal input forwardIntentDigestLo;
 
     signal input statePathElements[CREDENTIAL_STATE_TREE_DEPTH];
     signal input statePathIndices[CREDENTIAL_STATE_TREE_DEPTH];
@@ -36,12 +38,24 @@ template CredentialAuthorization() {
     commitment.inputs[5] <== credentialId;
     commitment.out === credentialCommitment;
 
-    component nullifierHash = Poseidon(5);
+    component intentHiRange = Num2Bits(128);
+    component intentLoRange = Num2Bits(128);
+    intentHiRange.in <== forwardIntentDigestHi;
+    intentLoRange.in <== forwardIntentDigestLo;
+    component verifyOnly = IsEqual();
+    verifyOnly.in[0] <== actionContext;
+    verifyOnly.in[1] <== 1;
+    verifyOnly.out * forwardIntentDigestHi === 0;
+    verifyOnly.out * forwardIntentDigestLo === 0;
+
+    component nullifierHash = Poseidon(7);
     nullifierHash.inputs[0] <== NULLIFIER_VERSION;
     nullifierHash.inputs[1] <== credentialId;
     nullifierHash.inputs[2] <== applicationDomain;
     nullifierHash.inputs[3] <== policyEpoch;
     nullifierHash.inputs[4] <== actionContext;
+    nullifierHash.inputs[5] <== forwardIntentDigestHi;
+    nullifierHash.inputs[6] <== forwardIntentDigestLo;
     nullifierHash.out === nullifier;
 
     component activeLeaf = Poseidon(2);
@@ -86,4 +100,4 @@ template CredentialAuthorization() {
     unexpired.out === 1;
 }
 
-component main {public [credentialCommitment, trustedIssuer, requiredRole, currentTimestamp, credentialStateRoot, applicationDomain, policyEpoch, actionContext, nullifier]} = CredentialAuthorization();
+component main {public [credentialCommitment, trustedIssuer, requiredRole, currentTimestamp, credentialStateRoot, applicationDomain, policyEpoch, actionContext, nullifier, forwardIntentDigestHi, forwardIntentDigestLo]} = CredentialAuthorization();

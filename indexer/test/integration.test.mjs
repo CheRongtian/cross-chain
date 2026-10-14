@@ -7,9 +7,9 @@ import { fileURLToPath } from "node:url";
 import {
   createPublicClient,
   createWalletClient,
+  decodeEventLog,
   defineChain,
   http,
-  parseAbi,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
@@ -37,10 +37,8 @@ import { createValidatorSetResolver } from "../../validator/src/validator-sets.m
 import { verifyDeliveryQueue } from "./helpers/delivery-integration.mjs";
 import { verifySingleRelayer } from "./helpers/relayer-integration.mjs";
 import { verifySourceSnapshotConcurrency } from "./helpers/source-snapshot-integration.mjs";
+import { prepareAuthorizedSourceMessage,verifyForwardAuthorizationNegatives,expectForwardRejection } from "./helpers/authorized-source-message.mjs";
 
-const IDENTITY_APPLICATION_ABI = parseAbi([
-  "function sendCrossChainMessage(uint256 destinationDomain, address destinationGateway, address destinationReceiver, bytes payload, uint256 deadline) returns (bytes32 messageId, uint256 nonce)",
-]);
 const execFileAsync = promisify(execFile);
 const INDEXER_MAIN_PATH = fileURLToPath(new URL("../src/main.mjs", import.meta.url));
 const LIFECYCLE_READER_PATH = fileURLToPath(new URL("./helpers/read-batch-lifecycle.mjs", import.meta.url));
@@ -183,25 +181,55 @@ test("recovers source workers and seals durable batches from real finalized mess
     });
   }
 
+  let forwardingNegativesVerified = false;
+  let lastForwardDeadline = 0n;
   async function produceMessage(payload) {
     const latestBlock = await publicClient.getBlock();
-    const deadline = latestBlock.timestamp + 3600n;
+    // Repeated fixture payloads and snapshot rewinds still represent distinct
+    // authorized requests. No Gateway nonce is added to the proof statement.
+    const proposedDeadline = latestBlock.timestamp + 3600n;
+    const deadline = proposedDeadline > lastForwardDeadline ? proposedDeadline : lastForwardDeadline + 1n;
+    lastForwardDeadline = deadline;
+    const prepared = await prepareAuthorizedSourceMessage({ publicClient,application: identityApplication,destinationDomain,
+      destinationGateway,destinationReceiver,payload: normalizePayload(payload),deadline,executor: account.address });
+    assert.equal(prepared.intent.sourceGateway,config.sourceGateway);
+    if (!forwardingNegativesVerified) {
+      await verifyForwardAuthorizationNegatives({ publicClient,walletClient,application: identityApplication,prepared,executor: account.address });
+      forwardingNegativesVerified = true;
+    }
     const transactionHash = await walletClient.writeContract({
       address: identityApplication,
-      abi: IDENTITY_APPLICATION_ABI,
-      functionName: "sendCrossChainMessage",
-      args: [destinationDomain, destinationGateway, destinationReceiver, normalizePayload(payload), deadline],
+      abi: prepared.abi,
+      functionName: "forwardAuthorizedMessage",
+      args: prepared.args,
     });
     const receipt = await publicClient.waitForTransactionReceipt({ hash: transactionHash });
+    assert.equal(receipt.status,"success","authorized source transaction must succeed");
     const gatewayLog = receipt.logs.find(
       (log) => normalizeAddress(log.address, "receipt log address") === config.sourceGateway,
     );
     assert.ok(gatewayLog, "CrossChainMessage log was not found in the integration transaction receipt");
 
-    return decodeCrossChainMessageLog(gatewayLog, {
+    const event = decodeCrossChainMessageLog(gatewayLog, {
       expectedGateway: config.sourceGateway,
       expectedSourceDomain: config.chainDomain,
     });
+    assert.equal(event.destinationDomain,destinationDomain);
+    assert.equal(event.destinationGateway,destinationGateway);
+    assert.equal(event.destinationReceiver,destinationReceiver);
+    assert.equal(event.payload,normalizePayload(payload)); assert.equal(event.deadline,deadline);
+    assert.equal(event.sourceSender,identityApplication);
+    const authorization = receipt.logs
+      .filter(log => normalizeAddress(log.address) === identityApplication)
+      .map(log => decodeEventLog({ abi: prepared.abi,data: log.data,topics: log.topics }))
+      .find(log => log.eventName === "AuthorizedMessageForwarded");
+    assert.ok(authorization,"source application authorization link event is required");
+    assert.equal(authorization.args.intentDigest,prepared.intentDigest);
+    assert.equal(authorization.args.nullifier,BigInt(prepared.publicInputs.nullifier));
+    assert.equal(authorization.args.messageId,event.messageId);
+    await expectForwardRejection(publicClient,identityApplication,prepared,prepared.args,account.address,"NullifierAlreadyUsed");
+    console.log("VALID: real intent-bound proof emitted exact CrossChainMessage and rejected replay: " + event.messageId);
+    return event;
   }
 
   async function mineBlock() {

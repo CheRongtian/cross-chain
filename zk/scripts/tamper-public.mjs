@@ -1,4 +1,5 @@
 import { readFile, writeFile } from "node:fs/promises";
+import { CREDENTIAL_PUBLIC_SIGNAL_ORDER } from "../../indexer/src/forward-authorization.mjs";
 
 const [inputPath, outputPath, scalarFieldPrime] = process.argv.slice(2);
 
@@ -8,9 +9,9 @@ if (!inputPath || !outputPath || !scalarFieldPrime) {
 
 const publicSignals = JSON.parse(await readFile(inputPath, "utf8"));
 
-if (!Array.isArray(publicSignals) || publicSignals.length !== 9) {
+if (!Array.isArray(publicSignals) || publicSignals.length !== CREDENTIAL_PUBLIC_SIGNAL_ORDER.length) {
   throw new Error(
-    "expected nine public signals ordered as commitment, issuer, role, timestamp, state root, application domain, policy epoch, action context, nullifier",
+    "expected eleven public signals with forwarding intent hi/lo appended after nullifier",
   );
 }
 

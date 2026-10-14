@@ -28,6 +28,29 @@
   },
   "cases": [
     {
+      "name": "authorized-forward-valid",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "contextOverrides": { "actionContext": "FORWARD_MESSAGE" },
+      "forwardIntent": {
+        "protocolVersion": "2",
+        "action": "3",
+        "sourceDomain": "10011",
+        "application": "0x000000000000000000000000000000000000a11c",
+        "sourceGateway": "0x0000000000000000000000000000000000001001",
+        "destinationDomain": "2001",
+        "destinationGateway": "0x000000000000000000000000000000000000d00d",
+        "destinationReceiver": "0x000000000000000000000000000000000000beef",
+        "payload": "0x68656c6c6f20636861696e2062",
+        "deadline": "2000000060",
+        "authorizedExecutor": "0x00000000000000000000000000000000000a11ce"
+      },
+      "expected": "proof-verifies"
+    },
+    {
       "name": "valid",
       "fixture": "valid.json",
       "commitmentSource": "self",

@@ -2,6 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { groth16 } from "snarkjs";
+import { CREDENTIAL_PUBLIC_SIGNAL_ORDER } from "../../indexer/src/forward-authorization.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ZK_ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -40,12 +41,12 @@ function formatArray(value) {
   return value;
 }
 
-function solidityFixture(proofA, proofB, proofC, publicSignals) {
+function solidityFixture(proofA, proofB, proofC, publicSignals, libraryName = "CredentialProofFixture") {
   return `// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
 /// @notice Generated from snarkjs Solidity calldata for local verification.
-library CredentialProofFixture {
+library ${libraryName} {
     function proofA() internal pure returns (uint256[2] memory value) {
         value[0] = uint256(${proofA[0]});
         value[1] = uint256(${proofA[1]});
@@ -63,7 +64,7 @@ library CredentialProofFixture {
         value[1] = uint256(${proofC[1]});
     }
 
-    function publicSignals() internal pure returns (uint256[9] memory value) {
+    function publicSignals() internal pure returns (uint256[11] memory value) {
         value[0] = uint256(${publicSignals[0]});
         value[1] = uint256(${publicSignals[1]});
         value[2] = uint256(${publicSignals[2]});
@@ -73,6 +74,8 @@ library CredentialProofFixture {
         value[6] = uint256(${publicSignals[6]});
         value[7] = uint256(${publicSignals[7]});
         value[8] = uint256(${publicSignals[8]});
+        value[9] = uint256(${publicSignals[9]});
+        value[10] = uint256(${publicSignals[10]});
     }
 }
 `;
@@ -102,7 +105,7 @@ async function loadSolidityCalldata(proofPath, publicPath) {
     "invalid Solidity proof B",
   );
   requireCondition(Array.isArray(proofC) && proofC.length === 2, "invalid Solidity proof C");
-  requireCondition(Array.isArray(publicSignals) && publicSignals.length === 9, "expected nine public signals");
+  requireCondition(Array.isArray(publicSignals) && publicSignals.length === CREDENTIAL_PUBLIC_SIGNAL_ORDER.length, "expected eleven public signals");
 
   return { proofA, proofB, proofC, publicSignals };
 }
@@ -132,6 +135,8 @@ async function main() {
     ["tampered-policy-epoch", 6],
     ["tampered-action-context", 7],
     ["tampered-nullifier", 8],
+    ["tampered-intent-hi", 9],
+    ["tampered-intent-lo", 10],
   ];
 
   for (const [name, index] of publicCases) {
@@ -148,10 +153,19 @@ async function main() {
     "application-alternate-domain",
     "application-other-action",
     "active-secondary-current",
+    "authorized-forward-valid",
   ]) {
     const proofPath = path.join(PROVING_DIR, `${name}-proof.json`);
     const publicPath = path.join(PROVING_DIR, `${name}-public.json`);
     const calldata = await loadSolidityCalldata(proofPath, publicPath);
+    const input = await loadJson(path.join(ZK_ROOT, "build", "inputs", name + ".json"));
+    for (const [index, signal] of CREDENTIAL_PUBLIC_SIGNAL_ORDER.entries()) {
+      requireCondition(BigInt(calldata.publicSignals[index]) === BigInt(input[signal]), "public signal mapping mismatch: " + signal);
+    }
+    if (name === "authorized-forward-valid") {
+      await writeFile(path.join(GENERATED_CONTRACTS_DIR, "ForwardCredentialProofFixture.sol"),
+        solidityFixture(calldata.proofA, calldata.proofB, calldata.proofC, calldata.publicSignals, "ForwardCredentialProofFixture"), "utf8");
+    }
 
     await writeCalldata(
       name,

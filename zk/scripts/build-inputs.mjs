@@ -9,6 +9,7 @@ import {
   requireCondition,
 } from "./credential-state.mjs";
 import { computeNullifier, resolveActionContext } from "./nullifier.mjs";
+import { computeForwardIntentDigest, splitForwardIntentDigest } from "../../indexer/src/forward-authorization.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ZK_ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -22,7 +23,7 @@ async function loadJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
 }
 
-function decimalInput(encoded, commitment, policy, credentialState, nullifierContext) {
+export function decimalInput(encoded, commitment, policy, credentialState, nullifierContext) {
   return {
     subject: encoded.subject.toString(),
     issuer: encoded.issuer.toString(),
@@ -38,6 +39,8 @@ function decimalInput(encoded, commitment, policy, credentialState, nullifierCon
     policyEpoch: nullifierContext.policyEpoch.toString(),
     actionContext: nullifierContext.actionContext.toString(),
     nullifier: nullifierContext.nullifier.toString(),
+    forwardIntentDigestHi: (nullifierContext.forwardIntentDigestHi ?? 0n).toString(),
+    forwardIntentDigestLo: (nullifierContext.forwardIntentDigestLo ?? 0n).toString(),
     statePathElements: credentialState.pathElements.map(String),
     statePathIndices: credentialState.pathIndices.map(String),
   };
@@ -61,7 +64,7 @@ function evaluationTime(manifest) {
   const configuredTimestamp = process.env.CREDENTIAL_PROOF_TIMESTAMP;
 
   if (configuredTimestamp === undefined) {
-    return manifest.evaluationTime;
+    return BigInt(manifest.evaluationTime);
   }
 
   requireCondition(
@@ -69,10 +72,10 @@ function evaluationTime(manifest) {
     "CREDENTIAL_PROOF_TIMESTAMP must be an unsigned decimal integer",
   );
 
-  const parsedTimestamp = Number(configuredTimestamp);
+  const parsedTimestamp = BigInt(configuredTimestamp);
   requireCondition(
-    Number.isSafeInteger(parsedTimestamp),
-    "CREDENTIAL_PROOF_TIMESTAMP must be a safe integer",
+    parsedTimestamp < (1n << 64n),
+    "CREDENTIAL_PROOF_TIMESTAMP must fit uint64",
   );
 
   return parsedTimestamp;
@@ -217,6 +220,8 @@ async function main() {
     }
 
     const nullifierContext = {
+      forwardIntentDigestHi: 0n,
+      forwardIntentDigestLo: 0n,
       applicationDomain: defaultContext.applicationDomain,
       policyEpoch:
         contextOverrides.policyEpoch === undefined
@@ -238,6 +243,10 @@ async function main() {
     requireCondition(nullifierContext.applicationDomain !== 0n, `${proofCase.name} applicationDomain is zero`);
     requireCondition(nullifierContext.policyEpoch !== 0n, `${proofCase.name} policyEpoch is zero`);
 
+    if (proofCase.forwardIntent) {
+      Object.assign(nullifierContext, splitForwardIntentDigest(computeForwardIntentDigest(proofCase.forwardIntent)));
+      requireCondition(nullifierContext.actionContext === resolveActionContext("FORWARD_MESSAGE", nullifierConfig), "forward intent requires its dedicated action");
+    }
     let nullifier = computeNullifier(
       poseidon,
       encodedWitness.credentialId,
@@ -279,4 +288,4 @@ async function main() {
   console.log("Verified proof-input nullifier determinism and context separation.");
 }
 
-await main();
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) await main();

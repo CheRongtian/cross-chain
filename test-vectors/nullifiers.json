@@ -1,5 +1,5 @@
 {
-  "vectorVersion": 1,
+  "vectorVersion": 2,
   "description": "Synthetic context vectors for deterministic Poseidon nullifier generation.",
   "generatedOutput": "zk/build/nullifier-vectors.json",
   "cases": [
@@ -42,16 +42,40 @@
       "policyEpoch": "1",
       "actionContext": "OTHER_TEST_ACTION",
       "expectedNullifier": "generated-by-zk/scripts/build-nullifier-vectors.mjs"
+    },
+    {
+      "name": "forward-baseline", "credentialIdField": "101", "applicationDomain": "1001", "policyEpoch": "1",
+      "actionContext": "FORWARD_MESSAGE", "forwardIntentDigestHi": "1", "forwardIntentDigestLo": "2",
+      "expectedNullifier": "generated-by-zk/scripts/build-nullifier-vectors.mjs"
+    },
+    {
+      "name": "same-forward-intent", "credentialIdField": "101", "applicationDomain": "1001", "policyEpoch": "1",
+      "actionContext": "FORWARD_MESSAGE", "forwardIntentDigestHi": "1", "forwardIntentDigestLo": "2",
+      "expectedNullifier": "generated-by-zk/scripts/build-nullifier-vectors.mjs"
+    },
+    {
+      "name": "different-forward-hi", "credentialIdField": "101", "applicationDomain": "1001", "policyEpoch": "1",
+      "actionContext": "FORWARD_MESSAGE", "forwardIntentDigestHi": "2", "forwardIntentDigestLo": "2",
+      "expectedNullifier": "generated-by-zk/scripts/build-nullifier-vectors.mjs"
+    },
+    {
+      "name": "different-forward-lo", "credentialIdField": "101", "applicationDomain": "1001", "policyEpoch": "1",
+      "actionContext": "FORWARD_MESSAGE", "forwardIntentDigestHi": "1", "forwardIntentDigestLo": "3",
+      "expectedNullifier": "generated-by-zk/scripts/build-nullifier-vectors.mjs"
     }
   ],
   "expectedRelations": {
     "equal": [
+      ["forward-baseline", "same-forward-intent"],
       [
         "baseline",
         "same-context"
       ]
     ],
     "different": [
+      ["forward-baseline", "different-forward-hi"],
+      ["forward-baseline", "different-forward-lo"],
+      ["baseline", "forward-baseline"],
       [
         "baseline",
         "different-application"

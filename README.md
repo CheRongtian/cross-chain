@@ -96,7 +96,7 @@ Public policy, state + context ──>│ Groth16 / BN254          │ ──> p
                                                          CredentialVerifier adapter
                                                                             │
                                                                             v
-                                                         IdentityApplicationA policy
+                                                   IdentityApplicationA policy + exact intent
                                                            │       │        │
                                                            │       v        v
                                                            │ usedNullifiers commitment status
@@ -198,7 +198,7 @@ Unknown EOA or contract ──────────────────�
                                               CONFIRMED / REVERTED
 ```
 
-`IdentityApplicationA` can call `SourceGateway`, but proof verification and message creation remain separate application entry points. A successful credential proof does not automatically emit a message, and sending a message does not consume a ZK nullifier. The Indexer persists emitted source events, and the Finality Watcher advances their database lifecycle; neither component adds proof-to-message binding. The generated Groth16 verifier, its credential adapter, `SourceGateway`, and `IdentityApplicationA` are deployed to Chain A during verification.
+`IdentityApplicationA.forwardAuthorizedMessage` verifies a credential proof bound to the exact forwarding intent, consumes its nullifier and calls `SourceGateway` in one transaction. The separate `verifySupplier` function records commitment-level credential verification and provides no forwarding capability. The Indexer and validators independently revalidate public canonical source events without inspecting private credentials or re-running the credential circuit. The generated Groth16 verifier, its adapter, Gateway and application are deployed to Chain A during verification.
 
 The Indexer and Finality Watcher are disposable worker processes. Their durable operational progress lives in PostgreSQL, and every new process reconciles that state with Chain A before continuing.
 
@@ -367,15 +367,17 @@ Each authorization proof exposes a deterministic nullifier while keeping `creden
 
 ```text
 Poseidon(
-    1,
+    2,
     credentialIdField,
     applicationDomain,
     policyEpoch,
-    actionContext
+    actionContext,
+    forwardIntentDigestHi,
+    forwardIntentDigestLo
 )
 ```
 
-The leading `1` is the nullifier version. `applicationDomain` is bound to the deployed application and chain:
+The leading `2` is the nullifier version. `applicationDomain` retains its existing deployed-application and chain namespace:
 
 ```text
 keccak256(
@@ -387,7 +389,7 @@ keccak256(
 ) mod BN254_SCALAR_FIELD
 ```
 
-`policyEpoch` starts at `1` and can only increase by one. It is the authorization-policy context owned by `IdentityApplicationA`; it is unrelated to any future validator or consensus epoch. The supplier-verification action is encoded as `1`. The same private credential and the same three public context values produce the same nullifier. Changing the application, epoch, or action produces a different nullifier. Machine-readable definitions are in `zk/nullifier.json`; reusable relation vectors are in `test-vectors/nullifiers.json`, and verification writes their concrete Poseidon results to `zk/build/nullifier-vectors.json`.
+`policyEpoch` starts at `1` and advances by one; it is independent of validator epochs. Action `1` is standalone supplier verification, with both intent limbs constrained to zero. Action `3` authorizes one exact forwarding intent. The same credential, application, epoch, action and intent produce the same nullifier, so that authorization can be consumed once. Distinct intents have distinct authorization contexts. Definitions and relations are in `zk/nullifier.json` and `test-vectors/nullifiers.json`.
 
 ### Circuit statement
 
@@ -399,7 +401,8 @@ keccak256(
 - `currentTimestamp < expiry`;
 - `currentTimestamp` and `expiry` both fit in uint64;
 - the active leaf derived from `credentialCommitment` belongs to the public `credentialStateRoot`.
-- the public `nullifier` is the Poseidon hash of the private `credentialId` and the public application, epoch, and action context.
+- the public `nullifier` binds the private `credentialId`, application, epoch, action and both forwarding digest limbs;
+- each forwarding limb fits in uint128; standalone verification constrains both to zero.
 
 Private witness inputs:
 
@@ -425,6 +428,8 @@ applicationDomain
 policyEpoch
 actionContext
 nullifier
+forwardIntentDigestHi
+forwardIntentDigestLo
 ```
 
 Issuer trust remains an external policy decision. The circuit proves that the committed issuer matches the supplied public policy value. It does not verify an issuer signature or query an issuer registry.
@@ -440,7 +445,7 @@ verifyProof(
     uint256[2] proofA,
     uint256[2][2] proofB,
     uint256[2] proofC,
-    uint256[9] publicSignals
+    uint256[11] publicSignals
 ) returns (bool)
 ```
 
@@ -456,6 +461,8 @@ verifyProof(
 [6] policyEpoch
 [7] actionContext
 [8] nullifier
+[9] forwardIntentDigestHi
+[10] forwardIntentDigestLo
 ```
 
 Proof coordinates are converted with snarkjs `groth16.exportSolidityCallData`, including the required G2 coordinate ordering. The same generated calldata is used by Forge tests and Chain A integration verification.
@@ -476,7 +483,7 @@ The Solidity verifier establishes that a Groth16 proof is valid for the supplied
 - a non-zero credential-state authority;
 - a non-zero initial credential-state root.
 
-`verifySupplier` accepts the proof coordinates and the nine-field public-input struct used by the credential verifier. Before calling the verifier, the application requires the proof issuer and role to equal its deployment policy, rejects timestamps later than `block.timestamp`, rejects timestamps older than `maxProofAge`, requires the proof root to equal the current application root, rejects commitments already marked `REVOKED`, and requires the canonical application domain, current policy epoch, and supplier action context. It also rejects out-of-field or previously consumed nullifiers. A successful verification atomically sets:
+`verifySupplier` accepts proof coordinates and the eleven-field public-input struct, with the standalone action and zero intent limbs. It checks issuer, role, freshness, current root, revocation, application domain, policy epoch and nullifier replay before verification. A successful verification atomically sets:
 
 ```text
 usedNullifiers[nullifier] = true
@@ -495,11 +502,25 @@ Revocation and nullifier consumption answer separate questions and are enforced 
 
 ### Application source messaging
 
-`IdentityApplicationA.sendCrossChainMessage` forwards the destination domain, destination gateway, destination receiver, payload, and deadline to its configured `ISourceGateway`. It returns the Gateway-created message ID and nonce and does not maintain a second nonce or message encoding implementation. The Gateway observes `address(IdentityApplicationA)` as the direct `sourceSender`.
+`IdentityApplicationA.forwardAuthorizedMessage` accepts proof coordinates, public inputs and a request with destination domain, Gateway, receiver, payload and deadline. It computes an intent using the actual source chain, own address, immutable source Gateway, message version `2`, action `3`, request fields and `msg.sender` as authorized executor. Payload hashing is performed by the contract.
+
+Its independent type separator is:
+
+```text
+ForwardAuthorizationIntent(uint8 protocolVersion,uint256 action,uint256 sourceDomain,address application,address sourceGateway,uint256 destinationDomain,address destinationGateway,address destinationReceiver,bytes32 payloadHash,uint256 deadline,address authorizedExecutor)
+```
+
+The digest is Keccak-256 of the Ethereum ABI encoding of the type hash followed by those fields. Its full 256 bits become `hi = uint256(digest) >> 128` and `lo = uint256(digest) & (2**128 - 1)`. Each limb is range-constrained and participates in the circuit's Poseidon nullifier derivation. No field reduction is applied to this digest. Fixed ABI words, signal order and limb cases in `test-vectors/forward-authorizations.json` are shared across JavaScript and Solidity.
+
+The application requires matching public limbs, applies all credential checks, verifies Groth16, consumes the nullifier, then forwards the exact request. A failed Gateway call rolls the consumption back. `AuthorizedMessageForwarded` links intent digest, nullifier and message ID without private fields. Another executor or altered intent cannot use that proof to authorize its call.
 
 After deployment, the source-authorization administrator explicitly authorizes `IdentityApplicationA` in the Gateway registry. The deployment flow performs this transaction only after confirming that the application was created at its predicted address, preserving the application-domain value used by the generated proofs.
 
-This transport entry point remains separate from `verifySupplier`. It does not require a proof, check stored supplier authorization, or consume a nullifier. Gateway authorization establishes which application contract may create a message; it does not authenticate the EOA calling that application or bind a proof nullifier to a message.
+There is no production no-proof forwarding entry point. Standalone supplier status permits no arbitrary subsequent messages. The Gateway remains credential-unaware and owns the canonical source nonce; the intent does not predict it. The final public message retains its version-2 encoding and message-ID algorithm. Its ID includes the Gateway nonce and is distinct from the authorization digest.
+
+The executor is the authorized submitter of that operation. This binding establishes no EVM identity for the private subject and automatically grants no destination role. Witnesses and Groth16 proofs remain local to Chain A and are absent from messages, batches, QCs and delivery packages. Validators/QCs authenticate canonical public source events and batches under the trusted-application model; destination execution remains unimplemented.
+
+Unified verification generates fresh intent-bound proofs using the deployed application's current root, epoch and block time, reusing one WASM/zkey. Real A/B/C/D/E messages use the protected production entry point. Mutations reuse a valid proof, and source reorg/finality, consensus, delivery and transaction recovery checks retain their original boundaries.
 
 ## Chain A Indexer and Finality Watcher
 
@@ -878,7 +899,7 @@ An integrity-checked candidate that fails canonical-block or depth validation ca
 7. deterministic batch reconstruction and Message Root recomputation through the existing production builders;
 8. a check that the fixed head's block hash still matches before persisting the local observation.
 
-`FINALIZED` in PostgreSQL is an eligibility input, not independent source truth. A source block above the fixed head, insufficient depth, missing or changed log, wrong context, or canonical mismatch fails closed. A fork affecting finalized members is not repaired by validators. Source-layer reconciliation and operator investigation retain that responsibility. Proof verification and outbound message creation also remain separate application operations; the validator layer adds no atomic ZK-to-message binding.
+`FINALIZED` in PostgreSQL is an eligibility input, not independent source truth. A source block above the fixed head, insufficient depth, missing or changed log, wrong context, or canonical mismatch fails closed. A fork affecting finalized members is not repaired by validators. Source-layer reconciliation and operator investigation retain that responsibility. Application A establishes proof-to-message binding atomically at the source; validators authenticate the resulting event without re-verifying private credential evidence.
 
 ### Peer transport and HTTP API
 
@@ -2032,6 +2053,6 @@ Cross-Chain/
 - Relayer A/B delegate verified zero-value transport to the Persistent Transaction Manager. Their shared exclusive EOA is an untrusted transport account with no validator or destination permission. Exact signed bytes are durable before broadcast; bounded retry reuses them, and replacement only appends a higher-fee candidate at the same nonce. Any historical candidate may win. CONFIRMED supplies no Gateway authentication, business execution or permanent destination finality.
 - Destination RPC failover uses ordered, fingerprint-checked access paths. Provider URLs never identify a transaction or grant destination authority. Conservative cross-provider checks do not provide Byzantine RPC consensus.
 - The repository does not provide decentralized validator governance, Byzantine-relayer handling, destination-confirmed transaction reorg recovery, destination gateway/QC verification, exactly-once downstream execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
-- ZK authorization remains local to `IdentityApplicationA` on Chain A and is not propagated across chains.
+- Groth16 verification remains local to `IdentityApplicationA`. Its protected messages carry exact authorized public intent fields; destination credential-proof verification and business execution remain unimplemented.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, production transaction recovery and destination reorganization handling, and a destination-chain execution security design.

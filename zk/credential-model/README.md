@@ -22,7 +22,7 @@ valid with respect to time only while `evaluationTime < expiry`.
 All credential fields are private by default and remain with the user. The
 authorization proof publishes `credentialCommitment`, `trustedIssuer`,
 `requiredRole`, `currentTimestamp`, `credentialStateRoot`,
-`applicationDomain`, `policyEpoch`, `actionContext`, and `nullifier`.
+`applicationDomain`, `policyEpoch`, `actionContext`, `nullifier`, and two public uint128 forwarding intent limbs.
 Credential fields and Merkle paths are not placed in public chain state. The
 identity application stores authorization under the public credential
 commitment and does not expose the private subject or credential identifier.
@@ -91,19 +91,27 @@ proof's public authorization context:
 
 ```text
 nullifier = Poseidon(
-    1,
+    2,
     credentialIdField,
     applicationDomain,
     policyEpoch,
-    actionContext
+    actionContext,
+    forwardIntentDigestHi,
+    forwardIntentDigestLo
 )
 ```
 
 The nullifier version and ordered inputs are fixed in
 [`../nullifier.json`](../nullifier.json). A verifier can detect repeated use in
-the same application, epoch, and action without learning the credential ID.
+the same application, epoch, action and intent without learning the credential ID.
 Changing any context component creates a different nullifier. This separation
 is intentional and means that the nullifier is not a global identifier.
+
+Standalone action 1 constrains both limbs to zero. Forwarding action 3 binds a
+domain-separated ABI/Keccak intent to exact public routing, payload, deadline and
+executor values. The private subject remains unbound to an EVM recipient;
+Application A checks the actual forwarding caller and consumes authorization
+atomically without exposing private credential fields.
 
 ## Fixtures
 
@@ -136,4 +144,4 @@ The following capabilities are intentionally absent:
 - automatic expiry of stored authorization
 - decentralized credential-state root publication or governance
 - anonymous unlinkability for the public commitment and other public signals
-- SourceGateway authorization integration
+- destination authorization and business execution

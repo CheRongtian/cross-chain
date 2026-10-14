@@ -131,6 +131,7 @@ verify_policy_proof "application-next-epoch"
 verify_policy_proof "application-alternate-domain"
 verify_policy_proof "application-other-action"
 verify_policy_proof "active-secondary-current"
+verify_policy_proof "authorized-forward-valid"
 
 GENERATED_VERIFIER="$GENERATED_CONTRACTS_DIR/Groth16Verifier.sol"
 

@@ -27,6 +27,8 @@ PROOF_TIMESTAMP_OFFSET="3600"
 APPLICATION_MAX_PROOF_AGE="3600"
 SNARK_SCALAR_FIELD="21888242871839275222246405745257275088548364400416034343698204186575808495617"
 APPLICATION_DOMAIN_NAMESPACE="cross-chain:identity-application-domain:v1"
+PUBLIC_INPUTS_SIGNATURE="(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256)"
+FORWARD_SIGNATURE="forwardAuthorizedMessage(uint256[2],uint256[2][2],uint256[2],${PUBLIC_INPUTS_SIGNATURE},(uint256,address,address,bytes,uint256))"
 
 ANVIL_DEV_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 SOURCE_SENDER="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
@@ -239,17 +241,27 @@ deploy_unknown_source_application() {
         || fail "could not extract unknown source application address"
 }
 
+prepare_application_forwarding() {
+    node "$INDEXER_DIR/scripts/build-forwarding-proof.mjs" \
+        "$CHAIN_A_RPC" "$IDENTITY_APPLICATION_ADDRESS" "$CHAIN_B_ID" \
+        "$DESTINATION_GATEWAY" "$DESTINATION_RECEIVER" "$PAYLOAD" "$MESSAGE_DEADLINE" "$SOURCE_SENDER" \
+        "$TEMP_DIR/forwarding-calldata.txt"
+    [[ "$(wc -l < "$TEMP_DIR/forwarding-calldata.txt" | tr -d '[:space:]')" == "14" ]] \
+        || fail "forwarding calldata must contain fourteen lines"
+    FORWARD_PROOF_A="$(sed -n '1p' "$TEMP_DIR/forwarding-calldata.txt")"
+    FORWARD_PROOF_B="$(sed -n '2p' "$TEMP_DIR/forwarding-calldata.txt")"
+    FORWARD_PROOF_C="$(sed -n '3p' "$TEMP_DIR/forwarding-calldata.txt")"
+    FORWARD_PUBLIC_INPUTS="($(sed -n '4,14p' "$TEMP_DIR/forwarding-calldata.txt" | paste -sd ',' -))"
+}
+
 send_application_message() {
     local output
 
     output="$(
         cast send "$IDENTITY_APPLICATION_ADDRESS" \
-            "sendCrossChainMessage(uint256,address,address,bytes,uint256)" \
-            "$CHAIN_B_ID" \
-            "$DESTINATION_GATEWAY" \
-            "$DESTINATION_RECEIVER" \
-            "$PAYLOAD" \
-            "$MESSAGE_DEADLINE" \
+            "$FORWARD_SIGNATURE" \
+            "$FORWARD_PROOF_A" "$FORWARD_PROOF_B" "$FORWARD_PROOF_C" "$FORWARD_PUBLIC_INPUTS" \
+            "($CHAIN_B_ID,$DESTINATION_GATEWAY,$DESTINATION_RECEIVER,$PAYLOAD,$MESSAGE_DEADLINE)" \
             --rpc-url "$CHAIN_A_RPC" \
             --private-key "$ANVIL_DEV_KEY" \
             --async
@@ -377,7 +389,8 @@ cleanup() {
             "$TEMP_DIR/deploy-output.log" \
             "$TEMP_DIR/deployment-addresses.env" \
             "$TEMP_DIR/validator-pids" \
-            "$TEMP_DIR/relayer-pids"
+            "$TEMP_DIR/relayer-pids" \
+            "$TEMP_DIR/forwarding-calldata.txt"
         rmdir "$TEMP_DIR" 2>/dev/null || true
     fi
 
@@ -640,6 +653,11 @@ printf '194. Retain all-path transient retry schedules across PostgreSQL clients
 printf '195. Preserve already-known, underpriced, nonce-too-low and deterministic rejection policy without blind fan-out\n'
 printf '196. Stop unknown/malformed responses separately; verify migration sequence/reruns and preserve historical upgrade state\n'
 printf '197. Keep identity, wrong-hash, fixed-head receipt, pending-parent replacement and secret-redaction regressions intact\n'
+printf '198. Match independently frozen forwarding ABI words, full-width digest limbs and eleven-signal mapping across JavaScript/Solidity\n'
+printf '199. Require an exact-intent credential proof and executor before atomic Application A forwarding\n'
+printf '200. Reject altered routing/payload/deadline, actions, limbs, executor, application/Gateway reuse and proof replay\n'
+printf '201. Preserve Gateway nonce/message IDs and failed-call nullifier rollback without a no-proof production path\n'
+printf '202. Produce real A/B/C/D/E messages through fresh intent-bound proofs and preserve all existing protocol regressions\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -677,6 +695,7 @@ node "$INDEXER_DIR/scripts/generate-merkle-golden-vectors.mjs" --check
 CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, recovery, RPC error classification, batch, Merkle, golden compatibility, lifecycle and portable delivery package unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
+    "$INDEXER_DIR/test/forward-authorization.test.mjs" \
     "$INDEXER_DIR/test/config.test.mjs" \
     "$INDEXER_DIR/test/canonical-message.test.mjs" \
     "$INDEXER_DIR/test/source-event-identity.test.mjs" \
@@ -815,6 +834,7 @@ APPLICATION_DOMAIN="$APPLICATION_DOMAIN" \
 CURRENT_STEP="canonical message vector generation"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node "$PROJECT_ROOT/scripts/build-canonical-message-vector.mjs"
+node "$INDEXER_DIR/scripts/build-forward-authorization-vectors.mjs"
 
 cd "$CONTRACTS_DIR"
 
@@ -823,6 +843,8 @@ printf '\n[%s]\n' "$CURRENT_STEP"
 forge fmt \
     generated/Groth16Verifier.sol \
     generated/CredentialProofFixture.sol \
+    generated/ForwardCredentialProofFixture.sol \
+    generated/ForwardAuthorizationVector.sol \
     generated/CanonicalMessageVector.sol
 
 CURRENT_STEP="forge build"
@@ -932,6 +954,7 @@ printf 'Verified deployed bytecode at %s.\n' "$SOURCE_GATEWAY"
 MESSAGE_CHAIN_TIMESTAMP="$(cast block latest --field timestamp --rpc-url "$CHAIN_A_RPC")"
 [[ "$MESSAGE_CHAIN_TIMESTAMP" =~ ^[0-9]+$ ]] || fail "Chain A timestamp must be an unsigned integer"
 MESSAGE_DEADLINE=$((MESSAGE_CHAIN_TIMESTAMP + 3600))
+FIRST_MESSAGE_DEADLINE="$MESSAGE_DEADLINE"
 printf 'Source message deadline: %s\n' "$MESSAGE_DEADLINE"
 
 CURRENT_STEP="initial contract state verification"
@@ -1035,6 +1058,7 @@ assert_equal \
 printf 'VALID: unauthorized sends did not consume nonce\n'
 
 CURRENT_STEP="first message ID prediction"
+prepare_application_forwarding
 printf '\n[%s]\n' "$CURRENT_STEP"
 FIRST_EXPECTED_MESSAGE_ID="$(
     cast call "$SOURCE_GATEWAY" \
@@ -1109,6 +1133,8 @@ assert_equal \
     "2" \
     "nonce after first message"
 
+MESSAGE_DEADLINE=$((MESSAGE_DEADLINE + 1))
+prepare_application_forwarding
 CURRENT_STEP="second message ID prediction"
 printf '\n[%s]\n' "$CURRENT_STEP"
 SECOND_EXPECTED_MESSAGE_ID="$(
@@ -1129,7 +1155,16 @@ if [[ "$(normalize "$FIRST_EXPECTED_MESSAGE_ID")" == "$(normalize "$SECOND_EXPEC
     fail "different nonces produced identical message IDs"
 fi
 
-printf 'Verified that nonce 1 and nonce 2 produce different message IDs.\n'
+NONCE_ONLY_MESSAGE_ID="$(
+    cast call "$SOURCE_GATEWAY" \
+        "computeMessageId(address,uint256,address,address,uint256,bytes32,uint256)(bytes32)" \
+        "$IDENTITY_APPLICATION_ADDRESS" "$CHAIN_B_ID" "$DESTINATION_GATEWAY" "$DESTINATION_RECEIVER" \
+        2 "$PAYLOAD_HASH" "$FIRST_MESSAGE_DEADLINE" --rpc-url "$CHAIN_A_RPC"
+)"
+if [[ "$(normalize "$FIRST_EXPECTED_MESSAGE_ID")" == "$(normalize "$NONCE_ONLY_MESSAGE_ID")" ]]; then
+    fail "changing only the Gateway nonce did not change the canonical message ID"
+fi
+printf 'Verified canonical nonce-only domain separation and distinct authorized request IDs.\n'
 
 CURRENT_STEP="second message send"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1152,6 +1187,8 @@ assert_equal \
     "3" \
     "nonce after second message"
 
+MESSAGE_DEADLINE=$((MESSAGE_DEADLINE + 1))
+prepare_application_forwarding
 CURRENT_STEP="Application A message ID prediction"
 printf '\n[%s]\n' "$CURRENT_STEP"
 APPLICATION_EXPECTED_MESSAGE_ID="$(
@@ -1197,12 +1234,9 @@ CURRENT_STEP="expired Application A message rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
 EXPIRED_MESSAGE_DEADLINE="$(cast block latest --field timestamp --rpc-url "$CHAIN_A_RPC")"
 if cast call "$IDENTITY_APPLICATION_ADDRESS" \
-    "sendCrossChainMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
-    "$CHAIN_B_ID" \
-    "$DESTINATION_GATEWAY" \
-    "$DESTINATION_RECEIVER" \
-    "$PAYLOAD" \
-    "$EXPIRED_MESSAGE_DEADLINE" \
+    "$FORWARD_SIGNATURE" \
+    "$FORWARD_PROOF_A" "$FORWARD_PROOF_B" "$FORWARD_PROOF_C" "$FORWARD_PUBLIC_INPUTS" \
+    "($CHAIN_B_ID,$DESTINATION_GATEWAY,$DESTINATION_RECEIVER,$PAYLOAD,$EXPIRED_MESSAGE_DEADLINE)" \
     --from "$SOURCE_SENDER" \
     --rpc-url "$CHAIN_A_RPC"; then
     fail "expired Application A message unexpectedly succeeded"
@@ -1217,12 +1251,9 @@ assert_equal \
 CURRENT_STEP="zero destination gateway rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
 if cast call "$IDENTITY_APPLICATION_ADDRESS" \
-    "sendCrossChainMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
-    "$CHAIN_B_ID" \
-    "$ZERO_ADDRESS" \
-    "$DESTINATION_RECEIVER" \
-    "$PAYLOAD" \
-    "$MESSAGE_DEADLINE" \
+    "$FORWARD_SIGNATURE" \
+    "$FORWARD_PROOF_A" "$FORWARD_PROOF_B" "$FORWARD_PROOF_C" "$FORWARD_PUBLIC_INPUTS" \
+    "($CHAIN_B_ID,$ZERO_ADDRESS,$DESTINATION_RECEIVER,$PAYLOAD,$MESSAGE_DEADLINE)" \
     --from "$SOURCE_SENDER" \
     --rpc-url "$CHAIN_A_RPC"; then
     fail "zero destination gateway call unexpectedly succeeded"
@@ -1237,12 +1268,9 @@ assert_equal \
 CURRENT_STEP="same-chain destination rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
 if cast call "$IDENTITY_APPLICATION_ADDRESS" \
-    "sendCrossChainMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
-    "$CHAIN_A_ID" \
-    "$DESTINATION_GATEWAY" \
-    "$DESTINATION_RECEIVER" \
-    "$PAYLOAD" \
-    "$MESSAGE_DEADLINE" \
+    "$FORWARD_SIGNATURE" \
+    "$FORWARD_PROOF_A" "$FORWARD_PROOF_B" "$FORWARD_PROOF_C" "$FORWARD_PUBLIC_INPUTS" \
+    "($CHAIN_A_ID,$DESTINATION_GATEWAY,$DESTINATION_RECEIVER,$PAYLOAD,$MESSAGE_DEADLINE)" \
     --from "$SOURCE_SENDER" \
     --rpc-url "$CHAIN_A_RPC"; then
     fail "same-chain destination call unexpectedly succeeded"
@@ -1253,12 +1281,9 @@ fi
 CURRENT_STEP="zero destination receiver rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
 if cast call "$IDENTITY_APPLICATION_ADDRESS" \
-    "sendCrossChainMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
-    "$CHAIN_B_ID" \
-    "$DESTINATION_GATEWAY" \
-    "$ZERO_ADDRESS" \
-    "$PAYLOAD" \
-    "$MESSAGE_DEADLINE" \
+    "$FORWARD_SIGNATURE" \
+    "$FORWARD_PROOF_A" "$FORWARD_PROOF_B" "$FORWARD_PROOF_C" "$FORWARD_PUBLIC_INPUTS" \
+    "($CHAIN_B_ID,$DESTINATION_GATEWAY,$ZERO_ADDRESS,$PAYLOAD,$MESSAGE_DEADLINE)" \
     --from "$SOURCE_SENDER" \
     --rpc-url "$CHAIN_A_RPC"; then
     fail "zero destination receiver call unexpectedly succeeded"
@@ -1266,6 +1291,8 @@ else
     printf 'Verified rejection of the zero destination receiver.\n'
 fi
 
+MESSAGE_DEADLINE=$((MESSAGE_DEADLINE + 1))
+prepare_application_forwarding
 CURRENT_STEP="IdentityApplicationA source authorization revocation"
 printf '\n[%s]\n' "$CURRENT_STEP"
 send_source_application_authorization "$IDENTITY_APPLICATION_ADDRESS" false
@@ -1289,7 +1316,7 @@ assert_hex_equal \
         "$DESTINATION_RECEIVER" \
         1 \
         "$PAYLOAD_HASH" \
-        "$MESSAGE_DEADLINE" \
+        "$FIRST_MESSAGE_DEADLINE" \
         --rpc-url "$CHAIN_A_RPC")" \
     "$FIRST_EXPECTED_MESSAGE_ID" \
     "historical message ID after source application revocation"
@@ -1300,12 +1327,9 @@ expect_call_revert \
     "revoked Application A rejected" \
     "UnauthorizedSourceApplication()" \
     "$IDENTITY_APPLICATION_ADDRESS" \
-    "sendCrossChainMessage(uint256,address,address,bytes,uint256)(bytes32,uint256)" \
-    "$CHAIN_B_ID" \
-    "$DESTINATION_GATEWAY" \
-    "$DESTINATION_RECEIVER" \
-    "$PAYLOAD" \
-    "$MESSAGE_DEADLINE" \
+    "$FORWARD_SIGNATURE" \
+    "$FORWARD_PROOF_A" "$FORWARD_PROOF_B" "$FORWARD_PROOF_C" "$FORWARD_PUBLIC_INPUTS" \
+    "($CHAIN_B_ID,$DESTINATION_GATEWAY,$DESTINATION_RECEIVER,$PAYLOAD,$MESSAGE_DEADLINE)" \
     --from "$SOURCE_SENDER" \
     --rpc-url "$CHAIN_A_RPC"
 assert_equal \

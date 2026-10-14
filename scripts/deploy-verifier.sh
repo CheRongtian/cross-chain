@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-# Canonical ABI fragments for the credential proof's nine public signals.
-PUBLIC_INPUTS_SIGNATURE="(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256)"
+# Canonical ABI fragments for all eleven credential public signals.
+PUBLIC_INPUTS_SIGNATURE="(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256)"
 VERIFY_CREDENTIAL_SIGNATURE="verifyCredentialProof(uint256[2],uint256[2][2],uint256[2],${PUBLIC_INPUTS_SIGNATURE})(bool)"
 VERIFY_SUPPLIER_SIGNATURE="verifySupplier(uint256[2],uint256[2][2],uint256[2],${PUBLIC_INPUTS_SIGNATURE})"
 EXPECTED_IDENTITY_APPLICATION_ADDRESS="${EXPECTED_IDENTITY_APPLICATION_ADDRESS:-}"
@@ -97,8 +97,8 @@ load_calldata() {
     local input_file="$CALLDATA_DIR/$case_name.txt"
 
     [[ -f "$input_file" ]] || fail "missing Solidity calldata: $input_file"
-    [[ "$(wc -l < "$input_file" | tr -d '[:space:]')" == "12" ]] \
-        || fail "Solidity calldata must contain twelve lines: $input_file"
+    [[ "$(wc -l < "$input_file" | tr -d '[:space:]')" == "14" ]] \
+        || fail "Solidity calldata must contain fourteen lines: $input_file"
 
     PROOF_A="$(sed -n '1p' "$input_file")"
     PROOF_B="$(sed -n '2p' "$input_file")"
@@ -112,7 +112,9 @@ load_calldata() {
     POLICY_EPOCH="$(sed -n '10p' "$input_file")"
     ACTION_CONTEXT="$(sed -n '11p' "$input_file")"
     NULLIFIER="$(sed -n '12p' "$input_file")"
-    PUBLIC_INPUTS="($CREDENTIAL_COMMITMENT,$TRUSTED_ISSUER,$REQUIRED_ROLE,$CURRENT_TIMESTAMP,$CREDENTIAL_STATE_ROOT,$APPLICATION_DOMAIN,$POLICY_EPOCH,$ACTION_CONTEXT,$NULLIFIER)"
+    INTENT_HI="$(sed -n '13p' "$input_file")"
+    INTENT_LO="$(sed -n '14p' "$input_file")"
+    PUBLIC_INPUTS="($CREDENTIAL_COMMITMENT,$TRUSTED_ISSUER,$REQUIRED_ROLE,$CURRENT_TIMESTAMP,$CREDENTIAL_STATE_ROOT,$APPLICATION_DOMAIN,$POLICY_EPOCH,$ACTION_CONTEXT,$NULLIFIER,$INTENT_HI,$INTENT_LO)"
 }
 
 call_credential_verifier() {
@@ -670,7 +672,9 @@ for case_spec in \
     "tampered-application-domain:wrong application domain" \
     "tampered-policy-epoch:wrong policy epoch" \
     "tampered-action-context:wrong action context" \
-    "tampered-nullifier:wrong nullifier"; do
+    "tampered-nullifier:wrong nullifier" \
+    "tampered-intent-hi:wrong forwarding intent high limb" \
+    "tampered-intent-lo:wrong forwarding intent low limb"; do
     CASE_NAME="${case_spec%%:*}"
     CASE_LABEL="${case_spec#*:}"
 

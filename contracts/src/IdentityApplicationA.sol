@@ -3,6 +3,7 @@ pragma solidity ^0.8.24;
 
 import {ICredentialVerifier} from "./interfaces/ICredentialVerifier.sol";
 import {ISourceGateway} from "./interfaces/ISourceGateway.sol";
+import {ForwardAuthorizationCodec} from "./ForwardAuthorizationCodec.sol";
 
 /// @notice Applies Chain A supplier policy to credential authorization proofs.
 contract IdentityApplicationA {
@@ -14,6 +15,8 @@ contract IdentityApplicationA {
 
     uint256 public constant VERIFIED_SUPPLIER_ROLE = 1;
     uint256 public constant ACTION_VERIFY_SUPPLIER = 1;
+    uint256 public constant ACTION_FORWARD_MESSAGE = 3;
+    uint8 public constant FORWARD_MESSAGE_VERSION = 2;
     uint256 public constant INITIAL_POLICY_EPOCH = 1;
     uint256 public constant SNARK_SCALAR_FIELD =
         21888242871839275222246405745257275088548364400416034343698204186575808495617;
@@ -42,6 +45,14 @@ contract IdentityApplicationA {
     mapping(uint256 credentialCommitment => AuthorizationStatus status) public authorizationStatus;
     mapping(uint256 nullifier => bool used) public usedNullifiers;
 
+    struct ForwardRequest {
+        uint256 destinationDomain;
+        address destinationGateway;
+        address destinationReceiver;
+        bytes payload;
+        uint256 deadline;
+    }
+
     error InvalidCredentialVerifier();
     error InvalidSourceGateway();
     error InvalidRequiredRole();
@@ -61,6 +72,11 @@ contract IdentityApplicationA {
     error InvalidNullifier();
     error NullifierAlreadyUsed();
     error InvalidCredentialProof();
+    error InvalidForwardIntent();
+    error InvalidDestinationDomain();
+    error InvalidDestinationGateway();
+    error InvalidDestinationReceiver();
+    error InvalidDeadline();
 
     event SupplierVerified(uint256 indexed credentialCommitment, address indexed submitter, uint256 proofTimestamp);
     event CredentialStateRootUpdated(uint256 indexed oldRoot, uint256 indexed newRoot);
@@ -72,6 +88,7 @@ contract IdentityApplicationA {
         uint256 actionContext
     );
     event PolicyEpochAdvanced(uint256 indexed oldEpoch, uint256 indexed newEpoch);
+    event AuthorizedMessageForwarded(bytes32 indexed intentDigest, uint256 indexed nullifier, bytes32 indexed messageId);
 
     constructor(
         address credentialVerifierAddress,
@@ -156,7 +173,10 @@ contract IdentityApplicationA {
     ) external {
         _validateProofPolicy(publicInputs);
         _validateCredentialState(publicInputs);
-        _validateNullifierContext(publicInputs);
+        _validateNullifierContext(publicInputs, ACTION_VERIFY_SUPPLIER);
+        if (publicInputs.forwardIntentDigestHi != 0 || publicInputs.forwardIntentDigestLo != 0) {
+            revert InvalidForwardIntent();
+        }
 
         bool valid = credentialVerifier.verifyCredentialProof(proofA, proofB, proofC, publicInputs);
         if (!valid) {
@@ -175,20 +195,59 @@ contract IdentityApplicationA {
         emit SupplierVerified(publicInputs.credentialCommitment, msg.sender, publicInputs.currentTimestamp);
     }
 
-    function sendCrossChainMessage(
-        uint256 destinationDomain,
-        address destinationGateway,
-        address destinationReceiver,
-        bytes calldata payload,
-        uint256 deadline
+    function forwardAuthorizedMessage(
+        uint256[2] calldata proofA,
+        uint256[2][2] calldata proofB,
+        uint256[2] calldata proofC,
+        ICredentialVerifier.CredentialPublicInputs calldata publicInputs,
+        ForwardRequest calldata request
     ) external returns (bytes32 messageId, uint256 nonce) {
-        return sourceGateway.sendMessage(
-            destinationDomain,
-            destinationGateway,
-            destinationReceiver,
-            payload,
-            deadline
+        if (request.destinationDomain == 0 || request.destinationDomain == block.chainid) {
+            revert InvalidDestinationDomain();
+        }
+        if (request.destinationGateway == address(0)) revert InvalidDestinationGateway();
+        if (request.destinationReceiver == address(0)) revert InvalidDestinationReceiver();
+        // forge-lint: disable-next-line(block-timestamp)
+        if (request.deadline <= block.timestamp) revert InvalidDeadline();
+        _validateProofPolicy(publicInputs);
+        _validateCredentialState(publicInputs);
+        _validateNullifierContext(publicInputs, ACTION_FORWARD_MESSAGE);
+        bytes32 intentDigest = _forwardIntentDigest(request, msg.sender);
+        (uint256 hi, uint256 lo) = ForwardAuthorizationCodec.split(intentDigest);
+        if (publicInputs.forwardIntentDigestHi != hi || publicInputs.forwardIntentDigestLo != lo) {
+            revert InvalidForwardIntent();
+        }
+        if (!credentialVerifier.verifyCredentialProof(proofA, proofB, proofC, publicInputs)) {
+            revert InvalidCredentialProof();
+        }
+        // Consume before the external call. An unsuccessful Gateway call reverts
+        // this update and both events with the rest of the transaction.
+        usedNullifiers[publicInputs.nullifier] = true;
+        emit NullifierConsumed(publicInputs.nullifier, publicInputs.credentialCommitment, publicInputs.policyEpoch, publicInputs.actionContext);
+        (messageId, nonce) = sourceGateway.sendMessage(
+            request.destinationDomain, request.destinationGateway, request.destinationReceiver, request.payload, request.deadline
         );
+        emit AuthorizedMessageForwarded(intentDigest, publicInputs.nullifier, messageId);
+    }
+
+    function forwardIntentDigest(ForwardRequest calldata request, address authorizedExecutor) external view returns (bytes32) {
+        return _forwardIntentDigest(request, authorizedExecutor);
+    }
+
+    function _forwardIntentDigest(ForwardRequest calldata request, address authorizedExecutor) internal view returns (bytes32) {
+        ForwardAuthorizationCodec.Intent memory intent;
+        intent.protocolVersion = FORWARD_MESSAGE_VERSION;
+        intent.action = ACTION_FORWARD_MESSAGE;
+        intent.sourceDomain = block.chainid;
+        intent.application = address(this);
+        intent.sourceGateway = address(sourceGateway);
+        intent.destinationDomain = request.destinationDomain;
+        intent.destinationGateway = request.destinationGateway;
+        intent.destinationReceiver = request.destinationReceiver;
+        intent.payloadHash = keccak256(request.payload);
+        intent.deadline = request.deadline;
+        intent.authorizedExecutor = authorizedExecutor;
+        return ForwardAuthorizationCodec.digest(intent);
     }
 
     function isVerifiedSupplier(uint256 credentialCommitment) external view returns (bool) {
@@ -225,7 +284,7 @@ contract IdentityApplicationA {
         }
     }
 
-    function _validateNullifierContext(ICredentialVerifier.CredentialPublicInputs calldata publicInputs)
+    function _validateNullifierContext(ICredentialVerifier.CredentialPublicInputs calldata publicInputs, uint256 expectedAction)
         internal
         view
     {
@@ -235,7 +294,7 @@ contract IdentityApplicationA {
         if (publicInputs.policyEpoch != currentPolicyEpoch) {
             revert InvalidPolicyEpoch();
         }
-        if (publicInputs.actionContext != ACTION_VERIFY_SUPPLIER) {
+        if (publicInputs.actionContext != expectedAction) {
             revert InvalidActionContext();
         }
         if (publicInputs.nullifier >= SNARK_SCALAR_FIELD) {

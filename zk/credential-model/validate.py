@@ -228,9 +228,9 @@ def validate_credential_state(state: dict[str, Any]) -> None:
 
 
 def validate_nullifier(nullifier: dict[str, Any]) -> None:
-    require(nullifier.get("nullifierVersion") == 1, "unsupported nullifier version")
+    require(nullifier.get("nullifierVersion") == 2, "unsupported nullifier version")
     require(nullifier.get("algorithm") == "Poseidon", "nullifier must use Poseidon")
-    require(nullifier.get("arity") == 5, "nullifier Poseidon arity must be five")
+    require(nullifier.get("arity") == 7, "nullifier Poseidon arity must be seven")
     require(
         nullifier.get("inputOrder")
         == [
@@ -239,6 +239,8 @@ def validate_nullifier(nullifier: dict[str, Any]) -> None:
             "applicationDomain",
             "policyEpoch",
             "actionContext",
+            "forwardIntentDigestHi",
+            "forwardIntentDigestLo",
         ],
         "nullifier input order is not canonical",
     )
@@ -278,19 +280,20 @@ def validate_nullifier(nullifier: dict[str, Any]) -> None:
     require(policy_epoch.get("initialValue") == 1, "initial policy epoch must be one")
     require(policy_epoch.get("advancement") == "increment-by-one", "policy epoch advancement is not canonical")
     require(
-        nullifier.get("actionContexts") == {"VERIFY_SUPPLIER": 1, "OTHER_TEST_ACTION": 2},
+        nullifier.get("actionContexts") == {"VERIFY_SUPPLIER": 1, "OTHER_TEST_ACTION": 2, "FORWARD_MESSAGE": 3},
         "nullifier action contexts are not canonical",
     )
 
 
 def validate_nullifier_vectors(vectors: dict[str, Any]) -> None:
-    require(vectors.get("vectorVersion") == 1, "unsupported nullifier vector version")
+    require(vectors.get("vectorVersion") == 2, "unsupported nullifier vector version")
     cases = vectors.get("cases")
-    require(isinstance(cases, list) and len(cases) == 5, "nullifier vectors must contain five cases")
+    require(isinstance(cases, list) and len(cases) == 9, "nullifier vectors must contain nine cases")
     names = [case.get("name") for case in cases]
     require(
         names
-        == ["baseline", "same-context", "different-application", "different-epoch", "different-action"],
+        == ["baseline", "same-context", "different-application", "different-epoch", "different-action",
+            "forward-baseline", "same-forward-intent", "different-forward-hi", "different-forward-lo"],
         "nullifier vector case order is not canonical",
     )
     for case in cases:
@@ -298,9 +301,12 @@ def validate_nullifier_vectors(vectors: dict[str, Any]) -> None:
         require(type(case.get("applicationDomain")) is str, "nullifier vector applicationDomain must be a string")
         require(type(case.get("policyEpoch")) is str, "nullifier vector policyEpoch must be a string")
         require(
-            case.get("actionContext") in {"VERIFY_SUPPLIER", "OTHER_TEST_ACTION"},
+            case.get("actionContext") in {"VERIFY_SUPPLIER", "OTHER_TEST_ACTION", "FORWARD_MESSAGE"},
             "nullifier vector action context is unsupported",
         )
+        for limb in ("forwardIntentDigestHi", "forwardIntentDigestLo"):
+            value = case.get(limb, "0")
+            require(type(value) is str and value.isdecimal() and 0 <= int(value) < 2**128, "invalid intent limb")
         require(
             case.get("expectedNullifier") == "generated-by-zk/scripts/build-nullifier-vectors.mjs",
             "nullifier vectors must delegate concrete Poseidon output generation",
@@ -309,8 +315,11 @@ def validate_nullifier_vectors(vectors: dict[str, Any]) -> None:
     require(
         vectors.get("expectedRelations")
         == {
-            "equal": [["baseline", "same-context"]],
+            "equal": [["forward-baseline", "same-forward-intent"], ["baseline", "same-context"]],
             "different": [
+                ["forward-baseline", "different-forward-hi"],
+                ["forward-baseline", "different-forward-lo"],
+                ["baseline", "forward-baseline"],
                 ["baseline", "different-application"],
                 ["baseline", "different-epoch"],
                 ["baseline", "different-action"],

@@ -15,6 +15,8 @@ contract CredentialVerifier is ICredentialVerifier {
     uint256 public constant POLICY_EPOCH_INDEX = 6;
     uint256 public constant ACTION_CONTEXT_INDEX = 7;
     uint256 public constant NULLIFIER_INDEX = 8;
+    uint256 public constant FORWARD_INTENT_DIGEST_HI_INDEX = 9;
+    uint256 public constant FORWARD_INTENT_DIGEST_LO_INDEX = 10;
 
     // Lower camel case preserves the existing project-facing getter name.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
@@ -36,7 +38,7 @@ contract CredentialVerifier is ICredentialVerifier {
         uint256[2] calldata proofC,
         CredentialPublicInputs calldata publicInputs
     ) external view returns (bool) {
-        uint256[9] memory publicSignals;
+        uint256[11] memory publicSignals;
         publicSignals[CREDENTIAL_COMMITMENT_INDEX] = publicInputs.credentialCommitment;
         publicSignals[TRUSTED_ISSUER_INDEX] = publicInputs.trustedIssuer;
         publicSignals[REQUIRED_ROLE_INDEX] = publicInputs.requiredRole;
@@ -46,6 +48,8 @@ contract CredentialVerifier is ICredentialVerifier {
         publicSignals[POLICY_EPOCH_INDEX] = publicInputs.policyEpoch;
         publicSignals[ACTION_CONTEXT_INDEX] = publicInputs.actionContext;
         publicSignals[NULLIFIER_INDEX] = publicInputs.nullifier;
+        publicSignals[FORWARD_INTENT_DIGEST_HI_INDEX] = publicInputs.forwardIntentDigestHi;
+        publicSignals[FORWARD_INTENT_DIGEST_LO_INDEX] = publicInputs.forwardIntentDigestLo;
 
         return groth16Verifier.verifyProof(proofA, proofB, proofC, publicSignals);
     }

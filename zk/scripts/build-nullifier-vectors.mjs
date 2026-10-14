@@ -33,6 +33,8 @@ async function main() {
       applicationDomain: BigInt(vector.applicationDomain),
       policyEpoch: BigInt(vector.policyEpoch),
       actionContext: resolveActionContext(vector.actionContext, nullifierConfig),
+      forwardIntentDigestHi: BigInt(vector.forwardIntentDigestHi ?? "0"),
+      forwardIntentDigestLo: BigInt(vector.forwardIntentDigestLo ?? "0"),
     };
     const expectedNullifier = computeNullifier(
       poseidon,
@@ -48,6 +50,8 @@ async function main() {
       applicationDomain: context.applicationDomain.toString(),
       policyEpoch: context.policyEpoch.toString(),
       actionContext: context.actionContext.toString(),
+      forwardIntentDigestHi: context.forwardIntentDigestHi.toString(),
+      forwardIntentDigestLo: context.forwardIntentDigestLo.toString(),
       expectedNullifier: expectedNullifier.toString(),
     };
 

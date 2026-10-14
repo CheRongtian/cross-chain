@@ -13,6 +13,8 @@ interface ICredentialVerifier {
         uint256 policyEpoch;
         uint256 actionContext;
         uint256 nullifier;
+        uint256 forwardIntentDigestHi;
+        uint256 forwardIntentDigestLo;
     }
 
     function verifyCredentialProof(

@@ -7,9 +7,10 @@ import {CredentialVerifier} from "../src/CredentialVerifier.sol";
 import {ICredentialVerifier} from "../src/interfaces/ICredentialVerifier.sol";
 import {Groth16Verifier} from "../generated/Groth16Verifier.sol";
 import {CredentialProofFixture} from "../generated/CredentialProofFixture.sol";
+import {ForwardCredentialProofFixture} from "../generated/ForwardCredentialProofFixture.sol";
 
 contract CredentialVerifierTest is Test {
-    uint256 internal constant PUBLIC_SIGNAL_COUNT = 9;
+    uint256 internal constant PUBLIC_SIGNAL_COUNT = 11;
 
     CredentialVerifier internal verifier;
 
@@ -34,6 +35,26 @@ contract CredentialVerifierTest is Test {
         );
 
         assertTrue(accepted);
+    }
+
+    function testForwardingProofBindsBothLimbsAndTheirOrder() public view {
+        uint256[11] memory signals = ForwardCredentialProofFixture.publicSignals();
+        assertTrue(verifier.verifyCredentialProof(ForwardCredentialProofFixture.proofA(),
+            ForwardCredentialProofFixture.proofB(), ForwardCredentialProofFixture.proofC(), _publicInputs(signals)));
+        assertTrue(signals[9] != signals[10]);
+        for (uint256 index = 9; index < 11; index++) {
+            uint256 original = signals[index];
+            signals[index] = original + 1;
+            _assertRejected(ForwardCredentialProofFixture.proofA(), ForwardCredentialProofFixture.proofB(),
+                ForwardCredentialProofFixture.proofC(), signals);
+            signals[index] = uint256(1) << 128;
+            _assertRejected(ForwardCredentialProofFixture.proofA(), ForwardCredentialProofFixture.proofB(),
+                ForwardCredentialProofFixture.proofC(), signals);
+            signals[index] = original;
+        }
+        (signals[9], signals[10]) = (signals[10], signals[9]);
+        _assertRejected(ForwardCredentialProofFixture.proofA(), ForwardCredentialProofFixture.proofB(),
+            ForwardCredentialProofFixture.proofC(), signals);
     }
 
     function testRejectsTamperedProof() public view {
@@ -191,7 +212,9 @@ contract CredentialVerifierTest is Test {
             applicationDomain: publicSignals[5],
             policyEpoch: publicSignals[6],
             actionContext: publicSignals[7],
-            nullifier: publicSignals[8]
+            nullifier: publicSignals[8],
+            forwardIntentDigestHi: publicSignals[9],
+            forwardIntentDigestLo: publicSignals[10]
         });
     }
 }
