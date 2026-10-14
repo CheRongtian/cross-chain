@@ -32,10 +32,16 @@ FORWARD_SIGNATURE="forwardAuthorizedMessage(uint256[2],uint256[2][2],uint256[2],
 
 ANVIL_DEV_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 SOURCE_SENDER="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+CHAIN_B_REGISTRY_ADMIN_KEY="0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+CHAIN_B_REGISTRY_ADMIN="0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
 UNAUTHORIZED_CALLER="0x000000000000000000000000000000000000cafe"
 DESTINATION_GATEWAY="0x000000000000000000000000000000000000d00d"
 ALTERNATE_DESTINATION_GATEWAY="0x000000000000000000000000000000000000d00e"
 DESTINATION_RECEIVER="0x000000000000000000000000000000000000bEEF"
+REMOTE_NO_CODE_GATEWAY="0x00000000000000000000000000000000000a11ce"
+REMOTE_ROTATION_GATEWAY="0x000000000000000000000000000000000000b0b0"
+UNKNOWN_REMOTE_DOMAIN="20022"
+LARGE_REMOTE_DOMAIN="9007199254740993"
 ZERO_ADDRESS="0x0000000000000000000000000000000000000000"
 PAYLOAD="0x68656c6c6f20636861696e2062"
 EXPECTED_PAYLOAD_TEXT="hello chain b"
@@ -176,9 +182,10 @@ wait_for_chain() {
 assert_transaction_success() {
     local transaction_hash="$1"
     local label="$2"
+    local rpc_url="${3:-$CHAIN_A_RPC}"
     local status
 
-    status="$(cast receipt "$transaction_hash" status --rpc-url "$CHAIN_A_RPC")"
+    status="$(cast receipt "$transaction_hash" status --rpc-url "$rpc_url")"
 
     case "$(normalize "$status")" in
         1|0x1|0x01|true)
@@ -188,6 +195,31 @@ assert_transaction_success() {
             fail "$label transaction failed with status '$status'"
             ;;
     esac
+}
+
+send_registry_transaction() {
+    local function_signature="$1"
+    shift
+    local output
+
+    output="$(
+        cast send "$REMOTE_GATEWAY_REGISTRY" \
+            "$function_signature" \
+            "$@" \
+            --rpc-url "$CHAIN_B_RPC" \
+            --private-key "$CHAIN_B_REGISTRY_ADMIN_KEY" \
+            --async
+    )"
+    printf 'cast send output: %s\n' "$output"
+
+    LAST_TX_HASH="$(
+        printf '%s\n' "$output" \
+            | sed -nE 's/.*(0x[[:xdigit:]]{64}).*/\1/p' \
+            | tail -n 1
+    )"
+    [[ "$LAST_TX_HASH" =~ ^0x[[:xdigit:]]{64}$ ]] \
+        || fail "could not extract RemoteGatewayRegistry transaction hash"
+    printf 'Transaction hash: %s\n' "$LAST_TX_HASH"
 }
 
 send_source_application_authorization() {
@@ -388,6 +420,7 @@ cleanup() {
         rm -f -- \
             "$TEMP_DIR/deploy-output.log" \
             "$TEMP_DIR/deployment-addresses.env" \
+            "$TEMP_DIR/remote-registry-addresses.env" \
             "$TEMP_DIR/validator-pids" \
             "$TEMP_DIR/relayer-pids" \
             "$TEMP_DIR/forwarding-calldata.txt"
@@ -452,7 +485,7 @@ printf '  5. Validate the credential model, fixtures, and state encoding\n'
 printf '  6. Build and verify the ZK circuit, proofs, and nullifier cases\n'
 printf '  7. Generate the Solidity verifier and canonical message fixtures\n'
 printf '  8. Build and test the Solidity contracts\n'
-printf '  9. Deploy and verify the complete current Chain A protocol\n'
+printf '  9. Deploy the current Chain A protocol and Chain B remote-gateway trust registry\n'
 printf ' 10. Preserve credential policy, replay, epoch, and revocation checks\n'
 printf ' 11. Preserve canonical message domain separation and authorization checks\n'
 printf ' 12. Produce and persist a real Chain A message as OBSERVED\n'
@@ -658,6 +691,12 @@ printf '199. Require an exact-intent credential proof and executor before atomic
 printf '200. Reject altered routing/payload/deadline, actions, limbs, executor, application/Gateway reuse and proof replay\n'
 printf '201. Preserve Gateway nonce/message IDs and failed-call nullifier rollback without a no-proof production path\n'
 printf '202. Produce real A/B/C/D/E messages through fresh intent-bound proofs and preserve all existing protocol regressions\n'
+printf '203. Deploy RemoteGatewayRegistry to Chain B after confirming chain ID 2001\n'
+printf '204. Register the real current Chain A SourceGateway under exact source domain 10011\n'
+printf '205. Reject unknown domains, mismatched gateways, zero gateways and unauthorized mutations\n'
+printf '206. Replace and remove remote trust deterministically, rejecting the former identity\n'
+printf '207. Preserve large uint256 domains and accept remote identities with no Chain B bytecode\n'
+printf '208. Restore the current Chain A SourceGateway mapping for subsequent verification\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -909,6 +948,7 @@ printf '\n[%s]\n' "$CURRENT_STEP"
 TEMP_PARENT="${TMPDIR:-/tmp}"
 TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-verification.XXXXXX")"
 DEPLOYMENT_ADDRESSES_FILE="$TEMP_DIR/deployment-addresses.env"
+REMOTE_REGISTRY_ADDRESSES_FILE="$TEMP_DIR/remote-registry-addresses.env"
 VALIDATOR_PID_FILE="$TEMP_DIR/validator-pids"
 RELAYER_PID_FILE="$TEMP_DIR/relayer-pids"
 : > "$VALIDATOR_PID_FILE"
@@ -940,6 +980,170 @@ CURRENT_STEP="SourceGateway deployment reuse"
 printf '\n[%s]\n' "$CURRENT_STEP"
 printf 'SourceGateway: %s\n' "$SOURCE_GATEWAY"
 printf 'IdentityApplicationA: %s\n' "$IDENTITY_APPLICATION_ADDRESS"
+
+CURRENT_STEP="Chain B RemoteGatewayRegistry deployment and trust-boundary verification"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+CHAIN_B_EXPECTED_ID="$CHAIN_B_ID" \
+REGISTRY_DEPLOYER_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
+REGISTRY_ADMIN="$CHAIN_B_REGISTRY_ADMIN" \
+REMOTE_SOURCE_DOMAIN="$CHAIN_A_ID" \
+REMOTE_SOURCE_GATEWAY="$SOURCE_GATEWAY" \
+DEPLOYMENT_OUTPUT_FILE="$REMOTE_REGISTRY_ADDRESSES_FILE" \
+    bash "$PROJECT_ROOT/scripts/deploy-remote-gateway-registry.sh"
+
+[[ -f "$REMOTE_REGISTRY_ADDRESSES_FILE" ]] \
+    || fail "RemoteGatewayRegistry deployment address output is missing"
+REMOTE_GATEWAY_REGISTRY="$(
+    sed -nE 's/^REMOTE_GATEWAY_REGISTRY_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' \
+        "$REMOTE_REGISTRY_ADDRESSES_FILE"
+)"
+[[ "$REMOTE_GATEWAY_REGISTRY" =~ ^0x[[:xdigit:]]{40}$ ]] \
+    || fail "invalid deployed RemoteGatewayRegistry address"
+
+assert_hex_equal \
+    "$(cast call "$REMOTE_GATEWAY_REGISTRY" \
+        "registryAdmin()(address)" \
+        --rpc-url "$CHAIN_B_RPC")" \
+    "$CHAIN_B_REGISTRY_ADMIN" \
+    "Chain B registry administrator"
+assert_hex_equal \
+    "$(cast call "$REMOTE_GATEWAY_REGISTRY" \
+        "trustedRemoteGateway(uint256)(address)" \
+        "$CHAIN_A_ID" \
+        --rpc-url "$CHAIN_B_RPC")" \
+    "$SOURCE_GATEWAY" \
+    "trusted Chain A SourceGateway identity"
+assert_equal \
+    "$(cast call "$REMOTE_GATEWAY_REGISTRY" \
+        "isTrustedRemoteGateway(uint256,address)(bool)" \
+        "$CHAIN_A_ID" \
+        "$SOURCE_GATEWAY" \
+        --rpc-url "$CHAIN_B_RPC")" \
+    "true" \
+    "exact remote domain and Gateway pair"
+cast call "$REMOTE_GATEWAY_REGISTRY" \
+    "requireTrustedRemoteGateway(uint256,address)" \
+    "$CHAIN_A_ID" \
+    "$SOURCE_GATEWAY" \
+    --rpc-url "$CHAIN_B_RPC" >/dev/null
+printf 'Trusted remote source: domain = %s, gateway = %s\n' "$CHAIN_A_ID" "$SOURCE_GATEWAY"
+
+assert_hex_equal \
+    "$(cast call "$REMOTE_GATEWAY_REGISTRY" \
+        "trustedRemoteGateway(uint256)(address)" \
+        "$UNKNOWN_REMOTE_DOMAIN" \
+        --rpc-url "$CHAIN_B_RPC")" \
+    "$ZERO_ADDRESS" \
+    "unknown remote domain zero result"
+expect_call_revert \
+    "unknown remote domain rejected" \
+    "UnknownSourceDomain(uint256)" \
+    "$REMOTE_GATEWAY_REGISTRY" \
+    "requireTrustedRemoteGateway(uint256,address)" \
+    "$UNKNOWN_REMOTE_DOMAIN" \
+    "$SOURCE_GATEWAY" \
+    --rpc-url "$CHAIN_B_RPC"
+expect_call_revert \
+    "mismatched remote gateway rejected" \
+    "UntrustedRemoteGateway(uint256,address,address)" \
+    "$REMOTE_GATEWAY_REGISTRY" \
+    "requireTrustedRemoteGateway(uint256,address)" \
+    "$CHAIN_A_ID" \
+    "$REMOTE_ROTATION_GATEWAY" \
+    --rpc-url "$CHAIN_B_RPC"
+expect_call_revert \
+    "zero remote gateway rejected" \
+    "InvalidRemoteGateway()" \
+    "$REMOTE_GATEWAY_REGISTRY" \
+    "setRemoteGateway(uint256,address)" \
+    "$UNKNOWN_REMOTE_DOMAIN" \
+    "$ZERO_ADDRESS" \
+    --from "$CHAIN_B_REGISTRY_ADMIN" \
+    --rpc-url "$CHAIN_B_RPC"
+expect_call_revert \
+    "unauthorized remote gateway add rejected" \
+    "UnauthorizedRegistryAdmin()" \
+    "$REMOTE_GATEWAY_REGISTRY" \
+    "setRemoteGateway(uint256,address)" \
+    "$UNKNOWN_REMOTE_DOMAIN" \
+    "$REMOTE_ROTATION_GATEWAY" \
+    --from "$UNAUTHORIZED_CALLER" \
+    --rpc-url "$CHAIN_B_RPC"
+expect_call_revert \
+    "unauthorized remote gateway replacement rejected" \
+    "UnauthorizedRegistryAdmin()" \
+    "$REMOTE_GATEWAY_REGISTRY" \
+    "setRemoteGateway(uint256,address)" \
+    "$CHAIN_A_ID" \
+    "$REMOTE_ROTATION_GATEWAY" \
+    --from "$UNAUTHORIZED_CALLER" \
+    --rpc-url "$CHAIN_B_RPC"
+expect_call_revert \
+    "unauthorized remote gateway removal rejected" \
+    "UnauthorizedRegistryAdmin()" \
+    "$REMOTE_GATEWAY_REGISTRY" \
+    "removeRemoteGateway(uint256)" \
+    "$CHAIN_A_ID" \
+    --from "$UNAUTHORIZED_CALLER" \
+    --rpc-url "$CHAIN_B_RPC"
+printf 'Unauthorized registry add, replacement and removal rejected.\n'
+
+REMOTE_TEST_CODE="$(cast code "$REMOTE_NO_CODE_GATEWAY" --rpc-url "$CHAIN_B_RPC")"
+[[ -z "$REMOTE_TEST_CODE" ]] || [[ "$REMOTE_TEST_CODE" == "0x" ]] \
+    || fail "remote no-code fixture unexpectedly contains Chain B bytecode"
+send_registry_transaction \
+    "setRemoteGateway(uint256,address)" \
+    "$LARGE_REMOTE_DOMAIN" \
+    "$REMOTE_NO_CODE_GATEWAY"
+assert_transaction_success "$LAST_TX_HASH" "large-domain no-code remote registration" "$CHAIN_B_RPC"
+assert_hex_equal \
+    "$(cast call "$REMOTE_GATEWAY_REGISTRY" \
+        "trustedRemoteGateway(uint256)(address)" \
+        "$LARGE_REMOTE_DOMAIN" \
+        --rpc-url "$CHAIN_B_RPC")" \
+    "$REMOTE_NO_CODE_GATEWAY" \
+    "large uint256 remote domain"
+printf 'Remote address with no local Chain B bytecode accepted as remote identity.\n'
+send_registry_transaction "removeRemoteGateway(uint256)" "$LARGE_REMOTE_DOMAIN"
+assert_transaction_success "$LAST_TX_HASH" "large-domain remote removal" "$CHAIN_B_RPC"
+
+send_registry_transaction \
+    "setRemoteGateway(uint256,address)" \
+    "$CHAIN_A_ID" \
+    "$REMOTE_ROTATION_GATEWAY"
+assert_transaction_success "$LAST_TX_HASH" "remote gateway replacement" "$CHAIN_B_RPC"
+assert_equal \
+    "$(cast call "$REMOTE_GATEWAY_REGISTRY" \
+        "isTrustedRemoteGateway(uint256,address)(bool)" \
+        "$CHAIN_A_ID" \
+        "$SOURCE_GATEWAY" \
+        --rpc-url "$CHAIN_B_RPC")" \
+    "false" \
+    "former remote gateway after replacement"
+send_registry_transaction "removeRemoteGateway(uint256)" "$CHAIN_A_ID"
+assert_transaction_success "$LAST_TX_HASH" "remote gateway removal" "$CHAIN_B_RPC"
+expect_call_revert \
+    "removed remote domain rejected" \
+    "UnknownSourceDomain(uint256)" \
+    "$REMOTE_GATEWAY_REGISTRY" \
+    "requireTrustedRemoteGateway(uint256,address)" \
+    "$CHAIN_A_ID" \
+    "$REMOTE_ROTATION_GATEWAY" \
+    --rpc-url "$CHAIN_B_RPC"
+send_registry_transaction \
+    "setRemoteGateway(uint256,address)" \
+    "$CHAIN_A_ID" \
+    "$SOURCE_GATEWAY"
+assert_transaction_success "$LAST_TX_HASH" "canonical remote gateway restoration" "$CHAIN_B_RPC"
+assert_hex_equal \
+    "$(cast call "$REMOTE_GATEWAY_REGISTRY" \
+        "trustedRemoteGateway(uint256)(address)" \
+        "$CHAIN_A_ID" \
+        --rpc-url "$CHAIN_B_RPC")" \
+    "$SOURCE_GATEWAY" \
+    "restored canonical Chain A SourceGateway"
+printf 'Restored trusted remote source: domain = %s, gateway = %s\n' "$CHAIN_A_ID" "$SOURCE_GATEWAY"
 
 CURRENT_STEP="deployment code verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
