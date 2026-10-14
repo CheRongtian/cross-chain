@@ -13,6 +13,7 @@ import {
 import {
   generateMerkleVectors, MERKLE_GOLDEN_PATH, serializeMerkleVectors,
 } from "../scripts/generate-merkle-golden-vectors.mjs";
+import { goldenInclusion, inclusionArguments } from "./helpers/merkle-inclusion-contract.mjs";
 
 const source = await readFile(MERKLE_GOLDEN_PATH, "utf8");
 const fixture = JSON.parse(source);
@@ -143,4 +144,34 @@ test("fixed preimages detect SHA3, narrowed index, and sorted-pair drift", () =>
     }
   }
   assert.equal(descendingPair, true, "golden cases must expose sorted-pair drift");
+});
+
+test("five-leaf higher-level odd sibling cannot be replaced even with its matching root", () => {
+  const input = proofInput(fixture.vectors[4], 4);
+  const siblings = [...input.proof.siblings];
+  siblings[1] = flip(siblings[1]);
+  let node = fixture.vectors[4].leaves[4];
+  let position = 4;
+  for (const sibling of siblings) {
+    node = position % 2 === 0 ? computeMessageMerkleNode(node, sibling) : computeMessageMerkleNode(sibling, node);
+    position = Math.floor(position / 2);
+  }
+  assert.equal(verifyMessageMerkleProof({ ...input, proof: { ...input.proof, siblings }, messageRoot: node }), false);
+});
+
+test("Chain B inclusion adapter preserves uint256 context and rejects inexact or malformed inputs", () => {
+  const input = goldenInclusion(fixture.vectors[2], 0);
+  const maximum = (1n << 256n) - 1n;
+  for (const index of [0n, (1n << 53n) + 1n, maximum]) {
+    const args = inclusionArguments({ ...input, index, proof: { ...input.proof, index, leafCount: maximum } });
+    assert.equal(args[3], index);
+    assert.equal(args[5].index, index);
+    assert.equal(args[5].leafCount, maximum);
+    assert.equal(args[0].epoch, BigInt(input.batchContext.epoch));
+    assert.deepEqual(args[4], input.orderedMessageIds);
+  }
+  for (const index of [Number.MAX_SAFE_INTEGER + 1, -1, 1.5, "1.0", -1n, 1n << 256n]) {
+    assert.throws(() => inclusionArguments({ ...input, index }), /exact uint256|invalid expected index/);
+  }
+  assert.throws(() => inclusionArguments({ ...input, proof: { ...input.proof, siblings: ["0x01"] } }), /invalid Merkle proof sibling/);
 });

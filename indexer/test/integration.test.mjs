@@ -902,7 +902,8 @@ test("recovers source workers and seals durable batches from real finalized mess
       nextMessageId: messageE.messageId, pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE"),
       registryAddress: requireEnvironment("VALIDATOR_SET_REGISTRY_ADDRESS"),
       registryRpcUrl: requireEnvironment("CHAIN_B_RPC_URL"),
-      certificateVerifierAddress: requireEnvironment("PBFT_CERTIFICATE_VERIFIER_ADDRESS") });
+      certificateVerifierAddress: requireEnvironment("PBFT_CERTIFICATE_VERIFIER_ADDRESS"),
+      merkleInclusionVerifierAddress: requireEnvironment("MERKLE_INCLUSION_VERIFIER_ADDRESS") });
   } finally {
     for (const worker of activeWorkers) {
       worker.kill("SIGKILL");

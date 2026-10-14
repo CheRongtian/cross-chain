@@ -229,6 +229,20 @@ contract MessageMerkleTest is Test {
         assertTrue(MessageMerkle.verifyProof(proof.batchId, proof.messageId, ALTERNATE_LEAF_COUNT, root, proof));
     }
 
+    function testHigherOddLevelRejectsMatchingForgedRoot() public view {
+        MessageMerkle.Proof memory proof = _readProof(fixture, ".vectors[4].proofs[4]");
+        proof.siblings[1] = _flip(proof.siblings[1]);
+        bytes32 node = MessageMerkle.computeLeaf(proof.batchId, proof.index, proof.messageId);
+        uint256 position = proof.index;
+        for (uint256 level = 0; level < proof.siblings.length; level++) {
+            node = position % 2 == 0
+                ? MessageMerkle.hashNode(node, proof.siblings[level])
+                : MessageMerkle.hashNode(proof.siblings[level], node);
+            position /= 2;
+        }
+        assertFalse(MessageMerkle.verifyProof(proof.batchId, proof.messageId, 5, node, proof));
+    }
+
     function testGoldenEncodingProbeLocksUint256AndKeccak() public view {
         bytes32 batchId = fixture.readBytes32(".encodingProbe.batchId");
         bytes32 messageId = fixture.readBytes32(".encodingProbe.messageId");

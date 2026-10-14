@@ -9,6 +9,27 @@ bytes32 constant MESSAGE_MERKLE_NODE_DOMAIN =
 /// @notice Ordered message commitments shared with the off-chain batch processor.
 /// @dev This primitive supplies no consensus or destination authorization.
 library MessageMerkle {
+    error EmptyMerkleTree();
+    error ProofBatchIdMismatch(bytes32 expected, bytes32 actual);
+    error ProofMessageIdMismatch(bytes32 expected, bytes32 actual);
+    error ProofLeafCountMismatch(uint256 expected, uint256 actual);
+    error ProofIndexOutOfBounds(uint256 index, uint256 leafCount);
+    error InvalidProofLength(uint256 expected, uint256 actual);
+    error InvalidOddSibling(uint256 level, bytes32 expected, bytes32 actual);
+    error MerkleRootMismatch(bytes32 expected, bytes32 actual);
+
+    enum Failure {
+        NONE,
+        EMPTY_TREE,
+        BATCH_ID,
+        MESSAGE_ID,
+        LEAF_COUNT,
+        INDEX,
+        PATH_LENGTH,
+        ODD_SIBLING,
+        ROOT
+    }
+
     struct Proof {
         bytes32 batchId;
         bytes32 messageId;
@@ -39,10 +60,48 @@ library MessageMerkle {
         bytes32 expectedRoot,
         Proof memory proof
     ) internal pure returns (bool) {
-        if (
-            expectedLeafCount == 0 || proof.leafCount != expectedLeafCount || proof.index >= expectedLeafCount
-                || proof.batchId != expectedBatchId || proof.messageId != expectedMessageId
-        ) return false;
+        (Failure failure,,) = _checkProof(expectedBatchId, expectedMessageId, expectedLeafCount, expectedRoot, proof);
+        return failure == Failure.NONE;
+    }
+
+    /// @dev Uses the same verification kernel as the boolean API; the path is folded only once.
+    // Retain the revert-based library API without duplicating traversal or moving error handling into callers.
+    // forge-lint: disable-next-item(internal-function-used-once)
+    function requireProof(
+        bytes32 expectedBatchId,
+        bytes32 expectedMessageId,
+        uint256 expectedLeafCount,
+        bytes32 expectedRoot,
+        Proof memory proof
+    ) internal pure {
+        (Failure failure, uint256 detail, bytes32 node) =
+            _checkProof(expectedBatchId, expectedMessageId, expectedLeafCount, expectedRoot, proof);
+        if (failure == Failure.NONE) return;
+        if (failure == Failure.EMPTY_TREE) revert EmptyMerkleTree();
+        if (failure == Failure.BATCH_ID) revert ProofBatchIdMismatch(expectedBatchId, proof.batchId);
+        if (failure == Failure.MESSAGE_ID) revert ProofMessageIdMismatch(expectedMessageId, proof.messageId);
+        if (failure == Failure.LEAF_COUNT) revert ProofLeafCountMismatch(expectedLeafCount, proof.leafCount);
+        if (failure == Failure.INDEX) revert ProofIndexOutOfBounds(proof.index, expectedLeafCount);
+        if (failure == Failure.PATH_LENGTH) revert InvalidProofLength(detail, proof.siblings.length);
+        if (failure == Failure.ODD_SIBLING) revert InvalidOddSibling(detail, node, proof.siblings[detail]);
+        revert MerkleRootMismatch(expectedRoot, node);
+    }
+
+    // Distinct metadata/structure/odd-sibling guards preserve precise failure context in one shared kernel.
+    // Keeping them with the single path fold prevents divergence between boolean and revert-based verification.
+    // forge-lint: disable-next-item(cyclomatic-complexity)
+    function _checkProof(
+        bytes32 expectedBatchId,
+        bytes32 expectedMessageId,
+        uint256 expectedLeafCount,
+        bytes32 expectedRoot,
+        Proof memory proof
+    ) private pure returns (Failure, uint256, bytes32) {
+        if (expectedLeafCount == 0) return (Failure.EMPTY_TREE, 0, 0);
+        if (proof.batchId != expectedBatchId) return (Failure.BATCH_ID, 0, 0);
+        if (proof.messageId != expectedMessageId) return (Failure.MESSAGE_ID, 0, 0);
+        if (proof.leafCount != expectedLeafCount) return (Failure.LEAF_COUNT, 0, 0);
+        if (proof.index >= expectedLeafCount) return (Failure.INDEX, 0, 0);
 
         uint256 depth = 0;
         for (
@@ -52,7 +111,7 @@ library MessageMerkle {
         ) {
             depth++;
         }
-        if (proof.siblings.length != depth) return false;
+        if (proof.siblings.length != depth) return (Failure.PATH_LENGTH, depth, 0);
 
         bytes32 node = computeLeaf(expectedBatchId, proof.index, expectedMessageId);
         uint256 position = proof.index;
@@ -60,7 +119,7 @@ library MessageMerkle {
         for (uint256 level = 0; level < depth; level++) {
             bytes32 sibling = proof.siblings[level];
             if (position % 2 == 0) {
-                if (position == width - 1 && sibling != node) return false;
+                if (position == width - 1 && sibling != node) return (Failure.ODD_SIBLING, level, node);
                 node = hashNode(node, sibling);
             } else {
                 node = hashNode(sibling, node);
@@ -68,6 +127,6 @@ library MessageMerkle {
             position /= 2;
             width = width / 2 + width % 2;
         }
-        return node == expectedRoot;
+        return (node == expectedRoot ? Failure.NONE : Failure.ROOT, 0, node);
     }
 }

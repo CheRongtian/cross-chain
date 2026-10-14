@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Historical PBFT Certificate Verification"
+VERIFICATION_NAME="Authenticated Batch Merkle Inclusion Verification"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -424,6 +424,7 @@ cleanup() {
             "$TEMP_DIR/validator-registry-addresses.env" \
             "$TEMP_DIR/validator-registry-config.env" \
             "$TEMP_DIR/pbft-verifier-addresses.env" \
+            "$TEMP_DIR/merkle-verifier-addresses.env" \
             "$TEMP_DIR/validator-pids" \
             "$TEMP_DIR/relayer-pids" \
             "$TEMP_DIR/forwarding-calldata.txt"
@@ -718,6 +719,14 @@ printf '223. Verify existing real epoch 7/8 QCs on-chain, including the old QC a
 printf '224. Reject real-QC root/epoch/signature/quorum/duplicate/nonmember mutations with precise contract errors\n'
 printf '225. Verify Solidity viewNumber mapping preserves the original protocol view, uint256 width and context ABI position\n'
 printf '226. Retain strict lint with documented local exceptions for bounded fail-fast checks, high-s compatibility and VM fixtures\n'
+printf '227. Validate canonical Solidity batch IDs from full nonempty unique ordered membership without a new size cap\n'
+printf '228. Verify exact message positions/counts and one shared ordered proof kernel with precise custom errors\n'
+printf '229. Preserve uint256 ABI widths and reject wrong context, membership, index, path length and every odd sibling\n'
+printf '230. Deploy the stateless MerkleInclusionVerifier on Chain B through the configured operator\n'
+printf '231. Verify all 1/2/3/4/5-leaf frozen golden positions, canonical encoding and precise-error negatives on Chain B\n'
+printf '232. Authenticate actual old and rotated QC context/root before checking every actual batch member on Chain B\n'
+printf '233. Preserve old proofs after rotation/V1 shutdown, single-leaf empty paths and actual odd-duplication checks\n'
+printf '234. Reject a QC for a different root even when a standalone Merkle path under that root is valid\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -929,6 +938,8 @@ forge test -vv
 
 printf 'VALID: Solidity PBFT certificates match frozen v1/v2/v3 digests, trusted context and signature acceptance\n'
 printf 'VALID: bounded ABI evidence, historical/legacy authority and every quorum entry verified\n'
+printf 'VALID: Solidity canonical batch IDs, exact membership/count/position and ordered inclusion checks verified\n'
+printf 'VALID: precise-error proof failures include single-leaf paths, full-width indexes and every odd level\n'
 printf 'VALID: Solidity ValidatorSetRegistry matches shared frozen committee vectors and canonical ordering\n'
 printf 'VALID: all 24 committee permutations, immutable history and fixed three-of-four quorum verified\n'
 printf 'VALID: exact zero, large and maximum uint256 validator epochs are independent of batch epochs\n'
@@ -990,6 +1001,7 @@ REMOTE_REGISTRY_ADDRESSES_FILE="$TEMP_DIR/remote-registry-addresses.env"
 VALIDATOR_REGISTRY_ADDRESSES_FILE="$TEMP_DIR/validator-registry-addresses.env"
 VALIDATOR_REGISTRY_CONFIG_FILE="$TEMP_DIR/validator-registry-config.env"
 PBFT_VERIFIER_ADDRESSES_FILE="$TEMP_DIR/pbft-verifier-addresses.env"
+MERKLE_VERIFIER_ADDRESSES_FILE="$TEMP_DIR/merkle-verifier-addresses.env"
 VALIDATOR_PID_FILE="$TEMP_DIR/validator-pids"
 RELAYER_PID_FILE="$TEMP_DIR/relayer-pids"
 : > "$VALIDATOR_PID_FILE"
@@ -1297,6 +1309,24 @@ CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
 PBFT_CERTIFICATE_VERIFIER_ADDRESS="$PBFT_CERTIFICATE_VERIFIER" \
 VALIDATOR_SET_REGISTRY_ADDRESS="$VALIDATOR_SET_REGISTRY" \
     node "$VALIDATOR_DIR/scripts/verify-pbft-certificates.mjs"
+
+CURRENT_STEP="Chain B canonical Merkle inclusion verifier deployment"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+VERIFIER_DEPLOYER_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
+DEPLOYMENT_OUTPUT_FILE="$MERKLE_VERIFIER_ADDRESSES_FILE" \
+    bash "$PROJECT_ROOT/scripts/deploy-merkle-inclusion-verifier.sh"
+[[ -f "$MERKLE_VERIFIER_ADDRESSES_FILE" ]] || fail "Merkle verifier deployment output is missing"
+MERKLE_INCLUSION_VERIFIER="$(sed -nE \
+    's/^MERKLE_INCLUSION_VERIFIER_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' \
+    "$MERKLE_VERIFIER_ADDRESSES_FILE")"
+[[ "$MERKLE_INCLUSION_VERIFIER" =~ ^0x[[:xdigit:]]{40}$ ]] || fail "invalid deployed Merkle inclusion verifier address"
+
+CURRENT_STEP="Chain B frozen Merkle encoding, membership and exact-error rejection"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+MERKLE_INCLUSION_VERIFIER_ADDRESS="$MERKLE_INCLUSION_VERIFIER" \
+    node "$INDEXER_DIR/scripts/verify-merkle-inclusion.mjs"
 
 CURRENT_STEP="deployment code verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1762,6 +1792,7 @@ VALIDATOR_VERIFICATION_PID_FILE="$VALIDATOR_PID_FILE" \
 RELAYER_VERIFICATION_PID_FILE="$RELAYER_PID_FILE" \
 VALIDATOR_SET_REGISTRY_ADDRESS="$VALIDATOR_SET_REGISTRY" \
 PBFT_CERTIFICATE_VERIFIER_ADDRESS="$PBFT_CERTIFICATE_VERIFIER" \
+MERKLE_INCLUSION_VERIFIER_ADDRESS="$MERKLE_INCLUSION_VERIFIER" \
 CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
 CHAIN_B_CHAIN_ID="$CHAIN_B_ID" \
 RPC_REQUEST_TIMEOUT_MS="$RPC_REQUEST_TIMEOUT_MS" \

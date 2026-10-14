@@ -1,8 +1,8 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A/B independently verify each package and delegate its versioned ABI transport to a Persistent Transaction Manager. The manager atomically reserves nonces, estimates gas and resolves EIP-1559 fees, signs locally, persists exact raw bytes before broadcast, and tracks canonical receipts with configured confirmation depth. Bounded durable retries rebroadcast exact bytes, append same-nonce higher-fee candidates, enforce configured limits and accept any historical canonical winner. Ordered destination RPC access paths validate chain ID and genesis, preserve exact signed transactions across failover, and conservatively check multi-provider receipt views. Chain B maintains on-chain trusted remote-gateway configuration for exact source-domain and source-address pairs. Destination message verification, replay protection and execution remain unimplemented.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A/B independently verify each package and delegate its versioned ABI transport to a Persistent Transaction Manager. The manager atomically reserves nonces, estimates gas and resolves EIP-1559 fees, signs locally, persists exact raw bytes before broadcast, and tracks canonical receipts with configured confirmation depth. Bounded durable retries rebroadcast exact bytes, append same-nonce higher-fee candidates, enforce configured limits and accept any historical canonical winner. Ordered destination RPC access paths validate chain ID and genesis, preserve exact signed transactions across failover, and conservatively check multi-provider receipt views. Chain B maintains on-chain trusted remote-gateway configuration for exact source-domain and source-address pairs. Complete destination message validation, replay protection and execution remain unimplemented.
 
-Chain B retains immutable historical validator committees in `ValidatorSetRegistry`. Each exact `uint256` validator epoch resolves to four canonical public identities, quorum three and the existing PBFT committee digest. `PBFTCertificateVerifier` authenticates existing v1/v2/v3 QC transport bytes against that authority and a caller-supplied trusted batch context. This read-only component does not deliver or consume messages.
+Chain B retains immutable historical validator committees in `ValidatorSetRegistry`. Each exact `uint256` validator epoch resolves to four canonical public identities, quorum three and the existing PBFT committee digest. `PBFTCertificateVerifier` authenticates existing v1/v2/v3 QC transport bytes against that authority and a caller-supplied trusted batch context. The independent `MerkleInclusionVerifier` checks an exact message ID and position under a canonical batch and expected Message Root. These read-only components do not deliver or consume messages.
 
 The current implementation can:
 
@@ -84,7 +84,8 @@ The current implementation can:
 - track canonical destination receipts to configured depth with distinct CONFIRMED and REVERTED outcomes.
 - configure one current trusted remote source-gateway identity per exact `uint256` source domain on Chain B;
 - append canonical four-validator committees with a three-validator quorum to immutable Chain B history and resolve each exact validator epoch without fallback;
-- verify existing v1/v2/v3 PBFT certificate bytes read-only on Chain B against trusted expected context and exact historical authority.
+- verify existing v1/v2/v3 PBFT certificate bytes read-only on Chain B against trusted expected context and exact historical authority;
+- verify ordered message-ID inclusion on Chain B against a canonical full-membership batch commitment and an independently authenticated Message Root.
 
 ## Architecture
 
@@ -212,7 +213,7 @@ The Indexer and Finality Watcher are disposable worker processes. Their durable 
 
 The batch lifecycle assigns finalized source occurrences to durable batch records. Sealing reuses the deterministic batch and Merkle builders to persist an immutable snapshot, and reading it reconstructs its inclusion proofs. A verified QC authorizes `CONSENSUS_PENDING → COMMITTED`. The Delivery Queue consumes that exact committed evidence without changing source messages, finality data or consensus state. READY denotes materialized evidence. Relayer A/B submit verified packages through destination RPC without changing READY or source state; a returned transaction hash establishes neither destination acceptance nor execution.
 
-The same commitment primitive is implemented in JavaScript and Solidity. Shared committed vectors constrain both runtimes, and complete verification passes a reconstructed real sealed batch into Foundry's local EVM. This compatibility path does not deploy a destination endpoint or execute a message on Chain B.
+The same commitment primitive is implemented in JavaScript and Solidity. Shared committed vectors constrain both runtimes, and complete verification passes a reconstructed real sealed batch into Foundry's local EVM. It additionally deploys a stateless Chain B inclusion verifier and checks every actual committed member after authenticating the exact QC context/root. No Destination Gateway or application execution endpoint is provided.
 
 Each validator reads the immutable source candidate and independently rechecks Chain A. Its local `VALID` or `INVALID` result is an observation, with no PBFT vote, quorum, or authorization to change the source batch lifecycle. Four local `VALID` results leave the batch `CONSENSUS_PENDING`.
 
@@ -357,6 +358,18 @@ Each COMMIT uses the original type-tagged ABI digest and signs the raw 32-byte d
 `test-vectors/pbft-certificates.json` freezes public v1/v2/v3 statements, proposal/COMMIT/QC digests, signing digests, signature bytes, recovered identities and exact transport bytes. An independent reference encoder creates the initial artifact; normal verification only checks it and never overwrites it. JavaScript and Foundry consume the same artifact, including full-width context, legacy authority, high-s/v normalization and invalid evidence cases. The existing real rotation scenario also sends its actual epoch-7 and epoch-8 QCs to the deployed Chain B verifier and rechecks the old QC after V1 stops.
 
 Certificate verification authenticates a batch commitment under trusted context. It does not establish remote-gateway trust, source finality, canonical message semantics, Merkle inclusion, deadlines, destination routing, replay prevention or Application B execution. Those destination enforcement boundaries remain separate work.
+
+### MerkleInclusionVerifier
+
+`contracts/src/MerkleInclusionVerifier.sol` is a pure, stateless Chain B facade over the existing `MessageMerkle` library. It has no administrator, registry dependency, events, replay state or callback. `verifyInclusion(expectedBatch, expectedRoot, messageId, position, orderedMessageIds, proof)` returns `true` or reverts with a specific custom error. `expectedBatch` contains only canonical batch fields: `version`, `sourceDomain`, `sourceGateway`, `epoch` and `batchId`. The proof retains the existing `batchId`, `messageId`, `index`, `leafCount` and `siblings` metadata.
+
+`MessageBatchCodec` recomputes the original typed ABI/Keccak batch commitment from version 1 and the full nonempty, unique, ordered ID list. Supplied membership cannot replace the trusted expected batch ID. The verifier derives count from that list, checks `orderedMessageIds[position] == messageId`, and requires the proof's batch/message/index/count metadata to agree. Positions stay `uint256`; an out-of-range position is rejected before array access. The shared Merkle kernel reconstructs the typed leaf, derives exact depth, preserves left/right order, enforces self-duplication at every unpaired level and compares the final node with the expected root. A single leaf requires an empty path.
+
+The caller must first authenticate the exact source scope, batch epoch/ID and Message Root through `PBFTCertificateVerifier`, then use the identical context/root for inclusion. The Merkle verifier does not call or replace the QC verifier. A valid standalone path under a self-selected root grants no QC authorization. Future Gateway policy must establish those expectations independently of the submitted proof and certificate.
+
+Full ordered membership costs O(N) calldata. Duplicate checking sorts one O(N) scratch copy in O(N log N), without changing the committed order; the batch ID is hashed once and one O(log N) proof path is folded. No new batch-size or gas-policy limit is introduced. Practical submission-envelope and package bounds remain future work.
+
+This verifier accepts canonical message IDs only. It does not reconstruct `CrossChainMessage` fields, enforce message version/domain/routing/deadline policy, prevent replay or execute Application B. Batch encoding version 1 is distinct from message-version and QC-version policy.
 
 ## Credentials and Zero-Knowledge Authorization
 
@@ -803,11 +816,11 @@ Keeping an old message ID while changing a nonce, payload, deadline, or another 
 
 Repeated construction, a fresh batch or Merkle builder, and permutations canonicalized by the batch builder reproduce identical leaves, roots, and proofs. These values contain no database row IDs, observation/finalization timestamps, process identifiers, or private credential attributes. Merkle computation does not write source records, eligibility, canonical block history, or batch lifecycle state.
 
-The Message Root commits to ordered batch membership. Its expected batch, root, and member count still require an appropriate trust source; a valid proof by itself grants no Chain B authorization, Byzantine consensus, quorum certificate, or delivery guarantee. The commitment primitive supports off-chain and Solidity verification. PBFT signatures are verified separately through the QC primitive. Relayer A/B carry that evidence unchanged; destination verification and execution remain unimplemented.
+The Message Root commits to ordered batch membership. Its expected batch and root still require an appropriate trust source; a valid proof by itself grants no Chain B authorization, Byzantine consensus, quorum certificate, or delivery guarantee. `MerkleInclusionVerifier` binds the count to the full canonical ordered list and expected batch ID. PBFT signatures are verified separately through the QC primitive. Relayer A/B carry existing evidence unchanged; complete destination message validation, replay protection and execution remain unimplemented.
 
 ## Shared Merkle Compatibility
 
-`contracts/src/MessageMerkle.sol` is a pure internal library with `computeLeaf`, `hashNode`, and `verifyProof`. It uses the same Ethereum Keccak-256 domains and `abi.encode` preimages as the off-chain implementation. It preserves left/right order, derives exact depth from the leaf count, rejects empty trees and out-of-range indices, and enforces self-duplication whenever traversal reaches an unpaired final node. A single leaf is its root and requires an empty sibling path. Invalid proofs return `false`.
+`contracts/src/MessageMerkle.sol` is a pure internal library with `computeLeaf`, `hashNode`, `verifyProof` and `requireProof`. Both verification interfaces share one kernel; `verifyProof` retains its boolean semantics and `requireProof` provides precise custom errors. It uses the same Ethereum Keccak-256 domains and `abi.encode` preimages as the off-chain implementation. It preserves left/right order, derives exact depth from the leaf count, rejects empty trees and out-of-range indices, and enforces self-duplication whenever traversal reaches an unpaired final node. A single leaf is its root and requires an empty sibling path. Invalid proofs return `false` through the boolean API.
 
 `verifyProof(expectedBatchId, expectedMessageId, expectedLeafCount, expectedRoot, proof)` accepts a proof with the existing `batchId`, `messageId`, `index`, `leafCount`, and `siblings` fields. The expected context must be supplied independently from a trusted snapshot. Solidity receives canonical message IDs; the existing `MessageCodec` remains responsible for message-field hashing. The off-chain verifier additionally validates complete messages, source provenance, finalized membership, and the expected deterministic batch.
 
@@ -833,6 +846,8 @@ The encoding tests lock exact preimages and a uint256 index exceeding uint32. Fo
 The real lifecycle integration reads a sealed A/B/D snapshot in a fresh process and supplies only its public identifiers, trusted count/root, leaves, and proofs to `MessageMerkleTest.testRealSealedSnapshot` through a test-only environment input. Foundry verifies every member in its local EVM without deploying a test harness to either chain. The ordinary Solidity suite skips this input-dependent test; the real integration invokes it with data and requires an actual passing result, never a skip. Dynamic integration data does not overwrite the shared golden fixture.
 
 Golden vectors establish compatibility regression boundaries. They provide no consensus, quorum certificate, trusted relayer, destination registry, replay protection, or execution authorization. No private credential data enters this fixture, and `CONSENSUS_PENDING` remains distinct from `COMMITTED`.
+
+Unified verification also checks the existing fixed 1/2/3/4/5-leaf vectors through the deployed Chain B facade: canonical batch IDs, leaf/node hashes, every member position and precise-error negative cases. The existing five-validator rotation scenario first authenticates the actual old A/B/D QC and rotated Message E QC, then verifies every inclusion under the same trusted expectations. It rechecks unchanged old proofs after rotation and V1 shutdown, exercises actual odd/single-leaf paths and rejects an old QC for a different root even when a standalone Merkle path under that root is valid. Dynamic evidence never overwrites the frozen fixture.
 
 ## Batch Lifecycle
 
@@ -1796,7 +1811,13 @@ The script uses strict error handling and performs:
 163. trusted-context binding, legacy downgrade/authority rejection and exact historical lookup without latest fallback;
 164. malformed/truncated/trailing/oversized ABI, signature length/scalar/recovery boundaries, signer ordering and duplicate identity rejection;
 165. actual Chain B verifier deployment and frozen positive/precise-error negative cases;
-166. real historical and rotated QCs accepted on-chain, old-QC acceptance after V1 shutdown, and actual-QC adversarial mutations.
+166. real historical and rotated QCs accepted on-chain, old-QC acceptance after V1 shutdown, and actual-QC adversarial mutations;
+167. canonical Solidity batch commitment, nonempty/unique ordered membership, trusted position/count and precise proof errors;
+168. actual Chain B inclusion verifier deployment, every frozen 1/2/3/4/5-leaf position and exact leaf/node/batch encoding;
+169. wrong context/root/message/position/list/count, truncated/extended/reordered/tampered paths and multi-level odd-duplication forgery rejection;
+170. full-width uint256 ABI preservation, out-of-range indexes above JavaScript safe-integer limits and malformed proof-node rejection;
+171. actual QC-authenticated old A/B/D and rotated Message E inclusion, single-leaf empty paths and unchanged old proofs after V1 shutdown;
+172. independent QC/root and inclusion checks, rejecting an unauthenticated root despite a mathematically valid standalone path.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -1814,7 +1835,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Historical PBFT Certificate Verification
+Authenticated Batch Merkle Inclusion Verification
 ```
 
 ### Expected error output
@@ -1848,7 +1869,7 @@ EXPECTED FAILURE: closed PostgreSQL client rejected a new operation
 
 These messages demonstrate that the contracts reject unauthorized source applications, invalid destinations and deadlines, the circuit rejects invalid witnesses, a proof cannot be reused with a tampered public input, the identity application enforces policy, freshness, context-bound replay protection, state-root authority, and revocation, and a closed PostgreSQL client cannot be treated as a successful operation. Each expected failure is followed by `Verified rejection`, `EXPECTED FAILURE`, or `Verified expected ... rejection`. Complete verification succeeds only when the script exits with code `0` and the log ends with `VERIFICATION PASSED`.
 
-Groth16 verifier negative cases normally return `false` and are reported as `Verified expected on-chain rejection`. PBFT certificate negative cases require a precise custom-error revert and print `EXPECTED FAILURE: Chain B PBFT certificate ...`. A transport error, an unrelated revert or successful acceptance of invalid evidence fails complete verification. No deployment or verification step treats an unexpected failure as a pass.
+Groth16 verifier negative cases normally return `false` and are reported as `Verified expected on-chain rejection`. PBFT certificate negative cases require a precise custom-error revert and print `EXPECTED FAILURE: Chain B PBFT certificate ...`. Merkle inclusion negative cases require the exact error name and arguments and print `EXPECTED FAILURE: Chain B Merkle inclusion ...`; odd-duplication forgeries have explicit per-level output. A transport error, an unrelated revert or successful acceptance of invalid evidence fails complete verification. No deployment or verification step treats an unexpected failure as a pass.
 
 ## Repository Layout
 
@@ -1866,9 +1887,11 @@ Cross-Chain/
 │   │   │   ├── ISourceGateway.sol
 │   │   │   └── IValidatorSetRegistry.sol
 │   │   ├── libraries/
+│   │   │   ├── MessageBatchCodec.sol
 │   │   │   └── PBFTCertificateCodec.sol
 │   │   ├── CredentialVerifier.sol
 │   │   ├── IdentityApplicationA.sol
+│   │   ├── MerkleInclusionVerifier.sol
 │   │   ├── MessageCodec.sol
 │   │   ├── MessageMerkle.sol
 │   │   ├── PBFTCertificateVerifier.sol
@@ -1878,6 +1901,7 @@ Cross-Chain/
 │   └── test/
 │       ├── CredentialVerifier.t.sol
 │       ├── IdentityApplicationA.t.sol
+│       ├── MerkleInclusionVerifier.t.sol
 │       ├── MessageMerkle.t.sol
 │       ├── PBFTCertificateVerifier.t.sol
 │       ├── RemoteGatewayRegistry.t.sol
@@ -1904,7 +1928,8 @@ Cross-Chain/
 │   │   ├── 013_relayer_job_leases.sql
 │   │   └── 014_transaction_recovery.sql
 │   ├── scripts/
-│   │   └── generate-merkle-golden-vectors.mjs
+│   │   ├── generate-merkle-golden-vectors.mjs
+│   │   └── verify-merkle-inclusion.mjs
 │   ├── src/
 │   │   ├── batch-lifecycle-policy.mjs
 │   │   ├── batch-lifecycle.mjs
@@ -1970,6 +1995,7 @@ Cross-Chain/
 │   │   │   ├── fail-relayer-rpc.mjs
 │   │   │   ├── legacy-relayer.mjs
 │   │   │   ├── lease-fixtures.mjs
+│   │   │   ├── merkle-inclusion-contract.mjs
 │   │   │   ├── multi-relayer-integration.mjs
 │   │   │   ├── read-batch-lifecycle.mjs
 │   │   │   ├── read-delivery.mjs
@@ -2007,6 +2033,7 @@ Cross-Chain/
 ├── scripts/
 │   ├── build-canonical-message-vector.mjs
 │   ├── build-validator-set-vector.mjs
+│   ├── deploy-merkle-inclusion-verifier.sh
 │   ├── deploy-pbft-certificate-verifier.sh
 │   ├── deploy-remote-gateway-registry.sh
 │   ├── deploy-validator-set-registry.sh
@@ -2142,7 +2169,7 @@ Cross-Chain/
 - Batch and Merkle computation preserve source lifecycle state and use only existing public message data and provenance. They introduce no private credential attributes.
 - PostgreSQL remains operational persistence. Batch and Merkle construction do not independently establish canonical-chain consensus or validator authority.
 - Persistent batch assignment, sealing, and epoch advancement preserve source lifecycle state. Validator-local `PREPARED` permits COMMIT voting. Only an independently verified QC authorizes the atomic `CONSENSUS_PENDING → COMMITTED` transition.
-- The Solidity Merkle primitive requires independently trusted expected context, including member count, and does not replace canonical message-field validation or authenticate a relayer. Shared golden vectors lock compatibility and grant no destination permissions.
+- The Solidity Merkle primitive requires independently trusted expected context, including member count. Its stateless facade derives count from the full unique ordered ID list and recomputes the expected batch commitment; the exact root/context must be authenticated separately by the QC verifier. Neither component replaces canonical message-field validation or authenticates a relayer. Shared golden vectors lock compatibility and grant no destination permissions.
 - Four independent validator processes may share one source RPC provider; independent checking does not eliminate that provider's trust assumptions or produce a cryptographic source-finality proof.
 - Validator-local observations are separate from source persistence and are never consensus votes. One validator or four local `VALID` results cannot commit a batch.
 - Peer handshake signatures prove configured identity control in a distinct domain and cannot serve as PREPARE/COMMIT signatures. Source mismatches fail closed and do not trigger source DB repairs.
@@ -2155,7 +2182,7 @@ Cross-Chain/
 - Relayer A/B delegate verified zero-value transport to the Persistent Transaction Manager. Their shared exclusive EOA is an untrusted transport account with no validator or destination permission. Exact signed bytes are durable before broadcast; bounded retry reuses them, and replacement only appends a higher-fee candidate at the same nonce. Any historical candidate may win. CONFIRMED supplies no Gateway authentication, business execution or permanent destination finality.
 - Destination RPC failover uses ordered, fingerprint-checked access paths. Provider URLs never identify a transaction or grant destination authority. Conservative cross-provider checks do not provide Byzantine RPC consensus.
 - Chain B QC verification requires trusted expected batch context. Legacy v1/v2 use the initial immutable authority with an explicitly expected legacy version; v3 uses its exact signed/expected validator epoch. A QC cannot choose destination eligibility for itself, and high-s compatibility cannot add quorum weight for a duplicated recovered identity.
-- The repository does not provide decentralized validator governance, Byzantine-relayer handling, destination-confirmed transaction reorg recovery, complete Destination Gateway message/Merkle/replay enforcement, exactly-once downstream execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
+- The repository does not provide decentralized validator governance, Byzantine-relayer handling, destination-confirmed transaction reorg recovery, an integrated Destination Gateway with full message policy/inclusion/replay enforcement, exactly-once downstream execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
 - Groth16 verification remains local to `IdentityApplicationA`. Its protected messages carry exact authorized public intent fields; destination credential-proof verification and business execution remain unimplemented.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, production transaction recovery and destination reorganization handling, and a destination-chain execution security design.
