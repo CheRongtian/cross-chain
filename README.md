@@ -2,6 +2,8 @@
 
 This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A/B independently verify each package and delegate its versioned ABI transport to a Persistent Transaction Manager. The manager atomically reserves nonces, estimates gas and resolves EIP-1559 fees, signs locally, persists exact raw bytes before broadcast, and tracks canonical receipts with configured confirmation depth. Bounded durable retries rebroadcast exact bytes, append same-nonce higher-fee candidates, enforce configured limits and accept any historical canonical winner. Ordered destination RPC access paths validate chain ID and genesis, preserve exact signed transactions across failover, and conservatively check multi-provider receipt views. Chain B maintains on-chain trusted remote-gateway configuration for exact source-domain and source-address pairs. Destination message verification, replay protection and execution remain unimplemented.
 
+Chain B also retains immutable historical validator committees in `ValidatorSetRegistry`. Each exact `uint256` validator epoch resolves to four canonical public identities, quorum three and the existing PBFT committee digest. This provides trusted configuration for destination verification; on-chain QC acceptance remains unimplemented.
+
 The current implementation can:
 
 - produce deterministic message identifiers that can be reproduced across implementations;
@@ -80,7 +82,8 @@ The current implementation can:
 - atomically reserve persistent nonces and retain one immutable locally signed type-2 attempt per logical delivery;
 - persist raw transaction bytes and their derived hash before sending to Chain B;
 - track canonical destination receipts to configured depth with distinct CONFIRMED and REVERTED outcomes.
-- configure one current trusted remote source-gateway identity per exact `uint256` source domain on Chain B.
+- configure one current trusted remote source-gateway identity per exact `uint256` source domain on Chain B;
+- append canonical four-validator committees with a three-validator quorum to immutable Chain B history and resolve each exact validator epoch without fallback.
 
 ## Architecture
 
@@ -314,6 +317,29 @@ The zero address represents an unknown source domain. `trustedRemoteGateway` ret
 A registered gateway is an address identity on its source chain and is not required to contain bytecode on Chain B. The registry does not attempt cross-chain code introspection. Its storage is trusted configuration available to a future destination verification layer; it does not authenticate a message, delivery package, Merkle proof, QC, validator set, relayer or application call by itself.
 
 The registry stores one currently trusted gateway per source domain. Replacing a mapping immediately makes the previous address non-current. Historical remote-gateway epochs and grace periods are not represented.
+
+### ValidatorSetRegistry
+
+`contracts/src/ValidatorSetRegistry.sol` is Chain B's trusted historical validator-set authority. Its immutable `registryAdmin` is the configured trusted operator. Only that operator can call `registerValidatorSet(uint256 validatorEpoch, address[4] validators)`. The contract sorts the four public Ethereum identities by unsigned address value, rejects zero and duplicate addresses, derives the existing PBFT committee digest, and stores quorum `3`. The registration API has no caller-selected quorum or digest.
+
+The initial validator epoch may be any exact `uint256`, including zero. Every subsequent epoch must equal the previous epoch plus one; duplicates, historical rewrites, retroactive epochs, gaps and overflow revert. The committee, quorum and digest of a registered epoch cannot be updated or removed. `ValidatorSetRegistered` emits the exact canonical public configuration. Storage supplies authority to consumers.
+
+`IValidatorSetRegistry.getValidatorSet(validatorEpoch)` returns `(address[4] validators, uint8 quorum, bytes32 committeeDigest)` for the exact historical epoch. Unknown epochs revert with `UnknownValidatorEpoch`; there is no initial, nearest or latest fallback. `hasValidatorSet` reports existence and `isValidator` checks membership in that exact epoch, also reverting for an unknown epoch. `hasValidatorHistory` distinguishes an empty registry from a valid initial epoch zero. Initial/latest getters revert before initialization. `latestValidatorEpoch` records append progress, while `initialValidatorEpoch` preserves the immutable authority anchor already used by the off-chain legacy v1/v2 resolver. The registry does not decide destination legacy-QC eligibility.
+
+The digest remains byte-for-byte compatible with `validator/src/committee.mjs`:
+
+```text
+committeeTypeHash = keccak256("PBFTStaticCommittee(uint8 protocolVersion,address[4] validators)")
+committeeDigest   = keccak256(abi.encode(committeeTypeHash, uint8(1), canonicalValidators))
+```
+
+The committee encoding version remains `1`, independently of PBFT evidence version `3`. This existing digest binds the canonical identities; validator epoch and quorum are represented by the registry record. Reusing the same committee under a later epoch produces the same digest. Changing a member changes it. `test-vectors/validator-sets.json` freezes public identities, canonical ordering, quorum and expected digests shared by Solidity and JavaScript tests. Expected values are checked against the existing implementation and never regenerated by deployment.
+
+The development identity directory contains V1–V5. Validator epoch `7` holds V1/V2/V3/V4; epoch `8` holds V2/V3/V4/V5. Both contain exactly four members. After rotation, V1 remains a historical epoch-7 member and is excluded from epoch 8; V5 is excluded from epoch 7. Batch epoch remains an independent message-batch sequence. Off-chain activation boundaries continue to schedule committees for batches and are not stored by this registry.
+
+The registry is configured from trusted public history before consensus evidence is examined. Relayers, DeliveryPackages, PostgreSQL records and RPC endpoints cannot register or supply committee authority. `scripts/deploy-validator-set-registry.sh` requires an explicit operator key, checks Chain B ID `2001`, appends the configured history and compares full ABI-encoded records with the off-chain expected members, quorum and digest. The root verification flow supplies public development history and reuses its existing Chain B registry operator. It also compares actual resolved history and historical QC epoch/digest bindings during the existing five-process rotation scenario.
+
+Remote-gateway trust and historical validator authority are separate contracts. `ValidatorSetRegistry` provides no QC parsing, COMMIT/signature acceptance, EIP-191 handling, Merkle inclusion acceptance, destination message validation, replay protection or application execution.
 
 ## Credentials and Zero-Knowledge Authorization
 
@@ -864,6 +890,8 @@ Legacy version 1 and 2 evidence retains its original type strings, ABI bytes, di
 Rotation authorization currently belongs to the trusted deployment/operator configuration boundary. QC signatures prove a quorum of the specified historical committee signed; they do not prove that decentralized governance selected that committee. There is no runtime force-rotation endpoint, validator election, staking or slashing.
 
 The unified integration reindexes real A/B/D and Message E into a verification-owned source namespace, starts five independent identities/PIDs/endpoints/stores, commits A/B/D under validator epoch 7, and commits the next Message E batch under epoch 8. V1 remains online while its new-epoch votes are rejected; V5 cannot add weight to historical epoch 7. A rotated-primary process crash requires view recovery with only epoch-8 members and a final three-signature QC that includes V5. Old and new certificates are then independently verified, including after V1 stops. Original source history, REORGED C, cursor, proofs, and existing committed QC are preserved.
+
+That same rotation scenario compares its actual resolved epoch-7/8 committees with Chain B `ValidatorSetRegistry` storage before consensus and after rotation/V1 shutdown. It checks exact canonical identities, quorum and digest, and resolves the existing historical QC epoch/digest to the already registered authority. This check grants no on-chain QC acceptance and leaves all signed certificate and delivery bytes unchanged.
 
 ## Independent Validators
 
@@ -1738,7 +1766,14 @@ The script uses strict error handling and performs:
 150. ambiguous replacement recovery with historical/new winners and preserved same-nonce lineage;
 151. real receipt reobservation, pre-COMMIT rollback, atomic finalization and post-COMMIT restart;
 152. concurrent recovery locks, stale post-RPC revisions, stopped-policy preservation and all-path-down no mutation;
-153. crash-fixture source/QC preservation and restoration of test-owned chain/process resources.
+153. crash-fixture source/QC preservation and restoration of test-owned chain/process resources;
+154. shared validator committee vectors, actual V1–V5 identities, all 24 permutations and exact large historical epochs;
+155. Solidity registry administrator, immutable initial/latest anchors, zero/large/maximum uint256 epochs and overflow;
+156. append-only historical committees, three-of-four quorum, exact membership and unknown-epoch rejection;
+157. Chain B deployment and registration of real validator epoch 7 (V1–V4) and epoch 8 (V2–V5);
+158. full ABI-record matching against off-chain canonical ordering, quorum and frozen digests;
+159. specific-error rejection of unauthorized, zero/duplicate-member, duplicate-epoch, rewrite, gap and retroactive registration;
+160. immutable epoch-7 authority after rotation, V1/V5 historical membership boundaries and real five-process/QC binding cross-checks.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -1756,7 +1791,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Durable Relayer and Transaction Recovery
+Historical Validator Committee Authority
 ```
 
 ### Expected error output
@@ -1804,13 +1839,15 @@ Cross-Chain/
 │   │   │   ├── ICredentialVerifier.sol
 │   │   │   ├── IGroth16Verifier.sol
 │   │   │   ├── IRemoteGatewayRegistry.sol
-│   │   │   └── ISourceGateway.sol
+│   │   │   ├── ISourceGateway.sol
+│   │   │   └── IValidatorSetRegistry.sol
 │   │   ├── CredentialVerifier.sol
 │   │   ├── IdentityApplicationA.sol
 │   │   ├── MessageCodec.sol
 │   │   ├── MessageMerkle.sol
 │   │   ├── RemoteGatewayRegistry.sol
-│   │   └── SourceGateway.sol
+│   │   ├── SourceGateway.sol
+│   │   └── ValidatorSetRegistry.sol
 │   └── test/
 │       ├── CredentialVerifier.t.sol
 │       ├── IdentityApplicationA.t.sol
@@ -1820,7 +1857,8 @@ Cross-Chain/
 │       │   ├── MockCredentialVerifier.sol
 │       │   ├── MockSourceApplication.sol
 │       │   └── MockSourceGateway.sol
-│       └── SourceGateway.t.sol
+│       ├── SourceGateway.t.sol
+│       └── ValidatorSetRegistry.t.sol
 ├── indexer/
 │   ├── migrations/
 │   │   ├── 001_chain_a_indexer.sql
@@ -1940,14 +1978,17 @@ Cross-Chain/
 │   └── package-lock.json
 ├── scripts/
 │   ├── build-canonical-message-vector.mjs
+│   ├── build-validator-set-vector.mjs
 │   ├── deploy-remote-gateway-registry.sh
+│   ├── deploy-validator-set-registry.sh
 │   ├── deploy-verifier.sh
 │   ├── start-chains.sh
 │   └── verify.sh
 ├── test-vectors/
 │   ├── canonical-messages.json
 │   ├── merkle-golden-vectors.json
-│   └── nullifiers.json
+│   ├── nullifiers.json
+│   └── validator-sets.json
 ├── validator/
 │   ├── .env.example
 │   ├── migrations/
@@ -1982,6 +2023,7 @@ Cross-Chain/
 │   │   ├── view-timeout.mjs
 │   │   └── consensus-runtime.mjs
 │   ├── test/
+│   │   ├── validator-set-golden.test.mjs
 │   │   ├── view-change.test.mjs
 │   │   ├── commit.test.mjs
 │   │   ├── config.test.mjs

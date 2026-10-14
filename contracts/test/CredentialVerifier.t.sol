@@ -11,6 +11,8 @@ import {ForwardCredentialProofFixture} from "../generated/ForwardCredentialProof
 
 contract CredentialVerifierTest is Test {
     uint256 internal constant PUBLIC_SIGNAL_COUNT = 11;
+    uint256 internal constant FORWARD_INTENT_HI_INDEX = 9;
+    uint256 internal constant FORWARD_INTENT_LO_INDEX = 10;
 
     CredentialVerifier internal verifier;
 
@@ -38,11 +40,11 @@ contract CredentialVerifierTest is Test {
     }
 
     function testForwardingProofBindsBothLimbsAndTheirOrder() public view {
-        uint256[11] memory signals = ForwardCredentialProofFixture.publicSignals();
+        uint256[PUBLIC_SIGNAL_COUNT] memory signals = ForwardCredentialProofFixture.publicSignals();
         assertTrue(verifier.verifyCredentialProof(ForwardCredentialProofFixture.proofA(),
             ForwardCredentialProofFixture.proofB(), ForwardCredentialProofFixture.proofC(), _publicInputs(signals)));
-        assertTrue(signals[9] != signals[10]);
-        for (uint256 index = 9; index < 11; index++) {
+        assertTrue(signals[FORWARD_INTENT_HI_INDEX] != signals[FORWARD_INTENT_LO_INDEX]);
+        for (uint256 index = FORWARD_INTENT_HI_INDEX; index < PUBLIC_SIGNAL_COUNT; index++) {
             uint256 original = signals[index];
             signals[index] = original + 1;
             _assertRejected(ForwardCredentialProofFixture.proofA(), ForwardCredentialProofFixture.proofB(),
@@ -52,7 +54,7 @@ contract CredentialVerifierTest is Test {
                 ForwardCredentialProofFixture.proofC(), signals);
             signals[index] = original;
         }
-        (signals[9], signals[10]) = (signals[10], signals[9]);
+        (signals[FORWARD_INTENT_HI_INDEX], signals[FORWARD_INTENT_LO_INDEX]) = (signals[FORWARD_INTENT_LO_INDEX], signals[FORWARD_INTENT_HI_INDEX]);
         _assertRejected(ForwardCredentialProofFixture.proofA(), ForwardCredentialProofFixture.proofB(),
             ForwardCredentialProofFixture.proofC(), signals);
     }
@@ -185,6 +187,8 @@ contract CredentialVerifierTest is Test {
         );
     }
 
+    // Each bounded mutation intentionally exercises the local EVM verifier through this helper.
+    // forge-lint: disable-next-item(calls-loop)
     function _assertRejected(
         uint256[2] memory proofA,
         uint256[2][2] memory proofB,

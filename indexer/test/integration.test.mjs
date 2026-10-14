@@ -899,7 +899,9 @@ test("recovers source workers and seals durable batches from real finalized mess
       validatorSets: createValidatorSetResolver(consensus.history),
       orphanMessageIds: afterNewMessage.filter((row) => row.status === "REORGED").map((row) => row.message_id) });
     await verifyValidatorRotation({ sourceConfig: config, sourcePool: activePool, snapshot: consensus.snapshot,
-      nextMessageId: messageE.messageId, pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE") });
+      nextMessageId: messageE.messageId, pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE"),
+      registryAddress: requireEnvironment("VALIDATOR_SET_REGISTRY_ADDRESS"),
+      registryRpcUrl: requireEnvironment("CHAIN_B_RPC_URL") });
   } finally {
     for (const worker of activeWorkers) {
       worker.kill("SIGKILL");

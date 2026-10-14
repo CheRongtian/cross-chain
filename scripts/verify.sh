@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Durable Relayer and Transaction Recovery"
+VERIFICATION_NAME="Historical Validator Committee Authority"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -421,6 +421,8 @@ cleanup() {
             "$TEMP_DIR/deploy-output.log" \
             "$TEMP_DIR/deployment-addresses.env" \
             "$TEMP_DIR/remote-registry-addresses.env" \
+            "$TEMP_DIR/validator-registry-addresses.env" \
+            "$TEMP_DIR/validator-registry-config.env" \
             "$TEMP_DIR/validator-pids" \
             "$TEMP_DIR/relayer-pids" \
             "$TEMP_DIR/forwarding-calldata.txt"
@@ -697,6 +699,16 @@ printf '205. Reject unknown domains, mismatched gateways, zero gateways and unau
 printf '206. Replace and remove remote trust deterministically, rejecting the former identity\n'
 printf '207. Preserve large uint256 domains and accept remote identities with no Chain B bytecode\n'
 printf '208. Restore the current Chain A SourceGateway mapping for subsequent verification\n'
+printf '209. Match frozen committee vectors to the existing validator digest and real V1-V5 identities\n'
+printf '210. Verify append-only registry history, all 24 permutations and exact uint256 epochs in Solidity\n'
+printf '211. Deploy ValidatorSetRegistry to Chain B with the configured trusted operator\n'
+printf '212. Register immutable validator epoch 7 (V1-V4) and epoch 8 (V2-V5)\n'
+printf '213. Match exact Chain B canonical members, three-of-four quorum and committee digests\n'
+printf '214. Reject unknown epochs, zero/duplicate members, unauthorized appends and historical rewrites\n'
+printf '215. Reject duplicate, noncontiguous and retroactive validator epochs with specific custom errors\n'
+printf '216. Preserve the initial authority anchor and epoch-specific removed/upcoming membership\n'
+printf '217. Compare actual five-process rotation history and historical QC bindings to Chain B storage\n'
+printf '218. Reject compiler and lint warnings without disabling project-wide lint rules\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -785,7 +797,8 @@ node --test \
     "$VALIDATOR_DIR/test/commit.test.mjs" \
     "$VALIDATOR_DIR/test/fault-transport.test.mjs" \
     "$VALIDATOR_DIR/test/view-change.test.mjs" \
-    "$VALIDATOR_DIR/test/validator-sets.test.mjs"
+    "$VALIDATOR_DIR/test/validator-sets.test.mjs" \
+    "$VALIDATOR_DIR/test/validator-set-golden.test.mjs"
 
 CURRENT_STEP="isolated validator migrations, endpoint/history separation, consistent PREPARE reads, COMMIT locks, and quorum persistence tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -888,12 +901,20 @@ forge fmt \
 
 CURRENT_STEP="forge build"
 printf '\n[%s]\n' "$CURRENT_STEP"
-forge build
+forge build --deny warnings --no-lint
+
+CURRENT_STEP="Solidity lint warning verification"
+printf '\n[%s]\n' "$CURRENT_STEP"
+# Run lint once with warning failures enabled; compilation above keeps its own warning guard.
+forge lint --deny warnings
 
 CURRENT_STEP="forge test -vv including shared Merkle golden compatibility"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test -vv
 
+printf 'VALID: Solidity ValidatorSetRegistry matches shared frozen committee vectors and canonical ordering\n'
+printf 'VALID: all 24 committee permutations, immutable history and fixed three-of-four quorum verified\n'
+printf 'VALID: exact zero, large and maximum uint256 validator epochs are independent of batch epochs\n'
 printf 'VALID: Solidity Merkle domains, leaves, and internal nodes match shared golden vectors\n'
 printf 'VALID: off-chain and Solidity roots and proofs match the same shared golden vectors\n'
 printf 'VALID: cross-runtime negative cases and trusted leaf-count checks verified\n'
@@ -949,6 +970,8 @@ TEMP_PARENT="${TMPDIR:-/tmp}"
 TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-verification.XXXXXX")"
 DEPLOYMENT_ADDRESSES_FILE="$TEMP_DIR/deployment-addresses.env"
 REMOTE_REGISTRY_ADDRESSES_FILE="$TEMP_DIR/remote-registry-addresses.env"
+VALIDATOR_REGISTRY_ADDRESSES_FILE="$TEMP_DIR/validator-registry-addresses.env"
+VALIDATOR_REGISTRY_CONFIG_FILE="$TEMP_DIR/validator-registry-config.env"
 VALIDATOR_PID_FILE="$TEMP_DIR/validator-pids"
 RELAYER_PID_FILE="$TEMP_DIR/relayer-pids"
 : > "$VALIDATOR_PID_FILE"
@@ -1144,6 +1167,98 @@ assert_hex_equal \
     "$SOURCE_GATEWAY" \
     "restored canonical Chain A SourceGateway"
 printf 'Restored trusted remote source: domain = %s, gateway = %s\n' "$CHAIN_A_ID" "$SOURCE_GATEWAY"
+
+CURRENT_STEP="trusted validator history and frozen digest export"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node "$PROJECT_ROOT/scripts/build-validator-set-vector.mjs" > "$VALIDATOR_REGISTRY_CONFIG_FILE"
+# Only validated public addresses, decimal epochs and committee digests are exported here.
+# shellcheck disable=SC1090
+source "$VALIDATOR_REGISTRY_CONFIG_FILE"
+
+CURRENT_STEP="Chain B ValidatorSetRegistry deployment and historical authority verification"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+REGISTRY_DEPLOYER_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
+REGISTRY_ADMIN="$CHAIN_B_REGISTRY_ADMIN" \
+VALIDATOR_INITIAL_EPOCH="$VALIDATOR_INITIAL_EPOCH" \
+VALIDATOR_ROTATED_EPOCH="$VALIDATOR_ROTATED_EPOCH" \
+VALIDATOR_INITIAL_MEMBERS="$VALIDATOR_INITIAL_MEMBERS" \
+VALIDATOR_ROTATED_MEMBERS="$VALIDATOR_ROTATED_MEMBERS" \
+VALIDATOR_INITIAL_DIGEST="$VALIDATOR_INITIAL_DIGEST" \
+VALIDATOR_ROTATED_DIGEST="$VALIDATOR_ROTATED_DIGEST" \
+DEPLOYMENT_OUTPUT_FILE="$VALIDATOR_REGISTRY_ADDRESSES_FILE" \
+    bash "$PROJECT_ROOT/scripts/deploy-validator-set-registry.sh"
+[[ -f "$VALIDATOR_REGISTRY_ADDRESSES_FILE" ]] \
+    || fail "ValidatorSetRegistry deployment address output is missing"
+VALIDATOR_SET_REGISTRY="$(sed -nE \
+    's/^VALIDATOR_SET_REGISTRY_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' \
+    "$VALIDATOR_REGISTRY_ADDRESSES_FILE")"
+[[ "$VALIDATOR_SET_REGISTRY" =~ ^0x[[:xdigit:]]{40}$ ]] \
+    || fail "invalid deployed ValidatorSetRegistry address"
+assert_hex_equal \
+    "$(cast call "$VALIDATOR_SET_REGISTRY" "registryAdmin()(address)" --rpc-url "$CHAIN_B_RPC")" \
+    "$CHAIN_B_REGISTRY_ADMIN" "historical validator registry administrator"
+assert_equal \
+    "$(cast call "$VALIDATOR_SET_REGISTRY" "initialValidatorEpoch()(uint256)" --rpc-url "$CHAIN_B_RPC" | awk '{print $1}')" \
+    "$VALIDATOR_INITIAL_EPOCH" "immutable initial validator epoch"
+assert_equal \
+    "$(cast call "$VALIDATOR_SET_REGISTRY" "latestValidatorEpoch()(uint256)" --rpc-url "$CHAIN_B_RPC" | awk '{print $1}')" \
+    "$VALIDATOR_ROTATED_EPOCH" "latest appended validator epoch"
+
+CURRENT_STEP="exact historical validator membership"
+printf '\n[%s]\n' "$CURRENT_STEP"
+assert_equal "$(cast call "$VALIDATOR_SET_REGISTRY" "isValidator(uint256,address)(bool)" \
+    "$VALIDATOR_INITIAL_EPOCH" "$VALIDATOR_IDENTITY_V1" --rpc-url "$CHAIN_B_RPC")" true "V1 historical epoch 7 membership"
+assert_equal "$(cast call "$VALIDATOR_SET_REGISTRY" "isValidator(uint256,address)(bool)" \
+    "$VALIDATOR_ROTATED_EPOCH" "$VALIDATOR_IDENTITY_V1" --rpc-url "$CHAIN_B_RPC")" false "V1 exclusion from epoch 8"
+assert_equal "$(cast call "$VALIDATOR_SET_REGISTRY" "isValidator(uint256,address)(bool)" \
+    "$VALIDATOR_INITIAL_EPOCH" "$VALIDATOR_IDENTITY_V5" --rpc-url "$CHAIN_B_RPC")" false "V5 exclusion from historical epoch 7"
+assert_equal "$(cast call "$VALIDATOR_SET_REGISTRY" "isValidator(uint256,address)(bool)" \
+    "$VALIDATOR_ROTATED_EPOCH" "$VALIDATOR_IDENTITY_V5" --rpc-url "$CHAIN_B_RPC")" true "V5 rotated epoch 8 membership"
+
+CURRENT_STEP="historical validator authority negative cases"
+printf '\n[%s]\n' "$CURRENT_STEP"
+INITIAL_VALIDATOR_RECORD="$(cast call "$VALIDATOR_SET_REGISTRY" "getValidatorSet(uint256)" \
+    "$VALIDATOR_INITIAL_EPOCH" --rpc-url "$CHAIN_B_RPC")"
+ROTATED_VALIDATOR_RECORD="$(cast call "$VALIDATOR_SET_REGISTRY" "getValidatorSet(uint256)" \
+    "$VALIDATOR_ROTATED_EPOCH" --rpc-url "$CHAIN_B_RPC")"
+for UNKNOWN_VALIDATOR_EPOCH in 0 6 9; do
+    assert_equal "$(cast call "$VALIDATOR_SET_REGISTRY" "hasValidatorSet(uint256)(bool)" \
+        "$UNKNOWN_VALIDATOR_EPOCH" --rpc-url "$CHAIN_B_RPC")" false "unknown epoch has no registry record"
+    expect_call_revert "unknown validator epoch $UNKNOWN_VALIDATOR_EPOCH rejected" "UnknownValidatorEpoch(uint256)" \
+        "$VALIDATOR_SET_REGISTRY" "getValidatorSet(uint256)" "$UNKNOWN_VALIDATOR_EPOCH" --rpc-url "$CHAIN_B_RPC"
+done
+expect_call_revert "zero validator rejected" "ZeroValidator()" \
+    "$VALIDATOR_SET_REGISTRY" "registerValidatorSet(uint256,address[4])" 9 \
+    "[$ZERO_ADDRESS,$VALIDATOR_IDENTITY_V2,$VALIDATOR_IDENTITY_V3,$VALIDATOR_IDENTITY_V4]" \
+    --from "$CHAIN_B_REGISTRY_ADMIN" --rpc-url "$CHAIN_B_RPC"
+expect_call_revert "duplicate validator identity rejected" "DuplicateValidator(address)" \
+    "$VALIDATOR_SET_REGISTRY" "registerValidatorSet(uint256,address[4])" 9 \
+    "[$VALIDATOR_IDENTITY_V1,$VALIDATOR_IDENTITY_V2,$VALIDATOR_IDENTITY_V2,$VALIDATOR_IDENTITY_V4]" \
+    --from "$CHAIN_B_REGISTRY_ADMIN" --rpc-url "$CHAIN_B_RPC"
+expect_call_revert "duplicate historical epoch rejected" "ValidatorEpochAlreadyRegistered(uint256)" \
+    "$VALIDATOR_SET_REGISTRY" "registerValidatorSet(uint256,address[4])" \
+    "$VALIDATOR_INITIAL_EPOCH" "$VALIDATOR_INITIAL_MEMBERS" \
+    --from "$CHAIN_B_REGISTRY_ADMIN" --rpc-url "$CHAIN_B_RPC"
+expect_call_revert "historical validator-set rewrite rejected" "ValidatorEpochAlreadyRegistered(uint256)" \
+    "$VALIDATOR_SET_REGISTRY" "registerValidatorSet(uint256,address[4])" \
+    "$VALIDATOR_INITIAL_EPOCH" "$VALIDATOR_ROTATED_MEMBERS" \
+    --from "$CHAIN_B_REGISTRY_ADMIN" --rpc-url "$CHAIN_B_RPC"
+expect_call_revert "noncontiguous validator epoch rejected" "NoncontiguousValidatorEpoch(uint256,uint256)" \
+    "$VALIDATOR_SET_REGISTRY" "registerValidatorSet(uint256,address[4])" 10 "$VALIDATOR_ROTATED_MEMBERS" \
+    --from "$CHAIN_B_REGISTRY_ADMIN" --rpc-url "$CHAIN_B_RPC"
+expect_call_revert "retroactive validator epoch rejected" "NoncontiguousValidatorEpoch(uint256,uint256)" \
+    "$VALIDATOR_SET_REGISTRY" "registerValidatorSet(uint256,address[4])" 6 "$VALIDATOR_INITIAL_MEMBERS" \
+    --from "$CHAIN_B_REGISTRY_ADMIN" --rpc-url "$CHAIN_B_RPC"
+expect_call_revert "unauthorized validator-set registration rejected" "UnauthorizedRegistryAdmin()" \
+    "$VALIDATOR_SET_REGISTRY" "registerValidatorSet(uint256,address[4])" 9 "$VALIDATOR_ROTATED_MEMBERS" \
+    --from "$UNAUTHORIZED_CALLER" --rpc-url "$CHAIN_B_RPC"
+assert_hex_equal "$(cast call "$VALIDATOR_SET_REGISTRY" "getValidatorSet(uint256)" \
+    "$VALIDATOR_INITIAL_EPOCH" --rpc-url "$CHAIN_B_RPC")" "$INITIAL_VALIDATOR_RECORD" "preserved historical epoch 7 after rejected mutations"
+assert_hex_equal "$(cast call "$VALIDATOR_SET_REGISTRY" "getValidatorSet(uint256)" \
+    "$VALIDATOR_ROTATED_EPOCH" --rpc-url "$CHAIN_B_RPC")" "$ROTATED_VALIDATOR_RECORD" "preserved historical epoch 8 after rejected mutations"
+assert_equal "$(cast call "$VALIDATOR_SET_REGISTRY" "hasValidatorSet(uint256)(bool)" \
+    9 --rpc-url "$CHAIN_B_RPC")" false "failed appends leave epoch 9 unregistered"
 
 CURRENT_STEP="deployment code verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1607,6 +1722,7 @@ INDEXER_INTEGRATION_DESTINATION_GATEWAY="$DESTINATION_GATEWAY" \
 INDEXER_INTEGRATION_DESTINATION_RECEIVER="$DESTINATION_RECEIVER" \
 VALIDATOR_VERIFICATION_PID_FILE="$VALIDATOR_PID_FILE" \
 RELAYER_VERIFICATION_PID_FILE="$RELAYER_PID_FILE" \
+VALIDATOR_SET_REGISTRY_ADDRESS="$VALIDATOR_SET_REGISTRY" \
 CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
 CHAIN_B_CHAIN_ID="$CHAIN_B_ID" \
 RPC_REQUEST_TIMEOUT_MS="$RPC_REQUEST_TIMEOUT_MS" \

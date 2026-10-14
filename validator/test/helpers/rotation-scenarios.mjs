@@ -19,10 +19,11 @@ import { closeScenarioResources, createValidatorProcesses, initializeValidatorSt
 import { sourceState } from "./four-process.mjs";
 import { verifyDeliveryQueue } from "../../../indexer/test/helpers/delivery-integration.mjs";
 import { verifySingleRelayer } from "../../../indexer/test/helpers/relayer-integration.mjs";
+import { createValidatorRegistryChecks } from "./validator-set-registry.mjs";
 
 const quiet = { log() {},warn() {},error() {} };
 
-export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot,nextMessageId,pidFile }) {
+export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot,nextMessageId,pidFile,registryAddress,registryRpcUrl }) {
   const original = await sourceState(sourcePool,sourceConfig.databaseSchema);
   const config = { ...sourceConfig,databaseSchema: "cross_chain_rotation_source",
     sourceGatewayStartBlock: snapshot.batch.messages.reduce((first,message) => message.sourceBlockNumber < first ? message.sourceBlockNumber : first,snapshot.batch.messages[0].sourceBlockNumber) };
@@ -52,6 +53,9 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
       { validatorEpoch: "7",activationBatchEpoch: "0",validators: peers.slice(0,4).map((peer) => peer.address) },
       { validatorEpoch: "8",activationBatchEpoch: newEpoch.toString(),validators: peers.slice(1).map((peer) => peer.address) },
     ]);
+    const registryChecks = await createValidatorRegistryChecks({
+      registryAddress, rpcUrl: registryRpcUrl, history: validatorSets.history,
+    });
     const lifecycle = createBatchLifecycle({ config,pool,committee: peers,validatorSets });
     async function seal(expectedEpoch,rows) {
       // initialEpoch anchors the complete batch history. Subsequent batches
@@ -124,6 +128,7 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     for (const index of [0,1,2]) assert.equal((await request(index,"/pbft/prepare/cast",{ epoch: oldEpoch.toString() })).status,200);
     for (const index of [0,1,2]) assert.equal((await request(index,"/pbft/commit/cast",{ epoch: oldEpoch.toString() })).status,200);
     const oldQc = (await request(0,"/pbft/qc",{ epoch: oldEpoch.toString() })).body.certificate;
+    await registryChecks.assertQcBinding(oldQc);
     assert.equal((await request(0,"/pbft/qc/submit",oldQc)).status,200);
     const oldCommitted = await lifecycle.readBatch({ batchRecordId: oldBatch.record.batchRecordId });
     assert.equal(oldCommitted.record.status,"COMMITTED"); assert.equal(oldQc.validatorEpoch,"7");
@@ -184,6 +189,10 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     }
     await processes.stop(validators[0]);
     assert.equal((await request(4,"/pbft/qc/verify",oldQc)).status,200);
+    await registryChecks.assertHistory();
+    await registryChecks.assertQcBinding(oldQc);
+    await registryChecks.assertQcBinding(qc);
+    console.log("VALID: Chain B historical epoch 7 stayed unchanged through real epoch 8 consensus, view recovery and V1 shutdown");
     assert.deepEqual(await lifecycle.readBatch({ batchRecordId: oldBatch.record.batchRecordId }),oldCommitted);
     assert.deepEqual(newCommitted.batch,newBatch.batch); assert.deepEqual(newCommitted.members,newBatch.members); assert.deepEqual(newCommitted.tree,newBatch.tree);
     await verifyDeliveryQueue({ config, pool, snapshots: [oldCommitted,newCommitted], validatorSets,

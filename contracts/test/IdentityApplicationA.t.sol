@@ -12,6 +12,35 @@ import {MockSourceGateway} from "./mocks/MockSourceGateway.sol";
 import {ForwardAuthorizationCodec} from "../src/ForwardAuthorizationCodec.sol";
 
 contract IdentityApplicationATest is Test {
+    enum ForwardIntentMutation {
+        PAYLOAD,
+        DESTINATION_DOMAIN,
+        DESTINATION_GATEWAY,
+        DESTINATION_RECEIVER,
+        DEADLINE
+    }
+
+    enum ForwardPolicyMutation {
+        ISSUER,
+        ROLE,
+        FUTURE_TIMESTAMP,
+        STALE_TIMESTAMP,
+        CREDENTIAL_STATE_ROOT,
+        POLICY_EPOCH,
+        INTENT_HIGH_LIMB,
+        INTENT_LOW_LIMB,
+        VERIFIER_REJECTION
+    }
+
+    uint256 internal constant FORWARD_NULLIFIER = 555_551;
+    uint256 internal constant ACTION_FORWARD_MESSAGE = 3;
+    uint8 internal constant FORWARD_PROTOCOL_VERSION = 2;
+    uint256 internal constant PROOF_PAIR_SIZE = 2;
+    uint256 internal constant OTHER_ROLE = 2;
+    uint256 internal constant FORWARD_EVENT_COUNT = 3;
+    uint256 internal constant FORWARD_EVENT_TOPIC_COUNT = 4;
+    uint256 internal constant FORWARD_INTENT_MUTATION_COUNT = uint256(ForwardIntentMutation.DEADLINE) + 1;
+    uint256 internal constant FORWARD_POLICY_MUTATION_COUNT = uint256(ForwardPolicyMutation.VERIFIER_REJECTION) + 1;
     uint256 internal constant TRUSTED_ISSUER = 12_345;
     uint256 internal constant REQUIRED_ROLE = 1;
     uint256 internal constant ONE_HOUR = 1 hours;
@@ -526,7 +555,7 @@ contract IdentityApplicationATest is Test {
         sourceGateway.setReturnValues(expectedMessageId, expectedNonce);
 
         IdentityApplicationA.ForwardRequest memory request = _forwardRequest(payload, deadline);
-        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, 555_551);
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER);
         vm.prank(SUBMITTER);
         (bytes32 messageId, uint256 nonce) = _invokeForward(application, inputs, request);
 
@@ -566,7 +595,7 @@ contract IdentityApplicationATest is Test {
         );
 
         IdentityApplicationA.ForwardRequest memory request = _forwardRequest(payload, deadline);
-        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(realGatewayApplication, request, SUBMITTER, 555_551);
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(realGatewayApplication, request, SUBMITTER, FORWARD_NULLIFIER);
         vm.recordLogs();
         vm.prank(SUBMITTER);
         (bytes32 messageId, uint256 nonce) = _invokeForward(realGatewayApplication, inputs, request);
@@ -593,7 +622,7 @@ contract IdentityApplicationATest is Test {
         );
 
         IdentityApplicationA.ForwardRequest memory request = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
-        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(realGatewayApplication, request, SUBMITTER, 555_551);
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(realGatewayApplication, request, SUBMITTER, FORWARD_NULLIFIER);
         vm.prank(SUBMITTER);
         vm.expectRevert(SourceGateway.UnauthorizedSourceApplication.selector);
         _invokeForward(realGatewayApplication, inputs, request);
@@ -620,14 +649,14 @@ contract IdentityApplicationATest is Test {
         realSourceGateway.setSourceApplicationAuthorization(address(realGatewayApplication), true);
 
         IdentityApplicationA.ForwardRequest memory request = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
-        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(realGatewayApplication, request, SUBMITTER, 555_551);
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(realGatewayApplication, request, SUBMITTER, FORWARD_NULLIFIER);
         vm.prank(SUBMITTER);
         (, uint256 acceptedNonce) = _invokeForward(realGatewayApplication, inputs, request);
         assertEq(acceptedNonce, 1);
         realSourceGateway.setSourceApplicationAuthorization(address(realGatewayApplication), false);
 
         request.deadline += 1;
-        inputs = _forwardInputs(realGatewayApplication, request, SUBMITTER, 555_552);
+        inputs = _forwardInputs(realGatewayApplication, request, SUBMITTER, FORWARD_NULLIFIER + 1);
         vm.prank(SUBMITTER);
         vm.expectRevert(SourceGateway.UnauthorizedSourceApplication.selector);
         _invokeForward(realGatewayApplication, inputs, request);
@@ -637,16 +666,24 @@ contract IdentityApplicationATest is Test {
     }
 
     function _forwardRequest(bytes memory payload, uint256 deadline) internal pure returns (IdentityApplicationA.ForwardRequest memory) {
-        return IdentityApplicationA.ForwardRequest(DESTINATION_DOMAIN, DESTINATION_GATEWAY, DESTINATION_RECEIVER, payload, deadline);
+        return IdentityApplicationA.ForwardRequest({
+            destinationDomain: DESTINATION_DOMAIN,
+            destinationGateway: DESTINATION_GATEWAY,
+            destinationReceiver: DESTINATION_RECEIVER,
+            payload: payload,
+            deadline: deadline
+        });
     }
 
     function _intentFor(IdentityApplicationA target, IdentityApplicationA.ForwardRequest memory request, address executor)
         internal view returns (ForwardAuthorizationCodec.Intent memory intent)
     {
-        intent.protocolVersion = 2;
-        intent.action = 3;
+        intent.protocolVersion = FORWARD_PROTOCOL_VERSION;
+        intent.action = ACTION_FORWARD_MESSAGE;
         intent.sourceDomain = block.chainid;
         intent.application = address(target);
+        // Local fixture getters are intentionally read for each bounded mutation.
+        // forge-lint: disable-next-line(calls-loop)
         intent.sourceGateway = address(target.sourceGateway());
         intent.destinationDomain = request.destinationDomain;
         intent.destinationGateway = request.destinationGateway;
@@ -663,10 +700,16 @@ contract IdentityApplicationATest is Test {
         inputs.trustedIssuer = TRUSTED_ISSUER;
         inputs.requiredRole = REQUIRED_ROLE;
         inputs.currentTimestamp = CURRENT_TIME;
+        // Local fixture getters are intentionally read for each bounded mutation.
+        // forge-lint: disable-next-line(calls-loop)
         inputs.credentialStateRoot = target.credentialStateRoot();
+        // Local fixture getters are intentionally read for each bounded mutation.
+        // forge-lint: disable-next-line(calls-loop)
         inputs.applicationDomain = target.applicationDomain();
+        // Local fixture getters are intentionally read for each bounded mutation.
+        // forge-lint: disable-next-line(calls-loop)
         inputs.policyEpoch = target.currentPolicyEpoch();
-        inputs.actionContext = 3;
+        inputs.actionContext = ACTION_FORWARD_MESSAGE;
         inputs.nullifier = nullifier;
         (inputs.forwardIntentDigestHi, inputs.forwardIntentDigestLo) = ForwardAuthorizationCodec.split(ForwardAuthorizationCodec.digest(_intentFor(target, request, executor)));
     }
@@ -674,31 +717,46 @@ contract IdentityApplicationATest is Test {
     function _invokeForward(IdentityApplicationA target, ICredentialVerifier.CredentialPublicInputs memory inputs, IdentityApplicationA.ForwardRequest memory request)
         internal returns (bytes32, uint256)
     {
-        return target.forwardAuthorizedMessage([uint256(1), uint256(2)],
-            [[uint256(3), uint256(4)], [uint256(5), uint256(6)]], [uint256(7), uint256(8)], inputs, request);
+        // Mutation tests deliberately exercise the actual local authorization entry point.
+        // forge-lint: disable-next-line(calls-loop)
+        return target.forwardAuthorizedMessage(_mockProofA(), _mockProofB(), _mockProofC(), inputs, request);
     }
 
     function testForwardIntentMutationsNeverConsumeNullifier() public {
         IdentityApplicationA.ForwardRequest memory original = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
-        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, original, SUBMITTER, 555_551);
-        for (uint256 variant = 0; variant < 5; variant++) {
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, original, SUBMITTER, FORWARD_NULLIFIER);
+        for (uint256 variant = 0; variant < FORWARD_INTENT_MUTATION_COUNT; ++variant) {
             IdentityApplicationA.ForwardRequest memory request = _forwardRequest(original.payload, original.deadline);
-            if (variant == 0) request.payload = "different payload";
-            if (variant == 1) request.destinationDomain += 1;
-            if (variant == 2) request.destinationGateway = address(0xD00E);
-            if (variant == 3) request.destinationReceiver = address(0xBEE1);
-            if (variant == 4) request.deadline += 1;
+            // The loop only visits declared mutation cases.
+            // forge-lint: disable-next-line(unsafe-typecast)
+            _mutateForwardIntent(request, ForwardIntentMutation(variant));
+            // Each case deliberately invokes local fixture contracts and VM assertions.
+            // forge-lint: disable-next-line(calls-loop)
             vm.prank(SUBMITTER);
+            // forge-lint: disable-next-line(calls-loop)
             vm.expectRevert(IdentityApplicationA.InvalidForwardIntent.selector);
             _invokeForward(application, inputs, request);
+            // forge-lint: disable-next-line(calls-loop)
             assertFalse(application.usedNullifiers(inputs.nullifier));
+            // forge-lint: disable-next-line(calls-loop)
             assertEq(sourceGateway.caller(), address(0));
         }
     }
 
+    function _mutateForwardIntent(
+        IdentityApplicationA.ForwardRequest memory request,
+        ForwardIntentMutation variant
+    ) private pure {
+        if (variant == ForwardIntentMutation.PAYLOAD) request.payload = "different payload";
+        if (variant == ForwardIntentMutation.DESTINATION_DOMAIN) request.destinationDomain += 1;
+        if (variant == ForwardIntentMutation.DESTINATION_GATEWAY) request.destinationGateway = address(0xD00E);
+        if (variant == ForwardIntentMutation.DESTINATION_RECEIVER) request.destinationReceiver = address(0xBEE1);
+        if (variant == ForwardIntentMutation.DEADLINE) request.deadline += 1;
+    }
+
     function testForwardProofTheftAndReplayAreRejected() public {
         IdentityApplicationA.ForwardRequest memory request = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
-        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, 555_551);
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER);
         vm.prank(UNAUTHORIZED_CALLER);
         vm.expectRevert(IdentityApplicationA.InvalidForwardIntent.selector);
         _invokeForward(application, inputs, request);
@@ -714,7 +772,7 @@ contract IdentityApplicationATest is Test {
     function testStandaloneVerificationDoesNotAuthorizeForwarding() public {
         _verifySupplier(CREDENTIAL_COMMITMENT, TRUSTED_ISSUER, REQUIRED_ROLE, CURRENT_TIME);
         IdentityApplicationA.ForwardRequest memory request = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
-        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, 555_551);
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER);
         inputs.actionContext = 1;
         inputs.forwardIntentDigestHi = 0;
         inputs.forwardIntentDigestLo = 0;
@@ -722,15 +780,15 @@ contract IdentityApplicationATest is Test {
         vm.expectRevert(IdentityApplicationA.InvalidActionContext.selector);
         _invokeForward(application, inputs, request);
         assertEq(sourceGateway.caller(), address(0));
-        inputs = _forwardInputs(application, request, SUBMITTER, 555_551);
+        inputs = _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER);
         vm.expectRevert(IdentityApplicationA.InvalidActionContext.selector);
-        application.verifySupplier([uint256(1), uint256(2)], [[uint256(3), uint256(4)], [uint256(5), uint256(6)]],
-            [uint256(7), uint256(8)], inputs);
+        application.verifySupplier(_mockProofA(), _mockProofB(),
+            _mockProofC(), inputs);
     }
 
     function testForwardingCannotReuseAnotherApplicationOrGatewayIntent() public {
         IdentityApplicationA.ForwardRequest memory request = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
-        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, 555_551);
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER);
         ForwardAuthorizationCodec.Intent memory intent = _intentFor(application, request, SUBMITTER);
         intent.sourceGateway = address(0x1002);
         (inputs.forwardIntentDigestHi, inputs.forwardIntentDigestLo) = ForwardAuthorizationCodec.split(ForwardAuthorizationCodec.digest(intent));
@@ -739,7 +797,7 @@ contract IdentityApplicationATest is Test {
         _invokeForward(application, inputs, request);
         IdentityApplicationA other = new IdentityApplicationA(address(verifier), address(sourceGateway), TRUSTED_ISSUER,
             REQUIRED_ROLE, MAX_PROOF_AGE, STATE_AUTHORITY, ROOT_N);
-        inputs = _forwardInputs(application, request, SUBMITTER, 555_551);
+        inputs = _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER);
         vm.prank(SUBMITTER);
         vm.expectRevert(IdentityApplicationA.InvalidApplicationDomain.selector);
         _invokeForward(other, inputs, request);
@@ -747,46 +805,90 @@ contract IdentityApplicationATest is Test {
 
     function testForwardPolicyAndVerifierRejectionsLeaveNoGatewayCall() public {
         IdentityApplicationA.ForwardRequest memory request = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
-        for (uint256 variant = 0; variant < 9; variant++) {
-            ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, 555_551);
-            bytes4 reason;
-            if (variant == 0) { inputs.trustedIssuer += 1; reason = IdentityApplicationA.InvalidIssuerPolicy.selector; }
-            if (variant == 1) { inputs.requiredRole = 2; reason = IdentityApplicationA.InvalidRolePolicy.selector; }
-            if (variant == 2) { inputs.currentTimestamp += 1; reason = IdentityApplicationA.FutureProofTimestamp.selector; }
-            if (variant == 3) { inputs.currentTimestamp -= MAX_PROOF_AGE + 1; reason = IdentityApplicationA.StaleProofTimestamp.selector; }
-            if (variant == 4) { inputs.credentialStateRoot += 1; reason = IdentityApplicationA.InvalidCredentialStateRoot.selector; }
-            if (variant == 5) { inputs.policyEpoch += 1; reason = IdentityApplicationA.InvalidPolicyEpoch.selector; }
-            if (variant == 6) { inputs.forwardIntentDigestHi += 1; reason = IdentityApplicationA.InvalidForwardIntent.selector; }
-            if (variant == 7) { inputs.forwardIntentDigestLo += 1; reason = IdentityApplicationA.InvalidForwardIntent.selector; }
-            if (variant == 8) { verifier.setVerificationResult(false); reason = IdentityApplicationA.InvalidCredentialProof.selector; }
+        for (uint256 variant = 0; variant < FORWARD_POLICY_MUTATION_COUNT; ++variant) {
+            ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER);
+            // Every enum case returns its exact expected error, without an uninitialized selector.
+            // forge-lint: disable-next-line(unsafe-typecast)
+            bytes4 reason = _mutateForwardPolicy(inputs, ForwardPolicyMutation(variant));
+            // Each case deliberately invokes local fixture contracts and VM assertions.
+            // forge-lint: disable-next-line(calls-loop)
             vm.prank(SUBMITTER);
+            // forge-lint: disable-next-line(calls-loop)
             vm.expectRevert(reason);
             _invokeForward(application, inputs, request);
+            // forge-lint: disable-next-line(calls-loop)
             assertFalse(application.usedNullifiers(inputs.nullifier));
+            // forge-lint: disable-next-line(calls-loop)
             assertEq(sourceGateway.caller(), address(0));
         }
     }
 
+    function _mutateForwardPolicy(
+        ICredentialVerifier.CredentialPublicInputs memory inputs,
+        ForwardPolicyMutation variant
+    ) private returns (bytes4) {
+        if (variant == ForwardPolicyMutation.ISSUER) {
+            inputs.trustedIssuer += 1;
+            return IdentityApplicationA.InvalidIssuerPolicy.selector;
+        }
+        if (variant == ForwardPolicyMutation.ROLE) {
+            inputs.requiredRole = OTHER_ROLE;
+            return IdentityApplicationA.InvalidRolePolicy.selector;
+        }
+        if (variant == ForwardPolicyMutation.FUTURE_TIMESTAMP) {
+            inputs.currentTimestamp += 1;
+            return IdentityApplicationA.FutureProofTimestamp.selector;
+        }
+        if (variant == ForwardPolicyMutation.STALE_TIMESTAMP) {
+            inputs.currentTimestamp -= MAX_PROOF_AGE + 1;
+            return IdentityApplicationA.StaleProofTimestamp.selector;
+        }
+        if (variant == ForwardPolicyMutation.CREDENTIAL_STATE_ROOT) {
+            inputs.credentialStateRoot += 1;
+            return IdentityApplicationA.InvalidCredentialStateRoot.selector;
+        }
+        if (variant == ForwardPolicyMutation.POLICY_EPOCH) {
+            inputs.policyEpoch += 1;
+            return IdentityApplicationA.InvalidPolicyEpoch.selector;
+        }
+        if (variant == ForwardPolicyMutation.INTENT_HIGH_LIMB) {
+            inputs.forwardIntentDigestHi += 1;
+            return IdentityApplicationA.InvalidForwardIntent.selector;
+        }
+        if (variant == ForwardPolicyMutation.INTENT_LOW_LIMB) {
+            inputs.forwardIntentDigestLo += 1;
+            return IdentityApplicationA.InvalidForwardIntent.selector;
+        }
+        // VERIFIER_REJECTION is the final enum member and is visited last by this fixture.
+        // forge-lint: disable-next-line(calls-loop)
+        verifier.setVerificationResult(false);
+        return IdentityApplicationA.InvalidCredentialProof.selector;
+    }
+
     function testRevokedCredentialAndOldEpochCannotForward() public {
         IdentityApplicationA.ForwardRequest memory request = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
-        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, 555_551);
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER);
         vm.prank(STATE_AUTHORITY);
         application.advancePolicyEpoch();
         vm.prank(SUBMITTER);
         vm.expectRevert(IdentityApplicationA.InvalidPolicyEpoch.selector);
         _invokeForward(application, inputs, request);
         _revokeCredential(CREDENTIAL_COMMITMENT);
-        inputs = _forwardInputs(application, request, SUBMITTER, 555_551);
+        inputs = _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER);
         vm.prank(SUBMITTER);
         vm.expectRevert(IdentityApplicationA.RevokedCredential.selector);
         _invokeForward(application, inputs, request);
     }
 
     function testNoProofSelectorCannotEmitMessage() public {
-        (bool success,) = address(application).call(abi.encodeWithSignature(
+        bytes memory legacyCalldata = abi.encodeWithSignature(
             "sendCrossChainMessage(uint256,address,address,bytes,uint256)",
-            DESTINATION_DOMAIN, DESTINATION_GATEWAY, DESTINATION_RECEIVER, "supplier update", CURRENT_TIME + MESSAGE_LIFETIME));
+            DESTINATION_DOMAIN, DESTINATION_GATEWAY, DESTINATION_RECEIVER, "supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
+        // A raw selector call is required to prove the no-proof entry point is absent.
+        // forge-lint: disable-next-line(low-level-calls)
+        (bool success, bytes memory result) = address(application).call(legacyCalldata);
         assertFalse(success);
+        assertEq(result.length, 0);
         assertEq(sourceGateway.caller(), address(0));
     }
 
@@ -798,19 +900,19 @@ contract IdentityApplicationATest is Test {
         bytes memory expectedPayload,
         uint256 expectedDeadline
     ) internal view {
-        assertEq(logs.length, 3);
+        assertEq(logs.length, FORWARD_EVENT_COUNT);
         assertEq(logs[0].topics[0], IdentityApplicationA.NullifierConsumed.selector);
-        assertEq(logs[2].topics[0], IdentityApplicationA.AuthorizedMessageForwarded.selector);
-        assertEq(logs[2].topics[1], ForwardAuthorizationCodec.digest(
+        assertEq(logs[FORWARD_EVENT_COUNT - 1].topics[0], IdentityApplicationA.AuthorizedMessageForwarded.selector);
+        assertEq(logs[FORWARD_EVENT_COUNT - 1].topics[1], ForwardAuthorizationCodec.digest(
             _intentFor(realGatewayApplication, _forwardRequest(expectedPayload, expectedDeadline), SUBMITTER)));
-        assertEq(logs[2].topics[2], bytes32(uint256(555_551)));
-        assertEq(logs[2].topics[3], expectedMessageId);
+        assertEq(logs[FORWARD_EVENT_COUNT - 1].topics[2], bytes32(FORWARD_NULLIFIER));
+        assertEq(logs[FORWARD_EVENT_COUNT - 1].topics[FORWARD_EVENT_TOPIC_COUNT - 1], expectedMessageId);
         assertEq(logs[1].emitter, address(realSourceGateway));
         assertEq(logs[1].topics.length, GATEWAY_EVENT_TOPIC_COUNT);
         assertEq(logs[1].topics[0], SourceGateway.CrossChainMessage.selector);
         assertEq(logs[1].topics[1], expectedMessageId);
         assertEq(logs[1].topics[2], bytes32(uint256(uint160(address(realGatewayApplication)))));
-        assertEq(logs[1].topics[3], bytes32(DESTINATION_DOMAIN));
+        assertEq(logs[1].topics[GATEWAY_EVENT_TOPIC_COUNT - 1], bytes32(DESTINATION_DOMAIN));
 
         (
             uint8 version,
@@ -901,11 +1003,23 @@ contract IdentityApplicationATest is Test {
         });
 
         application.verifySupplier(
-            [uint256(1), uint256(2)],
-            [[uint256(3), uint256(4)], [uint256(5), uint256(6)]],
-            [uint256(7), uint256(8)],
+            _mockProofA(),
+            _mockProofB(),
+            _mockProofC(),
             publicInputs
         );
+    }
+
+    function _mockProofA() internal pure returns (uint256[PROOF_PAIR_SIZE] memory) {
+        return [uint256(1), uint256(2)];
+    }
+
+    function _mockProofB() internal pure returns (uint256[PROOF_PAIR_SIZE][PROOF_PAIR_SIZE] memory) {
+        return [[uint256(3), uint256(4)], [uint256(5), uint256(6)]];
+    }
+
+    function _mockProofC() internal pure returns (uint256[PROOF_PAIR_SIZE] memory) {
+        return [uint256(7), uint256(8)];
     }
 
     function _nullifierFor(uint256 credentialCommitment, uint256 policyEpoch) internal pure returns (uint256) {

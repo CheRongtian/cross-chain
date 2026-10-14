@@ -6,6 +6,24 @@ import {CROSS_CHAIN_MESSAGE_TYPEHASH} from "../src/MessageCodec.sol";
 import {ForwardAuthorizationVector} from "../generated/ForwardAuthorizationVector.sol";
 
 contract ForwardAuthorizationCodecTest is Test {
+    enum IntentField {
+        PROTOCOL_VERSION,
+        ACTION,
+        SOURCE_DOMAIN,
+        APPLICATION,
+        SOURCE_GATEWAY,
+        DESTINATION_DOMAIN,
+        DESTINATION_GATEWAY,
+        DESTINATION_RECEIVER,
+        PAYLOAD_HASH,
+        DEADLINE,
+        AUTHORIZED_EXECUTOR
+    }
+
+    uint256 internal constant INTENT_FIELD_COUNT = uint256(IntentField.AUTHORIZED_EXECUTOR) + 1;
+    address internal constant CHANGED_ADDRESS = address(0x123);
+    bytes32 internal constant CHANGED_PAYLOAD_HASH = bytes32(uint256(123));
+
     function testSharedForwardIntentEncodingAndDigest() public pure {
         ForwardAuthorizationCodec.Intent memory intent = ForwardAuthorizationVector.intent();
         assertEq(ForwardAuthorizationCodec.encode(intent), ForwardAuthorizationVector.expectedEncoding());
@@ -26,20 +44,38 @@ contract ForwardAuthorizationCodecTest is Test {
     }
     function testEveryForwardIntentFieldChangesDigest() public pure {
         bytes32 original = ForwardAuthorizationVector.expectedDigest();
-        for (uint256 field = 0; field < 11; field++) {
-            ForwardAuthorizationCodec.Intent memory intent = ForwardAuthorizationVector.intent();
-            if (field == 0) intent.protocolVersion += 1;
-            if (field == 1) intent.action += 1;
-            if (field == 2) intent.sourceDomain += 1;
-            if (field == 3) intent.application = address(0x123);
-            if (field == 4) intent.sourceGateway = address(0x123);
-            if (field == 5) intent.destinationDomain += 1;
-            if (field == 6) intent.destinationGateway = address(0x123);
-            if (field == 7) intent.destinationReceiver = address(0x123);
-            if (field == 8) intent.payloadHash = bytes32(uint256(123));
-            if (field == 9) intent.deadline += 1;
-            if (field == 10) intent.authorizedExecutor = address(0x123);
+        for (uint256 field = 0; field < INTENT_FIELD_COUNT; ++field) {
+            // The loop bounds the conversion to the declared enum members.
+            // forge-lint: disable-next-line(unsafe-typecast)
+            ForwardAuthorizationCodec.Intent memory intent = _mutatedIntent(IntentField(field));
             assertTrue(ForwardAuthorizationCodec.digest(intent) != original);
         }
+    }
+
+    function _mutatedIntent(IntentField field)
+        private
+        pure
+        returns (ForwardAuthorizationCodec.Intent memory intent)
+    {
+        intent = ForwardAuthorizationVector.intent();
+        _mutateSourceFields(intent, field);
+        _mutateDestinationFields(intent, field);
+    }
+
+    function _mutateSourceFields(ForwardAuthorizationCodec.Intent memory intent, IntentField field) private pure {
+        if (field == IntentField.PROTOCOL_VERSION) intent.protocolVersion += 1;
+        if (field == IntentField.ACTION) intent.action += 1;
+        if (field == IntentField.SOURCE_DOMAIN) intent.sourceDomain += 1;
+        if (field == IntentField.APPLICATION) intent.application = CHANGED_ADDRESS;
+        if (field == IntentField.SOURCE_GATEWAY) intent.sourceGateway = CHANGED_ADDRESS;
+        if (field == IntentField.AUTHORIZED_EXECUTOR) intent.authorizedExecutor = CHANGED_ADDRESS;
+    }
+
+    function _mutateDestinationFields(ForwardAuthorizationCodec.Intent memory intent, IntentField field) private pure {
+        if (field == IntentField.DESTINATION_DOMAIN) intent.destinationDomain += 1;
+        if (field == IntentField.DESTINATION_GATEWAY) intent.destinationGateway = CHANGED_ADDRESS;
+        if (field == IntentField.DESTINATION_RECEIVER) intent.destinationReceiver = CHANGED_ADDRESS;
+        if (field == IntentField.PAYLOAD_HASH) intent.payloadHash = CHANGED_PAYLOAD_HASH;
+        if (field == IntentField.DEADLINE) intent.deadline += 1;
     }
 }

@@ -227,6 +227,9 @@ contract IdentityApplicationA {
         (messageId, nonce) = sourceGateway.sendMessage(
             request.destinationDomain, request.destinationGateway, request.destinationReceiver, request.payload, request.deadline
         );
+        // The configured SourceGateway has no receiver callbacks. This success event needs
+        // its returned messageId; the nullifier was consumed before the call.
+        // forge-lint: disable-next-line(reentrancy-events)
         emit AuthorizedMessageForwarded(intentDigest, publicInputs.nullifier, messageId);
     }
 
