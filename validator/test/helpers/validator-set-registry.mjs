@@ -49,5 +49,5 @@ export async function createValidatorRegistryChecks({ registryAddress, rpcUrl, h
   }
 
   await assertHistory();
-  return { assertHistory, assertQcBinding };
+  return { assertHistory, assertQcBinding, client };
 }

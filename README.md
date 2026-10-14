@@ -2,7 +2,7 @@
 
 This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A/B independently verify each package and delegate its versioned ABI transport to a Persistent Transaction Manager. The manager atomically reserves nonces, estimates gas and resolves EIP-1559 fees, signs locally, persists exact raw bytes before broadcast, and tracks canonical receipts with configured confirmation depth. Bounded durable retries rebroadcast exact bytes, append same-nonce higher-fee candidates, enforce configured limits and accept any historical canonical winner. Ordered destination RPC access paths validate chain ID and genesis, preserve exact signed transactions across failover, and conservatively check multi-provider receipt views. Chain B maintains on-chain trusted remote-gateway configuration for exact source-domain and source-address pairs. Destination message verification, replay protection and execution remain unimplemented.
 
-Chain B also retains immutable historical validator committees in `ValidatorSetRegistry`. Each exact `uint256` validator epoch resolves to four canonical public identities, quorum three and the existing PBFT committee digest. This provides trusted configuration for destination verification; on-chain QC acceptance remains unimplemented.
+Chain B retains immutable historical validator committees in `ValidatorSetRegistry`. Each exact `uint256` validator epoch resolves to four canonical public identities, quorum three and the existing PBFT committee digest. `PBFTCertificateVerifier` authenticates existing v1/v2/v3 QC transport bytes against that authority and a caller-supplied trusted batch context. This read-only component does not deliver or consume messages.
 
 The current implementation can:
 
@@ -83,7 +83,8 @@ The current implementation can:
 - persist raw transaction bytes and their derived hash before sending to Chain B;
 - track canonical destination receipts to configured depth with distinct CONFIRMED and REVERTED outcomes.
 - configure one current trusted remote source-gateway identity per exact `uint256` source domain on Chain B;
-- append canonical four-validator committees with a three-validator quorum to immutable Chain B history and resolve each exact validator epoch without fallback.
+- append canonical four-validator committees with a three-validator quorum to immutable Chain B history and resolve each exact validator epoch without fallback;
+- verify existing v1/v2/v3 PBFT certificate bytes read-only on Chain B against trusted expected context and exact historical authority.
 
 ## Architecture
 
@@ -340,6 +341,22 @@ The development identity directory contains V1–V5. Validator epoch `7` holds V
 The registry is configured from trusted public history before consensus evidence is examined. Relayers, DeliveryPackages, PostgreSQL records and RPC endpoints cannot register or supply committee authority. `scripts/deploy-validator-set-registry.sh` requires an explicit operator key, checks Chain B ID `2001`, appends the configured history and compares full ABI-encoded records with the off-chain expected members, quorum and digest. The root verification flow supplies public development history and reuses its existing Chain B registry operator. It also compares actual resolved history and historical QC epoch/digest bindings during the existing five-process rotation scenario.
 
 Remote-gateway trust and historical validator authority are separate contracts. `ValidatorSetRegistry` provides no QC parsing, COMMIT/signature acceptance, EIP-191 handling, Merkle inclusion acceptance, destination message validation, replay protection or application execution.
+
+### PBFTCertificateVerifier
+
+`contracts/src/PBFTCertificateVerifier.sol` binds one deployed `ValidatorSetRegistry` immutably. `verifyCertificate(bytes certificate, ExpectedContext expected)` returns `true` or reverts with a specific custom error. It has no administrator, mutable consensus state, events, replay state or application callback. It supports EVM static calls.
+
+The certificate bytes are the existing relayer QC tuple: `uint8,bytes,bytes32,(address voterIdentity,bytes32 commitDigest,bytes signature)[]`. The parser bounds evidence to three or four entries before allocation, validates canonical ABI offsets, address widths, version-dependent statement length, 65-byte signature lengths and zero padding, and rejects truncated, oversized or trailing data. Canonical certificates occupy 1,184–1,504 bytes. It preserves all existing message, batch, Merkle, COMMIT, QC and delivery encodings.
+
+The caller must supply trusted `protocolVersion`, `sourceDomain`, `sourceGateway`, `batchEpoch`, `viewNumber`, `batchId`, `messageRoot` and `authorityEpoch`. Solidity reserves `view`, so the contract identifier is `viewNumber`; the JavaScript contract adapter maps the protocol's original `view` to this key. ABI types and positions, JSON fields, signed type strings and frozen evidence remain unchanged. A self-selected valid certificate cannot establish those expectations. For v3, the signed `validatorEpoch` must equal the expected authority epoch; the registry resolves that exact record without a latest/nearest fallback. The verifier derives committee digest and the canonical PRE-PREPARE proposal digest from registry authority and the signed context, including the deterministic primary. Batch epoch and view retain their full `uint256` width, including primary selection when their mathematical sum exceeds `uint256`.
+
+Legacy eligibility is explicit: the trusted caller must expect v1 or v2, and `authorityEpoch` must equal the registry's immutable initial epoch. v1 has no signed view and requires expected `viewNumber` zero. v1/v2 contain no signed validator epoch; the authority anchor is caller/registry metadata and is never inserted into historical digest bytes. The current protocol has no universal pre-rotation batch cutoff for legacy evidence. A caller expecting v3 rejects a legacy certificate. Registering later committees does not revoke genuine old evidence or grant a future member authority over it. Future Destination Gateway wiring must obtain expected version/context from its own authenticated policy, independently of relayer-supplied data.
+
+Each COMMIT uses the original type-tagged ABI digest and signs the raw 32-byte digest through EIP-191 personal-sign (`\x19Ethereum Signed Message:\n32`). v3 appends `validatorEpoch` after `voterIdentity` in COMMIT and at the end of the QC statement. Recovery accepts exactly 65-byte signatures with `v` in `0/1/27/28`, nonzero `r/s` strictly below the secp256k1 order, and nonzero recovered identities. Existing viem/noble recovery accepts high-s, so the contract preserves that behavior. Raw-digest signing, double prefixing, compact signatures and other recovery IDs are rejected. Every recovered identity must match the claimed voter, belong to the exact historical committee and appear in strict ascending address order. Duplicates, including alternate signature bytes from the same identity, cannot add quorum weight. All four entries are checked when four are supplied.
+
+`test-vectors/pbft-certificates.json` freezes public v1/v2/v3 statements, proposal/COMMIT/QC digests, signing digests, signature bytes, recovered identities and exact transport bytes. An independent reference encoder creates the initial artifact; normal verification only checks it and never overwrites it. JavaScript and Foundry consume the same artifact, including full-width context, legacy authority, high-s/v normalization and invalid evidence cases. The existing real rotation scenario also sends its actual epoch-7 and epoch-8 QCs to the deployed Chain B verifier and rechecks the old QC after V1 stops.
+
+Certificate verification authenticates a batch commitment under trusted context. It does not establish remote-gateway trust, source finality, canonical message semantics, Merkle inclusion, deadlines, destination routing, replay prevention or Application B execution. Those destination enforcement boundaries remain separate work.
 
 ## Credentials and Zero-Knowledge Authorization
 
@@ -891,7 +908,7 @@ Rotation authorization currently belongs to the trusted deployment/operator conf
 
 The unified integration reindexes real A/B/D and Message E into a verification-owned source namespace, starts five independent identities/PIDs/endpoints/stores, commits A/B/D under validator epoch 7, and commits the next Message E batch under epoch 8. V1 remains online while its new-epoch votes are rejected; V5 cannot add weight to historical epoch 7. A rotated-primary process crash requires view recovery with only epoch-8 members and a final three-signature QC that includes V5. Old and new certificates are then independently verified, including after V1 stops. Original source history, REORGED C, cursor, proofs, and existing committed QC are preserved.
 
-That same rotation scenario compares its actual resolved epoch-7/8 committees with Chain B `ValidatorSetRegistry` storage before consensus and after rotation/V1 shutdown. It checks exact canonical identities, quorum and digest, and resolves the existing historical QC epoch/digest to the already registered authority. This check grants no on-chain QC acceptance and leaves all signed certificate and delivery bytes unchanged.
+That same rotation scenario compares its actual resolved epoch-7/8 committees with Chain B `ValidatorSetRegistry` storage before consensus and after rotation/V1 shutdown. It checks exact canonical identities, quorum and digest, and resolves the existing historical QC epoch/digest to the already registered authority. It then verifies both actual QCs through `PBFTCertificateVerifier` using persisted batch context, rechecks old evidence after V1 stops, and rejects root/epoch/signature/quorum/duplicate/nonmember mutations. Signed certificate and delivery bytes remain unchanged; these read-only checks grant no destination execution permission.
 
 ## Independent Validators
 
@@ -1126,7 +1143,7 @@ The normal integration verifies the fourth COMMIT, duplicates and conflicts befo
 
 Every `COMMITTED` snapshot read reconstructs the immutable batch and Merkle tree, loads its stored QC evidence, and repeats independent certificate verification against the expected committee. Missing evidence, corrupted signatures, or context drift fails closed. PostgreSQL remains operational persistence and supplies no cryptographic authority by itself. Source messages, finality records, canonical blocks, cursor, membership, and existing proofs remain unchanged; later messages continue into subsequent batch epochs.
 
-This implementation supplies COMMIT/QC authorization for each exact historical four-member committee. The Delivery Queue consumes canonical committed certificates. The verification infrastructure exercises the failure model below. Destination validator-set integration, destination QC verification and destination execution remain unsupported.
+This implementation supplies COMMIT/QC authorization for each exact historical four-member committee. The Delivery Queue consumes canonical committed certificates. The verification infrastructure exercises the failure model below. Chain B provides historical registry authority and read-only QC verification; complete Destination Gateway enforcement and destination execution remain unsupported.
 
 ### Consensus safety and failure model
 
@@ -1434,7 +1451,7 @@ The crash verification extends the existing process/IPC harness with explicit SQ
 
 Verification snapshots Chain B, controls automine and temporarily uses minimal reverting bytecode only to obtain a real status-0 receipt. It restores the original chain snapshot, bytecode and mining mode, and cleans up its own processes/proxies. These test fixtures implement no destination protocol and are separate from the normal durable deployment namespace. Unit/database tests also cover conflicts, corruption, exhaustion, exact identities, immutable journals, concurrent recovery and stale writeback.
 
-CONFIRMED means a successful canonical receipt was observed at configured depth, a heuristic rather than permanent finality. Provider redundancy supplies availability and basic identity/consistency checks, with no Byzantine RPC quorum or malicious-provider tolerance claim. Chain B remote/source gateway trust configuration is on-chain, while Destination Gateway enforcement, destination validator-set/QC verification, Merkle verification at the destination trust boundary, destination replay protection, Application B execution, post-confirmation destination reorg recovery, Byzantine-relayer handling and Byzantine RPC-provider consensus remain unimplemented. Durable transaction recovery does not establish cross-chain business execution or permanent chain finality.
+CONFIRMED means a successful canonical receipt was observed at configured depth, a heuristic rather than permanent finality. Provider redundancy supplies availability and basic identity/consistency checks, with no Byzantine RPC quorum or malicious-provider tolerance claim. Chain B provides remote/source gateway trust configuration, historical validator-set authority and read-only QC verification. Complete Destination Gateway enforcement, Merkle verification at the destination trust boundary, destination replay protection, Application B execution, post-confirmation destination reorg recovery, Byzantine-relayer handling and Byzantine RPC-provider consensus remain unimplemented. Durable transaction recovery does not establish cross-chain business execution or permanent chain finality.
 
 ## Local Two-Chain Environment
 
@@ -1773,7 +1790,13 @@ The script uses strict error handling and performs:
 157. Chain B deployment and registration of real validator epoch 7 (V1–V4) and epoch 8 (V2–V5);
 158. full ABI-record matching against off-chain canonical ordering, quorum and frozen digests;
 159. specific-error rejection of unauthorized, zero/duplicate-member, duplicate-epoch, rewrite, gap and retroactive registration;
-160. immutable epoch-7 authority after rotation, V1/V5 historical membership boundaries and real five-process/QC binding cross-checks.
+160. immutable epoch-7 authority after rotation, V1/V5 historical membership boundaries and real five-process/QC binding cross-checks;
+161. independently frozen v1/v2/v3 QC transport bytes, canonical proposal/COMMIT/QC and EIP-191 signing digests;
+162. three/four-voter quorums, high-s and v=0/1 compatibility, full-width context and actual relayer byte preservation;
+163. trusted-context binding, legacy downgrade/authority rejection and exact historical lookup without latest fallback;
+164. malformed/truncated/trailing/oversized ABI, signature length/scalar/recovery boundaries, signer ordering and duplicate identity rejection;
+165. actual Chain B verifier deployment and frozen positive/precise-error negative cases;
+166. real historical and rotated QCs accepted on-chain, old-QC acceptance after V1 shutdown, and actual-QC adversarial mutations.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -1791,7 +1814,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Historical Validator Committee Authority
+Historical PBFT Certificate Verification
 ```
 
 ### Expected error output
@@ -1825,7 +1848,7 @@ EXPECTED FAILURE: closed PostgreSQL client rejected a new operation
 
 These messages demonstrate that the contracts reject unauthorized source applications, invalid destinations and deadlines, the circuit rejects invalid witnesses, a proof cannot be reused with a tampered public input, the identity application enforces policy, freshness, context-bound replay protection, state-root authority, and revocation, and a closed PostgreSQL client cannot be treated as a successful operation. Each expected failure is followed by `Verified rejection`, `EXPECTED FAILURE`, or `Verified expected ... rejection`. Complete verification succeeds only when the script exits with code `0` and the log ends with `VERIFICATION PASSED`.
 
-The on-chain negative cases normally return `false` and are reported as `Verified expected on-chain rejection`. A successful result for any modified proof or public policy value fails the complete verification.
+Groth16 verifier negative cases normally return `false` and are reported as `Verified expected on-chain rejection`. PBFT certificate negative cases require a precise custom-error revert and print `EXPECTED FAILURE: Chain B PBFT certificate ...`. A transport error, an unrelated revert or successful acceptance of invalid evidence fails complete verification. No deployment or verification step treats an unexpected failure as a pass.
 
 ## Repository Layout
 
@@ -1838,13 +1861,17 @@ Cross-Chain/
 │   │   ├── interfaces/
 │   │   │   ├── ICredentialVerifier.sol
 │   │   │   ├── IGroth16Verifier.sol
+│   │   │   ├── IPBFTCertificateVerifier.sol
 │   │   │   ├── IRemoteGatewayRegistry.sol
 │   │   │   ├── ISourceGateway.sol
 │   │   │   └── IValidatorSetRegistry.sol
+│   │   ├── libraries/
+│   │   │   └── PBFTCertificateCodec.sol
 │   │   ├── CredentialVerifier.sol
 │   │   ├── IdentityApplicationA.sol
 │   │   ├── MessageCodec.sol
 │   │   ├── MessageMerkle.sol
+│   │   ├── PBFTCertificateVerifier.sol
 │   │   ├── RemoteGatewayRegistry.sol
 │   │   ├── SourceGateway.sol
 │   │   └── ValidatorSetRegistry.sol
@@ -1852,6 +1879,7 @@ Cross-Chain/
 │       ├── CredentialVerifier.t.sol
 │       ├── IdentityApplicationA.t.sol
 │       ├── MessageMerkle.t.sol
+│       ├── PBFTCertificateVerifier.t.sol
 │       ├── RemoteGatewayRegistry.t.sol
 │       ├── mocks/
 │       │   ├── MockCredentialVerifier.sol
@@ -1979,6 +2007,7 @@ Cross-Chain/
 ├── scripts/
 │   ├── build-canonical-message-vector.mjs
 │   ├── build-validator-set-vector.mjs
+│   ├── deploy-pbft-certificate-verifier.sh
 │   ├── deploy-remote-gateway-registry.sh
 │   ├── deploy-validator-set-registry.sh
 │   ├── deploy-verifier.sh
@@ -1988,6 +2017,7 @@ Cross-Chain/
 │   ├── canonical-messages.json
 │   ├── merkle-golden-vectors.json
 │   ├── nullifiers.json
+│   ├── pbft-certificates.json
 │   └── validator-sets.json
 ├── validator/
 │   ├── .env.example
@@ -1999,6 +2029,9 @@ Cross-Chain/
 │   │   ├── 005_view_change.sql
 │   │   ├── 006_view_recovery.sql
 │   │   └── 007_validator_epochs.sql
+│   ├── scripts/
+│   │   ├── generate-pbft-certificate-vectors.mjs
+│   │   └── verify-pbft-certificates.mjs
 │   ├── src/
 │   │   ├── committee.mjs
 │   │   ├── commit.mjs
@@ -2024,6 +2057,7 @@ Cross-Chain/
 │   │   └── consensus-runtime.mjs
 │   ├── test/
 │   │   ├── validator-set-golden.test.mjs
+│   │   ├── pbft-certificate-golden.test.mjs
 │   │   ├── view-change.test.mjs
 │   │   ├── commit.test.mjs
 │   │   ├── config.test.mjs
@@ -2040,7 +2074,11 @@ Cross-Chain/
 │   │       ├── fault-scenarios.mjs
 │   │       ├── fixtures.mjs
 │   │       ├── four-process.mjs
+│   │       ├── pbft-certificate.mjs
+│   │       ├── pbft-certificate-contract.mjs
 │   │       ├── process-cluster.mjs
+│   │       ├── rotation-scenarios.mjs
+│   │       ├── validator-set-registry.mjs
 │   │       └── view-change-scenarios.mjs
 │   ├── package.json
 │   └── package-lock.json
@@ -2116,7 +2154,8 @@ Cross-Chain/
 - READY jobs contain verified immutable evidence and provide no destination permission or execution guarantee. Delivery projectors coordinate per batch through database locks and uniqueness; this does not add multi-instance Indexer/Finality Watcher coordination or exactly-once destination consumption.
 - Relayer A/B delegate verified zero-value transport to the Persistent Transaction Manager. Their shared exclusive EOA is an untrusted transport account with no validator or destination permission. Exact signed bytes are durable before broadcast; bounded retry reuses them, and replacement only appends a higher-fee candidate at the same nonce. Any historical candidate may win. CONFIRMED supplies no Gateway authentication, business execution or permanent destination finality.
 - Destination RPC failover uses ordered, fingerprint-checked access paths. Provider URLs never identify a transaction or grant destination authority. Conservative cross-provider checks do not provide Byzantine RPC consensus.
-- The repository does not provide decentralized validator governance, Byzantine-relayer handling, destination-confirmed transaction reorg recovery, destination gateway/QC/Merkle enforcement, exactly-once downstream execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
+- Chain B QC verification requires trusted expected batch context. Legacy v1/v2 use the initial immutable authority with an explicitly expected legacy version; v3 uses its exact signed/expected validator epoch. A QC cannot choose destination eligibility for itself, and high-s compatibility cannot add quorum weight for a duplicated recovered identity.
+- The repository does not provide decentralized validator governance, Byzantine-relayer handling, destination-confirmed transaction reorg recovery, complete Destination Gateway message/Merkle/replay enforcement, exactly-once downstream execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
 - Groth16 verification remains local to `IdentityApplicationA`. Its protected messages carry exact authorized public intent fields; destination credential-proof verification and business execution remain unimplemented.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, production transaction recovery and destination reorganization handling, and a destination-chain execution security design.

@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Historical Validator Committee Authority"
+VERIFICATION_NAME="Historical PBFT Certificate Verification"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -423,6 +423,7 @@ cleanup() {
             "$TEMP_DIR/remote-registry-addresses.env" \
             "$TEMP_DIR/validator-registry-addresses.env" \
             "$TEMP_DIR/validator-registry-config.env" \
+            "$TEMP_DIR/pbft-verifier-addresses.env" \
             "$TEMP_DIR/validator-pids" \
             "$TEMP_DIR/relayer-pids" \
             "$TEMP_DIR/forwarding-calldata.txt"
@@ -709,6 +710,14 @@ printf '215. Reject duplicate, noncontiguous and retroactive validator epochs wi
 printf '216. Preserve the initial authority anchor and epoch-specific removed/upcoming membership\n'
 printf '217. Compare actual five-process rotation history and historical QC bindings to Chain B storage\n'
 printf '218. Reject compiler and lint warnings without disabling project-wide lint rules\n'
+printf '219. Check independently frozen v1/v2/v3 QC bytes, digests, EIP-191 signatures and relayer transport parity\n'
+printf '220. Reject malformed ABI evidence, downgrade/context drift, invalid/extra votes and duplicate recovered signers\n'
+printf '221. Deploy the read-only PBFTCertificateVerifier on Chain B with the historical registry\n'
+printf '222. Verify frozen quorum/signature/legacy/boundary cases on the actual Chain B verifier\n'
+printf '223. Verify existing real epoch 7/8 QCs on-chain, including the old QC after V1 shutdown\n'
+printf '224. Reject real-QC root/epoch/signature/quorum/duplicate/nonmember mutations with precise contract errors\n'
+printf '225. Verify Solidity viewNumber mapping preserves the original protocol view, uint256 width and context ABI position\n'
+printf '226. Retain strict lint with documented local exceptions for bounded fail-fast checks, high-s compatibility and VM fixtures\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -742,6 +751,10 @@ INDEXER_DB_SCHEMA="$INDEXER_DB_SCHEMA" \
 CURRENT_STEP="committed Merkle golden fixture drift check"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node "$INDEXER_DIR/scripts/generate-merkle-golden-vectors.mjs" --check
+
+CURRENT_STEP="frozen PBFT certificate reference drift check"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node "$VALIDATOR_DIR/scripts/generate-pbft-certificate-vectors.mjs" --check
 
 CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, recovery, RPC error classification, batch, Merkle, golden compatibility, lifecycle and portable delivery package unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -785,7 +798,7 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
         "$INDEXER_DIR/test/relayer-leases.database.test.mjs" \
         "$INDEXER_DIR/test/transaction-recovery.database.test.mjs"
 
-CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, and fault transport unit tests"
+CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, Solidity ABI context mapping and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$VALIDATOR_DIR/test/config.test.mjs" \
@@ -798,7 +811,8 @@ node --test \
     "$VALIDATOR_DIR/test/fault-transport.test.mjs" \
     "$VALIDATOR_DIR/test/view-change.test.mjs" \
     "$VALIDATOR_DIR/test/validator-sets.test.mjs" \
-    "$VALIDATOR_DIR/test/validator-set-golden.test.mjs"
+    "$VALIDATOR_DIR/test/validator-set-golden.test.mjs" \
+    "$VALIDATOR_DIR/test/pbft-certificate-golden.test.mjs"
 
 CURRENT_STEP="isolated validator migrations, endpoint/history separation, consistent PREPARE reads, COMMIT locks, and quorum persistence tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -906,12 +920,15 @@ forge build --deny warnings --no-lint
 CURRENT_STEP="Solidity lint warning verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
 # Run lint once with warning failures enabled; compilation above keeps its own warning guard.
+# Protocol/test-specific exceptions are documented at their source sites; global rules remain enabled.
 forge lint --deny warnings
 
 CURRENT_STEP="forge test -vv including shared Merkle golden compatibility"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test -vv
 
+printf 'VALID: Solidity PBFT certificates match frozen v1/v2/v3 digests, trusted context and signature acceptance\n'
+printf 'VALID: bounded ABI evidence, historical/legacy authority and every quorum entry verified\n'
 printf 'VALID: Solidity ValidatorSetRegistry matches shared frozen committee vectors and canonical ordering\n'
 printf 'VALID: all 24 committee permutations, immutable history and fixed three-of-four quorum verified\n'
 printf 'VALID: exact zero, large and maximum uint256 validator epochs are independent of batch epochs\n'
@@ -972,6 +989,7 @@ DEPLOYMENT_ADDRESSES_FILE="$TEMP_DIR/deployment-addresses.env"
 REMOTE_REGISTRY_ADDRESSES_FILE="$TEMP_DIR/remote-registry-addresses.env"
 VALIDATOR_REGISTRY_ADDRESSES_FILE="$TEMP_DIR/validator-registry-addresses.env"
 VALIDATOR_REGISTRY_CONFIG_FILE="$TEMP_DIR/validator-registry-config.env"
+PBFT_VERIFIER_ADDRESSES_FILE="$TEMP_DIR/pbft-verifier-addresses.env"
 VALIDATOR_PID_FILE="$TEMP_DIR/validator-pids"
 RELAYER_PID_FILE="$TEMP_DIR/relayer-pids"
 : > "$VALIDATOR_PID_FILE"
@@ -1259,6 +1277,26 @@ assert_hex_equal "$(cast call "$VALIDATOR_SET_REGISTRY" "getValidatorSet(uint256
     "$VALIDATOR_ROTATED_EPOCH" --rpc-url "$CHAIN_B_RPC")" "$ROTATED_VALIDATOR_RECORD" "preserved historical epoch 8 after rejected mutations"
 assert_equal "$(cast call "$VALIDATOR_SET_REGISTRY" "hasValidatorSet(uint256)(bool)" \
     9 --rpc-url "$CHAIN_B_RPC")" false "failed appends leave epoch 9 unregistered"
+
+CURRENT_STEP="Chain B historical PBFT certificate verifier deployment"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+VERIFIER_DEPLOYER_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
+VALIDATOR_SET_REGISTRY_ADDRESS="$VALIDATOR_SET_REGISTRY" \
+DEPLOYMENT_OUTPUT_FILE="$PBFT_VERIFIER_ADDRESSES_FILE" \
+    bash "$PROJECT_ROOT/scripts/deploy-pbft-certificate-verifier.sh"
+[[ -f "$PBFT_VERIFIER_ADDRESSES_FILE" ]] || fail "PBFT verifier deployment output is missing"
+PBFT_CERTIFICATE_VERIFIER="$(sed -nE \
+    's/^PBFT_CERTIFICATE_VERIFIER_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' \
+    "$PBFT_VERIFIER_ADDRESSES_FILE")"
+[[ "$PBFT_CERTIFICATE_VERIFIER" =~ ^0x[[:xdigit:]]{40}$ ]] || fail "invalid deployed PBFT verifier address"
+
+CURRENT_STEP="Chain B frozen PBFT certificate acceptance and exact-error rejection"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+PBFT_CERTIFICATE_VERIFIER_ADDRESS="$PBFT_CERTIFICATE_VERIFIER" \
+VALIDATOR_SET_REGISTRY_ADDRESS="$VALIDATOR_SET_REGISTRY" \
+    node "$VALIDATOR_DIR/scripts/verify-pbft-certificates.mjs"
 
 CURRENT_STEP="deployment code verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1723,6 +1761,7 @@ INDEXER_INTEGRATION_DESTINATION_RECEIVER="$DESTINATION_RECEIVER" \
 VALIDATOR_VERIFICATION_PID_FILE="$VALIDATOR_PID_FILE" \
 RELAYER_VERIFICATION_PID_FILE="$RELAYER_PID_FILE" \
 VALIDATOR_SET_REGISTRY_ADDRESS="$VALIDATOR_SET_REGISTRY" \
+PBFT_CERTIFICATE_VERIFIER_ADDRESS="$PBFT_CERTIFICATE_VERIFIER" \
 CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
 CHAIN_B_CHAIN_ID="$CHAIN_B_ID" \
 RPC_REQUEST_TIMEOUT_MS="$RPC_REQUEST_TIMEOUT_MS" \

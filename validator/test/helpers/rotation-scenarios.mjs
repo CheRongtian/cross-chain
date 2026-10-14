@@ -20,10 +20,12 @@ import { sourceState } from "./four-process.mjs";
 import { verifyDeliveryQueue } from "../../../indexer/test/helpers/delivery-integration.mjs";
 import { verifySingleRelayer } from "../../../indexer/test/helpers/relayer-integration.mjs";
 import { createValidatorRegistryChecks } from "./validator-set-registry.mjs";
+import { createCertificateChecks } from "./pbft-certificate-contract.mjs";
+import { encodeCertificate, snapshotContext } from "./pbft-certificate.mjs";
 
 const quiet = { log() {},warn() {},error() {} };
 
-export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot,nextMessageId,pidFile,registryAddress,registryRpcUrl }) {
+export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot,nextMessageId,pidFile,registryAddress,registryRpcUrl,certificateVerifierAddress }) {
   const original = await sourceState(sourcePool,sourceConfig.databaseSchema);
   const config = { ...sourceConfig,databaseSchema: "cross_chain_rotation_source",
     sourceGatewayStartBlock: snapshot.batch.messages.reduce((first,message) => message.sourceBlockNumber < first ? message.sourceBlockNumber : first,snapshot.batch.messages[0].sourceBlockNumber) };
@@ -56,6 +58,8 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     const registryChecks = await createValidatorRegistryChecks({
       registryAddress, rpcUrl: registryRpcUrl, history: validatorSets.history,
     });
+    const certificateChecks = await createCertificateChecks({ client: registryChecks.client,
+      address: certificateVerifierAddress, registryAddress });
     const lifecycle = createBatchLifecycle({ config,pool,committee: peers,validatorSets });
     async function seal(expectedEpoch,rows) {
       // initialEpoch anchors the complete batch history. Subsequent batches
@@ -133,6 +137,7 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     const oldCommitted = await lifecycle.readBatch({ batchRecordId: oldBatch.record.batchRecordId });
     assert.equal(oldCommitted.record.status,"COMMITTED"); assert.equal(oldQc.validatorEpoch,"7");
     assert.equal(oldQc.commits.length,3);
+    await certificateChecks.snapshot(oldCommitted, "actual epoch 7 A/B/D quorum");
 
     const active = [1,2,3,4];
     const newPrimary = peers.findIndex((peer) => peer.address === deterministicPrimary(validatorSets.history[1].validators,newEpoch));
@@ -176,6 +181,7 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     assert.equal(qc.commits.length,3); assert.ok(qc.commits.some((vote) => vote.voterIdentity === peers[4].address));
     assert.ok(qc.commits.every((vote) => vote.voterIdentity !== peers[0].address && vote.voterIdentity !== peers[newPrimary].address));
     await verifyQuorumCertificate(qc,{ peers,validatorSets,expected: { ...statement,view: qc.view,proposalDigest: undefined } });
+    await certificateChecks.snapshot(newCommitted, "actual epoch 8 quorum includes V5 after view recovery");
     for (const index of backups) {
       const accepted = await states[index].store.readNewView(newEpoch,qc.view);
       await authenticateNewView(states[index].config,accepted,proposalIdentity(statement));
@@ -192,6 +198,33 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     await registryChecks.assertHistory();
     await registryChecks.assertQcBinding(oldQc);
     await registryChecks.assertQcBinding(qc);
+    await certificateChecks.snapshot(oldCommitted, "old epoch 7 QC still verifies after rotation and V1 shutdown");
+    await certificateChecks.snapshot(newCommitted, "epoch 8 QC still verifies after V1 shutdown");
+    const oldContext = snapshotContext(oldCommitted);
+    const oldEncoded = encodeCertificate(oldQc);
+    await certificateChecks.reject(oldEncoded, { ...oldContext, messageRoot: qc.messageRoot },
+      "ContextMismatch", "actual QC / wrong trusted message root");
+    await certificateChecks.reject(oldEncoded, { ...oldContext, authorityEpoch: "8" },
+      "ContextMismatch", "actual old QC / rotated authority context");
+    const changedEpoch = { ...oldQc, validatorEpoch: "8" };
+    await certificateChecks.reject(encodeCertificate(changedEpoch), { ...oldContext, authorityEpoch: "8" },
+      "CommitteeDigestMismatch", "old signatures cannot be relabeled as epoch 8 evidence");
+    await certificateChecks.reject(encodeCertificate({ ...oldQc, commits: oldQc.commits.slice(0,2) }), oldContext,
+      "InvalidEvidenceCount", "actual QC / insufficient evidence");
+    const duplicate = structuredClone(oldQc);
+    duplicate.commits[1] = structuredClone(duplicate.commits[0]);
+    await certificateChecks.reject(encodeCertificate(duplicate), oldContext,
+      "NoncanonicalSigners", "actual QC / duplicate recovered identity");
+    const tampered = structuredClone(oldQc);
+    tampered.commits[0].signature = `0x${"00".repeat(65)}`;
+    await certificateChecks.reject(encodeCertificate(tampered), oldContext,
+      "InvalidSignature", "actual QC / tampered signature");
+    // This is a correctly signed COMMIT by V5, who has no authority in historical epoch 7.
+    const nonmember = structuredClone(oldQc);
+    nonmember.commits[2] = futureVote;
+    nonmember.commits.sort((a,b) => a.voterIdentity < b.voterIdentity ? -1 : 1);
+    await certificateChecks.reject(encodeCertificate(nonmember), oldContext,
+      "NonmemberSigner", "actual old QC / correctly signed nonmember V5");
     console.log("VALID: Chain B historical epoch 7 stayed unchanged through real epoch 8 consensus, view recovery and V1 shutdown");
     assert.deepEqual(await lifecycle.readBatch({ batchRecordId: oldBatch.record.batchRecordId }),oldCommitted);
     assert.deepEqual(newCommitted.batch,newBatch.batch); assert.deepEqual(newCommitted.members,newBatch.members); assert.deepEqual(newCommitted.tree,newBatch.tree);
