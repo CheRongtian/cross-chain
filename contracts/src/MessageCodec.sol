@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+uint8 constant CROSS_CHAIN_MESSAGE_VERSION = 2;
+
 // Protocol-level schema separator for canonical cross-chain messages.
 bytes32 constant CROSS_CHAIN_MESSAGE_TYPEHASH = keccak256(
     "CrossChainMessage(uint8 version,uint256 sourceDomain,address sourceGateway,address sourceSender,uint256 destinationDomain,address destinationGateway,address destinationReceiver,uint256 nonce,bytes32 payloadHash,uint256 deadline)"
 );
 
-/// @notice Canonical encoding for source-chain cross-chain messages.
+/// @notice Canonical encoding shared by source and destination message verification.
 library MessageCodec {
     struct CanonicalMessage {
         uint8 version;

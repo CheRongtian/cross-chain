@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Authenticated Batch Merkle Inclusion Verification"
+VERIFICATION_NAME="Cross-Chain Message Domain Verification"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -425,6 +425,8 @@ cleanup() {
             "$TEMP_DIR/validator-registry-config.env" \
             "$TEMP_DIR/pbft-verifier-addresses.env" \
             "$TEMP_DIR/merkle-verifier-addresses.env" \
+            "$TEMP_DIR/message-domain-verifier-addresses.env" \
+            "$TEMP_DIR/alternate-message-domain-verifier-addresses.env" \
             "$TEMP_DIR/validator-pids" \
             "$TEMP_DIR/relayer-pids" \
             "$TEMP_DIR/forwarding-calldata.txt"
@@ -727,6 +729,17 @@ printf '231. Verify all 1/2/3/4/5-leaf frozen golden positions, canonical encodi
 printf '232. Authenticate actual old and rotated QC context/root before checking every actual batch member on Chain B\n'
 printf '233. Preserve old proofs after rotation/V1 shutdown, single-leaf empty paths and actual odd-duplication checks\n'
 printf '234. Reject a QC for a different root even when a standalone Merkle path under that root is valid\n'
+printf '235. Match full destination message IDs to the existing SourceGateway, MessageCodec and off-chain encoders\n'
+printf '236. Deploy message-domain verifiers with the existing remote registry and explicit destination contexts\n'
+printf '237. Accept exactly message version 2 and reject self-consistent unsupported versions\n'
+printf '238. Resolve exact source domain/gateway through current remote authority without remote bytecode assumptions\n'
+printf '239. Bind destination domain/gateway/receiver, sender, nonce, payload and deadline to the authenticated ID\n'
+printf '240. Reject cross-domain and cross-source-gateway substitutions even with internally correct rehashed IDs\n'
+printf '241. Preserve strict destination deadline boundaries independently of QC/Merkle validity\n'
+printf '242. Verify real epoch-7 A/B/D and epoch-8 Message E full fields under the same authenticated member IDs\n'
+printf '243. Reject rehashed receiver/payload/domain variants against the unchanged original root and exclude REORGED C\n'
+printf '244. Preserve repeated stateless verification without introducing replay or application execution state\n'
+printf '245. Preserve every existing regression; isolate and restore temporary registry/time policy tests after transport workers stop\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -940,6 +953,8 @@ printf 'VALID: Solidity PBFT certificates match frozen v1/v2/v3 digests, trusted
 printf 'VALID: bounded ABI evidence, historical/legacy authority and every quorum entry verified\n'
 printf 'VALID: Solidity canonical batch IDs, exact membership/count/position and ordered inclusion checks verified\n'
 printf 'VALID: precise-error proof failures include single-leaf paths, full-width indexes and every odd level\n'
+printf 'VALID: message-domain unit cases cover source authority, explicit targets, exact identity and strict expiry\n'
+printf 'VALID: existing canonical vectors, empty payloads, unsupported versions and stateless repeated checks preserved\n'
 printf 'VALID: Solidity ValidatorSetRegistry matches shared frozen committee vectors and canonical ordering\n'
 printf 'VALID: all 24 committee permutations, immutable history and fixed three-of-four quorum verified\n'
 printf 'VALID: exact zero, large and maximum uint256 validator epochs are independent of batch epochs\n'
@@ -1002,6 +1017,8 @@ VALIDATOR_REGISTRY_ADDRESSES_FILE="$TEMP_DIR/validator-registry-addresses.env"
 VALIDATOR_REGISTRY_CONFIG_FILE="$TEMP_DIR/validator-registry-config.env"
 PBFT_VERIFIER_ADDRESSES_FILE="$TEMP_DIR/pbft-verifier-addresses.env"
 MERKLE_VERIFIER_ADDRESSES_FILE="$TEMP_DIR/merkle-verifier-addresses.env"
+MESSAGE_DOMAIN_ADDRESSES_FILE="$TEMP_DIR/message-domain-verifier-addresses.env"
+ALTERNATE_MESSAGE_DOMAIN_ADDRESSES_FILE="$TEMP_DIR/alternate-message-domain-verifier-addresses.env"
 VALIDATOR_PID_FILE="$TEMP_DIR/validator-pids"
 RELAYER_PID_FILE="$TEMP_DIR/relayer-pids"
 : > "$VALIDATOR_PID_FILE"
@@ -1327,6 +1344,41 @@ printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
 MERKLE_INCLUSION_VERIFIER_ADDRESS="$MERKLE_INCLUSION_VERIFIER" \
     node "$INDEXER_DIR/scripts/verify-merkle-inclusion.mjs"
+
+CURRENT_STEP="Chain B message-domain verifier deployment"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+VERIFIER_DEPLOYER_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
+REMOTE_GATEWAY_REGISTRY_ADDRESS="$REMOTE_GATEWAY_REGISTRY" \
+LOCAL_DESTINATION_DOMAIN="$CHAIN_B_ID" \
+DEPLOYMENT_OUTPUT_FILE="$MESSAGE_DOMAIN_ADDRESSES_FILE" \
+    bash "$PROJECT_ROOT/scripts/deploy-message-domain-verifier.sh"
+[[ -f "$MESSAGE_DOMAIN_ADDRESSES_FILE" ]] || fail "message-domain verifier deployment output is missing"
+MESSAGE_DOMAIN_VERIFIER="$(sed -nE \
+    's/^MESSAGE_DOMAIN_VERIFIER_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' "$MESSAGE_DOMAIN_ADDRESSES_FILE")"
+[[ "$MESSAGE_DOMAIN_VERIFIER" =~ ^0x[[:xdigit:]]{40}$ ]] || fail "invalid message-domain verifier address"
+
+CURRENT_STEP="alternate configured protocol-domain verifier for cross-domain rejection"
+printf '\n[%s]\n' "$CURRENT_STEP"
+# This stateless comparison target runs on the existing Chain B network; no third chain is started.
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+VERIFIER_DEPLOYER_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
+REMOTE_GATEWAY_REGISTRY_ADDRESS="$REMOTE_GATEWAY_REGISTRY" \
+LOCAL_DESTINATION_DOMAIN="$ALTERNATE_DESTINATION_DOMAIN" \
+DEPLOYMENT_OUTPUT_FILE="$ALTERNATE_MESSAGE_DOMAIN_ADDRESSES_FILE" \
+    bash "$PROJECT_ROOT/scripts/deploy-message-domain-verifier.sh"
+[[ -f "$ALTERNATE_MESSAGE_DOMAIN_ADDRESSES_FILE" ]] || fail "alternate-domain verifier deployment output is missing"
+ALTERNATE_MESSAGE_DOMAIN_VERIFIER="$(sed -nE \
+    's/^MESSAGE_DOMAIN_VERIFIER_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' "$ALTERNATE_MESSAGE_DOMAIN_ADDRESSES_FILE")"
+[[ "$ALTERNATE_MESSAGE_DOMAIN_VERIFIER" =~ ^0x[[:xdigit:]]{40}$ ]] || fail "invalid alternate-domain verifier address"
+
+CURRENT_STEP="Chain B existing canonical full-message encoding parity"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+REMOTE_GATEWAY_REGISTRY_ADDRESS="$REMOTE_GATEWAY_REGISTRY" \
+MESSAGE_DOMAIN_VERIFIER_ADDRESS="$MESSAGE_DOMAIN_VERIFIER" \
+LOCAL_DESTINATION_DOMAIN="$CHAIN_B_ID" \
+    node "$INDEXER_DIR/scripts/verify-message-domain.mjs"
 
 CURRENT_STEP="deployment code verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1793,6 +1845,11 @@ RELAYER_VERIFICATION_PID_FILE="$RELAYER_PID_FILE" \
 VALIDATOR_SET_REGISTRY_ADDRESS="$VALIDATOR_SET_REGISTRY" \
 PBFT_CERTIFICATE_VERIFIER_ADDRESS="$PBFT_CERTIFICATE_VERIFIER" \
 MERKLE_INCLUSION_VERIFIER_ADDRESS="$MERKLE_INCLUSION_VERIFIER" \
+MESSAGE_DOMAIN_VERIFIER_ADDRESS="$MESSAGE_DOMAIN_VERIFIER" \
+ALTERNATE_MESSAGE_DOMAIN_VERIFIER_ADDRESS="$ALTERNATE_MESSAGE_DOMAIN_VERIFIER" \
+REMOTE_GATEWAY_REGISTRY_ADDRESS="$REMOTE_GATEWAY_REGISTRY" \
+REMOTE_REGISTRY_ADMIN_PRIVATE_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
+INDEXER_INTEGRATION_ALTERNATE_DESTINATION_DOMAIN="$ALTERNATE_DESTINATION_DOMAIN" \
 CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
 CHAIN_B_CHAIN_ID="$CHAIN_B_ID" \
 RPC_REQUEST_TIMEOUT_MS="$RPC_REQUEST_TIMEOUT_MS" \

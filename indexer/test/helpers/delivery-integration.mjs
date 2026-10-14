@@ -79,4 +79,6 @@ export async function verifyDeliveryQueue({ config,pool,snapshots,validatorSets,
   console.log("VALID: concurrent fresh delivery projectors preserved one canonical READY job per real sealed position");
   console.log("VALID: fresh process recovered complete message/proof/QC packages; REORGED C excluded and source persistence unchanged");
   console.log("VALID: report loss after durable commit caused no duplicates; old queued packages retained historical committee evidence");
+  // Reuse these already recovered/verified public packages in destination-layer checks without another reconstruction.
+  return recovered.packages;
 }

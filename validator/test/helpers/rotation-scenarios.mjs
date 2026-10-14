@@ -23,10 +23,11 @@ import { createValidatorRegistryChecks } from "./validator-set-registry.mjs";
 import { createCertificateChecks } from "./pbft-certificate-contract.mjs";
 import { encodeCertificate, snapshotContext } from "./pbft-certificate.mjs";
 import { createMerkleInclusionChecks, snapshotInclusions, forgedPathRoot, flipMerkleHash } from "../../../indexer/test/helpers/merkle-inclusion-contract.mjs";
+import { createActualMessageDomainChecks } from "./message-domain-scenarios.mjs";
 
 const quiet = { log() {},warn() {},error() {} };
 
-export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot,nextMessageId,pidFile,registryAddress,registryRpcUrl,certificateVerifierAddress,merkleInclusionVerifierAddress }) {
+export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot,nextMessageId,pidFile,registryAddress,registryRpcUrl,certificateVerifierAddress,merkleInclusionVerifierAddress,messageDomainContext }) {
   const original = await sourceState(sourcePool,sourceConfig.databaseSchema);
   const config = { ...sourceConfig,databaseSchema: "cross_chain_rotation_source",
     sourceGatewayStartBlock: snapshot.batch.messages.reduce((first,message) => message.sourceBlockNumber < first ? message.sourceBlockNumber : first,snapshot.batch.messages[0].sourceBlockNumber) };
@@ -63,6 +64,8 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
       address: certificateVerifierAddress, registryAddress });
     const merkleChecks = await createMerkleInclusionChecks({ client: registryChecks.client,
       address: merkleInclusionVerifierAddress });
+    const domainChecks = await createActualMessageDomainChecks({ client: registryChecks.client,
+      rpcUrl: registryRpcUrl, sourceConfig: config, context: messageDomainContext });
     const lifecycle = createBatchLifecycle({ config,pool,committee: peers,validatorSets });
     async function seal(expectedEpoch,rows) {
       // initialEpoch anchors the complete batch history. Subsequent batches
@@ -146,6 +149,7 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     // These exact expectations have just been authenticated; proof metadata supplies no authority.
     const oldInclusions = snapshotInclusions(oldCommitted, oldContext);
     await merkleChecks.members(oldInclusions, "QC-authenticated actual epoch 7 A/B/D batch");
+    await domainChecks.members(oldCommitted, oldInclusions, "actual epoch 7 A/B/D after QC and Merkle authentication");
 
     const active = [1,2,3,4];
     const newPrimary = peers.findIndex((peer) => peer.address === deterministicPrimary(validatorSets.history[1].validators,newEpoch));
@@ -194,6 +198,7 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     await certificateChecks.accept(newEncoded, newContext, "actual epoch 8 quorum includes V5 after view recovery");
     const newInclusions = snapshotInclusions(newCommitted, newContext);
     await merkleChecks.members(newInclusions, "QC-authenticated actual epoch 8 Message E batch");
+    await domainChecks.members(newCommitted, newInclusions, "actual epoch 8 Message E after QC and Merkle authentication");
     for (const index of backups) {
       const accepted = await states[index].store.readNewView(newEpoch,qc.view);
       await authenticateNewView(states[index].config,accepted,proposalIdentity(statement));
@@ -220,8 +225,10 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     assert.deepEqual(newAfterInclusions, newInclusions);
     await certificateChecks.accept(oldEncoded, oldContext, "old epoch 7 QC still verifies after rotation and V1 shutdown");
     await merkleChecks.members(oldAfterInclusions, "unchanged authenticated old proofs after rotation and V1 shutdown");
+    await domainChecks.members(oldAfterRotation, oldAfterInclusions, "unchanged historical full messages after V1 shutdown");
     await certificateChecks.accept(newEncoded, newContext, "epoch 8 QC still verifies after V1 shutdown");
     await merkleChecks.members(newAfterInclusions, "authenticated rotated Message E proof after V1 shutdown");
+    await domainChecks.members(newAfterRotation, newAfterInclusions, "rotated full Message E after V1 shutdown");
     await merkleChecks.negatives(oldInclusions, "actual epoch 7 A/B/D batch");
     await merkleChecks.negatives(newInclusions, "actual epoch 8 Message E batch");
     const standalone = oldInclusions[0];
@@ -260,10 +267,26 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     console.log("VALID: Chain B historical epoch 7 stayed unchanged through real epoch 8 consensus, view recovery and V1 shutdown");
     assert.deepEqual(oldAfterRotation,oldCommitted);
     assert.deepEqual(newCommitted.batch,newBatch.batch); assert.deepEqual(newCommitted.members,newBatch.members); assert.deepEqual(newCommitted.tree,newBatch.tree);
-    await verifyDeliveryQueue({ config, pool, snapshots: [oldCommitted,newCommitted], validatorSets,
+    const deliveryPackages = await verifyDeliveryQueue({ config, pool, snapshots: [oldCommitted,newCommitted], validatorSets,
       orphanMessageIds: original.source_messages.filter((row) => row.status === "REORGED").map((row) => row.message_id) });
+    const domainEntries = [
+      { snapshot: oldCommitted, inputs: oldInclusions, context: oldContext, encoded: oldEncoded },
+      { snapshot: newCommitted, inputs: newInclusions, context: newContext, encoded: newEncoded },
+    ];
+    await domainChecks.packages(domainEntries, deliveryPackages);
+    await domainChecks.negatives(oldCommitted, oldInclusions, merkleChecks, "actual epoch 7 A/B/D full message");
+    await domainChecks.negatives(newCommitted, newInclusions, merkleChecks, "actual epoch 8 Message E full message");
+    for (const orphan of original.source_messages.filter((row) => row.status === "REORGED")) {
+      const input = oldInclusions[0];
+      await merkleChecks.reject({ ...input, messageId: orphan.message_id }, "MemberMessageIdMismatch",
+        [BigInt(input.index), orphan.message_id, input.messageId], "REORGED C has no authenticated committed membership");
+    }
     await verifySingleRelayer({ config, pool, snapshots: [oldCommitted,newCommitted], validatorSets,
       orphanMessageIds: original.source_messages.filter((row) => row.status === "REORGED").map((row) => row.message_id) });
+    // Transport workers have stopped: isolate policy mutations/time in a reversible destination snapshot.
+    const beforeDomainPolicy = await sourceState(pool,config.databaseSchema);
+    await domainChecks.policyLifecycle(domainEntries, certificateChecks, merkleChecks);
+    assert.deepEqual(await sourceState(pool,config.databaseSchema), beforeDomainPolicy);
     const after = await sourceState(pool,config.databaseSchema);
     for (const table of ["source_messages","indexed_source_blocks","indexer_cursors","message_batch_members","batch_consensus_bindings"]) assert.deepEqual(after[table],sourceBefore[table]);
     assert.equal(after.batch_quorum_certificates.length,2);

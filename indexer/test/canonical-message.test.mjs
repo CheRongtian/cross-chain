@@ -13,6 +13,7 @@ import {
   decodeCrossChainMessageLog,
   sourceEventToDatabaseRow,
 } from "../src/source-gateway-event.mjs";
+import { canonicalDomainMessage, messageDomainArguments } from "./helpers/message-domain-contract.mjs";
 
 const SOURCE_GATEWAY = "0x0000000000000000000000000000000000001001";
 const SOURCE_SENDER = "0x0000000000000000000000000000000000001002";
@@ -77,6 +78,39 @@ test("computes payload hash and canonical message ID", () => {
   assert.equal(computePayloadHash(PAYLOAD), "0x1c8aff950685c2ed4bc3174f3472287b56d9517b9c948127319a09a7a36deac8");
   assert.match(messageId, /^0x[0-9a-f]{64}$/);
   assert.equal(validateCanonicalMessage(message, messageId).messageId, messageId);
+});
+
+test("destination message adapter preserves full-width fields and the separately authenticated ID", () => {
+  const maximum = (1n << 256n) - 1n;
+  const message = { ...canonicalMessage(), payloadHash: computePayloadHash(PAYLOAD),
+    sourceDomain: maximum, destinationDomain: maximum - 1n, nonce: maximum, deadline: maximum };
+  const id = computeCanonicalMessageId(message);
+  const args = messageDomainArguments(message, id, DESTINATION_GATEWAY);
+  assert.equal(args[0].sourceDomain, maximum);
+  assert.equal(args[0].destinationDomain, maximum - 1n);
+  assert.equal(args[0].nonce, maximum);
+  assert.equal(args[0].deadline, maximum);
+  assert.equal(args[1], PAYLOAD);
+  assert.equal(args[2], id);
+  assert.equal(args[3], DESTINATION_GATEWAY);
+  assert.deepEqual(Object.keys(args[0]), ["version", "sourceDomain", "sourceGateway", "sourceSender",
+    "destinationDomain", "destinationGateway", "destinationReceiver", "nonce", "payloadHash", "deadline"]);
+});
+
+test("destination message adapter fails closed on inexact widths and malformed payloads without imposing policy", () => {
+  const message = { ...canonicalMessage(), payloadHash: computePayloadHash(PAYLOAD) };
+  for (const field of ["sourceDomain", "destinationDomain", "nonce", "deadline"]) {
+    for (const invalid of [Number.MAX_SAFE_INTEGER + 1, -1n, 1n << 256n]) {
+      assert.throws(() => canonicalDomainMessage({ ...message, [field]: invalid }), /exact uint256|invalid/);
+    }
+  }
+  assert.throws(() => canonicalDomainMessage({ ...message, version: 256n }), /fit uint8/);
+  assert.throws(() => canonicalDomainMessage({ ...message, payload: "0x1" }), /invalid payload/);
+  // Unsupported versions and inconsistent hashes must remain expressible as on-chain negative cases.
+  const [unsupported] = canonicalDomainMessage({ ...message, version: 1n });
+  assert.equal(unsupported.version, 1);
+  const incorrectHash = `0x${"00".repeat(32)}`;
+  assert.equal(canonicalDomainMessage({ ...message, payloadHash: incorrectHash })[0].payloadHash, incorrectHash);
 });
 
 test("decodes CrossChainMessage and maps it to a database row", () => {

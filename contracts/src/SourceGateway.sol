@@ -2,11 +2,11 @@
 pragma solidity ^0.8.24;
 
 import {ISourceGateway} from "./interfaces/ISourceGateway.sol";
-import {CROSS_CHAIN_MESSAGE_TYPEHASH, MessageCodec} from "./MessageCodec.sol";
+import {CROSS_CHAIN_MESSAGE_TYPEHASH, CROSS_CHAIN_MESSAGE_VERSION, MessageCodec} from "./MessageCodec.sol";
 
 /// @notice Creates canonical outbound messages on the source chain.
 contract SourceGateway is ISourceGateway {
-    uint8 public constant MESSAGE_VERSION = 2;
+    uint8 public constant MESSAGE_VERSION = CROSS_CHAIN_MESSAGE_VERSION;
     bytes32 public constant MESSAGE_TYPEHASH = CROSS_CHAIN_MESSAGE_TYPEHASH;
 
     // Lower camel case preserves the project-facing getter name.

@@ -903,7 +903,16 @@ test("recovers source workers and seals durable batches from real finalized mess
       registryAddress: requireEnvironment("VALIDATOR_SET_REGISTRY_ADDRESS"),
       registryRpcUrl: requireEnvironment("CHAIN_B_RPC_URL"),
       certificateVerifierAddress: requireEnvironment("PBFT_CERTIFICATE_VERIFIER_ADDRESS"),
-      merkleInclusionVerifierAddress: requireEnvironment("MERKLE_INCLUSION_VERIFIER_ADDRESS") });
+      merkleInclusionVerifierAddress: requireEnvironment("MERKLE_INCLUSION_VERIFIER_ADDRESS"),
+      messageDomainContext: {
+        verifierAddress: requireEnvironment("MESSAGE_DOMAIN_VERIFIER_ADDRESS"),
+        alternateVerifierAddress: requireEnvironment("ALTERNATE_MESSAGE_DOMAIN_VERIFIER_ADDRESS"),
+        registryAddress: requireEnvironment("REMOTE_GATEWAY_REGISTRY_ADDRESS"),
+        registryOperatorKey: requireEnvironment("REMOTE_REGISTRY_ADMIN_PRIVATE_KEY"),
+        localDomain: requireEnvironment("INDEXER_INTEGRATION_DESTINATION_DOMAIN"),
+        alternateDomain: requireEnvironment("INDEXER_INTEGRATION_ALTERNATE_DESTINATION_DOMAIN"),
+        expectedGateway: requireEnvironment("INDEXER_INTEGRATION_DESTINATION_GATEWAY"),
+      } });
   } finally {
     for (const worker of activeWorkers) {
       worker.kill("SIGKILL");
