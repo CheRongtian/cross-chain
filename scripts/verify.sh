@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Destination Message Replay Protection"
+VERIFICATION_NAME="Gateway-Authorized Application B Business State"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -428,6 +428,7 @@ cleanup() {
             "$TEMP_DIR/message-domain-verifier-addresses.env" \
             "$TEMP_DIR/alternate-message-domain-verifier-addresses.env" \
             "$TEMP_DIR/replay-test-addresses.env" \
+            "$TEMP_DIR/application-b-test-addresses.env" \
             "$TEMP_DIR/validator-pids" \
             "$TEMP_DIR/relayer-pids" \
             "$TEMP_DIR/forwarding-calldata.txt"
@@ -748,6 +749,14 @@ printf '249. Keep B unconsumed after invalid QC, Merkle path, domain and downstr
 printf '250. Verify callback-visible consumed state, exact same-message reentrancy rejection and outer rollback/retry using real D\n'
 printf '251. Keep authentic expired E unconsumed while preserving all prior QC/Merkle/domain expiry regressions\n'
 printf '252. Preserve consumed IDs through source trust/time changes and restore temporary destination policy state\n'
+printf '253. Verify production Application B only-Gateway authority, exact receiver ABI and immutable nonzero Gateway configuration\n'
+printf '254. Match Solidity/JS canonical command bytes to independent frozen uint8-version/uint8-action/address vectors\n'
+printf '255. Reject direct EOAs, Relayer-like callers, same-code untrusted contracts and tx.origin bypass\n'
+printf '256. Reject malformed/dirty/truncated/trailing commands, unsupported versions/actions and zero suppliers\n'
+printf '257. Deploy production Application B and two explicitly TEST-ONLY Gateway callers on Chain B\n'
+printf '258. Verify exact supplier false-to-true state and correlated business events through the trusted Gateway caller\n'
+printf '259. Reject redundant supplier grants independently of message replay; accept an independent second supplier\n'
+printf '260. Preserve all prior regressions, historical A/B/D/E payloads, replay authority and the production Relayer target\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -964,6 +973,7 @@ printf 'VALID: precise-error proof failures include single-leaf paths, full-widt
 printf 'VALID: message-domain unit cases cover source authority, explicit targets, exact identity and strict expiry\n'
 printf 'VALID: existing canonical vectors, empty payloads, unsupported versions and stateless repeated checks preserved\n'
 printf 'VALID: Solidity replay cases cover distinct callers/IDs, full-width keys, zero-target rejection, no reset, callback ordering and rollback/retry\n'
+printf 'VALID: Solidity Application B cases cover exact Gateway authority, strict canonical commands, business errors/state/events and frozen vectors\n'
 printf 'VALID: Solidity ValidatorSetRegistry matches shared frozen committee vectors and canonical ordering\n'
 printf 'VALID: all 24 committee permutations, immutable history and fixed three-of-four quorum verified\n'
 printf 'VALID: exact zero, large and maximum uint256 validator epochs are independent of batch epochs\n'
@@ -1029,6 +1039,7 @@ MERKLE_VERIFIER_ADDRESSES_FILE="$TEMP_DIR/merkle-verifier-addresses.env"
 MESSAGE_DOMAIN_ADDRESSES_FILE="$TEMP_DIR/message-domain-verifier-addresses.env"
 ALTERNATE_MESSAGE_DOMAIN_ADDRESSES_FILE="$TEMP_DIR/alternate-message-domain-verifier-addresses.env"
 REPLAY_TEST_ADDRESSES_FILE="$TEMP_DIR/replay-test-addresses.env"
+APPLICATION_B_TEST_ADDRESSES_FILE="$TEMP_DIR/application-b-test-addresses.env"
 VALIDATOR_PID_FILE="$TEMP_DIR/validator-pids"
 RELAYER_PID_FILE="$TEMP_DIR/relayer-pids"
 : > "$VALIDATOR_PID_FILE"
@@ -1894,5 +1905,28 @@ TX_MAX_ATTEMPTS="$TX_MAX_ATTEMPTS" \
 TX_MAX_FEE_PER_GAS="$TX_MAX_FEE_PER_GAS" \
 TX_MAX_PRIORITY_FEE_PER_GAS="$TX_MAX_PRIORITY_FEE_PER_GAS" \
     node --test "$INDEXER_DIR/test/integration.test.mjs"
+
+CURRENT_STEP="production Application B deployment for isolated Gateway-caller verification"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+VERIFIER_DEPLOYER_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
+DEPLOYMENT_OUTPUT_FILE="$APPLICATION_B_TEST_ADDRESSES_FILE" \
+    bash "$PROJECT_ROOT/scripts/deploy-application-b-test-fixture.sh"
+[[ -f "$APPLICATION_B_TEST_ADDRESSES_FILE" ]] || fail "Application B fixture deployment output is missing"
+APPLICATION_B="$(sed -nE 's/^APPLICATION_B_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' "$APPLICATION_B_TEST_ADDRESSES_FILE")"
+APPLICATION_B_GATEWAY_TEST="$(sed -nE 's/^APPLICATION_B_GATEWAY_TEST_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' "$APPLICATION_B_TEST_ADDRESSES_FILE")"
+APPLICATION_B_OTHER_GATEWAY_TEST="$(sed -nE 's/^APPLICATION_B_OTHER_GATEWAY_TEST_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' "$APPLICATION_B_TEST_ADDRESSES_FILE")"
+[[ "$APPLICATION_B" =~ ^0x[[:xdigit:]]{40}$ ]] || fail "invalid Application B address"
+[[ "$APPLICATION_B_GATEWAY_TEST" =~ ^0x[[:xdigit:]]{40}$ ]] || fail "invalid trusted Gateway fixture address"
+[[ "$APPLICATION_B_OTHER_GATEWAY_TEST" =~ ^0x[[:xdigit:]]{40}$ ]] || fail "invalid untrusted Gateway fixture address"
+
+CURRENT_STEP="Application B canonical commands, exact Gateway authority and on-chain supplier business state"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+APPLICATION_B_ADDRESS="$APPLICATION_B" \
+APPLICATION_B_GATEWAY_TEST_ADDRESS="$APPLICATION_B_GATEWAY_TEST" \
+APPLICATION_B_OTHER_GATEWAY_TEST_ADDRESS="$APPLICATION_B_OTHER_GATEWAY_TEST" \
+APPLICATION_B_OPERATOR_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
+    node "$INDEXER_DIR/scripts/verify-application-b.mjs"
 
 CURRENT_STEP="complete"
