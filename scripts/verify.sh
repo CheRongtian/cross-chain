@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Cross-Chain Message Domain Verification"
+VERIFICATION_NAME="Destination Message Replay Protection"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -427,6 +427,7 @@ cleanup() {
             "$TEMP_DIR/merkle-verifier-addresses.env" \
             "$TEMP_DIR/message-domain-verifier-addresses.env" \
             "$TEMP_DIR/alternate-message-domain-verifier-addresses.env" \
+            "$TEMP_DIR/replay-test-addresses.env" \
             "$TEMP_DIR/validator-pids" \
             "$TEMP_DIR/relayer-pids" \
             "$TEMP_DIR/forwarding-calldata.txt"
@@ -740,6 +741,13 @@ printf '242. Verify real epoch-7 A/B/D and epoch-8 Message E full fields under t
 printf '243. Reject rehashed receiver/payload/domain variants against the unchanged original root and exclude REORGED C\n'
 printf '244. Preserve repeated stateless verification without introducing replay or application execution state\n'
 printf '245. Preserve every existing regression; isolate and restore temporary registry/time policy tests after transport workers stop\n'
+printf '246. Verify the internal messageId-keyed replay primitive, exact duplicate errors, full bytes32 independence and zero-target harness rejection\n'
+printf '247. Deploy TEST-ONLY authenticated replay/callback harnesses without changing the production Relayer target\n'
+printf '248. Consume real authenticated A once; reverify unchanged QC/Merkle/message evidence before both same/different-submitter duplicates\n'
+printf '249. Keep B unconsumed after invalid QC, Merkle path, domain and downstream failure; accept its authentic retry\n'
+printf '250. Verify callback-visible consumed state, exact same-message reentrancy rejection and outer rollback/retry using real D\n'
+printf '251. Keep authentic expired E unconsumed while preserving all prior QC/Merkle/domain expiry regressions\n'
+printf '252. Preserve consumed IDs through source trust/time changes and restore temporary destination policy state\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -955,6 +963,7 @@ printf 'VALID: Solidity canonical batch IDs, exact membership/count/position and
 printf 'VALID: precise-error proof failures include single-leaf paths, full-width indexes and every odd level\n'
 printf 'VALID: message-domain unit cases cover source authority, explicit targets, exact identity and strict expiry\n'
 printf 'VALID: existing canonical vectors, empty payloads, unsupported versions and stateless repeated checks preserved\n'
+printf 'VALID: Solidity replay cases cover distinct callers/IDs, full-width keys, zero-target rejection, no reset, callback ordering and rollback/retry\n'
 printf 'VALID: Solidity ValidatorSetRegistry matches shared frozen committee vectors and canonical ordering\n'
 printf 'VALID: all 24 committee permutations, immutable history and fixed three-of-four quorum verified\n'
 printf 'VALID: exact zero, large and maximum uint256 validator epochs are independent of batch epochs\n'
@@ -1019,6 +1028,7 @@ PBFT_VERIFIER_ADDRESSES_FILE="$TEMP_DIR/pbft-verifier-addresses.env"
 MERKLE_VERIFIER_ADDRESSES_FILE="$TEMP_DIR/merkle-verifier-addresses.env"
 MESSAGE_DOMAIN_ADDRESSES_FILE="$TEMP_DIR/message-domain-verifier-addresses.env"
 ALTERNATE_MESSAGE_DOMAIN_ADDRESSES_FILE="$TEMP_DIR/alternate-message-domain-verifier-addresses.env"
+REPLAY_TEST_ADDRESSES_FILE="$TEMP_DIR/replay-test-addresses.env"
 VALIDATOR_PID_FILE="$TEMP_DIR/validator-pids"
 RELAYER_PID_FILE="$TEMP_DIR/relayer-pids"
 : > "$VALIDATOR_PID_FILE"
@@ -1379,6 +1389,22 @@ REMOTE_GATEWAY_REGISTRY_ADDRESS="$REMOTE_GATEWAY_REGISTRY" \
 MESSAGE_DOMAIN_VERIFIER_ADDRESS="$MESSAGE_DOMAIN_VERIFIER" \
 LOCAL_DESTINATION_DOMAIN="$CHAIN_B_ID" \
     node "$INDEXER_DIR/scripts/verify-message-domain.mjs"
+
+CURRENT_STEP="Chain B TEST-ONLY authenticated replay harness and atomicity receiver deployment"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+VERIFIER_DEPLOYER_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
+PBFT_CERTIFICATE_VERIFIER_ADDRESS="$PBFT_CERTIFICATE_VERIFIER" \
+MERKLE_INCLUSION_VERIFIER_ADDRESS="$MERKLE_INCLUSION_VERIFIER" \
+MESSAGE_DOMAIN_VERIFIER_ADDRESS="$MESSAGE_DOMAIN_VERIFIER" \
+EXPECTED_DESTINATION_GATEWAY="$DESTINATION_GATEWAY" \
+DEPLOYMENT_OUTPUT_FILE="$REPLAY_TEST_ADDRESSES_FILE" \
+    bash "$PROJECT_ROOT/scripts/deploy-replay-test-harness.sh"
+[[ -f "$REPLAY_TEST_ADDRESSES_FILE" ]] || fail "test replay deployment output is missing"
+REPLAY_TEST_HARNESS="$(sed -nE 's/^REPLAY_TEST_HARNESS_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' "$REPLAY_TEST_ADDRESSES_FILE")"
+REPLAY_TEST_RECEIVER="$(sed -nE 's/^REPLAY_TEST_RECEIVER_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' "$REPLAY_TEST_ADDRESSES_FILE")"
+[[ "$REPLAY_TEST_HARNESS" =~ ^0x[[:xdigit:]]{40}$ ]] || fail "invalid test replay harness address"
+[[ "$REPLAY_TEST_RECEIVER" =~ ^0x[[:xdigit:]]{40}$ ]] || fail "invalid test replay receiver address"
 
 CURRENT_STEP="deployment code verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1823,7 +1849,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source fixed-snapshot and fork recovery, validator identity-bound consensus/view/epoch recovery, historical QC, delivery queue, Relayer, persistent Chain B recovery and HTTP 429/408/provider-limit integration"
+CURRENT_STEP="real source/consensus/transport recovery, historical QC/Merkle/message verification and destination replay/rollback integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \
@@ -1847,6 +1873,8 @@ PBFT_CERTIFICATE_VERIFIER_ADDRESS="$PBFT_CERTIFICATE_VERIFIER" \
 MERKLE_INCLUSION_VERIFIER_ADDRESS="$MERKLE_INCLUSION_VERIFIER" \
 MESSAGE_DOMAIN_VERIFIER_ADDRESS="$MESSAGE_DOMAIN_VERIFIER" \
 ALTERNATE_MESSAGE_DOMAIN_VERIFIER_ADDRESS="$ALTERNATE_MESSAGE_DOMAIN_VERIFIER" \
+REPLAY_TEST_HARNESS_ADDRESS="$REPLAY_TEST_HARNESS" \
+REPLAY_TEST_RECEIVER_ADDRESS="$REPLAY_TEST_RECEIVER" \
 REMOTE_GATEWAY_REGISTRY_ADDRESS="$REMOTE_GATEWAY_REGISTRY" \
 REMOTE_REGISTRY_ADMIN_PRIVATE_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
 INDEXER_INTEGRATION_ALTERNATE_DESTINATION_DOMAIN="$ALTERNATE_DESTINATION_DOMAIN" \

@@ -24,10 +24,11 @@ import { createCertificateChecks } from "./pbft-certificate-contract.mjs";
 import { encodeCertificate, snapshotContext } from "./pbft-certificate.mjs";
 import { createMerkleInclusionChecks, snapshotInclusions, forgedPathRoot, flipMerkleHash } from "../../../indexer/test/helpers/merkle-inclusion-contract.mjs";
 import { createActualMessageDomainChecks } from "./message-domain-scenarios.mjs";
+import { createMessageReplayChecks } from "./message-replay-scenarios.mjs";
 
 const quiet = { log() {},warn() {},error() {} };
 
-export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot,nextMessageId,pidFile,registryAddress,registryRpcUrl,certificateVerifierAddress,merkleInclusionVerifierAddress,messageDomainContext }) {
+export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot,nextMessageId,pidFile,registryAddress,registryRpcUrl,certificateVerifierAddress,merkleInclusionVerifierAddress,messageDomainContext,replayContext }) {
   const original = await sourceState(sourcePool,sourceConfig.databaseSchema);
   const config = { ...sourceConfig,databaseSchema: "cross_chain_rotation_source",
     sourceGatewayStartBlock: snapshot.batch.messages.reduce((first,message) => message.sourceBlockNumber < first ? message.sourceBlockNumber : first,snapshot.batch.messages[0].sourceBlockNumber) };
@@ -285,7 +286,12 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
       orphanMessageIds: original.source_messages.filter((row) => row.status === "REORGED").map((row) => row.message_id) });
     // Transport workers have stopped: isolate policy mutations/time in a reversible destination snapshot.
     const beforeDomainPolicy = await sourceState(pool,config.databaseSchema);
-    await domainChecks.policyLifecycle(domainEntries, certificateChecks, merkleChecks);
+    const replayChecks = await createMessageReplayChecks({ client: registryChecks.client, rpcUrl: registryRpcUrl,
+      context: replayContext, domainContext: messageDomainContext, certificateVerifierAddress,
+      merkleInclusionVerifierAddress, certificateChecks, merkleChecks, domainChecks });
+    await replayChecks.run(domainEntries);
+    await domainChecks.policyLifecycle(domainEntries, certificateChecks, merkleChecks, replayChecks);
+    await replayChecks.assertState("after restoring temporary registry/time changes");
     assert.deepEqual(await sourceState(pool,config.databaseSchema), beforeDomainPolicy);
     const after = await sourceState(pool,config.databaseSchema);
     for (const table of ["source_messages","indexed_source_blocks","indexer_cursors","message_batch_members","batch_consensus_bindings"]) assert.deepEqual(after[table],sourceBefore[table]);

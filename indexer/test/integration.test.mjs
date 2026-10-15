@@ -912,6 +912,10 @@ test("recovers source workers and seals durable batches from real finalized mess
         localDomain: requireEnvironment("INDEXER_INTEGRATION_DESTINATION_DOMAIN"),
         alternateDomain: requireEnvironment("INDEXER_INTEGRATION_ALTERNATE_DESTINATION_DOMAIN"),
         expectedGateway: requireEnvironment("INDEXER_INTEGRATION_DESTINATION_GATEWAY"),
+      },
+      replayContext: {
+        harnessAddress: requireEnvironment("REPLAY_TEST_HARNESS_ADDRESS"),
+        receiverAddress: requireEnvironment("REPLAY_TEST_RECEIVER_ADDRESS"),
       } });
   } finally {
     for (const worker of activeWorkers) {

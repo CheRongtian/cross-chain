@@ -117,7 +117,7 @@ export async function createActualMessageDomainChecks({ client, rpcUrl, sourceCo
         [BigInt(input.index), changed.messageId, id], `recomputed ${name} mutation is not included in the authenticated actual root`);
     }
   }
-  async function policyLifecycle(entries, certificateChecks, merkleChecks) {
+  async function policyLifecycle(entries, certificateChecks, merkleChecks, replayChecks) {
     // Run only after the existing destination transport workers have completed and stopped.
     const account = privateKeyToAccount(context.registryOperatorKey);
     const wallet = createWalletClient({ account, transport: http(rpcUrl, { retryCount: 0, timeout: 10000 }) });
@@ -135,6 +135,7 @@ export async function createActualMessageDomainChecks({ client, rpcUrl, sourceCo
       assert.equal((await client.waitForTransactionReceipt({ hash: replaceHash })).status, "success");
       await primary.reject(first, originalId, target, "UntrustedRemoteGateway", [domain, originalGateway, OTHER_GATEWAY],
         "current remote-registry replacement rejects the unchanged original historical message");
+      await replayChecks.assertState("current source-gateway replacement does not clear consumed IDs");
       const replacement = rehashed(first, { sourceGateway: OTHER_GATEWAY });
       await primary.accept(replacement, replacement.messageId, target, "standalone message under current remote trust; no historical membership is implied");
       const restoreHash = await wallet.writeContract({ ...registryArgs, functionName: "setRemoteGateway", args: [domain, originalGateway] });
@@ -161,6 +162,7 @@ export async function createActualMessageDomainChecks({ client, rpcUrl, sourceCo
             "destination rejects authentic expired message despite valid QC and Merkle evidence");
         }
       }
+      await replayChecks.expired(expiryTimestamp);
       console.log("VALID: expiry is destination acceptance policy; source history, QC, roots, proofs and READY packages are unchanged");
     } catch (error) {
       failure = error;
@@ -175,5 +177,5 @@ export async function createActualMessageDomainChecks({ client, rpcUrl, sourceCo
       }
     }
   }
-  return { members, packages, negatives, policyLifecycle };
+  return { members, packages, negatives, policyLifecycle, accept: primary.accept };
 }

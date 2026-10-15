@@ -1,8 +1,8 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A/B independently verify each package and delegate its versioned ABI transport to a Persistent Transaction Manager. The manager atomically reserves nonces, estimates gas and resolves EIP-1559 fees, signs locally, persists exact raw bytes before broadcast, and tracks canonical receipts with configured confirmation depth. Bounded durable retries rebroadcast exact bytes, append same-nonce higher-fee candidates, enforce configured limits and accept any historical canonical winner. Ordered destination RPC access paths validate chain ID and genesis, preserve exact signed transactions across failover, and conservatively check multi-provider receipt views. Chain B maintains on-chain trusted remote-gateway configuration for exact source-domain and source-address pairs. Stateless destination verification is available; integrated acceptance, replay protection and execution remain unimplemented.
+This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A/B independently verify each package and delegate its versioned ABI transport to a Persistent Transaction Manager. The manager atomically reserves nonces, estimates gas and resolves EIP-1559 fees, signs locally, persists exact raw bytes before broadcast, and tracks canonical receipts with configured confirmation depth. Bounded durable retries rebroadcast exact bytes, append same-nonce higher-fee candidates, enforce configured limits and accept any historical canonical winner. Ordered destination RPC access paths validate chain ID and genesis, preserve exact signed transactions across failover, and conservatively check multi-provider receipt views. Chain B maintains on-chain trusted remote-gateway configuration for exact source-domain and source-address pairs. Stateless destination verification and an internal replay primitive are available; production Gateway integration and business execution remain unimplemented.
 
-Chain B retains immutable historical validator committees in `ValidatorSetRegistry`. Each exact `uint256` validator epoch resolves to four canonical public identities, quorum three and the existing PBFT committee digest. `PBFTCertificateVerifier` authenticates existing v1/v2/v3 QC transport bytes against that authority and a caller-supplied trusted batch context. The independent `MerkleInclusionVerifier` checks an exact message ID and position under a canonical batch and expected Message Root. `MessageDomainVerifier` binds that same ID to complete original message fields, current remote-source trust, explicit destination context and destination-time expiry. These read-only components do not deliver or consume messages.
+Chain B retains immutable historical validator committees in `ValidatorSetRegistry`. Each exact `uint256` validator epoch resolves to four canonical public identities, quorum three and the existing PBFT committee digest. `PBFTCertificateVerifier` authenticates existing v1/v2/v3 QC transport bytes against that authority and a caller-supplied trusted batch context. The independent `MerkleInclusionVerifier` checks an exact message ID and position under a canonical batch and expected Message Root. `MessageDomainVerifier` binds that same ID to complete original message fields, current remote-source trust, explicit destination context and destination-time expiry. These read-only components do not deliver or consume messages. `MessageReplayProtection` provides reusable internal exactly-once consumption storage for a future inheriting destination contract. Its authenticated composition and callbacks are currently test-only; integrated production Gateway acceptance, Application B and business execution remain unimplemented.
 
 The current implementation can:
 
@@ -221,6 +221,7 @@ Destination validation composes separate boundaries using the identical root and
 ```text
 Historical PBFT QC → authenticated Message Root → ordered Merkle inclusion
     → authenticated messageId → full message/domain/expiry validation
+    → internal exactly-once consumption → future business execution
 ```
 
 The remote source identity is resolved through Chain B's current `RemoteGatewayRegistry`. The message cannot supply its own source authority. Full-message verification supplies no consensus or membership of its own, and a valid transport receipt supplies no protocol acceptance.
@@ -391,9 +392,25 @@ The constructor binds a nonzero code-bearing remote registry with the expected g
 
 The message destination domain must match the configured local domain and differ from its source domain, as required by SourceGateway. Its Gateway must be nonzero and equal the trusted caller's expected target; it is not bound to the verifier's own address. The receiver must be nonzero and remains exactly ID-bound, with no code-presence requirement, receiver registry or business-permission inference. Sender, nonce, raw payload/hash and deadline are bound through the unchanged canonical identity. Nonces do not become destination replay state, and existing empty-payload semantics remain supported.
 
-Destination verification independently requires `block.timestamp < deadline`, matching SourceGateway: the instant equal to the deadline is already expired. QC agreement and membership authenticate historical intent but cannot extend freshness. Expiry leaves source history, committed evidence and READY packages unchanged. Domain verification is stateless; repeated checks before expiry can succeed. Exactly-once acceptance requires a replay-protection layer, which is not implemented here. No receiver call, ETH transfer, Application B update or destination role grant occurs.
+Destination verification independently requires `block.timestamp < deadline`, matching SourceGateway: the instant equal to the deadline is already expired. QC agreement and membership authenticate historical intent but cannot extend freshness. Expiry leaves source history, committed evidence and READY packages unchanged. Domain verification is stateless; repeated checks before expiry can succeed. Exactly-once acceptance is supplied separately by internal replay consumption; invoking this verifier never consumes an ID. No receiver call, ETH transfer, Application B update or destination role grant occurs.
 
 Unified verification reuses existing canonical vectors, then composes QC, inclusion and full-message checks for real historical A/B/D and rotated Message E. It compares original IDs across SourceGateway, Indexer, destination encoding and recovered delivery packages. It verifies cross-domain/Gateway rejection, field mutations and correctly rehashed receiver/payload/domain variants that the original root does not authorize. A comparison verifier configured for domain `3001` runs on the existing Chain B solely to exercise domain separation; no third chain is started. After transport workers stop, temporary remote-trust replacement and destination-time advancement run within a reversible Chain B snapshot. Authentic expired messages retain valid QC/Merkle evidence but fail deadline policy. Historical durable source/package data is not rewritten.
+
+### Destination replay protection
+
+`contracts/src/MessageReplayProtection.sol` is a minimal abstract storage component. It exposes `isMessageExecuted(bytes32 messageId)` as a public view query and `_consumeMessage(bytes32 messageId)` for internal use by the inheriting contract. Every full-width canonical ID starts unconsumed. The first successful consumption sets it to `true`; every later consumption reverts with `MessageAlreadyExecuted(messageId)`, including delivery by a different account. Duplicate delivery never silently reports a new acceptance.
+
+The key is the canonical message ID, independent of nonce alone, batch position, QC/proof representation, delivery metadata, sender account or destination transaction hash. Same payloads with distinct canonical IDs, the same nonce in distinct source domains and out-of-order delivery remain independent. There is no public arbitrary-consume production endpoint, external replay registry, administrator, reset, deletion, replay window or pruning. Consumed IDs remain recorded for the lifetime of that contract's storage, regardless of deadlines, source trust replacement or validator rotation. No new zero-ID meaning is introduced; the caller's existing canonical verification determines valid message identity.
+
+The acceptance contract must validate the QC, ordered membership and original full message first, consume the authenticated ID second, and enter application code last. Consumption is set before a callback, so nested acceptance of the same message sees it as consumed. If downstream execution fails, the failure must propagate: the whole EVM transaction, including the mapping write and any nested writes, rolls back. The same message may then be retried. No global reentrancy lock is supplied; policy for distinct-message nested business execution belongs to the final Gateway.
+
+Relayers provide at-least-once transport, and duplicate retries after crashes remain possible. The internal on-chain guard supplies exactly-once consumption within one deployed destination state domain. Worker leases, transaction nonces, receipts and PostgreSQL flags do not provide this authority. Destination-chain reorganization follows canonical EVM storage: removing a successful acceptance block also removes its state update. There is no destination reorg monitor here. Source credential/nullifier replay and destination message replay protect different identities and remain separate.
+
+The final production Gateway is not provided. `AuthenticatedMessageReplayHarness` lives under `contracts/test/mocks/` and composes the existing QC, Merkle and message-domain verifiers in one transaction before internal consumption. Expected batch context is supplied by the verification fixture, and the expected destination Gateway is bound independently at deployment. Its test ABI does not freeze the future Relayer submission envelope. It exposes no unchecked raw consumption. The separate unit harness does expose raw consumption solely to test the primitive; it is not deployed as destination authority.
+
+Unified verification deploys only test-owned replay and receiver contracts on the existing Chain B. It reuses actual A/B/D and rotated Message E: A is consumed once and rejected from both original and alternate submitters while unchanged upstream evidence remains valid; B remains unconsumed after invalid QC, Merkle, domain and downstream failure, then succeeds on retry; D exercises callback-visible state, exact same-message reentry rejection, outer rollback and retry. E stays unconsumed until controlled expiry, when valid QC/Merkle evidence cannot bypass the deadline or burn its ID. Consumed A/B/D remain recorded through the reversible registry/time scenario. Existing source history, packages, roots, signatures, Relayer target and production transaction manager are unchanged.
+
+`ReplayTestReceiver` observes only test callback behavior; its address is passed separately for atomicity checks and does not replace the canonical destination receiver. The alternate submitter uses a separate public local development identity outside the five-validator directory; Anvil fixture funding does not consume the production Tx Manager account's nonce or transfer ETH from it. These tests implement no Application B, supplier role, production ETH transfer or automatic production destination state change. Execution events and the final Gateway's submission ABI and practical package/gas bounds remain deferred.
 
 ## Credentials and Zero-Knowledge Authorization
 
@@ -1490,7 +1507,7 @@ The crash verification extends the existing process/IPC harness with explicit SQ
 
 Verification snapshots Chain B, controls automine and temporarily uses minimal reverting bytecode only to obtain a real status-0 receipt. It restores the original chain snapshot, bytecode and mining mode, and cleans up its own processes/proxies. These test fixtures implement no destination protocol and are separate from the normal durable deployment namespace. Unit/database tests also cover conflicts, corruption, exhaustion, exact identities, immutable journals, concurrent recovery and stale writeback.
 
-CONFIRMED means a successful canonical receipt was observed at configured depth, a heuristic rather than permanent finality. Provider redundancy supplies availability and basic identity/consistency checks, with no Byzantine RPC quorum or malicious-provider tolerance claim. Chain B provides remote/source gateway trust configuration, historical validator-set authority and read-only QC verification. Complete Destination Gateway enforcement, Merkle verification at the destination trust boundary, destination replay protection, Application B execution, post-confirmation destination reorg recovery, Byzantine-relayer handling and Byzantine RPC-provider consensus remain unimplemented. Durable transaction recovery does not establish cross-chain business execution or permanent chain finality.
+CONFIRMED means a successful canonical receipt was observed at configured depth, a heuristic rather than permanent finality. Provider redundancy supplies availability and basic identity/consistency checks, with no Byzantine RPC quorum or malicious-provider tolerance claim. Chain B provides remote/source gateway trust configuration, historical validator-set authority, read-only QC/Merkle/message-domain verification and a reusable internal replay guard. Their stateful acceptance composition is test-only. Complete production Destination Gateway enforcement, Application B execution, post-confirmation destination reorg recovery, Byzantine-relayer handling and Byzantine RPC-provider consensus remain unimplemented. Durable transaction recovery does not establish cross-chain business execution or permanent chain finality.
 
 ## Local Two-Chain Environment
 
@@ -1850,7 +1867,15 @@ The script uses strict error handling and performs:
 178. real A/B/D and rotated Message E QC → inclusion → full-message composition using the identical authenticated ID;
 179. parity with actual SourceGateway, off-chain encoder and recovered immutable delivery packages without another reconstruction;
 180. rehashed receiver/payload/alternate-domain intent rejected by the original root, while REORGED C remains excluded;
-181. authentic expired messages rejected despite unchanged valid QC/Merkle evidence, with temporary trust/time state restored after transport workers stop.
+181. authentic expired messages rejected despite unchanged valid QC/Merkle evidence, with temporary trust/time state restored after transport workers stop;
+182. internal full-bytes32 replay storage, exact duplicate rejection, different submitters, distinct canonical IDs and no public production consume/reset;
+183. rollback of intentional/downstream failures, retry, callback-visible consumed state and same/distinct-message nested behavior;
+184. test-only authenticated replay/callback deployments without changing the production Relayer destination or submission bytes;
+185. real A first consumption and same/different-submitter rejection after unchanged QC, Merkle and full-message rechecks;
+186. failed QC, tampered Merkle path and wrong domain leave B unconsumed, followed by downstream rollback and successful retry;
+187. real D same-message reentrancy, outer rollback, successful retry and exact nested replay error;
+188. authentic expired E remains unconsumed while previously consumed A/B/D survive deadlines and trust changes;
+189. complete original regressions, unchanged source/package evidence and restoration of temporary destination policy state.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -1868,7 +1893,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Cross-Chain Message Domain Verification
+Destination Message Replay Protection
 ```
 
 ### Expected error output
@@ -1906,6 +1931,8 @@ Groth16 verifier negative cases normally return `false` and are reported as `Ver
 
 Message-domain negative cases also require exact error names and arguments, including propagated remote-registry errors, and print `EXPECTED FAILURE: Chain B message domain verification ...`. An expired message can retain valid QC and inclusion; only destination deadline policy rejects it. The log identifies these facts independently and does not relabel historical cryptographic evidence as invalid.
 
+Replay negatives require the exact custom error in preflight, a real reverted Chain B transaction and unchanged replay state. They print `EXPECTED FAILURE: Chain B replay acceptance ...`. `MessageAlreadyExecuted` is an expected duplicate rejection; `MockExecutionFailed` belongs only to the callback fixture. Invalid upstream evidence and authentic expired messages remain unconsumed. A successful callback exposes the exact nested replay-error bytes, proving that same-message reentry fails after consumption and before any second accepted execution. Unexpected reverts, RPC failures or receipt statuses fail verification.
+
 ## Repository Layout
 
 ```text
@@ -1930,6 +1957,7 @@ Cross-Chain/
 │   │   ├── MessageCodec.sol
 │   │   ├── MessageDomainVerifier.sol
 │   │   ├── MessageMerkle.sol
+│   │   ├── MessageReplayProtection.sol
 │   │   ├── PBFTCertificateVerifier.sol
 │   │   ├── RemoteGatewayRegistry.sol
 │   │   ├── SourceGateway.sol
@@ -1940,12 +1968,18 @@ Cross-Chain/
 │       ├── MerkleInclusionVerifier.t.sol
 │       ├── MessageDomainVerifier.t.sol
 │       ├── MessageMerkle.t.sol
+│       ├── MessageReplayProtection.t.sol
 │       ├── PBFTCertificateVerifier.t.sol
 │       ├── RemoteGatewayRegistry.t.sol
 │       ├── mocks/
+│       │   ├── AuthenticatedMessageReplayHarness.sol
+│       │   ├── IReplayTestReceiver.sol
+│       │   ├── MessageReplayProtectionHarness.sol
 │       │   ├── MockCredentialVerifier.sol
 │       │   ├── MockSourceApplication.sol
-│       │   └── MockSourceGateway.sol
+│       │   ├── MockSourceGateway.sol
+│       │   ├── ReplayQueryHarness.sol
+│       │   └── ReplayTestReceiver.sol
 │       ├── SourceGateway.t.sol
 │       └── ValidatorSetRegistry.t.sol
 ├── indexer/
@@ -2076,6 +2110,7 @@ Cross-Chain/
 │   ├── deploy-message-domain-verifier.sh
 │   ├── deploy-pbft-certificate-verifier.sh
 │   ├── deploy-remote-gateway-registry.sh
+│   ├── deploy-replay-test-harness.sh
 │   ├── deploy-validator-set-registry.sh
 │   ├── deploy-verifier.sh
 │   ├── start-chains.sh
@@ -2141,6 +2176,7 @@ Cross-Chain/
 │   │       ├── fault-scenarios.mjs
 │   │       ├── fixtures.mjs
 │   │       ├── message-domain-scenarios.mjs
+│   │       ├── message-replay-scenarios.mjs
 │   │       ├── four-process.mjs
 │   │       ├── pbft-certificate.mjs
 │   │       ├── pbft-certificate-contract.mjs
@@ -2224,7 +2260,7 @@ Cross-Chain/
 - Destination RPC failover uses ordered, fingerprint-checked access paths. Provider URLs never identify a transaction or grant destination authority. Conservative cross-provider checks do not provide Byzantine RPC consensus.
 - Chain B QC verification requires trusted expected batch context. Legacy v1/v2 use the initial immutable authority with an explicitly expected legacy version; v3 uses its exact signed/expected validator epoch. A QC cannot choose destination eligibility for itself, and high-s compatibility cannot add quorum weight for a duplicated recovered identity.
 - Full-message verification must use the same ID authenticated by QC/Merkle composition, not an unrelated self-consistent ID. Unsupported versions and wrong current source/destination context fail independently of canonical hash consistency.
-- Source and destination require time strictly before deadline. Historical source validity, QC agreement and inclusion do not override destination expiry or rewrite source/READY evidence. Stateless domain checks can repeat and provide no exactly-once replay protection.
+- Source and destination require time strictly before deadline. Historical source validity, QC agreement and inclusion do not override destination expiry or rewrite source/READY evidence. Stateless domain checks can repeat without consuming IDs. The separate internal replay guard records only successful acceptance; failures roll back and consumed IDs are never cleared by expiry or policy changes.
 - The repository does not provide decentralized validator governance, Byzantine-relayer handling, destination-confirmed transaction reorg recovery, an integrated Destination Gateway with full message policy/inclusion/replay enforcement, exactly-once downstream execution, Application B, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
 - Groth16 verification remains local to `IdentityApplicationA`. Its protected messages carry exact authorized public intent fields; destination credential-proof verification and business execution remain unimplemented.
 
