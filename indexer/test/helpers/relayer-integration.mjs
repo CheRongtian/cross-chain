@@ -9,7 +9,7 @@ import { createDeliveryRepository } from "../../src/delivery/repository.mjs";
 import { deliveryJson } from "../../src/delivery/package.mjs";
 import { loadTransactionConfig } from "../../src/transaction-manager/config.mjs";
 import { createTransactionManager } from "../../src/transaction-manager/service.mjs";
-import { encodeDestinationSubmission } from "../../src/relayer/encoding.mjs";
+import { encodeGatewaySubmission } from "../../src/relayer/encoding.mjs";
 import { createRelaySubmissionRepository } from "../../src/relayer/repository.mjs";
 import { sourceState } from "../../../validator/test/helpers/four-process.mjs";
 import { rpcObserver } from "../../../validator/test/helpers/process-cluster.mjs";
@@ -58,8 +58,8 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
   const estimates = new Map();
   const packagesByData = new Map();
   for (const job of jobs) {
-    const encoded = await encodeDestinationSubmission(await queue.getDeliveryPackage(job.deliveryJobId),{ validatorSets });
-    packagesByData.set(encoded.data,encoded.package);
+    const encoded = await encodeGatewaySubmission(await queue.getDeliveryPackage(job.deliveryJobId),{ validatorSets });
+    packagesByData.set(encoded.calldata,encoded.package);
   }
   let latestBaseFee;
   let latestPriorityFee;
@@ -211,7 +211,7 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     assert.equal(await nonce(destination),destinationNonce + BigInt(expectedCount));
     for (const job of jobs) {
       const pack = await queue.getDeliveryPackage(job.deliveryJobId);
-      const encoded = await encodeDestinationSubmission(pack,{ validatorSets,sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway });
+      const encoded = await encodeGatewaySubmission(pack,{ validatorSets,sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway });
       const record = await manager.repository.getTransaction(job.deliveryJobId);
       const tx = await destination.request({ method: "eth_getTransactionByHash",params: [record.attempt.transactionHash] });
       assert.ok(tx,"Chain B RPC must expose the submitted transaction body");
@@ -219,7 +219,7 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
       assert.equal(normalizeAddress(tx.to),pack.message.destinationGateway);
       assert.notEqual(normalizeAddress(tx.to),pack.message.destinationReceiver);
       assert.equal(BigInt(tx.value),0n);
-      assert.equal(tx.input.toLowerCase(),encoded.data.toLowerCase());
+      assert.equal(tx.input.toLowerCase(),encoded.calldata.toLowerCase());
       assert.equal(record.intent.packageDigest,encoded.packageDigest);
       assert.equal(BigInt(tx.nonce).toString(),record.attempt.nonce); assert.equal(BigInt(tx.type),2n);
       assert.equal(BigInt(tx.chainId),relayConfig.destinationDomain);

@@ -8,6 +8,7 @@ import {
   validateCanonicalMessage,
 } from "./canonical-message.mjs";
 import { createFinalityStore } from "./db.mjs";
+import { DELIVERY_POLICY } from "./delivery/policy.mjs";
 import { MESSAGE_STATUS } from "./finality-policy.mjs";
 import {
   normalizeSourceEventIdentity,
@@ -240,7 +241,7 @@ export function createMessageBatcher({ config, pool }) {
         sourceDomain: scope.chainDomain,
         sourceGateway: scope.sourceGateway,
         epoch: normalizedEpoch,
-        messages: rows.map(databaseRowToBatchMessage),
+        messages: rows.slice(0, DELIVERY_POLICY.maxBatchMessages).map(databaseRowToBatchMessage),
       });
     },
   };

@@ -1,5 +1,6 @@
-import { encodeAbiParameters, keccak256, parseAbiParameters } from "viem";
+import { encodeAbiParameters, encodeFunctionData, keccak256, parseAbiParameters, parseAbi } from "viem";
 import { verifyDeliveryPackage } from "../delivery/package.mjs";
+import { DELIVERY_POLICY, requireDeliveryBounds } from "../delivery/policy.mjs";
 
 export const DESTINATION_SUBMISSION_VERSION = 1;
 export const DESTINATION_SUBMISSION_DOMAIN = "CrossChainDeliveryPackage";
@@ -14,6 +15,7 @@ export const QC_STATEMENT_PARAMETERS = Object.freeze({
 });
 export const QC_PARAMETERS = parseAbiParameters("uint8,bytes,bytes32,(address voterIdentity,bytes32 commitDigest,bytes signature)[]");
 export const ENVELOPE_PARAMETERS = parseAbiParameters("string,uint8,string,bytes,bytes,uint256,uint256,bytes32,bytes32[],bytes");
+export const DESTINATION_GATEWAY_ABI = parseAbi(["function execute(bytes packageBytes)"]);
 
 // Transport encoding only. Existing message/batch/Merkle/PBFT digests are unchanged.
 export async function encodeDestinationSubmission(input,options) {
@@ -35,4 +37,13 @@ export async function encodeDestinationSubmission(input,options) {
     pack.merkleProof.siblings,qcBytes]);
   // Comparing this digest avoids storing/comparing full ABI payloads in submission rows.
   return Object.freeze({ data,packageDigest: keccak256(data).toLowerCase(),package: pack });
+}
+
+// One production entry format. The transport-v1 bytes and their existing digest remain unchanged.
+export async function encodeGatewaySubmission(input, options) {
+  requireDeliveryBounds(input);
+  const encoded = await encodeDestinationSubmission(input, options);
+  if ((encoded.data.length - 2) / 2 > DELIVERY_POLICY.maxPackageBytes) throw new Error("PACKAGE_LIMIT_EXCEEDED");
+  return Object.freeze({ ...encoded, calldata: encodeFunctionData({ abi: DESTINATION_GATEWAY_ABI,
+    functionName: "execute", args: [encoded.data] }) });
 }

@@ -10,6 +10,7 @@ import {
 import { computeCanonicalMessageId, computePayloadHash } from "../src/canonical-message.mjs";
 import { createMessageBatcher } from "../src/message-batch.mjs";
 import { buildMessageMerkleTree, verifyMessageMerkleProof } from "../src/message-merkle.mjs";
+import { DELIVERY_POLICY } from "../src/delivery/policy.mjs";
 import { createValidatorSetResolver } from "../../validator/src/validator-sets.mjs";
 import { commitConfigs, signedCommitFixture } from "../../validator/test/helpers/commit-fixtures.mjs";
 import { buildQuorumCertificate, expectedCommitStatement, qcDigest } from "../../validator/src/quorum-certificate.mjs";
@@ -137,6 +138,26 @@ async function collectedPair(initialEpoch = 23n) {
   const collected = await lifecycle.collectEligible({ initialEpoch });
   return { ...source, collected, id: collected.snapshot.record.batchRecordId };
 }
+
+test("bounded canonical collection leaves overflow eligible for the next immutable batch", async () => {
+  const maximum = DELIVERY_POLICY.maxBatchMessages;
+  const messages = Array.from({ length: maximum + 1 }, (_, index) => message(10n, BigInt(index)));
+  await persist(10n, 10n, [...messages].reverse());
+  await finalityStore.advanceFinality(scope, { headBlock: 10n, finalityBlockDepth: 0n });
+  const first = await lifecycle.collectEligible({ initialEpoch: 23n });
+  assert.equal(first.assignedCount, maximum);
+  assert.equal((await lifecycle.collectEligible()).assignedCount, 0);
+  const sealed = await lifecycle.sealBatch({ batchRecordId: first.snapshot.record.batchRecordId });
+  assert.deepEqual(sealed.batch.messageIds, messages.slice(0, maximum).map(row => row.messageId));
+  const lastRow = (await readMessages(pool, config.databaseSchema)).find(row => row.message_id === messages.at(-1).messageId);
+  assert.equal((await pool.query(`SELECT 1 FROM ${members} WHERE source_message_id = $1`, [lastRow.id])).rowCount, 0);
+  const second = await lifecycle.collectEligible();
+  assert.equal(second.assignedCount, 1);
+  assert.equal(second.snapshot.record.epoch, sealed.record.epoch + 1n);
+  const next = await lifecycle.sealBatch({ batchRecordId: second.snapshot.record.batchRecordId });
+  assert.deepEqual(next.batch.messageIds, [messages.at(-1).messageId]);
+  assert.deepEqual(await lifecycle.readBatch({ batchRecordId: sealed.record.batchRecordId }), sealed);
+});
 
 test("only a matching independently verified QC can commit; equivalent evidence preserves the first certificate", async () => {
   const { id, pending, a, b, votes, options } = await pendingCertificateFixture();

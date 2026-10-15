@@ -183,15 +183,19 @@ test("recovers source workers and seals durable batches from real finalized mess
 
   let forwardingNegativesVerified = false;
   let lastForwardDeadline = 0n;
-  async function produceMessage(payload) {
+  async function produceMessage(payload, target = {}) {
+    const targetGateway = normalizeAddress(target.destinationGateway ?? destinationGateway);
+    const targetReceiver = normalizeAddress(target.destinationReceiver ?? destinationReceiver);
     const latestBlock = await publicClient.getBlock();
     // Repeated fixture payloads and snapshot rewinds still represent distinct
     // authorized requests. No Gateway nonce is added to the proof statement.
     const proposedDeadline = latestBlock.timestamp + 3600n;
-    const deadline = proposedDeadline > lastForwardDeadline ? proposedDeadline : lastForwardDeadline + 1n;
+    const destinationFloor = BigInt(target.deadlineFloor ?? 0n);
+    const candidateDeadline = proposedDeadline > destinationFloor ? proposedDeadline : destinationFloor;
+    const deadline = candidateDeadline > lastForwardDeadline ? candidateDeadline : lastForwardDeadline + 1n;
     lastForwardDeadline = deadline;
     const prepared = await prepareAuthorizedSourceMessage({ publicClient,application: identityApplication,destinationDomain,
-      destinationGateway,destinationReceiver,payload: normalizePayload(payload),deadline,executor: account.address });
+      destinationGateway: targetGateway,destinationReceiver: targetReceiver,payload: normalizePayload(payload),deadline,executor: account.address });
     assert.equal(prepared.intent.sourceGateway,config.sourceGateway);
     if (!forwardingNegativesVerified) {
       await verifyForwardAuthorizationNegatives({ publicClient,walletClient,application: identityApplication,prepared,executor: account.address });
@@ -215,8 +219,8 @@ test("recovers source workers and seals durable batches from real finalized mess
       expectedSourceDomain: config.chainDomain,
     });
     assert.equal(event.destinationDomain,destinationDomain);
-    assert.equal(event.destinationGateway,destinationGateway);
-    assert.equal(event.destinationReceiver,destinationReceiver);
+    assert.equal(event.destinationGateway,targetGateway);
+    assert.equal(event.destinationReceiver,targetReceiver);
     assert.equal(event.payload,normalizePayload(payload)); assert.equal(event.deadline,deadline);
     assert.equal(event.sourceSender,identityApplication);
     const authorization = receipt.logs
@@ -899,6 +903,7 @@ test("recovers source workers and seals durable batches from real finalized mess
       validatorSets: createValidatorSetResolver(consensus.history),
       orphanMessageIds: afterNewMessage.filter((row) => row.status === "REORGED").map((row) => row.message_id) });
     await verifyValidatorRotation({ sourceConfig: config, sourcePool: activePool, snapshot: consensus.snapshot,
+      produceBusinessMessage: produceMessage,
       nextMessageId: messageE.messageId, pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE"),
       registryAddress: requireEnvironment("VALIDATOR_SET_REGISTRY_ADDRESS"),
       registryRpcUrl: requireEnvironment("CHAIN_B_RPC_URL"),

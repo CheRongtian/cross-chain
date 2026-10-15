@@ -1,5 +1,5 @@
 import { normalizeAddress } from "../canonical-message.mjs";
-import { encodeDestinationSubmission } from "./encoding.mjs";
+import { encodeGatewaySubmission } from "./encoding.mjs";
 import { RelayerError, safeRelayerMessage } from "./config.mjs";
 import { createRelayerLeaseRepository } from "./leases.mjs";
 
@@ -35,7 +35,7 @@ export function createRelayerWorker({ config,pool,queue,transactionManager,
       assertHeld();
       const job = await queue.getDeliveryJob(id);
       if (job.status !== "READY" || job.deliveryJobId !== id) throw new RelayerError("RELAYER_REQUIRES_READY");
-      const encoded = await encodeDestinationSubmission(await queue.getDeliveryPackage(id),verification);
+      const encoded = await encodeGatewaySubmission(await queue.getDeliveryPackage(id),verification);
       const pack = encoded.package;
       if (pack.deliveryJobId !== id || pack.message.destinationDomain !== config.destinationDomain.toString() ||
           job.destinationDomain !== pack.message.destinationDomain || normalizeAddress(job.destinationGateway) !== pack.message.destinationGateway) throw new RelayerError("DESTINATION_CONTEXT_MISMATCH");

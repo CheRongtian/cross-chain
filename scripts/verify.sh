@@ -8,7 +8,7 @@ CONTRACTS_DIR="$PROJECT_ROOT/contracts"
 INDEXER_DIR="$PROJECT_ROOT/indexer"
 VALIDATOR_DIR="$PROJECT_ROOT/validator"
 LOG_FILE="$PROJECT_ROOT/verification.log"
-VERIFICATION_NAME="Gateway-Authorized Application B Business State"
+VERIFICATION_NAME="Complete End-to-End Cross-Chain Execution"
 
 ENV_FILE="$PROJECT_ROOT/.env"
 if [[ -f "$ENV_FILE" ]]; then
@@ -429,6 +429,7 @@ cleanup() {
             "$TEMP_DIR/alternate-message-domain-verifier-addresses.env" \
             "$TEMP_DIR/replay-test-addresses.env" \
             "$TEMP_DIR/application-b-test-addresses.env" \
+            "$TEMP_DIR/destination-gateway-addresses.env" \
             "$TEMP_DIR/validator-pids" \
             "$TEMP_DIR/relayer-pids" \
             "$TEMP_DIR/forwarding-calldata.txt"
@@ -757,6 +758,25 @@ printf '257. Deploy production Application B and two explicitly TEST-ONLY Gatewa
 printf '258. Verify exact supplier false-to-true state and correlated business events through the trusted Gateway caller\n'
 printf '259. Reject redundant supplier grants independently of message replay; accept an independent second supplier\n'
 printf '260. Preserve all prior regressions, historical A/B/D/E payloads, replay authority and the production Relayer target\n'
+printf '261. Freeze execute(bytes) with unchanged canonical transport-v1 bytes, package digest and immutable historical transactions\n'
+printf '262. Enforce shared 4096-byte payload, 128-member batch and 11232-byte package bounds with cross-language boundary tests\n'
+printf '263. Deploy the production DestinationGateway with existing PBFT/Merkle/domain verifiers on Chain B\n'
+printf '264. Bind production ApplicationB to that exact Gateway, independently of isolated regression mocks\n'
+printf '265. Reject malformed/noncanonical/over-limit packages and nonzero value; preserve precise upstream errors\n'
+printf '266. Compose QC, Merkle, full message, replay and contract receiver checks with atomic rollback and reentrancy coverage\n'
+printf '267. Authorize fresh supplier commands with unused exact-intent ZK proofs through Application A and SourceGateway\n'
+printf '268. Index and finalize new real events through OBSERVED, FINALIZING and FINALIZED without SQL lifecycle shortcuts\n'
+printf '269. Build bounded canonical batches and commit their roots through the existing real validator cluster\n'
+printf '270. Project real COMMITTED evidence into immutable READY packages\n'
+printf '271. Use production Relayer and persistent Tx Manager for exact zero-value Gateway signing, broadcast and confirmation\n'
+printf '272. Read back atomic Gateway replay and ApplicationB supplier transitions from Chain B\n'
+printf '273. Correlate exact Gateway/business events with the same canonical message and preserve identity separation\n'
+printf '274. Recover/rerun normal final-job logic without another intent, nonce, signature or business transition\n'
+printf '275. Reverify unchanged crypto/domain evidence and reject exact duplicate delivery from two controlled callers\n'
+printf '276. Reject QC/path/domain/receiver/envelope/expiry failures without consuming unexecuted messages\n'
+printf '277. Observe a real pre-signed business rejection as terminal REVERTED with Gateway replay rollback\n'
+printf '278. Preserve historical A/B/C/D/E, old batches/QCs/transactions and all earlier regressions\n'
+printf '279. Keep destination authorization in on-chain Gateway checks and business state in ApplicationB\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -813,6 +833,7 @@ node --test \
     "$INDEXER_DIR/test/batch-lifecycle-policy.test.mjs" \
     "$INDEXER_DIR/test/delivery-config.test.mjs" \
     "$INDEXER_DIR/test/delivery-package.test.mjs" \
+    "$INDEXER_DIR/test/delivery-policy.test.mjs" \
     "$INDEXER_DIR/test/relayer-config.test.mjs" \
     "$INDEXER_DIR/test/relayer-encoding.test.mjs" \
     "$INDEXER_DIR/test/relayer-service.test.mjs" \
@@ -966,6 +987,7 @@ CURRENT_STEP="forge test -vv including shared Merkle golden compatibility"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test -vv
 
+printf 'VALID: malformed Gateway offsets and impossible batch-array lengths reject with exact empty revert / Panic(0x41); replay, business state and events remain unchanged\n'
 printf 'VALID: Solidity PBFT certificates match frozen v1/v2/v3 digests, trusted context and signature acceptance\n'
 printf 'VALID: bounded ABI evidence, historical/legacy authority and every quorum entry verified\n'
 printf 'VALID: Solidity canonical batch IDs, exact membership/count/position and ordered inclusion checks verified\n'
@@ -1040,6 +1062,7 @@ MESSAGE_DOMAIN_ADDRESSES_FILE="$TEMP_DIR/message-domain-verifier-addresses.env"
 ALTERNATE_MESSAGE_DOMAIN_ADDRESSES_FILE="$TEMP_DIR/alternate-message-domain-verifier-addresses.env"
 REPLAY_TEST_ADDRESSES_FILE="$TEMP_DIR/replay-test-addresses.env"
 APPLICATION_B_TEST_ADDRESSES_FILE="$TEMP_DIR/application-b-test-addresses.env"
+DESTINATION_GATEWAY_ADDRESSES_FILE="$TEMP_DIR/destination-gateway-addresses.env"
 VALIDATOR_PID_FILE="$TEMP_DIR/validator-pids"
 RELAYER_PID_FILE="$TEMP_DIR/relayer-pids"
 : > "$VALIDATOR_PID_FILE"
@@ -1853,6 +1876,21 @@ assert_equal \
     "nonce after reauthorized Application A message"
 printf 'VALID: reauthorized Application A message accepted\n'
 
+CURRENT_STEP="production DestinationGateway and ApplicationB deployment"
+printf '\n[%s]\n' "$CURRENT_STEP"
+CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
+VERIFIER_DEPLOYER_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
+PBFT_CERTIFICATE_VERIFIER_ADDRESS="$PBFT_CERTIFICATE_VERIFIER" \
+MERKLE_INCLUSION_VERIFIER_ADDRESS="$MERKLE_INCLUSION_VERIFIER" \
+MESSAGE_DOMAIN_VERIFIER_ADDRESS="$MESSAGE_DOMAIN_VERIFIER" \
+DEPLOYMENT_OUTPUT_FILE="$DESTINATION_GATEWAY_ADDRESSES_FILE" \
+    bash "$PROJECT_ROOT/scripts/deploy-destination-gateway.sh"
+[[ -f "$DESTINATION_GATEWAY_ADDRESSES_FILE" ]] || fail "production Gateway deployment output is missing"
+PRODUCTION_DESTINATION_GATEWAY="$(sed -nE 's/^DESTINATION_GATEWAY_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' "$DESTINATION_GATEWAY_ADDRESSES_FILE")"
+PRODUCTION_APPLICATION_B="$(sed -nE 's/^PRODUCTION_APPLICATION_B_ADDRESS=(0x[[:xdigit:]]{40})$/\1/p' "$DESTINATION_GATEWAY_ADDRESSES_FILE")"
+[[ "$PRODUCTION_DESTINATION_GATEWAY" =~ ^0x[[:xdigit:]]{40}$ ]] || fail "invalid production Gateway address"
+[[ "$PRODUCTION_APPLICATION_B" =~ ^0x[[:xdigit:]]{40}$ ]] || fail "invalid production Application B address"
+
 CURRENT_STEP="persistent Chain A Indexer integration preparation"
 printf '\n[%s]\n' "$CURRENT_STEP"
 INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC")"
@@ -1891,6 +1929,8 @@ REMOTE_REGISTRY_ADMIN_PRIVATE_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
 INDEXER_INTEGRATION_ALTERNATE_DESTINATION_DOMAIN="$ALTERNATE_DESTINATION_DOMAIN" \
 CHAIN_B_RPC_URL="$CHAIN_B_RPC" \
 CHAIN_B_CHAIN_ID="$CHAIN_B_ID" \
+PRODUCTION_DESTINATION_GATEWAY_ADDRESS="$PRODUCTION_DESTINATION_GATEWAY" \
+PRODUCTION_APPLICATION_B_ADDRESS="$PRODUCTION_APPLICATION_B" \
 RPC_REQUEST_TIMEOUT_MS="$RPC_REQUEST_TIMEOUT_MS" \
 RELAYER_A_PRIVATE_KEY="$ANVIL_DEV_KEY" \
 RELAYER_WORKER_ID="relayer-a" \

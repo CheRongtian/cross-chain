@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+import {IPBFTCertificateVerifier} from "../interfaces/IPBFTCertificateVerifier.sol";
+
 /// @notice Bounded parser for QC_PARAMETERS in indexer/src/relayer/encoding.mjs.
 library PBFTCertificateCodec {
     uint8 internal constant LEGACY_VERSION = 1;
@@ -8,6 +10,8 @@ library PBFTCertificateCodec {
     uint8 internal constant EPOCH_VERSION = 3;
     uint256 private constant WORD = 32;
     uint256 private constant HEAD_SIZE = 128;
+    uint256 private constant VIEW_OFFSET = HEAD_SIZE + WORD * 4;
+    uint256 private constant AUTHORITY_OFFSET_FROM_BATCH_ID = WORD * 4;
     uint256 private constant LEGACY_STATEMENT_SIZE = 224;
     uint256 private constant TUPLE_SIZE = 224;
     uint256 private constant SIGNATURE_OFFSET = 96;
@@ -45,6 +49,33 @@ library PBFTCertificateCodec {
     error UnsupportedProtocolVersion(uint256 version);
     error InvalidEvidenceCount(uint256 count);
     error InvalidSignatureLength(uint256 length);
+
+    /// @dev Reads only the existing statement metadata; this is not certificate authentication.
+    ///      The production verifier still performs the single full evidence parse and signature checks.
+    // Only the production composition needs this metadata bridge to the existing verifier API.
+    // forge-lint: disable-next-item(internal-function-used-once)
+    function context(bytes memory encoded) internal pure returns (IPBFTCertificateVerifier.ExpectedContext memory expected) {
+        if (encoded.length < HEAD_SIZE || encoded.length > MAX_CERTIFICATE_SIZE) revert InvalidCertificateEncoding();
+        uint256 version = _memoryWord(encoded, 0);
+        if (version < LEGACY_VERSION || version > EPOCH_VERSION) revert UnsupportedProtocolVersion(version);
+        uint256 size = LEGACY_STATEMENT_SIZE + (version - LEGACY_VERSION) * WORD;
+        if (_memoryWord(encoded, WORD) != HEAD_SIZE || _memoryWord(encoded, HEAD_SIZE) != size) {
+            revert InvalidCertificateEncoding();
+        }
+        // Only version, view and the signed v3 authority are needed to construct the Gateway expectations.
+        // The other expectations are taken from its decoded message/batch/root and checked by the verifier.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        expected.protocolVersion = uint8(version);
+        if (version != LEGACY_VERSION) expected.viewNumber = _memoryWord(encoded, VIEW_OFFSET);
+        if (version == EPOCH_VERSION) expected.authorityEpoch = _memoryWord(encoded, HEAD_SIZE + WORD * 9);
+    }
+
+    function _memoryWord(bytes memory encoded, uint256 offset) private pure returns (uint256 value) {
+        if (offset > encoded.length || encoded.length - offset < WORD) revert InvalidCertificateEncoding();
+        // Read one already bounds-checked word from the immutable decoded certificate bytes.
+        // forge-lint: disable-next-line(inline-assembly)
+        assembly ("memory-safe") { value := mload(add(add(encoded, WORD), offset)) }
+    }
 
     /// @dev Exact ABI offsets, widths, lengths and padding are checked before copying evidence.
     // Keep the bounded parser as the library entry point, separate from signature and authority policy.
@@ -114,7 +145,9 @@ library PBFTCertificateCodec {
         statement.messageRoot = bytes32(_word(encoded, cursor + WORD));
         statement.proposalDigest = bytes32(_word(encoded, cursor + WORD * 2));
         statement.committeeDigest = bytes32(_word(encoded, cursor + WORD * 3));
-        if (version == EPOCH_VERSION) statement.validatorEpoch = _word(encoded, cursor + WORD * 4);
+        if (version == EPOCH_VERSION) {
+            statement.validatorEpoch = _word(encoded, cursor + AUTHORITY_OFFSET_FROM_BATCH_ID);
+        }
     }
 
     // Used for each bounded tuple as well as the statement; dirty address widths must never be accepted.

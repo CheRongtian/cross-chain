@@ -3,11 +3,13 @@ pragma solidity ^0.8.24;
 
 import {ISourceGateway} from "./interfaces/ISourceGateway.sol";
 import {CROSS_CHAIN_MESSAGE_TYPEHASH, CROSS_CHAIN_MESSAGE_VERSION, MessageCodec} from "./MessageCodec.sol";
+import {DeliveryPolicy} from "./libraries/DeliveryPolicy.sol";
 
 /// @notice Creates canonical outbound messages on the source chain.
 contract SourceGateway is ISourceGateway {
     uint8 public constant MESSAGE_VERSION = CROSS_CHAIN_MESSAGE_VERSION;
     bytes32 public constant MESSAGE_TYPEHASH = CROSS_CHAIN_MESSAGE_TYPEHASH;
+    uint256 public constant MAX_PAYLOAD_BYTES = DeliveryPolicy.MAX_PAYLOAD_BYTES;
 
     // Lower camel case preserves the project-facing getter name.
     // forge-lint: disable-next-line(screaming-snake-case-immutable)
@@ -25,6 +27,7 @@ contract SourceGateway is ISourceGateway {
     error InvalidDestinationGateway();
     error InvalidDestinationReceiver();
     error InvalidDeadline();
+    error PayloadLimitExceeded(uint256 actual, uint256 maximum);
 
     event SourceApplicationAuthorizationUpdated(address indexed application, bool authorized);
 
@@ -86,6 +89,7 @@ contract SourceGateway is ISourceGateway {
         if (destinationReceiver == address(0)) {
             revert InvalidDestinationReceiver();
         }
+        if (payload.length > MAX_PAYLOAD_BYTES) revert PayloadLimitExceeded(payload.length, MAX_PAYLOAD_BYTES);
         // forge-lint: disable-next-line(block-timestamp)
         if (deadline <= block.timestamp) {
             revert InvalidDeadline();

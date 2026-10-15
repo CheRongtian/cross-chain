@@ -56,7 +56,8 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
   async function strict(id,expected) {
     const record = records.get(id);
     if (!record) return null;
-    if (expected && Object.keys(expected).some(key => record.intent[key] !== expected[key])) throw new TransactionError("CONFLICTING_TRANSACTION_INTENT");
+    if (expected && Object.keys(expected).filter(key => key !== "historicalCalldata").some(key => record.intent[key] !== expected[key] &&
+      !(key === "calldata" && record.intent[key] === expected.historicalCalldata))) throw new TransactionError("CONFLICTING_TRANSACTION_INTENT");
     for (const [index,attempt] of record.attempts.entries()) {
       await verifySignedTransaction(record.intent,attempt);
       if (attempt.attemptNumber !== index || attempt.nonce !== record.intent.nonce ||
@@ -135,6 +136,7 @@ export async function transactionHarness({ config = transactionConfig(),mutate,b
       if (fence && [...records.values()].some(r => r.intent.status === "PENDING" && (r.intent.retryStoppedAt !== null || r.attempt.status === "SIGNED"))) throw new TransactionError("SIGNED_TRANSACTION_REQUIRES_EXPLICIT_BROADCAST");
       const allocation = allocateNonce({ pendingNonce,nextNonce: nextNonce ?? pendingNonce });
       const canonical = { ...intent,nonce: allocation.nonce.toString() };
+      delete canonical.historicalCalldata;
       calls.sign++;
       const signed = await sign(canonical,{ nonce: allocation.nonce,gasLimit,maxFeePerGas,maxPriorityFeePerGas });
       await verifySignedTransaction(canonical,signed);

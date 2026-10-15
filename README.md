@@ -1,8 +1,8 @@
 # Cross-Chain Protocol
 
-This repository is a prototype for canonical cross-chain source messaging, zero-knowledge credential authorization with revocation and replay protection, persistent source-event indexing, configurable source-block finality, reorganization recovery, deterministic message batching, Merkle commitments shared across JavaScript and Solidity, and four independent validators exchanging signed PBFT PRE-PREPARE, PREPARE, and COMMIT messages. Validators independently recheck Chain A and retain durable proposal and vote locks. Three matching PREPARE voters establish local `PREPARED`; three matching COMMIT voters produce a verifiable Quorum Certificate (QC) that authorizes an atomic batch transition to `COMMITTED`. Each historical committee uses `n = 4`, `f = 1`, and quorum `3`. Verification includes non-primary process failure, conflicting Byzantine messages, a bidirectional 2|2 partition and reconnection, and primary-failure safety. Signed VIEW_CHANGE and independently verified NEW_VIEW permit safe primary replacement within the same batch epoch. Validator-set rotation uses immutable operator-published history. The Delivery Queue materializes one immutable READY job per message in a strictly verified COMMITTED batch. Relayer A/B independently verify each package and delegate its versioned ABI transport to a Persistent Transaction Manager. The manager atomically reserves nonces, estimates gas and resolves EIP-1559 fees, signs locally, persists exact raw bytes before broadcast, and tracks canonical receipts with configured confirmation depth. Bounded durable retries rebroadcast exact bytes, append same-nonce higher-fee candidates, enforce configured limits and accept any historical canonical winner. Ordered destination RPC access paths validate chain ID and genesis, preserve exact signed transactions across failover, and conservatively check multi-provider receipt views. Chain B maintains on-chain trusted remote-gateway configuration for exact source-domain and source-address pairs. Stateless destination verification, an internal replay primitive and a Gateway-only supplier application are available; automatic production Gateway-to-application execution remains unimplemented.
+This repository implements a cross-chain messaging prototype from exact-intent zero-knowledge authorization on Chain A to atomic application execution on Chain B. It includes canonical source messages, persistent indexing and fixed-head finality/reorganization handling, deterministic bounded batches, ordered Merkle commitments, four-member PBFT committees with historical rotation and view recovery, a durable delivery queue, leased Relayer workers, and a persistent EIP-1559 Transaction Manager with retries, replacement, RPC failover and crash recovery. Private credentials and proofs remain on Chain A; only authorized public business intent and consensus/membership evidence cross the destination boundary.
 
-Chain B retains immutable historical validator committees in `ValidatorSetRegistry`. Each exact `uint256` validator epoch resolves to four canonical public identities, quorum three and the existing PBFT committee digest. `PBFTCertificateVerifier` authenticates existing v1/v2/v3 QC transport bytes against that authority and a caller-supplied trusted batch context. The independent `MerkleInclusionVerifier` checks an exact message ID and position under a canonical batch and expected Message Root. `MessageDomainVerifier` binds that same ID to complete original message fields, current remote-source trust, explicit destination context and destination-time expiry. These read-only components do not deliver or consume messages. `MessageReplayProtection` provides reusable internal exactly-once consumption storage. `ApplicationB` independently exposes the Gateway-only supplier business boundary. Verification/replay composition and application-caller integration use separate test-only harnesses; a final production Gateway connecting these components is not provided.
+On Chain B, DestinationGateway binds the existing PBFTCertificateVerifier, MerkleInclusionVerifier and MessageDomainVerifier immutably and inherits MessageReplayProtection. Anyone may submit evidence; Relayer identity and PostgreSQL grant no execution authority. The Gateway authenticates the QC, ordered membership and complete message, consumes its canonical ID, and calls the exact executable destinationReceiver through ICrossChainReceiver. ApplicationB accepts only its immutable Gateway and interprets a canonical supplier-grant payload. Receiver failure rolls back replay and business effects together. The independent components and test-only boundary harnesses remain available for regression coverage.
 
 The current implementation can:
 
@@ -214,7 +214,7 @@ The Indexer and Finality Watcher are disposable worker processes. Their durable 
 
 The batch lifecycle assigns finalized source occurrences to durable batch records. Sealing reuses the deterministic batch and Merkle builders to persist an immutable snapshot, and reading it reconstructs its inclusion proofs. A verified QC authorizes `CONSENSUS_PENDING → COMMITTED`. The Delivery Queue consumes that exact committed evidence without changing source messages, finality data or consensus state. READY denotes materialized evidence. Relayer A/B submit verified packages through destination RPC without changing READY or source state; a returned transaction hash establishes neither destination acceptance nor execution.
 
-The same commitment primitive is implemented in JavaScript and Solidity. Shared committed vectors constrain both runtimes, and complete verification passes a reconstructed real sealed batch into Foundry's local EVM. It additionally deploys a stateless Chain B inclusion verifier and checks every actual committed member after authenticating the exact QC context/root. No Destination Gateway or application execution endpoint is provided.
+The same commitment primitive is implemented in JavaScript and Solidity. Shared committed vectors constrain both runtimes, and complete verification passes a reconstructed real sealed batch into Foundry's local EVM. It additionally deploys a stateless Chain B inclusion verifier and checks every actual committed member after authenticating the exact QC context/root. DestinationGateway composes those same components and invokes the authenticated application after replay consumption.
 
 Destination validation composes separate boundaries using the identical root and message ID:
 
@@ -222,10 +222,10 @@ Destination validation composes separate boundaries using the identical root and
 Historical PBFT QC → authenticated Message Root → ordered Merkle inclusion
     → authenticated messageId → full message/domain/expiry validation
     → internal exactly-once consumption
-    → future production Gateway receiver call → Application B supplier grant
+    → production DestinationGateway receiver call → Application B supplier grant
 ```
 
-The remote source identity is resolved through Chain B's current `RemoteGatewayRegistry`. The message cannot supply its own source authority. Full-message verification supplies no consensus or membership of its own, and a valid transport receipt supplies no protocol acceptance.
+The remote source identity is resolved through Chain B's current `RemoteGatewayRegistry`. The message cannot supply its own source authority. Full-message verification supplies no consensus or membership of its own, and a historical EOA transport receipt supplies no protocol acceptance. A successful production DestinationGateway transaction commits its complete atomic execution.
 
 Each validator reads the immutable source candidate and independently rechecks Chain A. Its local `VALID` or `INVALID` result is an observation, with no PBFT vote, quorum, or authorization to change the source batch lifecycle. Four local `VALID` results leave the batch `CONSENSUS_PENDING`.
 
@@ -328,7 +328,7 @@ Binding `destinationGateway` makes the selected remote endpoint part of the cryp
 
 The zero address represents an unknown source domain. `trustedRemoteGateway` returns that value for an unconfigured domain, `isTrustedRemoteGateway` performs an exact domain-and-address comparison, and `requireTrustedRemoteGateway` fails closed with distinct errors for an unknown domain and a known-domain gateway mismatch. There is no wildcard or default gateway.
 
-A registered gateway is an address identity on its source chain and is not required to contain bytecode on Chain B. The registry does not attempt cross-chain code introspection. Its storage is trusted configuration available to a future destination verification layer; it does not authenticate a message, delivery package, Merkle proof, QC, validator set, relayer or application call by itself.
+A registered gateway is an address identity on its source chain and is not required to contain bytecode on Chain B. The registry does not attempt cross-chain code introspection. Its storage is trusted configuration used by MessageDomainVerifier and DestinationGateway; it does not authenticate a message, delivery package, Merkle proof, QC, validator set, relayer or application call by itself.
 
 The registry stores one currently trusted gateway per source domain. Replacing a mapping immediately makes the previous address non-current. Historical remote-gateway epochs and grace periods are not represented.
 
@@ -363,13 +363,13 @@ The certificate bytes are the existing relayer QC tuple: `uint8,bytes,bytes32,(a
 
 The caller must supply trusted `protocolVersion`, `sourceDomain`, `sourceGateway`, `batchEpoch`, `viewNumber`, `batchId`, `messageRoot` and `authorityEpoch`. Solidity reserves `view`, so the contract identifier is `viewNumber`; the JavaScript contract adapter maps the protocol's original `view` to this key. ABI types and positions, JSON fields, signed type strings and frozen evidence remain unchanged. A self-selected valid certificate cannot establish those expectations. For v3, the signed `validatorEpoch` must equal the expected authority epoch; the registry resolves that exact record without a latest/nearest fallback. The verifier derives committee digest and the canonical PRE-PREPARE proposal digest from registry authority and the signed context, including the deterministic primary. Batch epoch and view retain their full `uint256` width, including primary selection when their mathematical sum exceeds `uint256`.
 
-Legacy eligibility is explicit: the trusted caller must expect v1 or v2, and `authorityEpoch` must equal the registry's immutable initial epoch. v1 has no signed view and requires expected `viewNumber` zero. v1/v2 contain no signed validator epoch; the authority anchor is caller/registry metadata and is never inserted into historical digest bytes. The current protocol has no universal pre-rotation batch cutoff for legacy evidence. A caller expecting v3 rejects a legacy certificate. Registering later committees does not revoke genuine old evidence or grant a future member authority over it. Future Destination Gateway wiring must obtain expected version/context from its own authenticated policy, independently of relayer-supplied data.
+Legacy eligibility is explicit: the trusted caller must expect v1 or v2, and `authorityEpoch` must equal the registry's immutable initial epoch. v1 has no signed view and requires expected `viewNumber` zero. v1/v2 contain no signed validator epoch; the authority anchor is caller/registry metadata and is never inserted into historical digest bytes. The current protocol has no universal pre-rotation batch cutoff for legacy evidence. A caller expecting v3 rejects a legacy certificate. Registering later committees does not revoke genuine old evidence or grant a future member authority over it. DestinationGateway constructs source/batch/root expectations from one decoded snapshot. Existing QC metadata selects its original version schema and signed v3 authority; legacy authority comes from the immutable initial registry epoch. The existing verifier authenticates their exact agreement and signatures.
 
 Each COMMIT uses the original type-tagged ABI digest and signs the raw 32-byte digest through EIP-191 personal-sign (`\x19Ethereum Signed Message:\n32`). v3 appends `validatorEpoch` after `voterIdentity` in COMMIT and at the end of the QC statement. Recovery accepts exactly 65-byte signatures with `v` in `0/1/27/28`, nonzero `r/s` strictly below the secp256k1 order, and nonzero recovered identities. Existing viem/noble recovery accepts high-s, so the contract preserves that behavior. Raw-digest signing, double prefixing, compact signatures and other recovery IDs are rejected. Every recovered identity must match the claimed voter, belong to the exact historical committee and appear in strict ascending address order. Duplicates, including alternate signature bytes from the same identity, cannot add quorum weight. All four entries are checked when four are supplied.
 
 `test-vectors/pbft-certificates.json` freezes public v1/v2/v3 statements, proposal/COMMIT/QC digests, signing digests, signature bytes, recovered identities and exact transport bytes. An independent reference encoder creates the initial artifact; normal verification only checks it and never overwrites it. JavaScript and Foundry consume the same artifact, including full-width context, legacy authority, high-s/v normalization and invalid evidence cases. The existing real rotation scenario also sends its actual epoch-7 and epoch-8 QCs to the deployed Chain B verifier and rechecks the old QC after V1 stops.
 
-Certificate verification authenticates a batch commitment under trusted context. It does not establish remote-gateway trust, source finality, canonical message semantics, Merkle inclusion, deadlines, destination routing, replay prevention or Application B execution. Those destination enforcement boundaries remain separate work.
+Certificate verification authenticates a batch commitment under trusted context. It does not establish remote-gateway trust, source finality, canonical message semantics, Merkle inclusion, deadlines, destination routing, replay prevention or Application B execution. DestinationGateway composes these independent boundaries before application execution.
 
 ### MerkleInclusionVerifier
 
@@ -379,7 +379,7 @@ Certificate verification authenticates a batch commitment under trusted context.
 
 The caller must first authenticate the exact source scope, batch epoch/ID and Message Root through `PBFTCertificateVerifier`, then use the identical context/root for inclusion. The Merkle verifier does not call or replace the QC verifier. A valid standalone path under a self-selected root grants no QC authorization. Future Gateway policy must establish those expectations independently of the submitted proof and certificate.
 
-Full ordered membership costs O(N) calldata. Duplicate checking sorts one O(N) scratch copy in O(N log N), without changing the committed order; the batch ID is hashed once and one O(log N) proof path is folded. No new batch-size or gas-policy limit is introduced. Practical submission-envelope and package bounds remain future work.
+Full ordered membership costs O(N) calldata. Duplicate checking sorts one O(N) scratch copy in O(N log N), without changing the committed order; the batch ID is hashed once and one O(log N) proof path is folded. The primitive preserves its original encoding. Product construction and DestinationGateway execution cap membership at 128; payload and raw-package limits are documented below.
 
 This verifier accepts canonical message IDs only. It does not reconstruct `CrossChainMessage` fields, enforce message version/domain/routing/deadline policy, prevent replay or execute Application B. Batch encoding version 1 is distinct from message-version and QC-version policy.
 
@@ -407,7 +407,7 @@ The acceptance contract must validate the QC, ordered membership and original fu
 
 Relayers provide at-least-once transport, and duplicate retries after crashes remain possible. The internal on-chain guard supplies exactly-once consumption within one deployed destination state domain. Worker leases, transaction nonces, receipts and PostgreSQL flags do not provide this authority. Destination-chain reorganization follows canonical EVM storage: removing a successful acceptance block also removes its state update. There is no destination reorg monitor here. Source credential/nullifier replay and destination message replay protect different identities and remain separate.
 
-The final production Gateway is not provided. `AuthenticatedMessageReplayHarness` lives under `contracts/test/mocks/` and composes the existing QC, Merkle and message-domain verifiers in one transaction before internal consumption. Expected batch context is supplied by the verification fixture, and the expected destination Gateway is bound independently at deployment. Its test ABI does not freeze the future Relayer submission envelope. It exposes no unchecked raw consumption. The separate unit harness does expose raw consumption solely to test the primitive; it is not deployed as destination authority.
+Production replay state belongs to DestinationGateway. `AuthenticatedMessageReplayHarness` lives under `contracts/test/mocks/` and composes the existing QC, Merkle and message-domain verifiers in one transaction before internal consumption. Expected batch context is supplied by the verification fixture, and the expected destination Gateway is bound independently at deployment. Its test ABI remains isolated from the production execute(bytes) transport. It exposes no unchecked raw consumption. The separate unit harness does expose raw consumption solely to test the primitive; it is not deployed as destination authority.
 
 Unified verification deploys only test-owned replay and receiver contracts on the existing Chain B. It reuses actual A/B/D and rotated Message E: A is consumed once and rejected from both original and alternate submitters while unchanged upstream evidence remains valid; B remains unconsumed after invalid QC, Merkle, domain and downstream failure, then succeeds on retry; D exercises callback-visible state, exact same-message reentry rejection, outer rollback and retry. E stays unconsumed until controlled expiry, when valid QC/Merkle evidence cannot bypass the deadline or burn its ID. Consumed A/B/D remain recorded through the reversible registry/time scenario. Existing source history, packages, roots, signatures, Relayer target and production transaction manager are unchanged.
 
@@ -417,7 +417,7 @@ Unified verification deploys only test-owned replay and receiver contracts on th
 
 `contracts/src/ApplicationB.sol` records `VERIFIED_SUPPLIER` as a simple address-keyed boolean on Chain B. `isVerifiedSupplier(address)` reports the current business state. Its only mutation path is the nonpayable `ICrossChainReceiver.handleCrossChainMessage(bytes32 messageId, bytes payload)` entry. The constructor binds one immutable, nonzero `destinationGateway`; it does not require code at construction or offer a Gateway setter. Calls are authorized by the exact `msg.sender` address. Direct users, Relayers, Tx Manager signers and other contracts have no permission, including a contract with identical Gateway bytecode. `tx.origin` grants no authority.
 
-The Gateway performs protocol authentication and replay consumption; the application only interprets the authenticated business intent. It has no QC/Merkle verifier, source registry, deadline check, credential proof input or second message replay mapping. The receiver address is Application B; the destination Gateway is a separate verification/execution authority. The final production Gateway will call this receiver after validating everything and consuming the message ID. Application errors propagate so that future composition can roll back both replay consumption and business effects atomically.
+The Gateway performs protocol authentication and replay consumption; the application only interprets the authenticated business intent. It has no QC/Merkle verifier, source registry, deadline check, credential proof input or second message replay mapping. The receiver address is Application B; the destination Gateway is a separate verification/execution authority. DestinationGateway calls this exact receiver after validating the package and consuming the message ID. Application errors propagate and roll back both replay consumption and business effects atomically.
 
 The supplier command has exactly this ABI:
 
@@ -432,11 +432,67 @@ The explicit supplier comes from the payload; it is not derived from a credentia
 
 An initial valid grant changes only the intended supplier from `false` to `true` and emits `VerifiedSupplierGranted(bytes32 indexed messageId, address indexed supplier)`. The message ID provides event correlation, not application replay authority. A later grant for the same supplier reverts with `AlreadyVerifiedSupplier(supplier)`, even with a different message ID. This is a redundant business transition, separate from Gateway message replay. Other suppliers remain independent. There is no administrator grant, owner bypass, revocation, enumerable directory, token/payment logic or upgrade/governance framework.
 
-`test-vectors/application-b-commands.json` independently freezes two command payloads and their exact expected ABI bytes. Solidity tests and the verification JS encoder compare against these bytes without regenerating them. These commands define future business payloads; historical A/B/D/E messages retain their original arbitrary payloads, identities and proofs. No old payload is reinterpreted as a supplier grant.
+`test-vectors/application-b-commands.json` independently freezes two command payloads and their exact expected ABI bytes. Solidity tests and the verification JS encoder compare against these bytes without regenerating them. These commands define canonical business payloads; historical A/B/D/E messages retain their original arbitrary payloads, identities and proofs. No old payload is reinterpreted as a supplier grant.
 
 Unified verification deploys the production application contract on Chain B (`2001`) and binds it to a clearly identified `MockDestinationGateway` test caller. A second instance with identical code proves address-specific authorization. The mock only forwards the exact receiver call and intentionally performs no protocol validation or replay mutation. Direct EOA/Relayer-like calls and the untrusted contract must fail with unchanged state and no grant event; the trusted caller must change the exact supplier state and emit its correlated event. Malformed, unsupported, zero-supplier and redundant commands fail, while the second supplier can be granted independently. Fixtures use public local development identities without consuming the production Tx Manager account's nonce.
 
-This isolated application test uses correlation labels rather than claiming real source-authenticated messages. It does not connect the real Relayer, consume replay state or replace any existing destination target. Final QC → Merkle → message-domain → replay → Application B composition, automatic Chain A-to-B business execution, final Relayer submission ABI and practical package/gas policy remain deferred. Application B events are not yet indexed into a destination database.
+This isolated application test uses correlation labels rather than claiming real source-authenticated messages. It does not connect the real Relayer, consume replay state or replace any existing destination target. A separate production flow composes QC → Merkle → message-domain → replay → Application B through real source authorization, consensus, Relayer and Tx Manager execution, as documented below. Application B events are not yet indexed into a destination database.
+
+### DestinationGateway execution
+
+`contracts/src/DestinationGateway.sol` is the production destination trust boundary. Its only submission entry is nonpayable `execute(bytes packageBytes)`. There is no raw-package fallback, Relayer allowlist, admin execution bypass, mutable verifier pointer, arbitrary-call entry or ETH forwarding. Constructor dependencies are nonzero, code-bearing and immutable. Existing registry authority and verifier APIs remain authoritative; the Gateway copies no validator or remote-gateway registry state.
+
+```text
+Credential → fresh exact-intent ZK authorization → IdentityApplicationA → SourceGateway
+  → Indexer → fixed-head finality → bounded batch / ordered Merkle root
+  → real PBFT QC → COMMITTED → durable READY delivery package
+  → untrusted Relayer → persistent Transaction Manager → Chain B execute(bytes)
+  → QC → Merkle → full message/domain → consume messageId → ApplicationB
+  → VERIFIED_SUPPLIER
+```
+
+The Gateway checks canonical envelope encoding and bounds first, decodes one coherent package snapshot, and calls the existing `verifyCertificate`, `verifyInclusion` and `verifyMessage` APIs. Certificate statement metadata uses the existing QC codec; the existing verifier remains responsible for all signatures and historical authority. Batch/root/source expectations come from that same snapshot. v3 resolves its signed exact validator epoch; legitimate v1/v2 retain immutable initial-authority eligibility without a new batch cutoff. Merkle membership and complete message reconstruction must authenticate the identical message ID. DestinationGateway passes its own `address(this)` as the expected target, so a valid package for another Gateway cannot execute here.
+
+After all protocol checks, the authenticated receiver must have bytecode. The Gateway consumes the message ID and invokes exactly `ICrossChainReceiver(destinationReceiver).handleCrossChainMessage(messageId,payload)` with zero value. Receiver failure propagates and rolls the entire transaction back, including replay storage and all success events. Same-message reentry fails at the consumed ID; a different independently valid message may execute during a callback. A successful callback is followed by `CrossChainMessageExecuted(messageId,sourceDomain,destinationReceiver,batchId)`. ApplicationB emits its separate `VerifiedSupplierGranted` business event in that same transaction.
+
+Relayer transport can be repeated; on-chain successful execution is exactly once per canonical message ID within the canonical Gateway deployment state. Replay and business status are separate: a different valid message granting the same supplier can fail with `AlreadyVerifiedSupplier`, leaving that new ID unconsumed. A canonical reverted Tx Manager receipt is terminal `REVERTED`; deterministic business rejection is not retried indefinitely. Destination-chain reorganization can roll back execution state; post-confirmation reconciliation is not provided here.
+
+### Submission convention and practical bounds
+
+The inner ABI remains exactly transport version 1 (`CrossChainDeliveryPackage`). Message, batch, full ordered membership, Merkle and v1/v2/v3 QC encodings are unchanged. Production calldata is one standard ABI function wrapper around those exact bytes:
+
+```text
+execute(bytes)
+  selector + offset + length + unchanged canonical transport-v1 envelope
+```
+
+The package digest still hashes only the original inner envelope. `encodeDestinationSubmission` preserves its original raw encoding; `encodeGatewaySubmission` adds the sole production wrapper. Normal new Tx Manager intents sign the wrapped bytes. Existing raw-envelope persisted intents are recognized only by exact equality against their independently re-derived original encoding, retaining their nonce, target, signed attempts, hashes and receipts. No migration or historical transaction rewrite is used. A historical transaction sent to an EOA is never reclassified as a business execution.
+
+The committed policy is `test-vectors/delivery-policy.json`, mirrored by `DeliveryPolicy.sol` with cross-language checks:
+
+| Boundary | Maximum |
+| --- | ---: |
+| Source and destination message payload | 4,096 bytes |
+| Ordered batch membership | 128 messages |
+| Merkle depth | 7 |
+| Raw inner package | 11,232 bytes |
+| Wrapped Gateway calldata | 11,300 bytes |
+
+The package bound follows the actual ABI: `320 + 64 + 224 + 4544 + 4288 + 256 + 1536 = 11232`. These terms cover the envelope head, domain, at most 192 bytes of full-width delivery-job identity, message bytes with the maximum payload, full batch membership, seven siblings, and the existing maximum 1,504-byte four-signature QC. Canonical ABI padding is included. Limits do not enter any message, batch, Merkle or QC hash. Domain, nonce, batch epoch, view and validator epoch retain uint256 semantics.
+
+128 members keep full membership calldata and the existing O(N log N) duplicate check bounded while allowing substantially larger batches than the small compatibility fixtures. The current local Chain B configuration records a 30,000,000 block gas limit. A maximum-size composed Solidity test checks that budget; its result is determined by the user's verification run. Production transactions retain real `eth_estimateGas` and existing fee/replacement semantics, without a fixed gas override. Arbitrary receiver logic can still revert or exhaust gas; no payload cap guarantees arbitrary application success.
+
+SourceGateway rejects oversized payloads before nonce allocation or event emission. The source application's transaction also rolls back its nullifier on failure. Lifecycle collection takes the first canonical unassigned messages up to remaining capacity; overflow stays eligible for the next batch and is not marked assigned. Explicit assignment fails atomically above capacity. Relayer preflight and the Gateway enforce matching bounds; on-chain checks remain authoritative. Historical sealed/committed snapshots and frozen fixtures are never rewritten.
+
+`test-vectors/destination-transport.json` freezes complete inner bytes, outer calldata, selector, target, zero value, package digest and the original signed QC for cross-language parity. It uses the existing opaque-payload compatibility fixture; no historical payload becomes a supplier command. Normal verification only reads it. Its explicit offline authoring helper uses exclusive file creation and is not called by `verify.sh`.
+
+### Real source-to-destination verification
+
+The sole root entry, `./scripts/verify.sh`, deploys the production Gateway on Chain B (`2001`) using the existing registries and verifier contracts, then deploys ApplicationB with that exact Gateway authority. The isolated mock-caller application checks remain separate regressions; no mock or replay harness is authority in the production positive flow.
+
+After preserving historical A/B/C/D/E and rotation/recovery checks, the existing validator cluster processes fresh exact-intent-authorized business messages. The real source Indexer observes each event and the Finality Watcher advances it before normal batch sealing, PBFT commitment and READY projection. Production Relayer/Tx Manager components sign, persist and broadcast the exact zero-value Gateway transaction, and canonical confirmation is followed by direct replay/business-state reads and exact event correlation. Supplier identity comes solely from the authenticated command and differs from the private subject, executor, validator, deployer and transport identities.
+
+A second distinct valid message is prepared while the supplier is still unverified, then delivered after the first grant. Its original gas estimate and signed bytes are retained; the ordinary Tx Manager observes the actual `AlreadyVerifiedSupplier` transaction as `REVERTED`, with no replay consumption. Fresh normal recovery/rerun must create no new intent, nonce or signed attempt. Controlled alternate callers replay the successful package and exercise precise failed boundaries without using the exclusive Tx Manager EOA. A separate real authenticated EOA-receiver message must fail the executable-receiver check. Temporary source-trust/time tests restore only their owned Chain B snapshot. PostgreSQL records no supplier-authority state, and no destination application indexer is introduced.
 
 ## Credentials and Zero-Knowledge Authorization
 
@@ -804,7 +860,7 @@ npm run finality
 
 ## Deterministic Message Batching
 
-The standalone `createMessageBatcher({ config, pool })` reads all currently `FINALIZED` source occurrences in the configured `chainDomain` and `sourceGateway` scope through the existing `listBatchEligibleMessages` query. Its `buildBatch({ epoch })` operation requires an explicit uint256 epoch and returns `undefined` when no finalized messages are available. This standalone builder does not filter lifecycle ownership. The persistent lifecycle described below instead seals only a particular batch's assigned occurrences. The batch epoch is independent of the identity application's policy epoch and the validator-set epoch.
+The standalone `createMessageBatcher({ config, pool })` selects at most the first 128 canonically ordered `FINALIZED` source occurrences in the configured `chainDomain` and `sourceGateway` scope through the existing `listBatchEligibleMessages` query. Its `buildBatch({ epoch })` operation requires an explicit uint256 epoch and returns `undefined` when no finalized messages are available. This standalone builder does not filter lifecycle ownership. The persistent lifecycle described below instead seals only a particular batch's assigned occurrences. The batch epoch is independent of the identity application's policy epoch and the validator-set epoch.
 
 The batch representation contains:
 
@@ -1365,7 +1421,7 @@ Configuration combines the Delivery Queue scope and public validator history wit
 
 Selection includes immutable READY jobs with absent or unfinished transaction intents, ordered by batch epoch, message index and job ID. Historical direct submissions, final intents, automatically stopped retries and leases actively held by another session are excluded before the per-worker limit. Pending intent takeover is allowed. Ordinary scans defer previously attempted intents until their durable next-action time, so they cannot fill the limit and starve new jobs; clean SIGNED candidates and unresolved broadcast journals remain immediately claimable. Relayer and Transaction Manager each strictly read and independently verify the package at their boundary, including canonical message, payload hash, ordered batch commitment, Merkle path, root, QC signatures and exact historical committee. A queue status or database row cannot replace cryptographic verification. Invalid evidence or the wrong RPC chain creates no intent, reserved nonce or signed attempt.
 
-Every destination access path must match both the configured chain ID and genesis hash before use; the chain ID must also match the canonical message domain. Submission uses the canonical `destinationGateway`, never `destinationReceiver`, with `value = 0`. Payload bytes remain opaque and unchanged. New-job Relayer passes are fail-fast after bounded provider fallback. Durable Transaction Manager retries handle transaction-level failures separately; invalid evidence and malformed hashes remain failures. A shared earlier unbroadcast or stopped nonce can defer new work without creating another intent. Worker A becoming unavailable does not require a new Ethereum account.
+Every destination access path must match both the configured chain ID and genesis hash before use; the chain ID must also match the canonical message domain. Submission uses the canonical `destinationGateway`, never `destinationReceiver`, with `value = 0` and execute(bytes) wrapping the unchanged v1 envelope. Payload bytes remain opaque and unchanged. New-job Relayer passes are fail-fast after bounded provider fallback. Durable Transaction Manager retries handle transaction-level failures separately; invalid evidence and malformed hashes remain failures. A shared earlier unbroadcast or stopped nonce can defer new work without creating another intent. Worker A becoming unavailable does not require a new Ethereum account.
 
 ### Worker identity, leases and fencing
 
@@ -1533,7 +1589,7 @@ The crash verification extends the existing process/IPC harness with explicit SQ
 
 Verification snapshots Chain B, controls automine and temporarily uses minimal reverting bytecode only to obtain a real status-0 receipt. It restores the original chain snapshot, bytecode and mining mode, and cleans up its own processes/proxies. These test fixtures implement no destination protocol and are separate from the normal durable deployment namespace. Unit/database tests also cover conflicts, corruption, exhaustion, exact identities, immutable journals, concurrent recovery and stale writeback.
 
-CONFIRMED means a successful canonical receipt was observed at configured depth, a heuristic rather than permanent finality. Provider redundancy supplies availability and basic identity/consistency checks, with no Byzantine RPC quorum or malicious-provider tolerance claim. Chain B provides remote/source gateway trust configuration, historical validator-set authority, read-only QC/Merkle/message-domain verification, a reusable internal replay guard and the Gateway-only Application B business receiver. Their complete production execution path is not wired. Final Destination Gateway enforcement, automatic Relayer-driven application execution, post-confirmation destination reorg recovery, Byzantine-relayer handling and Byzantine RPC-provider consensus remain unimplemented. Durable transaction recovery does not establish cross-chain business execution or permanent chain finality.
+CONFIRMED records a successful canonical receipt at configured depth, a heuristic rather than permanent finality. For a new zero-value execute(bytes) transaction targeting the production DestinationGateway, EVM success means its complete verification, replay consumption and receiver call committed atomically; verification also reads both Gateway and ApplicationB storage directly. Historical EOA-targeted receipts retain their narrower transport-inclusion meaning. Post-confirmation destination-reorg reconciliation and Byzantine RPC-provider consensus remain outside the implementation.
 
 ## Local Two-Chain Environment
 
@@ -1911,6 +1967,20 @@ The script uses strict error handling and performs:
 196. failed commands commit no business state or success event, and redundant grants reject independently of message replay;
 197. a second supplier remains independently grantable without granting caller/Gateway identities;
 198. separate application-boundary verification without final Gateway composition, production Relayer retargeting or new database authority.
+199. production DestinationGateway dependency wiring and ApplicationB deployment with exact immutable Gateway authority;
+200. one execute(bytes) convention, frozen complete JS/Solidity transport bytes and unchanged historical package digests/QCs;
+201. shared payload, membership, path and package bounds, maximum-size composition and overflow carryover without lost assignments;
+202. permissionless QC → Merkle → full-message/domain → replay → exact contract-receiver composition, malformed ABI and nonpayable rejection;
+203. legacy/current historical authority, valid arbitrary callers, same-message nested rejection, distinct-message nesting and receiver rollback/retry;
+204. fresh exact-intent source ZK business messages observed and finalized through production workers, with A/B/C/D/E unchanged;
+205. real bounded business batches committed through the existing rotated validator cluster and projected into READY;
+206. actual production Relayer/Tx Manager zero-value Gateway transaction, persisted signature/nonce, exact calldata, canonical receipt and matching Gateway/business events;
+207. direct Chain B replay false-to-true and supplier false-to-true reads in the same successful transaction;
+208. exact duplicate rejection from two controlled submitters while unchanged upstream evidence remains valid;
+209. a distinct authenticated pre-signed redundant business command reaches terminal REVERTED without consuming its replay ID;
+210. fresh normal recovery/rerun allocates no new intent, nonce or signed candidate and causes no duplicate business transition;
+211. specific invalid QC/path/domain/source-trust/message/receiver/envelope failures, including an authentic historical package targeting a different Gateway;
+212. a fresh authentic EOA-receiver message fails final executable-receiver policy, authentic expiry remains independent of QC/Merkle, and temporary destination policy snapshots are restored.
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
 
@@ -1928,7 +1998,7 @@ Each run replaces the previous `verification.log`. A successful run ends with:
 
 ```text
 VERIFICATION PASSED
-Gateway-Authorized Application B Business State
+Complete End-to-End Cross-Chain Execution
 ```
 
 ### Expected error output
@@ -1968,7 +2038,7 @@ Message-domain negative cases also require exact error names and arguments, incl
 
 Replay negatives require the exact custom error in preflight, a real reverted Chain B transaction and unchanged replay state. They print `EXPECTED FAILURE: Chain B replay acceptance ...`. `MessageAlreadyExecuted` is an expected duplicate rejection; `MockExecutionFailed` belongs only to the callback fixture. Invalid upstream evidence and authentic expired messages remain unconsumed. A successful callback exposes the exact nested replay-error bytes, proving that same-message reentry fails after consumption and before any second accepted execution. Unexpected reverts, RPC failures or receipt statuses fail verification.
 
-Application B negatives print `EXPECTED FAILURE: Application B ...` only after matching a specific custom error, observing a real reverted transaction and confirming unchanged business state and no grant event. `AlreadyVerifiedSupplier` identifies a redundant business transition; it does not represent Gateway replay rejection. The test caller is explicitly a mock, and its correlation IDs provide no claim of source/QC authentication or replay consumption.
+Application B negatives print `EXPECTED FAILURE: Application B ...` only after matching a specific custom error, observing a real reverted transaction and confirming unchanged business state and no grant event. `AlreadyVerifiedSupplier` identifies a redundant business transition; it does not represent Gateway replay rejection. The isolated test caller is explicitly a mock, and its correlation IDs provide no claim of source/QC authentication or replay consumption. Separate production Gateway negatives print EXPECTED FAILURE only after precise error matching, a real reverted receipt and replay/business-state checks.
 
 ## Repository Layout
 
@@ -1987,10 +2057,13 @@ Cross-Chain/
 │   │   │   ├── ISourceGateway.sol
 │   │   │   └── IValidatorSetRegistry.sol
 │   │   ├── libraries/
+│   │   │   ├── DeliveryPackageCodec.sol
+│   │   │   ├── DeliveryPolicy.sol
 │   │   │   ├── MessageBatchCodec.sol
 │   │   │   └── PBFTCertificateCodec.sol
 │   │   ├── CredentialVerifier.sol
 │   │   ├── ApplicationB.sol
+│   │   ├── DestinationGateway.sol
 │   │   ├── IdentityApplicationA.sol
 │   │   ├── MerkleInclusionVerifier.sol
 │   │   ├── MessageCodec.sol
@@ -2042,6 +2115,7 @@ Cross-Chain/
 │   ├── scripts/
 │   │   ├── generate-merkle-golden-vectors.mjs
 │   │   ├── verify-message-domain.mjs
+│   │   ├── generate-destination-transport-vector.mjs
 │   │   ├── verify-application-b.mjs
 │   │   └── verify-merkle-inclusion.mjs
 │   ├── src/
@@ -2056,6 +2130,7 @@ Cross-Chain/
 │   │   │   ├── config.mjs
 │   │   │   ├── main.mjs
 │   │   │   ├── package.mjs
+│   │   │   ├── policy.mjs
 │   │   │   ├── projector.mjs
 │   │   │   └── repository.mjs
 │   │   ├── finality-policy.mjs
@@ -2099,6 +2174,7 @@ Cross-Chain/
 │   │   ├── database.test.mjs
 │   │   ├── delivery-config.test.mjs
 │   │   ├── delivery-package.test.mjs
+│   │   ├── delivery-policy.test.mjs
 │   │   ├── delivery.database.test.mjs
 │   │   ├── finality-policy.test.mjs
 │   │   ├── finality-watcher.test.mjs
@@ -2149,6 +2225,7 @@ Cross-Chain/
 │   ├── build-canonical-message-vector.mjs
 │   ├── build-validator-set-vector.mjs
 │   ├── deploy-application-b-test-fixture.sh
+│   ├── deploy-destination-gateway.sh
 │   ├── deploy-merkle-inclusion-verifier.sh
 │   ├── deploy-message-domain-verifier.sh
 │   ├── deploy-pbft-certificate-verifier.sh
@@ -2161,6 +2238,8 @@ Cross-Chain/
 ├── test-vectors/
 │   ├── application-b-commands.json
 │   ├── canonical-messages.json
+│   ├── delivery-policy.json
+│   ├── destination-transport.json
 │   ├── merkle-golden-vectors.json
 │   ├── nullifiers.json
 │   ├── pbft-certificates.json
@@ -2216,6 +2295,7 @@ Cross-Chain/
 │   │   ├── source-validation.test.mjs
 │   │   └── helpers/
 │   │       ├── commit-fixtures.mjs
+│   │       ├── destination-execution-scenarios.mjs
 │   │       ├── fault-transport.mjs
 │   │       ├── fault-scenarios.mjs
 │   │       ├── fixtures.mjs
@@ -2283,7 +2363,7 @@ Cross-Chain/
 - PostgreSQL client errors fail the active pass. Recovery requires a fresh client or worker process connected to the same durable database; the project does not manage PostgreSQL server availability, replication, or automatic failover.
 - The runtime supports one active Indexer and one active Finality Watcher concurrently. Each watcher pass evaluates a fixed head snapshot, preserves canonical Indexer progress beyond it, and leaves newer occurrences for a later pass. Multi-instance coordination, distributed locking, active-active failover, and zero-downtime orchestration remain unimplemented.
 - The current message binds its protocol type, source domain, source gateway, source sender, destination domain, destination gateway, destination receiver, nonce, payload hash, and deadline.
-- A committed destination gateway is caller-selected. `SourceGateway` does not validate remote deployment, domain ownership, or trust. Chain B's `RemoteGatewayRegistry` supplies current administrator-configured source-domain/SourceGateway authority to `MessageDomainVerifier`; destination Gateway expectations remain independent caller policy, not the verifier's own address.
+- A committed destination gateway is caller-selected. `SourceGateway` does not validate remote deployment, domain ownership, or trust. Chain B's `RemoteGatewayRegistry` supplies current administrator-configured source-domain/SourceGateway authority to `MessageDomainVerifier`; the production Gateway supplies address(this) as the independent expected destination target.
 - The batcher consumes only the existing `FINALIZED` eligibility boundary. `REORGED` occurrences remain terminal and are excluded from every batch.
 - A deterministic batch ID binds its source scope, epoch, and ordered canonical message IDs. The Merkle Message Root and proofs additionally bind message membership to canonical batch positions through distinct leaf and internal-node hash domains.
 - Off-chain inclusion verification requires the caller's expected batch and root. A valid proof establishes membership within that commitment and supplies no consensus result, quorum certificate, Chain B authorization, or cross-chain acceptance.
@@ -2300,13 +2380,13 @@ Cross-Chain/
 - The failure model retains progress with one unavailable non-primary and an honest available primary. A single conflicting backup cannot supply a conflicting QC. A 2|2 partition preserves safety and pauses progress until explicit retries restore delivery; connectivity changes do not reset vote locks or select a new primary.
 - Primary failure or withholding triggers progress timeouts; replacement still requires three valid VIEW_CHANGE votes and an available deterministic new primary. Process availability is not commit authority. PostgreSQL never substitutes for independent source and signature verification.
 - READY jobs contain verified immutable evidence and provide no destination permission or execution guarantee. Delivery projectors coordinate per batch through database locks and uniqueness; this does not add multi-instance Indexer/Finality Watcher coordination or exactly-once destination consumption.
-- Relayer A/B delegate verified zero-value transport to the Persistent Transaction Manager. Their shared exclusive EOA is an untrusted transport account with no validator or destination permission. Exact signed bytes are durable before broadcast; bounded retry reuses them, and replacement only appends a higher-fee candidate at the same nonce. Any historical candidate may win. CONFIRMED supplies no Gateway authentication, business execution or permanent destination finality.
+- Relayer A/B delegate verified zero-value transport to the Persistent Transaction Manager. Their shared exclusive EOA is an untrusted transport account with no validator or destination permission. Exact signed bytes are durable before broadcast; bounded retry reuses them, and replacement only appends a higher-fee candidate at the same nonce. Any historical candidate may win. A successful production Gateway-targeted receipt commits atomic application execution; historical EOA transport receipts provide no business-execution claim, and neither provides permanent destination finality.
 - Destination RPC failover uses ordered, fingerprint-checked access paths. Provider URLs never identify a transaction or grant destination authority. Conservative cross-provider checks do not provide Byzantine RPC consensus.
 - Chain B QC verification requires trusted expected batch context. Legacy v1/v2 use the initial immutable authority with an explicitly expected legacy version; v3 uses its exact signed/expected validator epoch. A QC cannot choose destination eligibility for itself, and high-s compatibility cannot add quorum weight for a duplicated recovered identity.
 - Full-message verification must use the same ID authenticated by QC/Merkle composition, not an unrelated self-consistent ID. Unsupported versions and wrong current source/destination context fail independently of canonical hash consistency.
 - Source and destination require time strictly before deadline. Historical source validity, QC agreement and inclusion do not override destination expiry or rewrite source/READY evidence. Stateless domain checks can repeat without consuming IDs. The separate internal replay guard records only successful acceptance; failures roll back and consumed IDs are never cleared by expiry or policy changes.
 - Application B trusts exactly one configured Gateway address. It stores business supplier state, not credential-subject ownership or message replay. Test Gateway callers deliberately omit protocol authorization; they must not be used as production authority.
 - The repository does not provide decentralized validator governance, Byzantine-relayer handling, destination-confirmed transaction reorg recovery, an integrated Destination Gateway with full message policy/inclusion/replay enforcement and application dispatch, automatic exactly-once downstream execution, a cryptographic finality proof, multi-worker source orchestration, or a production cross-chain security model.
-- Groth16 verification remains local to `IdentityApplicationA`. Its protected messages carry exact authorized public intent fields; destination credential-proof verification and complete automatic Gateway-to-application business execution remain unimplemented.
+- Groth16 verification remains local to IdentityApplicationA. Protected source messages bind the exact public destination intent. DestinationGateway authenticates that public message through PBFT/Merkle/domain checks and executes ApplicationB; no private credential, witness or Groth16 proof crosses to Chain B.
 
 Before using real assets, permissions, or production networks, the protocol requires a production trusted setup or verifiable ceremony, issuer authentication, production credential-state publication and governance, production transaction recovery and destination reorganization handling, and a destination-chain execution security design.

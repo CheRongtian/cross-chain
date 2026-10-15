@@ -1,0 +1,11 @@
+{
+  "maxPayloadBytes": 4096,
+  "maxBatchMessages": 128,
+  "maxPackageBytes": 11232,
+  "maxDeliveryJobIdBytes": 192,
+  "maxCertificateBytes": 1504,
+  "maxMerkleDepth": 7,
+  "transportVersion": 1,
+  "gatewayFunction": "execute(bytes)",
+  "gatewayValue": "0"
+}

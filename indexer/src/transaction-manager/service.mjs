@@ -2,7 +2,7 @@ import { privateKeyToAccount } from "viem/accounts";
 import { normalizeAddress } from "../canonical-message.mjs";
 import { createDeliveryRepository } from "../delivery/repository.mjs";
 import { createRelaySubmissionRepository } from "../relayer/repository.mjs";
-import { encodeDestinationSubmission } from "../relayer/encoding.mjs";
+import { encodeGatewaySubmission } from "../relayer/encoding.mjs";
 import { safeRelayerMessage } from "../relayer/config.mjs";
 import { protocolInteger } from "../../../validator/src/committee.mjs";
 import { createTransactionRepository } from "./repository.mjs";
@@ -34,12 +34,13 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
   async function resolveIntent(id) {
     const job = await queue.getDeliveryJob(id);
     if (job.deliveryJobId !== id || job.status !== "READY") throw new TransactionError("TRANSACTION_REQUIRES_READY");
-    const encoded = await encodeDestinationSubmission(await queue.getDeliveryPackage(id),verification);
+    const encoded = await encodeGatewaySubmission(await queue.getDeliveryPackage(id),verification);
     const message = encoded.package.message;
     if (encoded.package.deliveryJobId !== id || message.destinationDomain !== config.destinationDomain.toString() ||
         job.destinationDomain !== message.destinationDomain || normalizeAddress(job.destinationGateway) !== message.destinationGateway) throw new TransactionError("DESTINATION_CONTEXT_MISMATCH");
     return Object.freeze({ deliveryJobId: id,packageDigest: encoded.packageDigest,chainId: message.destinationDomain,
-      senderAddress: normalizeAddress(config.relayerAddress),destinationGateway: message.destinationGateway,value: "0",calldata: encoded.data });
+      senderAddress: normalizeAddress(config.relayerAddress),destinationGateway: message.destinationGateway,value: "0",
+      calldata: encoded.calldata,historicalCalldata: encoded.data });
   }
   const store = repository ?? createTransactionRepository({ config,pool,resolveIntent,beforeSignedCommit,hooks,clock });
   const sign = (intent,fields) => signDeliveryTransaction(intent,fields,account);

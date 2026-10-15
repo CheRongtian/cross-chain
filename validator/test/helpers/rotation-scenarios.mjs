@@ -25,10 +25,11 @@ import { encodeCertificate, snapshotContext } from "./pbft-certificate.mjs";
 import { createMerkleInclusionChecks, snapshotInclusions, forgedPathRoot, flipMerkleHash } from "../../../indexer/test/helpers/merkle-inclusion-contract.mjs";
 import { createActualMessageDomainChecks } from "./message-domain-scenarios.mjs";
 import { createMessageReplayChecks } from "./message-replay-scenarios.mjs";
+import { verifyDestinationExecution } from "./destination-execution-scenarios.mjs";
 
 const quiet = { log() {},warn() {},error() {} };
 
-export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot,nextMessageId,pidFile,registryAddress,registryRpcUrl,certificateVerifierAddress,merkleInclusionVerifierAddress,messageDomainContext,replayContext }) {
+export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot,nextMessageId,pidFile,registryAddress,registryRpcUrl,certificateVerifierAddress,merkleInclusionVerifierAddress,messageDomainContext,replayContext,produceBusinessMessage }) {
   const original = await sourceState(sourcePool,sourceConfig.databaseSchema);
   const config = { ...sourceConfig,databaseSchema: "cross_chain_rotation_source",
     sourceGatewayStartBlock: snapshot.batch.messages.reduce((first,message) => message.sourceBlockNumber < first ? message.sourceBlockNumber : first,snapshot.batch.messages[0].sourceBlockNumber) };
@@ -300,6 +301,11 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     console.log("VALID: five independent validator identities/PIDs/endpoints/stores resolved the same immutable history; each epoch retained exactly four active members");
     console.log("VALID: validator epoch 8 used V2/V3/V4/V5, rejected online V1, and required V5 in its rotated view-change quorum and final QC");
     console.log("VALID: historical epoch 7 QC remained valid after rotation and V1 shutdown; old and new votes never mixed and both committed batches retained their immutable roots");
+    // All old-history equality assertions above remain intact. New business history is additive.
+    await verifyDestinationExecution({ config, pool, lifecycle, validatorSets, peers, states, environments,
+      validators, processes, request, until, produceMessage: produceBusinessMessage,
+      historical: [oldCommitted, newCommitted], rpcUrl: registryRpcUrl, registryChecks,
+      certificateChecks, merkleChecks, domainVerifierAddress: messageDomainContext.verifierAddress });
   } catch (error) {
     failed = true;
     console.error(`ROTATION FAILED before cleanup: ${error.message}`);

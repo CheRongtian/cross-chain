@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
+import { privateKeyToAccount } from "viem/accounts";
 import { createDatabasePool, applyMigrations, resetIndexerTables, tableName } from "../src/db.mjs";
 import { createDeliveryRepository } from "../src/delivery/repository.mjs";
 import { encodeDestinationSubmission } from "../src/relayer/encoding.mjs";
@@ -7,6 +8,7 @@ import { createRelaySubmissionRepository } from "../src/relayer/repository.mjs";
 import { createRelayerWorker } from "../src/relayer/service.mjs";
 import { createTransactionManager } from "../src/transaction-manager/service.mjs";
 import { createTransactionRepository } from "../src/transaction-manager/repository.mjs";
+import { signDeliveryTransaction } from "../src/transaction-manager/transaction.mjs";
 import { transactionConfig, transactionHarness, transientSendError } from "./helpers/transaction-fixtures.mjs";
 import { persistReadyTransactionFixture } from "./helpers/transaction-database-fixtures.mjs";
 import { fixtureHash } from "./helpers/delivery-fixtures.mjs";
@@ -42,6 +44,29 @@ function managerFor(databasePool = pool, overrides = {}) {
   } };
   return createTransactionManager({ config, pool: databasePool, queue: reader, rpc, ...overrides });
 }
+
+test("fresh Gateway intents wrap v1 while a historical raw signed intent is recovered byte-for-byte", async () => {
+  const manager = managerFor();
+  const id = jobs[0].deliveryJobId;
+  const expected = await manager.resolveIntent(id);
+  const raw = expected.historicalCalldata;
+  assert.notEqual(expected.calldata, raw);
+  const originalIntent = { ...expected, calldata: raw };
+  delete originalIntent.historicalCalldata;
+  const old = createTransactionRepository({ config, pool, resolveIntent: async () => originalIntent });
+  const historical = await old.persistPrepared({ intent: originalIntent, pendingNonce: 9n, gasLimit: 500000n,
+    maxFeePerGas: 3000000000n, maxPriorityFeePerGas: 1000000000n,
+    sign: (intent, fields) => signDeliveryTransaction(intent, fields, privateKeyToAccount(config.privateKey)) });
+  const fresh = createDatabasePool(config);
+  try {
+    const recovered = await managerFor(fresh).prepareDeliveryTransaction(id);
+    assert.equal(recovered.created, false);
+    assert.deepEqual(recovered.intent, historical.intent);
+    assert.deepEqual(recovered.attempts, historical.attempts);
+    assert.equal(recovered.intent.calldata, raw);
+    assert.deepEqual(await counts(), { accounts: 1, intents: 1, attempts: 1 });
+  } finally { await fresh.end(); }
+});
 async function counts() {
   return (await pool.query(`SELECT (SELECT COUNT(*) FROM ${accounts})::int AS accounts,
     (SELECT COUNT(*) FROM ${intents})::int AS intents,(SELECT COUNT(*) FROM ${attempts})::int AS attempts`)).rows[0];

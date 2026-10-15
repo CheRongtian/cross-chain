@@ -24,7 +24,10 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
   function intentRecord(row,expected) {
     const actual = { deliveryJobId: row.delivery_job_id,packageDigest: row.package_digest,chainId: row.chain_id,
       senderAddress: row.sender_address,destinationGateway: row.destination_gateway,value: row.value,calldata: row.calldata };
-    if (Object.keys(actual).some(key => actual[key] !== expected[key])) throw new TransactionError("CONFLICTING_TRANSACTION_INTENT");
+    // Existing raw-envelope transactions predate production Gateway execution. Re-derive their exact
+    // original bytes from verified evidence; never rewrite an intent, signature, hash or receipt.
+    if (Object.keys(actual).some(key => actual[key] !== expected[key] &&
+        !(key === "calldata" && actual[key] === expected.historicalCalldata))) throw new TransactionError("CONFLICTING_TRANSACTION_INTENT");
     const nonce = protocolInteger(row.nonce,"intent nonce").toString();
     const status = row.status;
     if (!["PENDING","CONFIRMED","REVERTED"].includes(status) ||

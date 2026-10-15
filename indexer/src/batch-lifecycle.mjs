@@ -1,4 +1,5 @@
 import { normalizeBytes32 } from "./canonical-message.mjs";
+import { DELIVERY_POLICY } from "./delivery/policy.mjs";
 import { createFinalityStore, normalizeSourceScope, tableName } from "./db.mjs";
 import {
   buildMessageBatch,
@@ -262,6 +263,7 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
     }
     const eligible = await createFinalityStore(client, config.databaseSchema).listBatchEligibleMessages(scope);
     const eligibleById = new Map(eligible.map((message) => [message.id, message]));
+    let memberCount = (await readMembership(client, row)).length;
     let assignedCount = 0;
     for (const value of sourceMessageIds) {
       const id = databaseId(value, "source message ID");
@@ -283,11 +285,14 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
         }
         continue;
       }
+      if (memberCount >= DELIVERY_POLICY.maxBatchMessages) throw new Error("BATCH_MEMBERSHIP_LIMIT_EXCEEDED");
+      if ((message.payload.length - 2) / 2 > DELIVERY_POLICY.maxPayloadBytes) throw new Error("MESSAGE_PAYLOAD_LIMIT_EXCEEDED");
       await client.query(
         `INSERT INTO ${members} (batch_record_id, source_message_id, message_id) VALUES ($1, $2, $3)`,
         [row.batch_record_id, id, message.messageId],
       );
       assignedCount += 1;
+      memberCount += 1;
     }
     return assignedCount;
   }
@@ -367,7 +372,8 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
           scopeParameters,
         );
         const claimedIds = new Set(claimed.rows.map((member) => member.source_message_id));
-        const available = eligible.filter((source) => !claimedIds.has(source.id)).map((source) => source.id);
+        const capacity = DELIVERY_POLICY.maxBatchMessages - (await readMembership(client, row)).length;
+        const available = eligible.filter((source) => !claimedIds.has(source.id)).slice(0, Math.max(0, capacity)).map((source) => source.id);
         const assignedCount = await assign(client, row, available);
         return { snapshot: await snapshot(client, row), assignedCount };
       });
