@@ -41,7 +41,8 @@ export function createRelayerLeaseRepository({ config,pool,queue }) {
   const events = tableName(config.databaseSchema,"transaction_broadcast_events");
   const submissions = tableName(config.databaseSchema,"relayer_submissions");
   const scope = normalizeSourceScope(config);
-  const eligible = `b.source_domain = $1 AND b.source_gateway = $2 AND j.status = 'READY'
+  const destinationDomain = config.destinationDomain.toString();
+  const eligible = `b.source_domain = $1 AND b.source_gateway = $2 AND j.destination_domain = $3 AND j.status = 'READY'
     AND NOT EXISTS (SELECT 1 FROM ${submissions} s WHERE s.delivery_job_id = j.delivery_job_id)
     AND NOT EXISTS (SELECT 1 FROM ${intents} i WHERE i.delivery_job_id = j.delivery_job_id
       AND (i.status <> 'PENDING' OR i.retry_stopped_at IS NOT NULL))`;
@@ -75,7 +76,7 @@ export function createRelayerLeaseRepository({ config,pool,queue }) {
       const rows = (await pool.query(`SELECT j.delivery_job_id FROM ${jobs} j JOIN ${batches} b USING (batch_record_id)
         LEFT JOIN ${leases} l ON l.delivery_job_id = j.delivery_job_id
         WHERE ${eligible} AND (l.delivery_job_id IS NULL OR l.lease_expires_at <= clock_timestamp()
-          OR (l.owner_id = $3 AND l.owner_session_id = $4))
+          OR (l.owner_id = $4 AND l.owner_session_id = $5))
         AND (NOT EXISTS (SELECT 1 FROM ${intents} i WHERE i.delivery_job_id = j.delivery_job_id)
           OR EXISTS (SELECT 1 FROM ${intents} i WHERE i.delivery_job_id = j.delivery_job_id AND
             (i.next_action_at <= clock_timestamp() OR EXISTS (SELECT 1 FROM ${attempts} a
@@ -83,15 +84,15 @@ export function createRelayerLeaseRepository({ config,pool,queue }) {
                 AND a.attempt_number = (SELECT MAX(attempt_number) FROM ${attempts} WHERE delivery_job_id = i.delivery_job_id))
               OR EXISTS (SELECT 1 FROM ${events} e JOIN ${attempts} a USING (attempt_id)
                 WHERE a.delivery_job_id = i.delivery_job_id AND e.completed_at IS NULL))))
-        ORDER BY b.batch_epoch,j.message_index,j.delivery_job_id LIMIT $5`,
-        [scope.chainDomain,scope.sourceGateway,session.workerId,session.sessionId,limit])).rows;
+        ORDER BY b.batch_epoch,j.message_index,j.delivery_job_id LIMIT $6`,
+        [scope.chainDomain,scope.sourceGateway,destinationDomain,session.workerId,session.sessionId,limit])).rows;
       return Object.freeze(await Promise.all(rows.map(row => queue.getDeliveryJob(row.delivery_job_id))));
     },
     async tryAcquireLease(id,session) {
       session.assertHeld(); normalizeWorkerId(session.workerId);
       return deliveryTransaction(pool,async client => {
         if (!(await client.query(`SELECT j.delivery_job_id FROM ${jobs} j JOIN ${batches} b USING (batch_record_id)
-          WHERE ${eligible} AND j.delivery_job_id = $3`,[scope.chainDomain,scope.sourceGateway,id])).rowCount) return null;
+          WHERE ${eligible} AND j.delivery_job_id = $4`,[scope.chainDomain,scope.sourceGateway,destinationDomain,id])).rowCount) return null;
         const inserted = await client.query(`INSERT INTO ${leases}
           (delivery_job_id,owner_id,owner_session_id,fencing_token,lease_acquired_at,lease_expires_at,last_renewed_at)
           SELECT $1,$2,$3,1,t,t + $4::bigint * interval '1 millisecond',t FROM (SELECT clock_timestamp() AS t) n

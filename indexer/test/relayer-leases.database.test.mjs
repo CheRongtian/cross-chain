@@ -48,6 +48,101 @@ async function counts() {
     (SELECT COUNT(*) FROM ${attemptTable})::int AS attempts`)).rows[0];
 }
 
+async function useMultiDestinationFixture() {
+  await resetIndexerTables(pool,config.databaseSchema);
+  await persistReadyTransactionFixture({ config,pool,multiDestination: true });
+  jobs = await queue.listReadyDeliveryJobs();
+}
+
+test("SQL filters a foreign-first prefix before LIMIT=1 and refuses foreign lease acquisition", async () => {
+  await useMultiDestinationFixture();
+  assert.deepEqual(jobs.map(job => job.destinationDomain),["2001","3001","2001"]);
+  const scoped = { ...configB,destinationDomain: 3001n,maxJobs: 1 };
+  const repository = createRelayerLeaseRepository({ config: scoped,pool: poolB,queue: queueB });
+  const sourceBefore = await sourceState(pool,config.databaseSchema);
+  await repository.withWorker(async session => {
+    assert.deepEqual(await repository.listClaimableJobs({ session,limit: 1 }),[jobs[1]]);
+    for (const job of [jobs[0],jobs[2]]) {
+      assert.equal(await repository.tryAcquireLease(job.deliveryJobId,session),null);
+      assert.equal(await repository.getLease(job.deliveryJobId),null);
+    }
+    const acquired = await repository.tryAcquireLease(jobs[1].deliveryJobId,session);
+    assert.equal(acquired.ownerId,session.workerId); assert.equal(acquired.ownerSessionId,session.sessionId);
+    assert.equal(acquired.fencingToken,"1");
+    assert.ok(Date.parse(acquired.leaseExpiresAt) > Date.parse(acquired.leaseAcquiredAt));
+  });
+  assert.deepEqual(await counts(),{ intents: 0,attempts: 0 });
+  assert.equal(await reader.repository.getAccount(),null);
+  assert.deepEqual(await queue.listReadyDeliveryJobs(),jobs);
+  assert.deepEqual(await sourceState(pool,config.databaseSchema),sourceBefore);
+});
+
+test("SQL all-foreign selection preserves existing foreign lease owner, expiry, fence and READY data", async () => {
+  const before = await leases.withWorker(session => leases.tryAcquireLease(jobs[0].deliveryJobId,session));
+  const sourceBefore = await sourceState(pool,config.databaseSchema);
+  const scoped = { ...configB,destinationDomain: 4001n,maxJobs: 1 };
+  const repository = createRelayerLeaseRepository({ config: scoped,pool: poolB,queue: queueB });
+  const rpc = destinationRpcFixture({ config: scoped });
+  const transactionManager = manager({ cfg: scoped,db: poolB,rpc: rpc.rpc });
+  const worker = createRelayerWorker({ config: scoped,pool: poolB,queue: queueB,leases: repository,transactionManager });
+  const result = await worker.runOnce();
+  assert.equal(result.selected,0); assert.equal(result.submitted,0); assert.equal(result.skipped,0);
+  assert.deepEqual(result.results,[]);
+  await repository.withWorker(async session => {
+    assert.deepEqual(await repository.listClaimableJobs({ session,limit: 100 }),[]);
+    for (const job of jobs) assert.equal(await repository.tryAcquireLease(job.deliveryJobId,session),null);
+  });
+  assert.deepEqual(await leases.getLease(jobs[0].deliveryJobId),before);
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM ${leaseTable}`)).rows[0].count,1);
+  assert.deepEqual(await counts(),{ intents: 0,attempts: 0 });
+  assert.equal(await transactionManager.repository.getAccount(),null);
+  assert.equal(rpc.nodes.flatMap(node => node.broadcasts).length,0);
+  assert.equal(rpc.nodes.flatMap(node => node.calls).some(call => ["eth_estimateGas","eth_getTransactionCount"].includes(call.method)),false);
+  assert.deepEqual(await queue.listReadyDeliveryJobs(),jobs);
+  assert.deepEqual(await sourceState(pool,config.databaseSchema),sourceBefore);
+});
+
+test("SQL mixed destinations preserve local order and submit only local jobs at a larger limit", async () => {
+  await useMultiDestinationFixture();
+  const local = [jobs[0],jobs[2]];
+  const sourceBefore = await sourceState(pool,config.databaseSchema);
+  await leases.withWorker(async session => {
+    assert.deepEqual(await leases.listClaimableJobs({ session,limit: 100 }),local);
+  });
+  const worker = createRelayerWorker({ config,pool,queue,leases,transactionManager: reader });
+  const result = await worker.runOnce();
+  assert.equal(result.selected,2); assert.equal(result.submitted,2);
+  assert.deepEqual(result.results.map(record => record.intent.deliveryJobId),local.map(job => job.deliveryJobId));
+  assert.equal(await leases.getLease(jobs[1].deliveryJobId),null);
+  assert.deepEqual(await counts(),{ intents: 2,attempts: 2 });
+  assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,2);
+  assert.deepEqual(await queue.listReadyDeliveryJobs(),jobs);
+  assert.deepEqual(await sourceState(pool,config.databaseSchema),sourceBefore);
+});
+
+test("explicit foreign submission fails specifically before lease, intent, nonce, signing and RPC", async () => {
+  await useMultiDestinationFixture();
+  const sourceBefore = await sourceState(pool,config.databaseSchema);
+  let preparations = 0; let signatures = 0;
+  const account = { ...h.options.account,async signTransaction(...args) {
+    signatures++; return h.options.account.signTransaction(...args);
+  } };
+  const active = manager({ account });
+  const transactionManager = { ...active,async prepareDeliveryTransaction(...args) {
+    preparations++; return active.prepareDeliveryTransaction(...args);
+  } };
+  const worker = createRelayerWorker({ config,pool,queue,leases,transactionManager });
+  await assert.rejects(worker.submitJob(jobs[1].deliveryJobId),{ code: "DESTINATION_CONTEXT_MISMATCH" });
+  assert.equal(preparations,0); assert.equal(signatures,0);
+  assert.equal(await leases.getLease(jobs[1].deliveryJobId),null);
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM ${leaseTable}`)).rows[0].count,0);
+  assert.deepEqual(await counts(),{ intents: 0,attempts: 0 });
+  assert.equal(await active.repository.getAccount(),null);
+  assert.deepEqual(destination.nodes.flatMap(node => node.calls),[]);
+  assert.deepEqual(await queue.listReadyDeliveryJobs(),jobs);
+  assert.deepEqual(await sourceState(pool,config.databaseSchema),sourceBefore);
+});
+
 test("migration reruns preserve lease history; independent clients contend for one owner", async () => {
   const id = jobs[0].deliveryJobId;
   await leases.withWorker(async a => leasesB.withWorker(async b => {

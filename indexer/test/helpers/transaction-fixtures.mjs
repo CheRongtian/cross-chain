@@ -17,8 +17,8 @@ export const cloneTransactionValue = value => JSON.parse(deliveryJson(value));
 export function transactionConfig(overrides = {}) { return loadTransactionConfig(relayerEnvironment(overrides)); }
 export const transientSendError = (message = "injected send failure") => Object.assign(new Error(message),{ code: "ECONNREFUSED" });
 
-export async function transactionHarness({ config = transactionConfig(),mutate,beforeCommit,account,hooks = {} } = {}) {
-  const packets = cloneTransactionValue(await buildDeliveryPackages(await deliveryFixture(),{ validatorSets: config.validatorSets }));
+export async function transactionHarness({ config = transactionConfig(),multiDestination = false,mutate,beforeCommit,account,hooks = {} } = {}) {
+  const packets = cloneTransactionValue(await buildDeliveryPackages(await deliveryFixture({ multiDestination }),{ validatorSets: config.validatorSets }));
   const original = cloneTransactionValue(packets);
   if (mutate) mutate(packets[0]);
   const jobs = packets.map(pack => ({ deliveryJobId: pack.deliveryJobId,status: "READY",

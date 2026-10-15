@@ -4,16 +4,101 @@ import { normalizeWorkerId, normalizeLeaseDuration } from "../src/relayer/config
 import { normalizeLeaseFence } from "../src/relayer/leases.mjs";
 import { createRelayerWorker } from "../src/relayer/service.mjs";
 import { createTransactionManager } from "../src/transaction-manager/service.mjs";
-import { transactionHarness,transientSendError } from "./helpers/transaction-fixtures.mjs";
+import { transactionConfig,transactionHarness,transientSendError } from "./helpers/transaction-fixtures.mjs";
 import { memoryLeaseFixture } from "./helpers/lease-fixtures.mjs";
 
-async function fixture() {
-  const h = await transactionHarness(); const leases = memoryLeaseFixture(h);
+async function fixture(options = {}) {
+  const h = await transactionHarness(options); const leases = memoryLeaseFixture(h);
   const a = leases.repository(); const bConfig = { ...h.config,workerId: "relayer-b" }; const b = leases.repository(bConfig);
   const managerB = createTransactionManager({ ...h.options,config: bConfig });
   const worker = (config,repository,manager,options = {}) => createRelayerWorker({ config,queue: h.queue,leases: repository,transactionManager: manager,...options });
   return { ...h,leases,a,b,bConfig,managerB,worker,id: h.jobs[0].deliveryJobId };
 }
+
+test("foreign-first READY jobs cannot fill limit=1 ahead of the configured destination", async () => {
+  const h = await fixture({ multiDestination: true,
+    config: transactionConfig({ CHAIN_B_CHAIN_ID: "3001",RELAYER_MAX_JOBS_PER_RUN: "1" }) });
+  assert.deepEqual(h.jobs.map(job => job.destinationDomain),["2001","3001","2001"]);
+  const local = h.jobs[1]; const foreign = [h.jobs[0],h.jobs[2]];
+  await h.a.withWorker(async session => {
+    const selected = await h.a.listClaimableJobs({ session,limit: 1 });
+    assert.deepEqual(selected,[local]);
+    for (const job of foreign) {
+      assert.equal(await h.a.tryAcquireLease(job.deliveryJobId,session),null);
+      assert.equal(await h.a.getLease(job.deliveryJobId),null);
+    }
+    const acquired = await h.a.tryAcquireLease(local.deliveryJobId,session);
+    assert.equal(acquired.ownerId,session.workerId); assert.equal(acquired.ownerSessionId,session.sessionId);
+    assert.equal(acquired.fencingToken,"1");
+    assert.ok(Date.parse(acquired.leaseExpiresAt) > Date.parse(acquired.leaseAcquiredAt));
+    await h.a.releaseLease(acquired);
+  });
+  const result = await h.worker(h.config,h.a,h.manager).runOnce();
+  assert.equal(result.selected,1); assert.equal(result.submitted,1);
+  assert.deepEqual(result.results.map(record => record.intent.deliveryJobId),[local.deliveryJobId]);
+  assert.deepEqual([...h.records.keys()],[local.deliveryJobId]);
+  assert.equal(h.calls.sign,1); assert.equal(h.calls.broadcast.length,1);
+  for (const job of foreign) assert.equal(await h.a.getLease(job.deliveryJobId),null);
+  assert.deepEqual(h.packets,h.original);
+});
+
+test("all-foreign automatic work preserves READY jobs, existing leases and transaction state", async () => {
+  const h = await fixture({ multiDestination: true,config: transactionConfig({ CHAIN_B_CHAIN_ID: "4001" }) });
+  const owner = h.leases.repository({ ...h.config,destinationDomain: 2001n,workerId: "other-domain" });
+  const before = await owner.withWorker(session => owner.tryAcquireLease(h.id,session));
+  const jobsBefore = h.jobs.map(job => ({ ...job }));
+  const result = await h.worker(h.config,h.a,h.manager).runOnce();
+  assert.equal(result.selected,0); assert.equal(result.submitted,0); assert.equal(result.skipped,0);
+  assert.deepEqual(result.results,[]);
+  await h.a.withWorker(async session => {
+    assert.deepEqual(await h.a.listClaimableJobs({ session,limit: 1 }),[]);
+    for (const job of h.jobs) assert.equal(await h.a.tryAcquireLease(job.deliveryJobId,session),null);
+  });
+  assert.deepEqual(await h.a.getLease(h.id),before); assert.equal(h.leases.rows.size,1);
+  assert.deepEqual(h.jobs,jobsBefore); assert.deepEqual(h.packets,h.original);
+  assert.equal(h.records.size,0); assert.equal(await h.repository.getAccount(),null);
+  assert.equal(h.calls.gas,0); assert.equal(h.calls.fees,0); assert.equal(h.calls.pending,0);
+  assert.equal(h.calls.sign,0); assert.equal(h.calls.broadcast.length,0);
+});
+
+test("mixed destinations retain local canonical order with a larger selection limit", async () => {
+  const h = await fixture({ multiDestination: true });
+  const localIds = [h.jobs[0].deliveryJobId,h.jobs[2].deliveryJobId];
+  await h.a.withWorker(async session => {
+    const selected = await h.a.listClaimableJobs({ session,limit: 100 });
+    assert.deepEqual(selected.map(job => job.deliveryJobId),localIds);
+  });
+  const result = await h.worker(h.config,h.a,h.manager).runOnce();
+  assert.equal(result.selected,2); assert.equal(result.submitted,2);
+  assert.deepEqual(result.results.map(record => record.intent.deliveryJobId),localIds);
+  assert.equal(h.records.size,2); assert.equal(h.calls.sign,2); assert.equal(h.calls.broadcast.length,2);
+  assert.equal(await h.a.getLease(h.jobs[1].deliveryJobId),null);
+  assert.deepEqual(h.packets,h.original);
+});
+
+test("explicit foreign submissions reject precisely without acquiring or changing another domain's lease", async () => {
+  const h = await fixture({ multiDestination: true }); const id = h.jobs[1].deliveryJobId;
+  await h.a.withWorker(async session => assert.equal(await h.a.tryAcquireLease(id,session),null));
+  assert.equal(await h.a.getLease(id),null);
+  const owner = h.leases.repository({ ...h.config,destinationDomain: 3001n,workerId: "other-domain" });
+  const before = await owner.withWorker(session => owner.tryAcquireLease(id,session));
+  await assert.rejects(h.worker(h.config,h.a,h.manager).submitJob(id),{ code: "DESTINATION_CONTEXT_MISMATCH" });
+  assert.deepEqual(await h.a.getLease(id),before); assert.equal(h.leases.rows.size,1);
+  assert.equal(h.records.size,0); assert.equal(await h.repository.getAccount(),null);
+  assert.equal(h.calls.gas,0); assert.equal(h.calls.fees,0); assert.equal(h.calls.pending,0);
+  assert.equal(h.calls.sign,0); assert.equal(h.calls.broadcast.length,0);
+  assert.deepEqual(h.packets,h.original);
+});
+
+test("local job metadata cannot bypass independent portable-package destination validation", async () => {
+  const h = await fixture({ multiDestination: true }); const job = h.jobs[1];
+  job.destinationDomain = h.config.destinationDomain.toString();
+  await assert.rejects(h.worker(h.config,h.a,h.manager).submitJob(job.deliveryJobId),{ code: "DESTINATION_CONTEXT_MISMATCH" });
+  assert.notEqual((await h.a.getLease(job.deliveryJobId)).releasedAt,null);
+  assert.equal(h.records.size,0); assert.equal(await h.repository.getAccount(),null);
+  assert.equal(h.calls.sign,0); assert.equal(h.calls.broadcast.length,0);
+  assert.deepEqual(h.packets,h.original);
+});
 
 test("fenced recovery sends retain the injected RPC failure diagnostic through the worker boundary", async () => {
   const h = await fixture();

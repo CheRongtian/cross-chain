@@ -27,7 +27,7 @@ export function memoryLeaseFixture(h) {
           const intent = h.records.get(job.deliveryJobId)?.intent;
           const attempt = h.records.get(job.deliveryJobId)?.attempt;
           const row = rows.get(job.deliveryJobId);
-          return !h.historical.has(job.deliveryJobId) && (!intent || (intent.status === "PENDING" && intent.retryStoppedAt === null &&
+          return job.destinationDomain === config.destinationDomain.toString() && !h.historical.has(job.deliveryJobId) && (!intent || (intent.status === "PENDING" && intent.retryStoppedAt === null &&
             (Date.parse(intent.nextActionAt) <= h.clock.now() || (attempt.status === "SIGNED" && attempt.broadcastAttemptCount === "0") ||
               h.journal.some(event => event.completedAt === null && h.records.get(job.deliveryJobId).attempts.some(a => a.attemptId === event.attemptId))))) &&
             (!row || Date.parse(row.leaseExpiresAt) <= h.clock.now() || (row.ownerId === session.workerId && row.ownerSessionId === session.sessionId));
@@ -35,7 +35,8 @@ export function memoryLeaseFixture(h) {
       },
       async tryAcquireLease(id,session) {
         const intent = h.records.get(id)?.intent;
-        if (!h.jobs.some(job => job.deliveryJobId === id) || h.historical.has(id) || (intent && (intent.status !== "PENDING" || intent.retryStoppedAt !== null))) return null;
+        if (!h.jobs.some(job => job.deliveryJobId === id && job.destinationDomain === config.destinationDomain.toString()) ||
+            h.historical.has(id) || (intent && (intent.status !== "PENDING" || intent.retryStoppedAt !== null))) return null;
         const old = rows.get(id);
         if (old && Date.parse(old.leaseExpiresAt) > h.clock.now()) return old.ownerId === session.workerId && old.ownerSessionId === session.sessionId ? snapshot(old) : null;
         if (old && BigInt(old.fencingToken) === MAX_FENCING_TOKEN) throw new RelayerError("FENCING_TOKEN_EXHAUSTED");

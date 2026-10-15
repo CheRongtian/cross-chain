@@ -69,7 +69,13 @@ export function createRelayerWorker({ config,pool,queue,transactionManager,
   }
   return {
     async submitJob(deliveryJobId) {
-      return protectedOperation(() => leases.withWorker(session => processJob(deliveryJobId,session)));
+      return protectedOperation(() => leases.withWorker(async session => {
+        session.assertHeld();
+        const job = await queue.getDeliveryJob(deliveryJobId);
+        // A wrong-domain explicit request is an error, not a busy lease or silent no-work result.
+        if (job.destinationDomain !== config.destinationDomain.toString()) throw new RelayerError("DESTINATION_CONTEXT_MISMATCH");
+        return processJob(deliveryJobId,session);
+      }));
     },
     async runOnce() {
       return protectedOperation(() => leases.withWorker(async session => {

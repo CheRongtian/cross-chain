@@ -3,11 +3,11 @@ import { createCanonicalStore, createDatabaseStore, createFinalityStore } from "
 import { createDeliveryProjector } from "../../src/delivery/projector.mjs";
 import { deliveryFixture, fixtureHash } from "./delivery-fixtures.mjs";
 
-export async function persistReadyTransactionFixture({ config, pool }) {
+export async function persistReadyTransactionFixture({ config, pool, multiDestination = false }) {
   await createDatabaseStore(pool, config.databaseSchema).loadOrInitializeCursor(config, 10n);
   await createCanonicalStore(pool, config.databaseSchema).bootstrapCanonicalHistory(config, {
     expectedNextBlock: 10n, blocks: [{ number: 9n, hash: fixtureHash(10), parentHash: fixtureHash(9) }] });
-  const fixture = await deliveryFixture();
+  const fixture = await deliveryFixture({ multiDestination });
   await createDatabaseStore(pool, config.databaseSchema).persistRange(config, { fromBlock: 10n, toBlock: 10n,
     blocks: [{ number: 10n, hash: fixtureHash(11), parentHash: fixtureHash(10) }],
     rows: fixture.batch.messages.map(message => ({ ...message, payload: Buffer.from(message.payload.slice(2), "hex") })) });

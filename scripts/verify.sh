@@ -652,7 +652,7 @@ printf '159. Send the exact pending replacement through secondary without anothe
 printf '160. Restore primary preference when its access path recovers\n'
 printf '161. Preserve signed history while all destination endpoints are unavailable\n'
 printf '162. Start independent Relayer A/B processes with distinct worker IDs and a shared signer\n'
-printf '163. Atomically claim one job lease and exact monotonic fencing token using database time\n'
+printf '163. Filter READY jobs by source and destination before LIMIT; acquire scoped leases and exact monotonic fencing tokens using database time\n'
 printf '164. Verify renewal, release, expiry, restart and duplicate-worker rejection\n'
 printf '165. Reject stale ownership and intent mutations within their database transaction\n'
 printf '166. Race two OS processes for one job and retain exactly one current owner\n'
@@ -815,7 +815,7 @@ CURRENT_STEP="frozen PBFT certificate reference drift check"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node "$VALIDATOR_DIR/scripts/generate-pbft-certificate-vectors.mjs" --check
 
-CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, recovery, RPC error classification, batch, Merkle, golden compatibility, lifecycle and portable delivery package unit tests"
+CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, recovery, RPC error classification, batch, Merkle, golden compatibility, lifecycle, portable delivery package and destination-scoped lease unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$INDEXER_DIR/test/forward-authorization.test.mjs" \
@@ -843,7 +843,7 @@ node --test \
     "$INDEXER_DIR/test/relayer-leases.test.mjs" \
     "$INDEXER_DIR/test/transaction-recovery.test.mjs"
 
-CURRENT_STEP="Chain A Indexer database, current migration sequence/reruns, fixed-snapshot concurrency, conditional reorg recovery, RPC retry/restart and response-class upgrade, batch eligibility, Merkle, lifecycle, epoch rollover, consensus binding and atomic delivery queue tests"
+CURRENT_STEP="Chain A Indexer database, current migration sequence/reruns, fixed-snapshot concurrency, conditional reorg recovery, RPC retry/restart and response-class upgrade, batch eligibility, Merkle, lifecycle, epoch rollover, consensus binding, atomic delivery queue and destination-scoped lease tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
