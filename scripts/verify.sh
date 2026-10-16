@@ -54,7 +54,9 @@ INDEXER_DB_SCHEMA="${INDEXER_DB_SCHEMA:-cross_chain_indexer_verification}"
 INDEXER_DATABASE_TEST_SCHEMA="cross_chain_indexer_database_verification"
 INDEXER_BLOCK_RANGE="${INDEXER_BLOCK_RANGE:-2}"
 INDEXER_POLL_INTERVAL_MS="${INDEXER_POLL_INTERVAL_MS:-100}"
-FINALITY_BLOCK_DEPTH="${FINALITY_BLOCK_DEPTH:-2}"
+readonly FULL_VERIFICATION_FINALITY_BLOCK_DEPTH="2"
+# Default only when unset; a supplied empty value must fail profile validation.
+FINALITY_BLOCK_DEPTH="${FINALITY_BLOCK_DEPTH-$FULL_VERIFICATION_FINALITY_BLOCK_DEPTH}"
 FINALITY_POLL_INTERVAL_MS="${FINALITY_POLL_INTERVAL_MS:-100}"
 DESTINATION_CONFIRMATIONS="${DESTINATION_CONFIRMATIONS:-3}"
 RPC_REQUEST_TIMEOUT_MS="${RPC_REQUEST_TIMEOUT_MS:-10000}"
@@ -553,6 +555,8 @@ printf 'Verification time: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
 printf 'Project root: %s\n' "$PROJECT_ROOT"
 printf 'Contracts directory: %s\n' "$CONTRACTS_DIR"
 printf 'Log file: %s\n' "$LOG_FILE"
+printf 'Full verification finality profile: successor depth = %s\n' "$FULL_VERIFICATION_FINALITY_BLOCK_DEPTH"
+printf 'Effective FINALITY_BLOCK_DEPTH: %q\n' "$FINALITY_BLOCK_DEPTH"
 
 if [[ -e "$PROJECT_ROOT/.git" ]]; then
     printf '\nGit information:\n'
@@ -878,6 +882,15 @@ printf '286. Rotate recovery independently without changing send order, allocati
 printf '287. Observe a later canonical receipt behind incomplete earlier evidence with limit 1\n'
 printf '288. Preserve progress across fresh processes, selection crashes, wrap, terminal removal and concurrent clients\n'
 printf '289. Schedule unchanged NO_REPLACEMENT work into the future without signing, sending or nonce allocation\n'
+
+CURRENT_STEP="full verification finality profile validation"
+printf '\n[%s]\n' "$CURRENT_STEP"
+# Keep this fixed profile in sync with the deterministic integration fixture.
+# Production configuration retains its independent exact uint256 validation.
+if [[ "$FINALITY_BLOCK_DEPTH" != "$FULL_VERIFICATION_FINALITY_BLOCK_DEPTH" ]]; then
+    fail "Unsupported full-verification configuration: FINALITY_BLOCK_DEPTH must be exactly '$FULL_VERIFICATION_FINALITY_BLOCK_DEPTH' (configured value shown in the header). Other valid depths remain supported by production runtime; this deterministic integration fixture does not support them. No database, RPC, proof, build, test or deployment work has started."
+fi
+printf 'Verified full repository verification profile: FINALITY_BLOCK_DEPTH=%s\n' "$FINALITY_BLOCK_DEPTH"
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"

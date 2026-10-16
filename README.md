@@ -763,6 +763,8 @@ headBlock >= sourceBlock + FINALITY_BLOCK_DEPTH
 
 The depth counts successor blocks. At depth `2`, a source message in block `N` becomes final at head `N + 2`. Equality is sufficient. A depth of `0` immediately finalizes a message when its source block is at or below the watcher head and provides no confirmation-depth protection.
 
+Production deployments may configure any valid non-negative uint256 depth for their source-chain policy. The repository's deterministic full-verification fixture uses a fixed successor depth of `2`; that fixture constraint does not restrict the production loader or change finality semantics.
+
 The lifecycle states are:
 
 - `OBSERVED` records durable ingestion before the watcher evaluates the event;
@@ -1790,6 +1792,10 @@ Run the unified verification script from the repository root:
 ```bash
 ./scripts/verify.sh
 ```
+
+The full-verification profile requires the exact decimal setting `FINALITY_BLOCK_DEPTH=2`. The script reads the effective value after sourcing the root `.env`; assignments in that file retain their existing precedence over the calling shell's environment. An unset value defaults to `2`; an explicitly empty or otherwise mismatched value is rejected without silent replacement. The header records the expected and effective depths, and profile validation exits nonzero before Indexer prerequisite checks, PostgreSQL connectivity/migrations, RPC access, chain startup, tests, proof generation, builds or deployments. Production runtime continues to validate other configured depths independently.
+
+For an optional early-rejection check, temporarily set the effective `FINALITY_BLOCK_DEPTH` to `3`, run the same script, and confirm that `verification.log` stops at `full verification finality profile validation` before `[Indexer prerequisite verification]`. Restore `2` or leave the value unset, then run the full verification again. Each run overwrites the root log, so retain the final normal full run as the completion evidence. The integration fixture also keeps its own depth-`2` assertion when invoked directly.
 
 The script uses strict error handling and performs:
 
