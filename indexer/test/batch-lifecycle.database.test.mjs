@@ -29,6 +29,7 @@ const canonicalStore = createCanonicalStore(pool, config.databaseSchema);
 const lifecycle = createBatchLifecycle({ config: lifecycleConfig, pool });
 const batches = tableName(config.databaseSchema, "message_batches");
 const members = tableName(config.databaseSchema, "message_batch_members");
+const sources = tableName(config.databaseSchema, "source_messages");
 const failureFunction = tableName(config.databaseSchema, "reject_batch_seal_for_test");
 const committee = commitConfigs[0].peers;
 const certificateTable = tableName(config.databaseSchema, "batch_quorum_certificates");
@@ -139,24 +140,174 @@ async function collectedPair(initialEpoch = 23n) {
   return { ...source, collected, id: collected.snapshot.record.batchRecordId };
 }
 
+function observedLifecycle() {
+  const queries = [];
+  const manager = createBatchLifecycle({ config: lifecycleConfig,
+    pool: barrierPool({ observe(query) { queries.push(query); } }) });
+  return { manager, queries };
+}
+
+function sourceSelections(queries) {
+  return queries.filter(({ sql }) => sql.startsWith("SELECT") && sql.includes(`FROM ${sources}`));
+}
+
 test("bounded canonical collection leaves overflow eligible for the next immutable batch", async () => {
   const maximum = DELIVERY_POLICY.maxBatchMessages;
   const messages = Array.from({ length: maximum + 1 }, (_, index) => message(10n, BigInt(index)));
   await persist(10n, 10n, [...messages].reverse());
   await finalityStore.advanceFinality(scope, { headBlock: 10n, finalityBlockDepth: 0n });
-  const first = await lifecycle.collectEligible({ initialEpoch: 23n });
+  const { manager, queries } = observedLifecycle();
+  const first = await manager.collectEligible({ initialEpoch: 23n });
   assert.equal(first.assignedCount, maximum);
-  assert.equal((await lifecycle.collectEligible()).assignedCount, 0);
+  assert.equal(sourceSelections(queries).length, 1);
+  assert.deepEqual(sourceSelections(queries)[0].result.rows.map(row => row.message_id), messages.slice(0, maximum).map(row => row.messageId));
+  assert.deepEqual(sourceSelections(queries)[0].parameters, [scope.chainDomain.toString(), scope.sourceGateway, maximum]);
+  assert.equal(queries.some(({ sql }) => sql.startsWith(`SELECT m.source_message_id FROM ${members}`)), false);
+  queries.length = 0;
+  const repeated = await manager.collectEligible();
+  assert.equal(repeated.assignedCount, 0);
+  assert.deepEqual(repeated.snapshot, first.snapshot);
+  assert.equal(sourceSelections(queries).length, 0, "full BUILDING batches must skip candidate payload reads");
+  assert.equal(queries.some(({ sql }) => sql.startsWith("SELECT batch_record_id, message_id") ||
+    sql.startsWith(`SELECT m.source_message_id FROM ${members}`)), false, "full batches must not scan ownership for candidates");
   const sealed = await lifecycle.sealBatch({ batchRecordId: first.snapshot.record.batchRecordId });
   assert.deepEqual(sealed.batch.messageIds, messages.slice(0, maximum).map(row => row.messageId));
   const lastRow = (await readMessages(pool, config.databaseSchema)).find(row => row.message_id === messages.at(-1).messageId);
+  assert.equal(lastRow.status, "FINALIZED");
   assert.equal((await pool.query(`SELECT 1 FROM ${members} WHERE source_message_id = $1`, [lastRow.id])).rowCount, 0);
-  const second = await lifecycle.collectEligible();
+  // The standalone API continues returning every FINALIZED row, including owned history.
+  assert.equal((await finalityStore.listBatchEligibleMessages(scope)).length, maximum + 1);
+  queries.length = 0;
+  const second = await manager.collectEligible();
   assert.equal(second.assignedCount, 1);
+  assert.equal(sourceSelections(queries).length, 1);
+  assert.deepEqual(sourceSelections(queries)[0].result.rows.map(row => row.id), [lastRow.id]);
   assert.equal(second.snapshot.record.epoch, sealed.record.epoch + 1n);
   const next = await lifecycle.sealBatch({ batchRecordId: second.snapshot.record.batchRecordId });
   assert.deepEqual(next.batch.messageIds, [messages.at(-1).messageId]);
   assert.deepEqual(await lifecycle.readBatch({ batchRecordId: sealed.record.batchRecordId }), sealed);
+});
+
+for (const remaining of [1, 2]) {
+  test(`collection materializes only ${remaining} canonical unassigned candidates after claimed FINALIZED history`, async () => {
+    const { id } = await collectedPair();
+    const historical = await lifecycle.sealBatch({ batchRecordId: id });
+    const count = DELIVERY_POLICY.maxBatchMessages - remaining;
+    const messages = Array.from({ length: count + 3 }, (_, index) => message(11n, BigInt(index)));
+    await persist(11n, 11n, [...messages].reverse());
+    await finalityStore.advanceFinality(scope, { headBlock: 11n, finalityBlockDepth: 0n });
+    const rows = await finalityStore.listBatchEligibleMessages(scope);
+    const current = await lifecycle.getOrCreateBuilding();
+    const byMessageId = new Map(rows.map(row => [row.message_id, row]));
+    const assigned = await lifecycle.assignMessages({ batchRecordId: current.record.batchRecordId,
+      sourceMessageIds: messages.slice(0, count).map(row => byMessageId.get(row.messageId).id) });
+    await assert.rejects(lifecycle.assignMessages({ batchRecordId: current.record.batchRecordId,
+      sourceMessageIds: messages.slice(count, count + remaining + 1).map(row => byMessageId.get(row.messageId).id) }),
+    { message: "BATCH_MEMBERSHIP_LIMIT_EXCEEDED" });
+    assert.deepEqual(await lifecycle.readBatch({ batchRecordId: current.record.batchRecordId }), assigned.snapshot,
+      "an oversized explicit request must roll back its earlier inserts");
+    const { manager, queries } = observedLifecycle();
+    const collected = await manager.collectEligible();
+    assert.equal(collected.assignedCount, remaining);
+    const reads = sourceSelections(queries);
+    assert.equal(reads.length, 1, "assignment must reuse the selected candidates instead of reading eligible history again");
+    assert.deepEqual(reads[0].parameters, [scope.chainDomain.toString(), scope.sourceGateway, remaining]);
+    assert.deepEqual(reads[0].result.rows.map(row => row.message_id), messages.slice(count, count + remaining).map(row => row.messageId));
+    assert.equal(queries.some(({ sql }) => sql.startsWith(`SELECT m.source_message_id FROM ${members}`)), false);
+    const overflow = messages.slice(count + remaining).map(row => byMessageId.get(row.messageId));
+    for (const row of overflow) {
+      assert.equal(row.status, "FINALIZED");
+      assert.equal((await pool.query(`SELECT 1 FROM ${members} WHERE source_message_id = $1`, [row.id])).rowCount, 0);
+    }
+    const sealed = await lifecycle.sealBatch({ batchRecordId: current.record.batchRecordId });
+    assert.deepEqual(sealed.batch.messageIds, messages.slice(0, DELIVERY_POLICY.maxBatchMessages).map(row => row.messageId));
+    await assert.rejects(lifecycle.assignMessages({ batchRecordId: (await lifecycle.getOrCreateBuilding()).record.batchRecordId,
+      sourceMessageIds: [historical.members[0].sourceMessageId] }),
+    { message: "source occurrence already belongs to another lifecycle batch" });
+    const next = await lifecycle.collectEligible();
+    assert.equal(next.assignedCount, overflow.length);
+    assert.deepEqual(next.snapshot.members.map(member => member.messageId).sort(), overflow.map(row => row.message_id).sort());
+    assert.deepEqual(await lifecycle.readBatch({ batchRecordId: historical.record.batchRecordId }), historical);
+    assert.deepEqual(await lifecycle.readBatch({ batchRecordId: sealed.record.batchRecordId }), sealed);
+  });
+}
+
+test("explicit assignment loads only requested IDs while preserving insertion order, duplicates and same-batch idempotency", async () => {
+  await persist(10n, 10n, Array.from({ length: 4 }, (_, index) => message(10n, BigInt(index))));
+  await finalityStore.advanceFinality(scope, { headBlock: 10n, finalityBlockDepth: 0n });
+  const rows = await readMessages(pool, config.databaseSchema);
+  const current = await lifecycle.getOrCreateBuilding({ initialEpoch: 23n });
+  const ids = [rows[2].id, rows[0].id, rows[1].id, rows[2].id];
+  const { manager, queries } = observedLifecycle();
+  const result = await manager.assignMessages({ batchRecordId: current.record.batchRecordId, sourceMessageIds: ids });
+  assert.equal(result.assignedCount, 3);
+  const reads = sourceSelections(queries);
+  assert.equal(reads.length, 1);
+  assert.deepEqual(reads[0].parameters, [[rows[2].id, rows[0].id, rows[1].id]]);
+  assert.deepEqual(reads[0].result.rows.map(row => row.id).sort(), rows.slice(0, 3).map(row => row.id).sort());
+  assert.deepEqual(queries.filter(({ sql }) => sql.startsWith(`INSERT INTO ${members}`)).map(query => query.parameters[1]), ids.slice(0, 3));
+  assert.deepEqual(result.snapshot.members.map(member => member.sourceMessageId), rows.slice(0, 3).map(row => row.id));
+  queries.length = 0;
+  const repeated = await manager.assignMessages({ batchRecordId: current.record.batchRecordId, sourceMessageIds: ids });
+  assert.equal(repeated.assignedCount, 0);
+  assert.deepEqual(repeated.snapshot, result.snapshot);
+  assert.equal(sourceSelections(queries).length, 1);
+  assert.equal(queries.some(({ sql }) => sql.startsWith(`INSERT INTO ${members}`)), false);
+  await assert.rejects(manager.assignMessages({ batchRecordId: current.record.batchRecordId, sourceMessageIds: [rows[3].id, "9223372036854775807"] }),
+    { message: "source occurrence must be FINALIZED in the configured scope" });
+  assert.deepEqual(await lifecycle.readBatch({ batchRecordId: current.record.batchRecordId }), result.snapshot);
+  for (const value of [0n, -1n, "not-an-id", 1n << 63n, Number.MAX_SAFE_INTEGER + 1]) {
+    await assert.rejects(manager.assignMessages({ batchRecordId: current.record.batchRecordId, sourceMessageIds: [value] }),
+      { message: "invalid source message ID" });
+  }
+});
+
+test("candidate SQL preserves full canonical hash tie-breaks before LIMIT without changing standalone eligibility", async () => {
+  const { rows } = await finalizedPair();
+  await persist(11n, 11n, [message(11n, 0n)]);
+  await finalityStore.advanceFinality(scope, { headBlock: 11n, finalityBlockDepth: 0n });
+  const third = (await readMessages(pool, config.databaseSchema)).at(-1);
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // Query-only tie fixtures stay inside this rollback transaction. The
+    // canonical batch builder still rejects conflicting source log positions.
+    for (const [row, blockHash, txHash] of [[rows[0], hash(30), hash(50)], [rows[1], hash(30), hash(40)], [third, hash(20), hash(60)]]) {
+      await client.query(`UPDATE ${sources} SET source_block_number = $2, source_log_index = 0,
+        source_block_hash = $3, source_tx_hash = $4 WHERE id = $1`, [row.id, ((1n << 200n) + 1n).toString(), blockHash, txHash]);
+    }
+    const queries = [];
+    const store = createFinalityStore({ async query(sql, parameters) {
+      const result = await client.query(sql, parameters); queries.push({ sql, parameters, result }); return result;
+    } }, config.databaseSchema);
+    assert.deepEqual((await store.listUnassignedBatchCandidates(scope, 2)).map(row => row.id), [third.id, rows[1].id]);
+    assert.deepEqual((await store.listBatchEligibleMessages(scope)).map(row => row.id), [third.id, rows[1].id, rows[0].id]);
+    for (const { sql } of queries) assert.match(sql.replace(/\s+/g, " "), /ORDER BY source_block_number ASC, source_log_index ASC, source_block_hash COLLATE "C" ASC, source_tx_hash COLLATE "C" ASC, message_id COLLATE "C" ASC/);
+    const previous = queries.length;
+    for (const limit of [0, -1, 1.5, "1", DELIVERY_POLICY.maxBatchMessages + 1, NaN]) {
+      await assert.rejects(store.listUnassignedBatchCandidates(scope, limit), { message: "invalid lifecycle candidate limit" });
+    }
+    assert.equal(queries.length, previous);
+  } finally { await client.query("ROLLBACK"); client.release(); }
+});
+
+test("a collection failure after member insertion rolls back every assignment and a fresh client retries", async () => {
+  await finalizedPair();
+  const current = await lifecycle.getOrCreateBuilding({ initialEpoch: 23n });
+  let inserts = 0;
+  const failing = createBatchLifecycle({ config: lifecycleConfig, pool: barrierPool({ observe({ sql }) {
+    if (sql.startsWith(`INSERT INTO ${members}`) && ++inserts === 2) throw new Error("injected failure after candidate assignment");
+  } }) });
+  await assert.rejects(failing.collectEligible(), { message: "injected failure after candidate assignment" });
+  assert.equal(inserts, 2);
+  assert.deepEqual(await lifecycle.readBatch({ batchRecordId: current.record.batchRecordId }), current);
+  assert.equal((await pool.query(`SELECT COUNT(*) AS count FROM ${members}`)).rows[0].count, "0");
+  const fresh = createDatabasePool(config);
+  try {
+    const result = await createBatchLifecycle({ config: lifecycleConfig, pool: fresh }).collectEligible();
+    assert.equal(result.assignedCount, 2);
+    assert.equal(result.snapshot.record.batchRecordId, current.record.batchRecordId);
+  } finally { await fresh.end(); }
 });
 
 test("only a matching independently verified QC can commit; equivalent evidence preserves the first certificate", async () => {
@@ -612,7 +763,7 @@ function deferred() {
   return { promise, resolve };
 }
 
-function barrierPool({ acquired, release, attempted }) {
+function barrierPool({ acquired, release, attempted, observe }) {
   let intercepted = false;
   return {
     async connect() {
@@ -624,13 +775,16 @@ function barrierPool({ acquired, release, attempted }) {
             intercepted = true;
             attempted?.resolve();
             const result = await client.query(sql, parameters);
+            await observe?.({ sql, parameters, result });
             acquired?.resolve();
             if (release !== undefined) {
               await release.promise;
             }
             return result;
           }
-          return client.query(sql, parameters);
+          const result = await client.query(sql, parameters);
+          await observe?.({ sql, parameters, result });
+          return result;
         },
         release(error) {
           client.release(error);

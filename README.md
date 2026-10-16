@@ -999,12 +999,16 @@ The lifecycle API exposes:
 | Operation | Result |
 | --- | --- |
 | `getOrCreateBuilding({ initialEpoch } = {})` | Create or recover the building snapshot |
-| `collectEligible({ initialEpoch } = {})` | Assign all unclaimed finalized occurrences; return `{ snapshot, assignedCount }` |
+| `collectEligible({ initialEpoch } = {})` | Assign the next canonical unclaimed finalized occurrences up to remaining capacity; return `{ snapshot, assignedCount }` |
 | `assignMessages({ batchRecordId, sourceMessageIds })` | Assign explicit eligible occurrence IDs with the same ownership rules; return `{ snapshot, assignedCount }` |
 | `sealBatch({ batchRecordId, expectedBatchId?, expectedMessageRoot? })` | Atomically seal, or recover the identical sealed snapshot |
 | `readBatch({ batchRecordId })` | Read and validate a durable snapshot |
 | `markConsensusPending({ batchRecordId })` | Advance a sealed snapshot to pending; repeated calls are idempotent |
 | `commitWithCertificate({ certificate })` | Verify and persist QC evidence while atomically committing its exact pending batch; equivalent retries preserve the original QC |
+
+Collection counts the current BUILDING membership before selecting candidates. SQL filters the configured source scope, `FINALIZED` status and absence from any lifecycle batch, then applies the existing canonical order and a limit equal to remaining capacity. Only the needed unassigned candidate rows and their payloads are returned to the application. A full BUILDING batch performs no candidate query, returns zero assignments and stays unsealed. Overflow remains FINALIZED and unassigned for the next batch; historical rows are retained. This bounds candidate materialization, without claiming constant database execution cost.
+
+Explicit assignment loads only the requested database IDs and checks their scope, status, canonical message and ownership in request order. Duplicate requests and existing members of the same batch are idempotent; another batch's ownership remains an explicit conflict. An oversized request or any later failure rolls back all assignments in that transaction. Collection reuses its selected rows inside the same lifecycle transaction, with no public trusted-row parameter. The standalone `listBatchEligibleMessages(scope)` API continues returning the full canonical FINALIZED list, including assigned history; its standalone batcher semantics are unchanged.
 
 Snapshots contain `{ record, members, batch, tree }`. Building snapshots have `batch: null` and `tree: null`. Sealed snapshots reconstruct the existing batch representation and Merkle result, including every inclusion proof. Committed snapshots additionally contain independently verified `quorumCertificate` and require the caller's expected static committee. Protocol values remain `BigInt`; operational timestamps and record IDs do not enter any protocol hash.
 

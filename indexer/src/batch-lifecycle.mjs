@@ -254,21 +254,22 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
     return Object.freeze({ record, members: persistedMembers, batch, tree, consensusBinding });
   }
 
-  async function assign(client, row, sourceMessageIds) {
-    if (row.status !== BATCH_STATUS.BUILDING) {
-      throw new Error("members can only be assigned to a BUILDING batch");
-    }
-    if (!Array.isArray(sourceMessageIds)) {
-      throw new Error("source message IDs must be an array");
-    }
-    const eligible = await createFinalityStore(client, config.databaseSchema).listBatchEligibleMessages(scope);
-    const eligibleById = new Map(eligible.map((message) => [message.id, message]));
-    let memberCount = (await readMembership(client, row)).length;
+  async function memberCount(client, row) {
+    const result = await client.query(
+      `SELECT COUNT(*) AS count FROM ${members} WHERE batch_record_id = $1`,
+      [row.batch_record_id],
+    );
+    return BigInt(result.rows[0].count);
+  }
+
+  // Both entry paths supply rows read by this lifecycle in the same transaction.
+  // Public callers provide database IDs only; all member checks remain here.
+  async function assignRows(client, row, ids, sourcesById, count) {
     let assignedCount = 0;
-    for (const value of sourceMessageIds) {
-      const id = databaseId(value, "source message ID");
-      const source = eligibleById.get(id);
-      if (source === undefined) {
+    for (const id of ids) {
+      const source = sourcesById.get(id);
+      if (source === undefined || source.status !== "FINALIZED" ||
+          source.source_domain !== scope.chainDomain || source.source_gateway !== scope.sourceGateway) {
         throw new Error("source occurrence must be FINALIZED in the configured scope");
       }
       const message = normalizeBatchMessage(databaseRowToBatchMessage(source), protocolScope);
@@ -285,16 +286,31 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
         }
         continue;
       }
-      if (memberCount >= DELIVERY_POLICY.maxBatchMessages) throw new Error("BATCH_MEMBERSHIP_LIMIT_EXCEEDED");
+      if (count >= BigInt(DELIVERY_POLICY.maxBatchMessages)) throw new Error("BATCH_MEMBERSHIP_LIMIT_EXCEEDED");
       if ((message.payload.length - 2) / 2 > DELIVERY_POLICY.maxPayloadBytes) throw new Error("MESSAGE_PAYLOAD_LIMIT_EXCEEDED");
       await client.query(
         `INSERT INTO ${members} (batch_record_id, source_message_id, message_id) VALUES ($1, $2, $3)`,
         [row.batch_record_id, id, message.messageId],
       );
       assignedCount += 1;
-      memberCount += 1;
+      count += 1n;
     }
     return assignedCount;
+  }
+
+  async function assign(client, row, sourceMessageIds) {
+    if (row.status !== BATCH_STATUS.BUILDING) {
+      throw new Error("members can only be assigned to a BUILDING batch");
+    }
+    if (!Array.isArray(sourceMessageIds)) {
+      throw new Error("source message IDs must be an array");
+    }
+    const ids = sourceMessageIds.map((value) => databaseId(value, "source message ID"));
+    const requested = [...new Set(ids)];
+    const rows = requested.length === 0 ? [] : (await client.query(
+      `SELECT * FROM ${sources} WHERE id = ANY($1::bigint[])`, [requested],
+    )).rows;
+    return assignRows(client, row, ids, new Map(rows.map((source) => [source.id, source])), await memberCount(client, row));
   }
 
   function checkExpectations(result, expectedBatchId, expectedMessageRoot) {
@@ -364,17 +380,15 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
     async collectEligible({ initialEpoch } = {}) {
       return transaction(async (client) => {
         const row = await ensureBuilding(client, initialEpoch);
-        const eligible = await createFinalityStore(client, config.databaseSchema).listBatchEligibleMessages(scope);
-        const claimed = await client.query(
-          `SELECT m.source_message_id FROM ${members} m
-            JOIN ${batches} b ON b.batch_record_id = m.batch_record_id
-           WHERE b.source_domain = $1 AND b.source_gateway = $2`,
-          scopeParameters,
-        );
-        const claimedIds = new Set(claimed.rows.map((member) => member.source_message_id));
-        const capacity = DELIVERY_POLICY.maxBatchMessages - (await readMembership(client, row)).length;
-        const available = eligible.filter((source) => !claimedIds.has(source.id)).slice(0, Math.max(0, capacity)).map((source) => source.id);
-        const assignedCount = await assign(client, row, available);
+        const count = await memberCount(client, row);
+        const remaining = BigInt(DELIVERY_POLICY.maxBatchMessages) - count;
+        let assignedCount = 0;
+        if (remaining > 0n) {
+          const candidates = await createFinalityStore(client, config.databaseSchema)
+            .listUnassignedBatchCandidates(scope, Number(remaining));
+          assignedCount = await assignRows(client, row, candidates.map((source) => source.id),
+            new Map(candidates.map((source) => [source.id, source])), count);
+        }
         return { snapshot: await snapshot(client, row), assignedCount };
       });
     },

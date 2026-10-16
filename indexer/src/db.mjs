@@ -14,6 +14,7 @@ import {
 import { normalizeAddress, normalizeBytes32, toUint256 } from "./canonical-message.mjs";
 import { validateSchemaName } from "./config.mjs";
 import { determineFinalityTransition, MESSAGE_STATUS } from "./finality-policy.mjs";
+import { DELIVERY_POLICY } from "./delivery/policy.mjs";
 import {
   normalizeSourceEventIdentity,
   sourceEventIdentityKey,
@@ -822,6 +823,12 @@ export function createCanonicalStore(pool, schema) {
 
 export function createFinalityStore(pool, schema) {
   const messages = tableName(schema, "source_messages");
+  const members = tableName(schema, "message_batch_members");
+  const batchOrder = `source_block_number ASC,
+            source_log_index ASC,
+            source_block_hash COLLATE "C" ASC,
+            source_tx_hash COLLATE "C" ASC,
+            message_id COLLATE "C" ASC`;
 
   return {
     async advanceFinality(scope, { headBlock, finalityBlockDepth }) {
@@ -920,13 +927,24 @@ export function createFinalityStore(pool, schema) {
           WHERE source_domain = $1
             AND source_gateway = $2
             AND status = 'FINALIZED'
-          ORDER BY
-            source_block_number ASC,
-            source_log_index ASC,
-            source_block_hash COLLATE "C" ASC,
-            source_tx_hash COLLATE "C" ASC,
-            message_id COLLATE "C" ASC`,
+          ORDER BY ${batchOrder}`,
         [normalizedScope.chainDomain, normalizedScope.sourceGateway],
+      );
+      return result.rows;
+    },
+
+    async listUnassignedBatchCandidates(scope, limit) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > DELIVERY_POLICY.maxBatchMessages) {
+        throw new Error("invalid lifecycle candidate limit");
+      }
+      const normalizedScope = normalizeSourceScope(scope);
+      const result = await pool.query(
+        `SELECT s.* FROM ${messages} s
+          WHERE s.source_domain = $1 AND s.source_gateway = $2 AND s.status = 'FINALIZED'
+            AND NOT EXISTS (SELECT 1 FROM ${members} m WHERE m.source_message_id = s.id)
+          ORDER BY ${batchOrder}
+          LIMIT $3`,
+        [normalizedScope.chainDomain, normalizedScope.sourceGateway, limit],
       );
       return result.rows;
     },
