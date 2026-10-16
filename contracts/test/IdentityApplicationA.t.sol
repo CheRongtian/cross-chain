@@ -722,6 +722,92 @@ contract IdentityApplicationATest is Test {
         return target.forwardAuthorizedMessage(_mockProofA(), _mockProofB(), _mockProofC(), inputs, request);
     }
 
+    function testExpiredForwardDeadlinePrecedesProofVerification() public {
+        _expectNoForwardCalls();
+        IdentityApplicationA.ForwardRequest memory request = _forwardRequest("supplier update", CURRENT_TIME);
+        _assertForwardRequestGuard(
+            request, _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER),
+            IdentityApplicationA.InvalidDeadline.selector
+        );
+    }
+
+    function testZeroForwardGatewayPrecedesProofVerification() public {
+        _expectNoForwardCalls();
+        IdentityApplicationA.ForwardRequest memory request = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
+        request.destinationGateway = address(0);
+        _assertForwardRequestGuard(
+            request, _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER),
+            IdentityApplicationA.InvalidDestinationGateway.selector
+        );
+    }
+
+    function testLocalForwardDomainPrecedesProofVerification() public {
+        _expectNoForwardCalls();
+        IdentityApplicationA.ForwardRequest memory request = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
+        request.destinationDomain = block.chainid;
+        _assertForwardRequestGuard(
+            request, _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER),
+            IdentityApplicationA.InvalidDestinationDomain.selector
+        );
+    }
+
+    function testZeroForwardReceiverPrecedesProofVerification() public {
+        _expectNoForwardCalls();
+        IdentityApplicationA.ForwardRequest memory request = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
+        request.destinationReceiver = address(0);
+        _assertForwardRequestGuard(
+            request, _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER),
+            IdentityApplicationA.InvalidDestinationReceiver.selector
+        );
+    }
+
+    function testForwardRequestGuardsPrecedeAlreadyUsedNullifier() public {
+        IdentityApplicationA.ForwardRequest memory original = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, original, SUBMITTER, FORWARD_NULLIFIER);
+        vm.prank(SUBMITTER);
+        _invokeForward(application, inputs, original);
+        assertTrue(application.usedNullifiers(inputs.nullifier));
+
+        // Counted expectations are registered once, after the legitimate forward,
+        // and cover all four following rejected requests in this test.
+        _expectNoForwardCalls();
+        IdentityApplicationA.ForwardRequest memory request = _forwardRequest(original.payload, CURRENT_TIME);
+        _assertForwardRequestGuard(request, inputs, IdentityApplicationA.InvalidDeadline.selector);
+        request = _forwardRequest(original.payload, original.deadline);
+        request.destinationGateway = address(0);
+        _assertForwardRequestGuard(request, inputs, IdentityApplicationA.InvalidDestinationGateway.selector);
+        request = _forwardRequest(original.payload, original.deadline);
+        request.destinationDomain = block.chainid;
+        _assertForwardRequestGuard(request, inputs, IdentityApplicationA.InvalidDestinationDomain.selector);
+        request = _forwardRequest(original.payload, original.deadline);
+        request.destinationReceiver = address(0);
+        _assertForwardRequestGuard(request, inputs, IdentityApplicationA.InvalidDestinationReceiver.selector);
+    }
+
+    function _expectNoForwardCalls() internal {
+        vm.expectCall(address(verifier), abi.encodeWithSelector(ICredentialVerifier.verifyCredentialProof.selector), uint64(0));
+        vm.expectCall(address(sourceGateway), abi.encodeWithSelector(MockSourceGateway.sendMessage.selector), uint64(0));
+    }
+
+    function _assertForwardRequestGuard(
+        IdentityApplicationA.ForwardRequest memory request,
+        ICredentialVerifier.CredentialPublicInputs memory inputs,
+        bytes4 expectedError
+    ) internal {
+        bool nullifierBefore = application.usedNullifiers(inputs.nullifier);
+        IdentityApplicationA.AuthorizationStatus statusBefore = application.authorizationStatus(inputs.credentialCommitment);
+        verifier.setVerificationResult(false);
+        vm.recordLogs();
+        vm.prank(SUBMITTER);
+        vm.expectRevert(expectedError);
+        _invokeForward(application, inputs, request);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+
+        assertEq(logs.length, 0);
+        assertEq(application.usedNullifiers(inputs.nullifier), nullifierBefore);
+        assertEq(uint256(application.authorizationStatus(inputs.credentialCommitment)), uint256(statusBefore));
+    }
+
     function testForwardIntentMutationsNeverConsumeNullifier() public {
         IdentityApplicationA.ForwardRequest memory original = _forwardRequest("supplier update", CURRENT_TIME + MESSAGE_LIFETIME);
         ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, original, SUBMITTER, FORWARD_NULLIFIER);

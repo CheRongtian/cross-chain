@@ -120,9 +120,17 @@ expect_call_revert() {
     local error_name="${error_signature%%(*}"
     local error_selector
     local output
+    local line
+    local decoded_pattern
+    local selector_pattern
+    local matched="false"
     shift 2
 
-    error_selector="$(cast sig "$error_signature")"
+    error_selector="$(cast sig "$error_signature")" || fail "could not derive selector for $error_signature"
+    [[ "$error_selector" =~ ^0x[[:xdigit:]]{8}$ ]] || fail "invalid selector for $error_signature"
+    error_selector="$(normalize "$error_selector")"
+    decoded_pattern="execution reverted:[[:space:]]*$(normalize "$error_name")(\(|[[:space:]]*$)"
+    selector_pattern="execution reverted(:[[:space:]]*(custom error[[:space:]]+)?${error_selector}[[:xdigit:]]*([[:space:],\"]|$)|,[[:space:]]*data:[[:space:]]*\"?${error_selector}[[:xdigit:]]*(\"|[[:space:]]|$))"
 
     if output="$(cast call "$@" 2>&1)"; then
         printf '%s\n' "$output"
@@ -130,13 +138,95 @@ expect_call_revert() {
     fi
 
     printf '%s\n' "$output"
-    if [[ "$(normalize "$output")" != *"$(normalize "$error_selector")"* ]] \
-        && [[ "$output" != *"$error_name"* ]]; then
+    # Match the actual revert reason/data on its own line, not an error name or
+    # selector mentioned elsewhere in CLI, transport, or contextual diagnostics.
+    while IFS= read -r line; do
+        if [[ "$line" =~ $decoded_pattern ]] || [[ "$line" =~ $selector_pattern ]]; then
+            matched="true"
+            break
+        fi
+    done <<< "$(normalize "$output")"
+    if [[ "$matched" != "true" ]]; then
         fail "$label reverted without $error_signature"
     fi
 
     printf 'EXPECTED FAILURE: %s (%s)\n' "$label" "$error_name"
 }
+
+verify_call_revert_assertions() (
+    # This subshell confines the command double to synthetic helper fixtures.
+    # No fixture invokes an RPC or replaces any deployed-contract call below.
+    trap - EXIT INT TERM
+    local expected_selector
+    local fixture
+    local diagnostic
+    local call_status
+    local expected_status
+    local actual_status
+    local output
+    expected_selector="$(cast sig 'InvalidDeadline()')" || fail "could not derive fixture selector"
+    [[ "$expected_selector" =~ ^0x[[:xdigit:]]{8}$ ]] || fail "invalid fixture selector"
+
+    cast() {
+        case "$1" in
+            sig) printf '%s\n' "$expected_selector" ;;
+            call)
+                printf 'synthetic cast stdout: %s\n' "$fixture"
+                printf '%s\n' "$diagnostic" >&2
+                return "$call_status"
+                ;;
+            *) return 2 ;;
+        esac
+    }
+
+    for fixture in decoded selector rpc-data wrong-revert name-prefix transport cli success; do
+        call_status=1
+        expected_status=1
+        case "$fixture" in
+            decoded)
+                diagnostic='Error: execution reverted: InvalidDeadline'
+                expected_status=0
+                ;;
+            selector)
+                diagnostic="Error: execution reverted: custom error $expected_selector, data: \"$expected_selector\""
+                expected_status=0
+                ;;
+            rpc-data)
+                diagnostic="Error: server returned an error response: error code 3: execution reverted, data: \"$expected_selector\""
+                expected_status=0
+                ;;
+            wrong-revert)
+                diagnostic="Error: execution reverted: InvalidDestinationDomain
+Expected InvalidDeadline ($expected_selector) but received a different revert"
+                ;;
+            name-prefix) diagnostic='Error: execution reverted: InvalidDeadlineExtended' ;;
+            transport) diagnostic="Error: connection refused while requesting InvalidDeadline ($expected_selector)" ;;
+            cli) diagnostic="error: unexpected argument 'InvalidDeadline' ($expected_selector)" ;;
+            success)
+                diagnostic='Error: execution reverted: InvalidDeadline'
+                call_status=0
+                ;;
+        esac
+        if output="$(expect_call_revert "synthetic $fixture" 'InvalidDeadline()' "$ZERO_ADDRESS" 'fixture()' 2>&1)"; then
+            actual_status=0
+        else
+            actual_status=$?
+        fi
+        if [[ "$actual_status" != "$expected_status" ]] \
+            || [[ "$output" != *"synthetic cast stdout: $fixture"* ]] \
+            || [[ "$output" != *"$diagnostic"* ]]; then
+            printf '%s\n' "$output"
+            fail "revert-helper fixture $fixture returned unexpected status or lost diagnostics"
+        fi
+        if [[ "$expected_status" == "0" ]]; then
+            [[ "$output" == *"EXPECTED FAILURE: synthetic $fixture (InvalidDeadline)"* ]] || fail "fixture $fixture lost exact-revert evidence"
+        elif [[ "$output" == *"EXPECTED FAILURE:"* ]]; then
+            printf '%s\n' "$output"
+            fail "fixture $fixture incorrectly credited an expected policy rejection"
+        fi
+        printf 'VALID: synthetic revert-helper fixture / %s / exit %s, stdout/stderr preserved\n' "$fixture" "$actual_status"
+    done
+)
 
 probe_chain_id() {
     local rpc_url="$1"
@@ -497,6 +587,7 @@ printf '  8. Build and test the Solidity contracts\n'
 printf '  9. Deploy the current Chain A protocol and Chain B remote-gateway trust registry\n'
 printf ' 10. Preserve credential policy, replay, epoch, and revocation checks\n'
 printf ' 11. Preserve canonical message domain separation and authorization checks\n'
+printf '     Require exact source routing/deadline errors and unchanged nonce/nullifier/business state\n'
 printf ' 12. Produce and persist a real Chain A message as OBSERVED\n'
 printf ' 13. Abruptly stop the Indexer after its durable range commit\n'
 printf ' 14. Recreate the PostgreSQL client and recover persisted state\n'
@@ -1739,66 +1830,111 @@ assert_equal \
     "4" \
     "nonce after Application A message"
 
+CURRENT_STEP="source policy revert-helper fixtures and before-state snapshot"
+printf '\n[%s]\n' "$CURRENT_STEP"
+verify_call_revert_assertions
+# Reuse the exact proof just accepted above, including its already-used nullifier.
+# These eth_call simulations cannot persist a transaction or CrossChainMessage log.
+SOURCE_NEGATIVE_COMMITMENT="$(sed -n '4p' "$TEMP_DIR/forwarding-calldata.txt")"
+SOURCE_NEGATIVE_NULLIFIER="$(sed -n '12p' "$TEMP_DIR/forwarding-calldata.txt")"
+[[ "$SOURCE_NEGATIVE_COMMITMENT" =~ ^[0-9]+$ ]] || fail "invalid forwarding credential commitment"
+[[ "$SOURCE_NEGATIVE_NULLIFIER" =~ ^[0-9]+$ ]] || fail "invalid forwarding nullifier"
+SOURCE_NEGATIVE_NONCE_BEFORE="$(cast call "$SOURCE_GATEWAY" 'nextNonce()(uint256)' --rpc-url "$CHAIN_A_RPC")"
+SOURCE_NEGATIVE_NULLIFIER_BEFORE="$(cast call "$IDENTITY_APPLICATION_ADDRESS" 'usedNullifiers(uint256)(bool)' "$SOURCE_NEGATIVE_NULLIFIER" --rpc-url "$CHAIN_A_RPC")"
+SOURCE_NEGATIVE_STATUS_BEFORE="$(cast call "$IDENTITY_APPLICATION_ADDRESS" 'authorizationStatus(uint256)(uint8)' "$SOURCE_NEGATIVE_COMMITMENT" --rpc-url "$CHAIN_A_RPC")"
+
 CURRENT_STEP="expired Application A message rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
 EXPIRED_MESSAGE_DEADLINE="$(cast block latest --field timestamp --rpc-url "$CHAIN_A_RPC")"
-if cast call "$IDENTITY_APPLICATION_ADDRESS" \
+expect_call_revert \
+    "expired deadline rejected" "InvalidDeadline()" \
+    "$IDENTITY_APPLICATION_ADDRESS" \
     "$FORWARD_SIGNATURE" \
     "$FORWARD_PROOF_A" "$FORWARD_PROOF_B" "$FORWARD_PROOF_C" "$FORWARD_PUBLIC_INPUTS" \
     "($CHAIN_B_ID,$DESTINATION_GATEWAY,$DESTINATION_RECEIVER,$PAYLOAD,$EXPIRED_MESSAGE_DEADLINE)" \
     --from "$SOURCE_SENDER" \
-    --rpc-url "$CHAIN_A_RPC"; then
-    fail "expired Application A message unexpectedly succeeded"
-else
-    printf 'EXPECTED FAILURE: expired deadline rejected\n'
-fi
+    --rpc-url "$CHAIN_A_RPC"
 assert_equal \
     "$(cast call "$SOURCE_GATEWAY" "nextNonce()(uint256)" --rpc-url "$CHAIN_A_RPC")" \
-    "4" \
-    "nonce after expired deadline rejection"
+    "$SOURCE_NEGATIVE_NONCE_BEFORE" \
+    "nonce unchanged after expired deadline rejection"
+assert_equal \
+    "$(cast call "$IDENTITY_APPLICATION_ADDRESS" 'usedNullifiers(uint256)(bool)' "$SOURCE_NEGATIVE_NULLIFIER" --rpc-url "$CHAIN_A_RPC")" \
+    "$SOURCE_NEGATIVE_NULLIFIER_BEFORE" \
+    "nullifier state unchanged after expired deadline rejection"
+assert_equal \
+    "$(cast call "$IDENTITY_APPLICATION_ADDRESS" 'authorizationStatus(uint256)(uint8)' "$SOURCE_NEGATIVE_COMMITMENT" --rpc-url "$CHAIN_A_RPC")" \
+    "$SOURCE_NEGATIVE_STATUS_BEFORE" \
+    "business state unchanged after expired deadline rejection"
 
 CURRENT_STEP="zero destination gateway rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
-if cast call "$IDENTITY_APPLICATION_ADDRESS" \
+expect_call_revert \
+    "zero destination gateway rejected" "InvalidDestinationGateway()" \
+    "$IDENTITY_APPLICATION_ADDRESS" \
     "$FORWARD_SIGNATURE" \
     "$FORWARD_PROOF_A" "$FORWARD_PROOF_B" "$FORWARD_PROOF_C" "$FORWARD_PUBLIC_INPUTS" \
     "($CHAIN_B_ID,$ZERO_ADDRESS,$DESTINATION_RECEIVER,$PAYLOAD,$MESSAGE_DEADLINE)" \
     --from "$SOURCE_SENDER" \
-    --rpc-url "$CHAIN_A_RPC"; then
-    fail "zero destination gateway call unexpectedly succeeded"
-else
-    printf 'EXPECTED FAILURE: zero destination gateway rejected\n'
-fi
+    --rpc-url "$CHAIN_A_RPC"
 assert_equal \
     "$(cast call "$SOURCE_GATEWAY" "nextNonce()(uint256)" --rpc-url "$CHAIN_A_RPC")" \
-    "4" \
-    "nonce after zero destination gateway rejection"
+    "$SOURCE_NEGATIVE_NONCE_BEFORE" \
+    "nonce unchanged after zero destination gateway rejection"
+assert_equal \
+    "$(cast call "$IDENTITY_APPLICATION_ADDRESS" 'usedNullifiers(uint256)(bool)' "$SOURCE_NEGATIVE_NULLIFIER" --rpc-url "$CHAIN_A_RPC")" \
+    "$SOURCE_NEGATIVE_NULLIFIER_BEFORE" \
+    "nullifier state unchanged after zero destination gateway rejection"
+assert_equal \
+    "$(cast call "$IDENTITY_APPLICATION_ADDRESS" 'authorizationStatus(uint256)(uint8)' "$SOURCE_NEGATIVE_COMMITMENT" --rpc-url "$CHAIN_A_RPC")" \
+    "$SOURCE_NEGATIVE_STATUS_BEFORE" \
+    "business state unchanged after zero destination gateway rejection"
 
 CURRENT_STEP="same-chain destination rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
-if cast call "$IDENTITY_APPLICATION_ADDRESS" \
+expect_call_revert \
+    "local destination domain rejected" "InvalidDestinationDomain()" \
+    "$IDENTITY_APPLICATION_ADDRESS" \
     "$FORWARD_SIGNATURE" \
     "$FORWARD_PROOF_A" "$FORWARD_PROOF_B" "$FORWARD_PROOF_C" "$FORWARD_PUBLIC_INPUTS" \
     "($CHAIN_A_ID,$DESTINATION_GATEWAY,$DESTINATION_RECEIVER,$PAYLOAD,$MESSAGE_DEADLINE)" \
     --from "$SOURCE_SENDER" \
-    --rpc-url "$CHAIN_A_RPC"; then
-    fail "same-chain destination call unexpectedly succeeded"
-else
-    printf 'Verified rejection of the source domain as destination domain.\n'
-fi
+    --rpc-url "$CHAIN_A_RPC"
+assert_equal \
+    "$(cast call "$SOURCE_GATEWAY" 'nextNonce()(uint256)' --rpc-url "$CHAIN_A_RPC")" \
+    "$SOURCE_NEGATIVE_NONCE_BEFORE" \
+    "nonce unchanged after local destination domain rejection"
+assert_equal \
+    "$(cast call "$IDENTITY_APPLICATION_ADDRESS" 'usedNullifiers(uint256)(bool)' "$SOURCE_NEGATIVE_NULLIFIER" --rpc-url "$CHAIN_A_RPC")" \
+    "$SOURCE_NEGATIVE_NULLIFIER_BEFORE" \
+    "nullifier state unchanged after local destination domain rejection"
+assert_equal \
+    "$(cast call "$IDENTITY_APPLICATION_ADDRESS" 'authorizationStatus(uint256)(uint8)' "$SOURCE_NEGATIVE_COMMITMENT" --rpc-url "$CHAIN_A_RPC")" \
+    "$SOURCE_NEGATIVE_STATUS_BEFORE" \
+    "business state unchanged after local destination domain rejection"
 
 CURRENT_STEP="zero destination receiver rejection"
 printf '\n[%s]\n' "$CURRENT_STEP"
-if cast call "$IDENTITY_APPLICATION_ADDRESS" \
+expect_call_revert \
+    "zero destination receiver rejected" "InvalidDestinationReceiver()" \
+    "$IDENTITY_APPLICATION_ADDRESS" \
     "$FORWARD_SIGNATURE" \
     "$FORWARD_PROOF_A" "$FORWARD_PROOF_B" "$FORWARD_PROOF_C" "$FORWARD_PUBLIC_INPUTS" \
     "($CHAIN_B_ID,$DESTINATION_GATEWAY,$ZERO_ADDRESS,$PAYLOAD,$MESSAGE_DEADLINE)" \
     --from "$SOURCE_SENDER" \
-    --rpc-url "$CHAIN_A_RPC"; then
-    fail "zero destination receiver call unexpectedly succeeded"
-else
-    printf 'Verified rejection of the zero destination receiver.\n'
-fi
+    --rpc-url "$CHAIN_A_RPC"
+assert_equal \
+    "$(cast call "$SOURCE_GATEWAY" 'nextNonce()(uint256)' --rpc-url "$CHAIN_A_RPC")" \
+    "$SOURCE_NEGATIVE_NONCE_BEFORE" \
+    "nonce unchanged after zero destination receiver rejection"
+assert_equal \
+    "$(cast call "$IDENTITY_APPLICATION_ADDRESS" 'usedNullifiers(uint256)(bool)' "$SOURCE_NEGATIVE_NULLIFIER" --rpc-url "$CHAIN_A_RPC")" \
+    "$SOURCE_NEGATIVE_NULLIFIER_BEFORE" \
+    "nullifier state unchanged after zero destination receiver rejection"
+assert_equal \
+    "$(cast call "$IDENTITY_APPLICATION_ADDRESS" 'authorizationStatus(uint256)(uint8)' "$SOURCE_NEGATIVE_COMMITMENT" --rpc-url "$CHAIN_A_RPC")" \
+    "$SOURCE_NEGATIVE_STATUS_BEFORE" \
+    "business state unchanged after zero destination receiver rejection"
 
 MESSAGE_DEADLINE=$((MESSAGE_DEADLINE + 1))
 prepare_application_forwarding
