@@ -14,6 +14,9 @@ export const rpcHttpError = (status,message = "controlled destination HTTP failu
   Object.assign(new Error(message),{ name: "HttpRequestError",status });
 export const rpcProviderLimit = (code = -32007) =>
   Object.assign(new Error("controlled provider request limit"),{ name: "RpcRequestError",code });
+export const rpcExecutionRevert = () => Object.assign(new Error("controlled EVM execution revert"),{
+  name: "RpcRequestError",code: 3,data: "0x12345678",
+});
 export function transactionBody(intent,attempt,blockNumber = null,blockHash = null) {
   return { hash: attempt.transactionHash,from: intent.senderAddress,to: intent.destinationGateway,input: intent.calldata,
     nonce: toHex(BigInt(attempt.nonce)),value: "0x0",type: "0x2",chainId: toHex(BigInt(intent.chainId)),

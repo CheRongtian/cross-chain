@@ -18,8 +18,13 @@ export function createRelayerWorker({ config,pool,queue,transactionManager,
   }
   async function processJob(id,session) {
     session.assertHeld();
+    const deferredResult = lease => Object.freeze({ deliveryJobId: id,action: "PREPARATION_DEFERRED",submitted: false,
+      reason: lease.preparationDeferReason,retryAt: lease.preparationRetryAt,workerId: session.workerId });
     const fence = await leases.tryAcquireLease(id,session);
-    if (!fence) return Object.freeze({ deliveryJobId: id,action: "BUSY",submitted: false });
+    if (!fence) {
+      const deferred = await leases.getPreparationDefer(id);
+      return deferred ? deferredResult(deferred) : Object.freeze({ deliveryJobId: id,action: "BUSY",submitted: false });
+    }
     let stopped = false; let timer; let renewal; let failure;
     const renew = () => {
       if (stopped) return;
@@ -40,7 +45,18 @@ export function createRelayerWorker({ config,pool,queue,transactionManager,
       if (pack.deliveryJobId !== id || pack.message.destinationDomain !== config.destinationDomain.toString() ||
           job.destinationDomain !== pack.message.destinationDomain || normalizeAddress(job.destinationGateway) !== pack.message.destinationGateway) throw new RelayerError("DESTINATION_CONTEXT_MISMATCH");
       assertHeld();
-      const prepared = await transactionManager.prepareDeliveryTransaction(id,{ fence });
+      let prepared;
+      try { prepared = await transactionManager.prepareDeliveryTransaction(id,{ fence }); }
+      catch (error) {
+        if (error.code !== "PREPARATION_EXECUTION_REJECTED") throw error;
+        assertHeld();
+        const deferred = await leases.deferPreparation(fence);
+        assertHeld();
+        if (deferred) return deferredResult(deferred);
+        // Concurrent explicit manager preparation won the shared job-row gate.
+        // Its durable intent takes precedence; never convert it into defer.
+        prepared = await transactionManager.prepareDeliveryTransaction(id,{ fence });
+      }
       await afterPrepared({ fence,stored: prepared });
       assertHeld();
       if (prepared.historicalSubmission) return Object.freeze({ ...prepared,submitted: false,workerId: session.workerId });
@@ -86,6 +102,7 @@ export function createRelayerWorker({ config,pool,queue,transactionManager,
         for (const job of jobs) results.push(await processJob(job.deliveryJobId,session));
         return Object.freeze({ workerId: session.workerId,relayerAddress: config.relayerAddress,destinationDomain: config.destinationDomain.toString(),
           selected: jobs.length,submitted: results.filter((result) => result.submitted).length,
+          deferred: results.filter(result => result.action === "PREPARATION_DEFERRED").length,
           skipped: results.filter((result) => !result.submitted).length,results: Object.freeze(results) });
       }));
     },

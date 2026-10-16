@@ -22,11 +22,12 @@ export function deliveryMessage(index = 0, overrides = {}) {
 }
 
 export async function deliveryFixture({ count = 3, epoch = 23n, validatorSets = deliveryValidatorSets,
-  protocolVersion = "3", multiDestination = false } = {}) {
-  const messages = Array.from({ length: count }, (_, index) => deliveryMessage(index,
-    multiDestination && index === 1 ? { destinationDomain: 3001n,
+  protocolVersion = "3", multiDestination = false, messageOffset = 0,sourceBlockNumber = 10n } = {}) {
+  const messages = Array.from({ length: count }, (_, index) => deliveryMessage(index + messageOffset,{
+    sourceBlockNumber,sourceBlockHash: fixtureHash(sourceBlockNumber + 1n),
+    ...(multiDestination && index === 1 ? { destinationDomain: 3001n,
       destinationGateway: "0x0000000000000000000000000000000000003001",
-      destinationReceiver: "0x0000000000000000000000000000000000003002" } : {}));
+      destinationReceiver: "0x0000000000000000000000000000000000003002" } : {}) }));
   const batch = buildMessageBatch({ sourceDomain: deliveryScope.chainDomain, sourceGateway: deliveryScope.sourceGateway, epoch, messages });
   const tree = buildMessageMerkleTree(batch);
   const statement = expectedCommitStatement({ protocolVersion, sourceDomain: batch.sourceDomain,

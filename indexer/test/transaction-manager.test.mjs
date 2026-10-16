@@ -10,6 +10,27 @@ import { signDeliveryTransaction, verifySignedTransaction, unsignedTransaction, 
 import { transactionConfig, transactionHarness } from "./helpers/transaction-fixtures.mjs";
 import { relayerEnvironment } from "./helpers/relayer-fixtures.mjs";
 import { fixtureHash } from "./helpers/delivery-fixtures.mjs";
+import { DestinationRpcError } from "../src/transaction-manager/rpc-pool.mjs";
+
+test("explicit estimate execution rejection precedes fees, pending nonce and all durable transaction side effects", async () => {
+  const h = await transactionHarness(); const id = h.jobs[0].deliveryJobId;
+  h.rpc.estimateGas = async () => { h.calls.gas++; throw new DestinationRpcError("ESTIMATE_EXECUTION_REVERT",{ errorClass: "DETERMINISTIC_REJECTION" }); };
+  await assert.rejects(h.manager.prepareDeliveryTransaction(id),{ code: "PREPARATION_EXECUTION_REJECTED" });
+  assert.equal(h.records.size,0); assert.equal(h.journal.length,0); assert.equal(await h.repository.getAccount(),null);
+  assert.equal(h.calls.gas,1); assert.equal(h.calls.fees,0); assert.equal(h.calls.pending,0);
+  assert.equal(h.calls.sign,0); assert.equal(h.calls.broadcast.length,0); assert.deepEqual(h.packets,h.original);
+});
+
+test("the preparation signal is restricted to estimate and absent-intent boundaries", async () => {
+  const h = await transactionHarness(); const id = h.jobs[0].deliveryJobId;
+  const first = await h.manager.prepareDeliveryTransaction(id);
+  h.rpc.estimateGas = async () => { throw new Error("existing intent must bypass estimate"); };
+  assert.deepEqual((await h.restart().prepareDeliveryTransaction(id)).attempt,first.attempt);
+  const late = await transactionHarness();
+  late.rpc.fees = async () => { throw new DestinationRpcError("ESTIMATE_EXECUTION_REVERT",{ errorClass: "DETERMINISTIC_REJECTION" }); };
+  await assert.rejects(late.manager.prepareDeliveryTransaction(late.jobs[0].deliveryJobId),{ code: "ESTIMATE_EXECUTION_REVERT" });
+  assert.equal(late.records.size,0); assert.equal(late.calls.sign,0);
+});
 
 test("confirmation configuration is exact, nonzero and private-key free in public output", () => {
   assert.equal(transactionConfig().destinationConfirmations,3n);

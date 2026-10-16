@@ -5,7 +5,46 @@ import { loadRelayerConfig, publicRelayerConfig, safeRelayerMessage } from "../s
 import { relayerEnvironment } from "./helpers/relayer-fixtures.mjs";
 import { fixtureHash } from "./helpers/delivery-fixtures.mjs";
 import { transactionConfig } from "./helpers/transaction-fixtures.mjs";
-import { destinationRpcFixture, transactionFailoverHarness, rpcUnavailable, rpcTimeout, rpcRejection, rpcHttpError, rpcProviderLimit } from "./helpers/destination-rpc-fixtures.mjs";
+import { destinationRpcFixture, transactionFailoverHarness, rpcUnavailable, rpcTimeout, rpcRejection, rpcHttpError, rpcProviderLimit, rpcExecutionRevert } from "./helpers/destination-rpc-fixtures.mjs";
+import { normalizeRpcError } from "../src/transaction-manager/rpc-errors.mjs";
+
+test("structured execution-revert classification is estimate-only and never relies on revert text", async () => {
+  const error = rpcExecutionRevert();
+  assert.equal(normalizeRpcError(error,{ operation: "estimate" }).errorCode,"ESTIMATE_EXECUTION_REVERT");
+  for (const operation of ["read","broadcast"]) {
+    assert.equal(normalizeRpcError(error,{ operation }).errorCode,"RPC_UNKNOWN_ERROR");
+  }
+  for (const invalid of [new Error("execution reverted"),rpcRejection("execution reverted"),
+    Object.assign(new TypeError("execution reverted"),{ code: 3 }),
+    Object.assign(rpcExecutionRevert(),{ status: 503 }),
+    Object.assign(rpcExecutionRevert(),{ cause: rpcTimeout() })]) {
+    assert.notEqual(normalizeRpcError(invalid,{ operation: "estimate" }).errorCode,"ESTIMATE_EXECUTION_REVERT");
+  }
+  const f = destinationRpcFixture();
+  f.nodes[0].faults.set("eth_estimateGas",() => { throw error; });
+  await assert.rejects(f.rpc.estimateGas({ senderAddress: f.config.relayerAddress,
+    destinationGateway: "0x0000000000000000000000000000000000002001",calldata: "0x1234" }),value => {
+    assert.equal(value.name,"DestinationRpcError"); assert.equal(value.code,"ESTIMATE_EXECUTION_REVERT");
+    assert.equal(value.rpcCode,3); assert.equal(value.errorClass,"DETERMINISTIC_REJECTION");
+    assert.equal(JSON.stringify(value).includes("controlled EVM"),false);
+    assert.equal(JSON.stringify(value).includes("http://"),false); return true;
+  });
+  assert.equal(f.nodes[1].calls.length,0,"execution rejection must not trigger provider fallback");
+});
+
+test("estimate infrastructure, malformed response and unsupported RPC errors never become execution defer", async () => {
+  for (const failure of [rpcUnavailable(),rpcTimeout(),rpcHttpError(500),rpcProviderLimit(),
+    Object.assign(new Error("unsupported"),{ code: -32601 }),new SyntaxError("invalid JSON"),new Error("unknown RPC error")]) {
+    const f = destinationRpcFixture();
+    f.nodes.forEach(node => node.faults.set("eth_estimateGas",() => { throw failure; }));
+    await assert.rejects(f.rpc.estimateGas({ senderAddress: f.config.relayerAddress,
+      destinationGateway: "0x0000000000000000000000000000000000002001",calldata: "0x1234" }),error => error.code !== "ESTIMATE_EXECUTION_REVERT");
+  }
+  const f = destinationRpcFixture();
+  f.nodes[0].faults.set("eth_estimateGas",() => undefined);
+  await assert.rejects(f.rpc.estimateGas({ senderAddress: f.config.relayerAddress,
+    destinationGateway: "0x0000000000000000000000000000000000002001",calldata: "0x1234" }),{ code: "RPC_INVALID_RESPONSE" });
+});
 
 test("ordered endpoints, normalized duplicates, fingerprint and timeout configuration", () => {
   const env = relayerEnvironment({ CHAIN_B_RPC_URLS: '["http://localhost:9545","http://localhost:9546"]' });

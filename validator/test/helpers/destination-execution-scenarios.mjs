@@ -15,8 +15,10 @@ import { DELIVERY_POLICY } from "../../../indexer/src/delivery/policy.mjs";
 import { encodeDestinationSubmission, encodeGatewaySubmission, ENVELOPE_PARAMETERS, MESSAGE_PARAMETERS,
   QC_PARAMETERS, DESTINATION_GATEWAY_ABI } from "../../../indexer/src/relayer/encoding.mjs";
 import { createRelayerWorker } from "../../../indexer/src/relayer/service.mjs";
+import { createRelayerLeaseRepository } from "../../../indexer/src/relayer/leases.mjs";
 import { loadTransactionConfig } from "../../../indexer/src/transaction-manager/config.mjs";
 import { createTransactionManager } from "../../../indexer/src/transaction-manager/service.mjs";
+import { createTransactionRpc } from "../../../indexer/src/transaction-manager/rpc.mjs";
 import { deterministicPrimary } from "../../src/committee.mjs";
 import { developmentKeys } from "./fixtures.mjs";
 import { snapshotContext, encodeCertificate } from "./pbft-certificate.mjs";
@@ -329,5 +331,70 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   assert.equal(await readGateway("isMessageExecuted", [first.messageId]), true);
   assert.equal(await readGateway("isMessageExecuted", [redundant.messageId]), false);
   assert.equal(await readApp("isVerifiedSupplier", [supplier]), true);
+  // Unlike the retained pre-signed redundant transaction above, this message
+  // has NEVER been prepared before the first supplier grant took effect.
+  const lateRedundant = await produceAndFinalize(payload);
+  const independent = vectors.vectors[1];
+  const independentSupplier = normalizeAddress(independent.supplier);
+  assert.equal(await readApp("isVerifiedSupplier", [independentSupplier]), false);
+  const following = await produceAndFinalize(independent.expectedPayload);
+  const preparationSnapshot = await commitFresh([lateRedundant, following]);
+  await projector.materializeBatch({ batchRecordId: preparationSnapshot.record.batchRecordId });
+  const [deferPack, followingPack] = await buildDeliveryPackages(preparationSnapshot, { validatorSets });
+  await authenticate(deferPack, preparationSnapshot);
+  await expectError(call((await encodeGatewaySubmission(deferPack, { validatorSets })).data), operator,
+    "AlreadyVerifiedSupplier", [supplier]);
+  const limited = { ...relayConfig, maxJobs: 1 };
+  const liveRpc = createTransactionRpc(limited);
+  const activity = { estimates: 0, fees: 0, nonces: 0, signatures: 0, sends: 0 };
+  const account = privateKeyToAccount(limited.privateKey);
+  const liveManager = () => createTransactionManager({ config: limited, pool, queue,
+    account: { ...account, async signTransaction(...args) { activity.signatures++; return account.signTransaction(...args); } },
+    rpc: { ...liveRpc,
+      async estimateGas(...args) { activity.estimates++; return liveRpc.estimateGas(...args); },
+      async fees(...args) { activity.fees++; return liveRpc.fees(...args); },
+      async pendingNonce(...args) { activity.nonces++; return liveRpc.pendingNonce(...args); },
+      async broadcast(...args) { activity.sends++; return liveRpc.broadcast(...args); },
+    } });
+  const beforeDefer = await evidence();
+  const journals = tableName(config.databaseSchema, "transaction_broadcast_events");
+  const beforeJournal = (await pool.query(`SELECT * FROM ${journals} ORDER BY event_id`)).rows;
+  assert.equal(await manager.repository.getTransaction(deferPack.deliveryJobId), null);
+  const deferredPass = await createRelayerWorker({ config: limited, pool, queue, transactionManager: liveManager() }).runOnce();
+  assert.equal(deferredPass.selected, 1); assert.equal(deferredPass.deferred, 1); assert.equal(deferredPass.submitted, 0);
+  const deferred = deferredPass.results[0];
+  assert.equal(deferred.deliveryJobId, deferPack.deliveryJobId); assert.equal(deferred.action, "PREPARATION_DEFERRED");
+  assert.equal(deferred.reason, "ESTIMATE_EXECUTION_REVERT");
+  for (const key of ["intent", "attempt", "nonce", "transactionHash", "receipt"]) assert.equal(key in deferred, false);
+  assert.deepEqual(activity, { estimates: 1, fees: 0, nonces: 0, signatures: 0, sends: 0 });
+  assert.deepEqual(await evidence(), beforeDefer);
+  assert.deepEqual((await pool.query(`SELECT * FROM ${journals} ORDER BY event_id`)).rows, beforeJournal);
+  const schedule = await createRelayerLeaseRepository({ config: limited, pool, queue }).getLease(deferPack.deliveryJobId);
+  assert.equal(schedule.preparationRetryAt, deferred.retryAt); assert.notEqual(schedule.releasedAt, null);
+  assert.equal((await queue.getDeliveryJob(deferPack.deliveryJobId)).status, "READY");
+  assert.equal(await readGateway("isMessageExecuted", [lateRedundant.messageId]), false);
+  assert.equal(await readApp("isVerifiedSupplier", [supplier]), true);
+  console.log(`VALID: real eth_estimateGas AlreadyVerifiedSupplier classified as PREPARATION_DEFERRED for ${deferPack.deliveryJobId}; bounded reason ${deferred.reason}; retry ${deferred.retryAt}`);
+  console.log("VALID: preparation defer created zero intent, zero nonce allocation, zero signed attempt/signature, zero broadcast/journal/receipt; READY, replay and ApplicationB state unchanged");
+  let progressed;
+  for (let round = 0; round < 2 && !progressed; round++) {
+    const pass = await createRelayerWorker({ config: limited, pool, queue, transactionManager: liveManager() }).runOnce();
+    progressed = pass.results.find(result => result.submitted);
+  }
+  assert.ok(progressed, "following ordinary job must obtain a slot within two selection rounds even if the defer already became due");
+  assert.equal(progressed.intent.deliveryJobId, followingPack.deliveryJobId);
+  const followingReceipt = await client.waitForTransactionReceipt({ hash: progressed.attempt.transactionHash });
+  assert.equal(followingReceipt.status, "success");
+  assert.equal(await readGateway("isMessageExecuted", [following.messageId]), true);
+  assert.equal(await readApp("isVerifiedSupplier", [independentSupplier]), true);
+  assert.equal(await readGateway("isMessageExecuted", [lateRedundant.messageId]), false);
+  assert.equal(await manager.repository.getTransaction(deferPack.deliveryJobId), null);
+  assert.equal(activity.signatures, 1); assert.equal(activity.sends, 1);
+  await client.request({ method: "anvil_mine", params: [toHex(limited.destinationConfirmations)] });
+  await manager.checkReceiptsOnce();
+  assert.equal((await manager.repository.getTransaction(followingPack.deliveryJobId)).intent.status, "CONFIRMED");
+  assert.equal((await manager.repository.getTransaction(failurePack.deliveryJobId)).intent.status, "REVERTED");
+  for (const old of historical) assert.deepEqual(await lifecycle.readBatch({ batchRecordId: old.record.batchRecordId }), old);
+  console.log("VALID: following fresh READY job progressed through the real Relayer/Gateway/ApplicationB within the two-group bound; earlier actual mined REVERTED remained final; deferred message has no transaction outcome");
   console.log("COMPLETE END-TO-END EXECUTION EVIDENCE RECORDED: fresh ZK intent → source event → real finality/batch/PBFT/READY → production Relayer/Tx Manager → atomic Gateway/ApplicationB; duplicate rejection and business rollback; historical snapshots unchanged");
 }

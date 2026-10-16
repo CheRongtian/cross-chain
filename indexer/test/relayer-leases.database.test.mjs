@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
+import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { readdir,readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { applyMigrations, createDatabasePool, resetIndexerTables, tableName } from "../src/db.mjs";
 import { createDeliveryRepository } from "../src/delivery/repository.mjs";
 import { createRelayerLeaseRepository } from "../src/relayer/leases.mjs";
@@ -8,7 +12,7 @@ import { createTransactionManager } from "../src/transaction-manager/service.mjs
 import { verifySignedTransaction } from "../src/transaction-manager/transaction.mjs";
 import { transactionConfig, transactionHarness } from "./helpers/transaction-fixtures.mjs";
 import { persistReadyTransactionFixture } from "./helpers/transaction-database-fixtures.mjs";
-import { destinationRpcFixture, transactionBody } from "./helpers/destination-rpc-fixtures.mjs";
+import { destinationRpcFixture, transactionBody,rpcExecutionRevert,rpcUnavailable } from "./helpers/destination-rpc-fixtures.mjs";
 import { sourceState } from "../../validator/test/helpers/four-process.mjs";
 
 const config = transactionConfig({ DATABASE_URL: process.env.DATABASE_URL,
@@ -53,6 +57,233 @@ async function useMultiDestinationFixture() {
   await persistReadyTransactionFixture({ config,pool,multiDestination: true });
   jobs = await queue.listReadyDeliveryJobs();
 }
+
+async function rejectEstimatesFor(ids) {
+  const calldata = new Set(await Promise.all(ids.map(async id => (await reader.resolveIntent(id)).calldata)));
+  destination.nodes.forEach(node => node.faults.set("eth_estimateGas",({ params,forward }) => {
+    if (calldata.has(params[0].data)) throw rpcExecutionRevert();
+    return forward();
+  }));
+  return calldata;
+}
+async function preparationDue(id) {
+  await pool.query(`UPDATE ${leaseTable} SET preparation_retry_at = clock_timestamp() - interval '1 millisecond' WHERE delivery_job_id = $1`,[id]);
+}
+async function runInFreshProcess(rejectedIds) {
+  return new Promise((resolve,reject) => {
+    const child = spawn(process.execPath,[fileURLToPath(new URL("./helpers/lease-selection-process.mjs",import.meta.url))],{
+      env: { ...process.env,DATABASE_URL: config.databaseUrl,INDEXER_DB_SCHEMA: config.databaseSchema,
+        PREPARATION_REJECT_JOB_IDS: JSON.stringify(rejectedIds) },
+      stdio: ["ignore","pipe","pipe"],timeout: 30000,
+    });
+    let output = ""; let diagnostics = "";
+    child.stdout.on("data",chunk => { output += chunk; });
+    child.stderr.on("data",chunk => { diagnostics += chunk; });
+    child.once("error",reject);
+    child.once("close",code => {
+      if (code !== 0) return reject(new Error(`fresh Relayer process failed (${code}): ${diagnostics}`));
+      try { resolve(JSON.parse(output)); } catch (error) { reject(error); }
+    });
+  });
+}
+
+test("SQL explicit estimate defer persists across clients without intent, account nonce, attempt, journal or send", async () => {
+  const id = jobs[0].deliveryJobId; await rejectEstimatesFor([id]);
+  const before = await sourceState(pool,config.databaseSchema);
+  const worker = createRelayerWorker({ config,pool,queue,transactionManager: reader });
+  const result = await worker.submitJob(id);
+  assert.equal(result.action,"PREPARATION_DEFERRED"); assert.equal(result.submitted,false);
+  assert.equal("nonce" in result,false); assert.equal("transactionHash" in result,false);
+  assert.deepEqual(await counts(),{ intents: 0,attempts: 0 }); assert.equal(await reader.repository.getAccount(),null);
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM ${tableName(config.databaseSchema,"transaction_broadcast_events")}`)).rows[0].count,0);
+  assert.equal(destination.nodes.flatMap(node => node.calls).some(call => ["eth_getTransactionCount","eth_maxPriorityFeePerGas","eth_sendRawTransaction"].includes(call.method)),false);
+  const fresh = createDatabasePool(config);
+  try {
+    const restarted = createRelayerLeaseRepository({ config,pool: fresh,queue });
+    const stored = await restarted.getLease(id);
+    assert.equal(stored.preparationRetryAt,result.retryAt); assert.equal(stored.preparationDeferReason,"ESTIMATE_EXECUTION_REVERT");
+    assert.notEqual(stored.releasedAt,null);
+    // Keep this not-due assertion independent of test host speed.
+    await pool.query(`UPDATE ${leaseTable} SET preparation_retry_at = clock_timestamp() + interval '1 hour' WHERE delivery_job_id = $1`,[id]);
+    await restarted.withWorker(async session => {
+      assert.equal(await restarted.tryAcquireLease(id,session),null);
+      const selected = await restarted.listClaimableJobs({ session,limit: 1 });
+      assert.equal(selected[0].deliveryJobId,jobs[1].deliveryJobId);
+    });
+    assert.equal((await createRelayerWorker({ config,pool: fresh,queue,leases: restarted,transactionManager: reader }).submitJob(id)).action,"PREPARATION_DEFERRED");
+  } finally { await fresh.end(); }
+  assert.deepEqual(await queue.listReadyDeliveryJobs(),jobs); assert.deepEqual(await sourceState(pool,config.databaseSchema),before);
+});
+
+test("SQL automatic larger pass defers one estimate rejection and still submits following READY jobs", async () => {
+  await rejectEstimatesFor([jobs[0].deliveryJobId]);
+  const result = await createRelayerWorker({ config,pool,queue,transactionManager: reader }).runOnce();
+  assert.equal(result.selected,3); assert.equal(result.deferred,1); assert.equal(result.submitted,2);
+  assert.deepEqual(await counts(),{ intents: 2,attempts: 2 });
+  assert.equal(await reader.repository.getTransaction(jobs[0].deliveryJobId),null);
+});
+
+test("SQL due retry renews defer, then state improvement clears scheduling in the intent commit", async () => {
+  const id = jobs[0].deliveryJobId; const rejected = await rejectEstimatesFor([id]);
+  const worker = () => createRelayerWorker({ config,pool: poolB,queue: queueB,transactionManager: manager({ db: poolB }) });
+  await worker().submitJob(id); await preparationDue(id);
+  const old = await leases.getLease(id); const again = await worker().submitJob(id);
+  assert.equal(again.action,"PREPARATION_DEFERRED"); assert.ok(Date.parse(again.retryAt) > Date.parse(old.preparationRetryAt));
+  rejected.clear(); await preparationDue(id);
+  const prepared = await worker().submitJob(id);
+  assert.equal(prepared.submitted,true); assert.equal((await leases.getLease(id)).preparationRetryAt,null);
+  assert.equal((await leases.getLease(id)).preparationDeferReason,null);
+  const attempts = prepared.attempts; const gas = destination.nodes.flatMap(node => node.calls).filter(call => call.method === "eth_estimateGas").length;
+  await pool.query(`UPDATE ${leaseTable} SET preparation_retry_at = clock_timestamp() + interval '1 hour',preparation_defer_reason = 'ESTIMATE_EXECUTION_REVERT' WHERE delivery_job_id = $1`,[id]);
+  assert.deepEqual((await worker().submitJob(id)).attempts,attempts);
+  assert.equal(destination.nodes.flatMap(node => node.calls).filter(call => call.method === "eth_estimateGas").length,gas);
+});
+
+test("SQL persistent fairness survives fresh OS processes, slow one-shots and continuous genuine READY arrivals", async () => {
+  // Three due deferred jobs, then one newly committed/materialized batch on
+  // EVERY round. No in-memory selection cursor and no real sleep are involved.
+  const deferredIds = jobs.map(job => job.deliveryJobId);
+  for (const id of deferredIds) {
+    const [item] = await runInFreshProcess(deferredIds);
+    assert.equal(item.deliveryJobId,id); assert.equal(item.action,"PREPARATION_DEFERRED");
+    await pool.query(`UPDATE ${leaseTable} SET preparation_retry_at = clock_timestamp() + interval '1 hour' WHERE delivery_job_id = $1`,[id]);
+  }
+  assert.deepEqual(await counts(),{ intents: 0,attempts: 0 });
+  for (const id of deferredIds) await preparationDue(id);
+  const seen = []; const ordinary = [];
+  for (let round = 0; round < 6; round++) {
+    await persistReadyTransactionFixture({ config,pool,append: true,count: 1,epoch: 24n + BigInt(round),messageOffset: 100 + round });
+    // Shift all schedules by the SAME elapsed interval, preserving their
+    // relative retry order. Every invocation models a gap longer than defer.
+    await pool.query(`UPDATE ${leaseTable} SET preparation_retry_at = preparation_retry_at -
+      $1::bigint * interval '1 millisecond' WHERE preparation_retry_at IS NOT NULL`,[config.rebroadcastIntervalMs + 1]);
+    const [item] = await runInFreshProcess(deferredIds); assert.ok(item);
+    const id = item.deliveryJobId;
+    if (deferredIds.includes(id)) {
+      seen.push(id); assert.equal(item.action,"PREPARATION_DEFERRED"); assert.equal(item.submitted,false);
+      assert.equal(await reader.repository.getTransaction(id),null);
+    } else {
+      ordinary.push(id); assert.equal(item.submitted,true);
+      const prepared = await reader.repository.getTransaction(id);
+      // Finalize through the existing repository so no unrelated pending
+      // intent can compete with the preparation-only selection assertion.
+      await reader.repository.recordOutcome(id,{ transactionHash: prepared.attempt.transactionHash,status: 1,
+        blockNumber: 100n,blockHash: config.destinationGenesisHash,head: 102n });
+    }
+  }
+  assert.equal(ordinary.length,3); assert.equal(new Set(seen).size,3);
+  assert.ok(deferredIds.every(id => seen.includes(id)),"D=3 due jobs are reconsidered within 2D=6 rounds despite fresh arrivals");
+});
+
+test("SQL job-row gate serializes a late defer behind a concurrently committing initial intent", async () => {
+  const id = jobs[0].deliveryJobId;
+  let signed; let commit; let attempted;
+  const entered = new Promise(resolve => { signed = resolve; });
+  const release = new Promise(resolve => { commit = resolve; });
+  const waiting = new Promise(resolve => { attempted = resolve; });
+  const watched = { async connect() {
+    const client = await poolB.connect();
+    return { query(sql,params) {
+      const pending = client.query(sql,params);
+      if (sql.includes("FOR NO KEY UPDATE")) attempted();
+      return pending;
+    },release: () => client.release() };
+  } };
+  await leases.withWorker(async session => {
+    const fence = await leases.tryAcquireLease(id,session);
+    const creator = manager({ beforeSignedCommit: async () => { signed(); await release; } });
+    const preparation = creator.prepareDeliveryTransaction(id);
+    let deferred;
+    try {
+      await entered;
+      const contender = createRelayerLeaseRepository({ config,pool: watched,queue });
+      deferred = contender.deferPreparation(fence);
+      await waiting;
+    } finally { commit(); }
+    const stored = await preparation;
+    assert.equal(await deferred,null);
+    assert.equal((await leases.getLease(id)).preparationRetryAt,null);
+    assert.equal((await reader.repository.getTransaction(id)).attempt.transactionHash,stored.attempt.transactionHash);
+    assert.deepEqual(await counts(),{ intents: 1,attempts: 1 });
+  });
+});
+
+test("SQL stale owners cannot defer and concurrent initial intent creation takes precedence", async () => {
+  const id = jobs[0].deliveryJobId;
+  await leases.withWorker(async a => leasesB.withWorker(async b => {
+    const old = await leases.tryAcquireLease(id,a); await expire(id);
+    const current = await leasesB.tryAcquireLease(id,b);
+    await assert.rejects(leases.deferPreparation(old),{ code: "STALE_FENCE" });
+    assert.equal((await leases.getLease(id)).preparationRetryAt,null);
+    await leasesB.deferPreparation(current);
+    // Exercise the unfenced direct Manager path against the same job-row gate.
+    const stored = await reader.prepareDeliveryTransaction(id);
+    assert.equal((await leases.getLease(id)).preparationRetryAt,null);
+    assert.equal(await leasesB.deferPreparation(current),null);
+    assert.deepEqual((await reader.repository.getTransaction(id)).attempt,stored.attempt);
+    assert.deepEqual(await counts(),{ intents: 1,attempts: 1 });
+  }));
+});
+
+test("SQL failed initial intent commit rolls back preparation-schedule clearing with the nonce and attempt", async () => {
+  const id = jobs[0].deliveryJobId; const rejected = await rejectEstimatesFor([id]);
+  await createRelayerWorker({ config,pool,queue,transactionManager: reader }).submitJob(id);
+  rejected.clear(); await preparationDue(id);
+  const before = await leases.getLease(id);
+  const failed = manager({ beforeSignedCommit: async () => { throw new Error("controlled preparation commit failure"); } });
+  await assert.rejects(createRelayerWorker({ config,pool,queue,transactionManager: failed }).submitJob(id),/controlled preparation commit failure/);
+  assert.deepEqual(await counts(),{ intents: 0,attempts: 0 }); assert.equal(await reader.repository.getAccount(),null);
+  assert.equal((await leases.getLease(id)).preparationRetryAt,before.preparationRetryAt);
+  assert.equal((await leases.getLease(id)).preparationDeferReason,before.preparationDeferReason);
+});
+
+test("SQL infrastructure errors and invalid evidence stay fail-fast without preparation scheduling", async () => {
+  destination.nodes.forEach(node => node.faults.set("eth_estimateGas",() => { throw rpcUnavailable(); }));
+  await assert.rejects(createRelayerWorker({ config,pool,queue,transactionManager: reader }).runOnce(),{ code: "RPC_UNAVAILABLE" });
+  assert.equal((await leases.getLease(jobs[0].deliveryJobId)).preparationRetryAt,null);
+  const invalidQueue = { ...queue,async getDeliveryPackage(id) { const pack = structuredClone(await queue.getDeliveryPackage(id)); pack.messageRoot = `0x${"ff".repeat(32)}`; return pack; } };
+  await assert.rejects(createRelayerWorker({ config,pool,queue: invalidQueue,transactionManager: reader }).submitJob(jobs[0].deliveryJobId));
+  assert.equal((await leases.getLease(jobs[0].deliveryJobId)).preparationRetryAt,null);
+  assert.deepEqual(await counts(),{ intents: 0,attempts: 0 }); assert.equal(await reader.repository.getAccount(),null);
+});
+
+test("preparation migration upgrades existing leases and signed history without backfill or outcome changes", async () => {
+  const schema = "preparation_upgrade_" + randomUUID().replaceAll("-",""); const cfg = { ...config,databaseSchema: schema };
+  const client = await pool.connect(); let open = false;
+  try {
+    const names = (await readdir(new URL("../migrations/",import.meta.url))).filter(name => /^\d+_.*\.sql$/.test(name) && Number(name.slice(0,3)) <= 15).sort();
+    await client.query("BEGIN"); open = true; await client.query(`CREATE SCHEMA "${schema}"`);
+    await client.query(`SET LOCAL search_path TO "${schema}"`);
+    await client.query("CREATE TABLE schema_migrations (name TEXT PRIMARY KEY,applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)");
+    for (const name of names) {
+      await client.query(await readFile(new URL("../migrations/" + name,import.meta.url),"utf8"));
+      await client.query("INSERT INTO schema_migrations (name) VALUES ($1)",[name]);
+    }
+    await client.query("COMMIT"); open = false;
+    await persistReadyTransactionFixture({ config: cfg,pool });
+    const q = createDeliveryRepository({ config: cfg,pool }); const oldJobs = await q.listReadyDeliveryJobs(); const id = oldJobs[0].deliveryJobId;
+    await pool.query(`INSERT INTO ${tableName(schema,"relayer_worker_ids")} (worker_id) VALUES ('relayer-a')`);
+    await pool.query(`INSERT INTO ${tableName(schema,"relayer_job_leases")}
+      (delivery_job_id,owner_id,owner_session_id,fencing_token,lease_acquired_at,lease_expires_at,last_renewed_at)
+      VALUES ($1,'relayer-a',$2,1,clock_timestamp(),clock_timestamp() + interval '1 hour',clock_timestamp())`,[id,randomUUID()]);
+    const legacy = manager({ cfg,db: pool }); const signed = await legacy.prepareDeliveryTransaction(oldJobs[1].deliveryJobId);
+    const account = await legacy.repository.getAccount(); const source = await sourceState(pool,schema);
+    const before = (await pool.query(`SELECT * FROM ${tableName(schema,"relayer_job_leases")}`)).rows[0];
+    assert.equal((await applyMigrations(pool,schema)).at(-1),"016_relayer_preparation_defer.sql");
+    const upgraded = (await pool.query(`SELECT * FROM ${tableName(schema,"relayer_job_leases")}`)).rows[0];
+    const { preparation_retry_at,preparation_defer_reason,...unchanged } = upgraded;
+    assert.equal(preparation_retry_at,null); assert.equal(preparation_defer_reason,null); assert.deepEqual(unchanged,before);
+    assert.equal((await pool.query(`SELECT preparation_deferred_turn FROM ${tableName(schema,"relayer_worker_ids")}`)).rows[0].preparation_deferred_turn,false);
+    await applyMigrations(pool,schema);
+    assert.deepEqual(await legacy.repository.getTransaction(oldJobs[1].deliveryJobId),{ intent: signed.intent,attempt: signed.attempt,attempts: signed.attempts,winningAttempt: signed.winningAttempt });
+    assert.deepEqual(await legacy.repository.getAccount(),account); assert.deepEqual(await q.listReadyDeliveryJobs(),oldJobs);
+    assert.deepEqual(await sourceState(pool,schema),source);
+    await assert.rejects(pool.query(`UPDATE ${tableName(schema,"relayer_job_leases")} SET preparation_defer_reason = 'UNBOUNDED_RAW_PROVIDER_TEXT' WHERE delivery_job_id = $1`,[id]));
+  } finally {
+    try { if (open) await client.query("ROLLBACK"); await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`); }
+    finally { client.release(); }
+  }
+});
 
 test("SQL filters a foreign-first prefix before LIMIT=1 and refuses foreign lease acquisition", async () => {
   await useMultiDestinationFixture();

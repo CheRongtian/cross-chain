@@ -19,7 +19,8 @@ try {
   const result = await createRelayerWorker({ config,pool,queue,transactionManager }).runOnce();
   console.log(deliveryJson({ ...result, results: result.results.map((record) => ({ deliveryJobId: record.intent?.deliveryJobId ?? record.historicalSubmission?.deliveryJobId ?? record.deliveryJobId,
     transactionHash: record.attempt?.transactionHash ?? record.historicalSubmission?.transactionHash,
-    nonce: record.attempt?.nonce ?? null,status: record.attempt?.status ?? record.action ?? "HISTORICAL",workerId: record.workerId,
+    ...(record.attempt ? { nonce: record.attempt.nonce } : {}),
+    reason: record.reason,retryAt: record.retryAt,status: record.attempt?.status ?? record.action ?? "HISTORICAL",workerId: record.workerId,
     fencingToken: record.fencingToken,submitted: record.submitted })) }));
 } catch (error) {
   console.error(`Relayer worker failed: ${safeRelayerMessage(error,config)}`);

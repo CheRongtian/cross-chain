@@ -6,6 +6,9 @@ import { createRelayerWorker } from "../src/relayer/service.mjs";
 import { createTransactionManager } from "../src/transaction-manager/service.mjs";
 import { transactionConfig,transactionHarness,transientSendError } from "./helpers/transaction-fixtures.mjs";
 import { memoryLeaseFixture } from "./helpers/lease-fixtures.mjs";
+import { DestinationRpcError } from "../src/transaction-manager/rpc-pool.mjs";
+
+const executionRejection = () => new DestinationRpcError("ESTIMATE_EXECUTION_REVERT",{ errorClass: "DETERMINISTIC_REJECTION",rpcCode: 3 });
 
 async function fixture(options = {}) {
   const h = await transactionHarness(options); const leases = memoryLeaseFixture(h);
@@ -14,6 +17,156 @@ async function fixture(options = {}) {
   const worker = (config,repository,manager,options = {}) => createRelayerWorker({ config,queue: h.queue,leases: repository,transactionManager: manager,...options });
   return { ...h,leases,a,b,bConfig,managerB,worker,id: h.jobs[0].deliveryJobId };
 }
+
+function rejectEstimateFor(h,ids) {
+  const estimate = h.rpc.estimateGas;
+  h.rpc.estimateGas = async intent => {
+    if (ids.has(intent.deliveryJobId)) { h.calls.gas++; throw executionRejection(); }
+    return estimate(intent);
+  };
+}
+
+test("explicit preparation defer is durable READY scheduling with zero intent, nonce, signature, attempt, broadcast or receipt", async () => {
+  const h = await fixture(); rejectEstimateFor(h,new Set([h.id]));
+  const worker = () => h.worker(h.config,h.leases.repository(),h.restart());
+  const deferred = await worker().submitJob(h.id);
+  assert.equal(deferred.action,"PREPARATION_DEFERRED"); assert.equal(deferred.submitted,false);
+  assert.equal(deferred.reason,"ESTIMATE_EXECUTION_REVERT"); assert.ok(Date.parse(deferred.retryAt) > h.clock.now());
+  for (const key of ["intent","attempt","nonce","transactionHash","receipt"]) assert.equal(key in deferred,false);
+  assert.equal(h.records.size,0); assert.equal(await h.repository.getAccount(),null); assert.equal(h.journal.length,0);
+  assert.equal(h.calls.gas,1); assert.equal(h.calls.fees,0); assert.equal(h.calls.pending,0); assert.equal(h.calls.sign,0); assert.equal(h.calls.broadcast.length,0);
+  const lease = await h.a.getLease(h.id); assert.notEqual(lease.releasedAt,null);
+  assert.equal(lease.preparationRetryAt,deferred.retryAt);
+  assert.equal((await worker().submitJob(h.id)).action,"PREPARATION_DEFERRED"); assert.equal(h.calls.gas,1);
+  assert.equal(h.jobs[0].status,"READY"); assert.deepEqual(h.packets,h.original);
+});
+
+test("limit=1 excludes not-due preparation before LIMIT and a fresh worker advances the following job", async () => {
+  const h = await fixture({ config: transactionConfig({ RELAYER_MAX_JOBS_PER_RUN: "1" }) });
+  rejectEstimateFor(h,new Set([h.id]));
+  const worker = () => h.worker(h.config,h.leases.repository(),h.restart());
+  const first = await worker().runOnce(); assert.equal(first.deferred,1); assert.equal(first.submitted,0);
+  const second = await worker().runOnce(); assert.equal(second.submitted,1);
+  assert.equal(second.results[0].intent.deliveryJobId,h.jobs[1].deliveryJobId);
+  assert.equal(h.records.has(h.id),false); assert.equal(h.calls.gas,2);
+});
+
+test("larger selection continues the same pass after explicit estimate rejection", async () => {
+  const h = await fixture(); rejectEstimateFor(h,new Set([h.id]));
+  const result = await h.worker(h.config,h.a,h.manager).runOnce();
+  assert.equal(result.selected,3); assert.equal(result.deferred,1); assert.equal(result.submitted,2);
+  assert.equal(result.results[0].action,"PREPARATION_DEFERRED");
+  assert.deepEqual([...h.records.keys()],h.jobs.slice(1).map(job => job.deliveryJobId));
+  assert.equal(h.calls.sign,2); assert.equal(h.calls.broadcast.length,2);
+});
+
+test("a due improved job prepares normally and atomically clears preparation scheduling", async () => {
+  const h = await fixture(); const rejected = new Set([h.id]); rejectEstimateFor(h,rejected);
+  const worker = () => h.worker(h.config,h.leases.repository(),h.restart());
+  const first = await worker().submitJob(h.id); rejected.clear();
+  h.advance(h.config.rebroadcastIntervalMs);
+  const result = await worker().submitJob(h.id);
+  assert.equal(result.submitted,true); assert.equal(result.intent.status,"PENDING");
+  assert.equal((await h.a.getLease(h.id)).preparationRetryAt,null);
+  assert.equal((await h.a.getLease(h.id)).preparationDeferReason,null);
+  assert.equal(h.calls.sign,1); assert.equal(h.records.size,1);
+  assert.ok(Date.parse(first.retryAt) <= h.clock.now());
+  // Even stale scheduling metadata must not mask an already signed intent.
+  Object.assign(h.leases.rows.get(h.id),{ preparationRetryAt: new Date(h.clock.now() + 100000).toISOString(),preparationDeferReason: "ESTIMATE_EXECUTION_REVERT" });
+  const gas = h.calls.gas;
+  await worker().submitJob(h.id); assert.equal(h.calls.gas,gas); assert.equal(h.calls.sign,1);
+});
+
+test("slow fresh one-shot workers rotate due deferred jobs and fresh arrivals within the two-group bound", async () => {
+  const h = await fixture({ count: 15,config: transactionConfig({ RELAYER_MAX_JOBS_PER_RUN: "1" }) });
+  const waiting = h.jobs.splice(3); const rejected = new Set(h.jobs.map(job => job.deliveryJobId));
+  rejectEstimateFor(h,rejected);
+  for (const job of h.jobs) await h.worker(h.config,h.a,h.manager).submitJob(job.deliveryJobId);
+  const ids = [...rejected]; const seen = new Set(); let normal = 0;
+  // One new legitimate job arrives before EVERY invocation. Each iteration
+  // constructs fresh worker/repository/manager instances, with no sleep.
+  for (let round = 0; round < 6; round++) {
+    h.jobs.push(waiting.shift()); h.advance(h.config.rebroadcastIntervalMs + 1);
+    const result = await h.worker(h.config,h.leases.repository(),h.restart()).runOnce();
+    assert.equal(result.selected,1);
+    const item = result.results[0];
+    if (item.action === "PREPARATION_DEFERRED") {
+      seen.add(item.deliveryJobId);
+      assert.ok(Date.parse(item.retryAt) > h.clock.now());
+    } else {
+      normal++; h.mine(item.intent.deliveryJobId); h.state.head = 102n; await h.manager.checkReceiptsOnce();
+    }
+  }
+  assert.deepEqual([...seen],ids); assert.equal(normal,3);
+  for (const id of ids) assert.equal(h.records.has(id),false);
+});
+
+test("stale estimate failure cannot write defer after takeover; the current owner can", async () => {
+  const h = await fixture(); let current;
+  h.rpc.estimateGas = async () => {
+    h.advance(h.config.leaseMs);
+    await h.b.withWorker(async b => { current = await h.b.tryAcquireLease(h.id,b); });
+    throw executionRejection();
+  };
+  await assert.rejects(h.worker(h.config,h.a,h.manager).submitJob(h.id),{ code: "STALE_FENCE" });
+  assert.equal((await h.a.getLease(h.id)).preparationRetryAt,null);
+  const deferred = await h.b.deferPreparation(current);
+  assert.equal(deferred.ownerId,"relayer-b"); assert.ok(Date.parse(deferred.preparationRetryAt) > h.clock.now());
+  assert.equal(h.records.size,0); assert.equal(h.calls.sign,0); assert.equal(await h.repository.getAccount(),null);
+});
+
+test("an intent committed during the estimate takes precedence over a late preparation rejection", async () => {
+  const h = await fixture(); const estimate = h.rpc.estimateGas; let once = true;
+  h.rpc.estimateGas = async intent => {
+    if (!once) return estimate(intent);
+    once = false; await h.managerB.prepareDeliveryTransaction(h.id);
+    throw executionRejection();
+  };
+  const result = await h.worker(h.config,h.a,h.manager).submitJob(h.id);
+  assert.equal(result.submitted,true); assert.equal(h.records.size,1); assert.equal(h.calls.sign,1);
+  assert.equal((await h.a.getLease(h.id)).preparationRetryAt,null);
+});
+
+test("RPC, malformed responses, unknown and programming failures still abort without a preparation defer write", async () => {
+  for (const error of [new DestinationRpcError("RPC_UNAVAILABLE",{ errorClass: "TRANSIENT_RPC_ERROR" }),
+    new DestinationRpcError("RPC_INVALID_RESPONSE"),new DestinationRpcError("RPC_UNKNOWN_ERROR"),
+    new TypeError("controlled programming error"),new Error("execution reverted without structured evidence")]) {
+    const h = await fixture(); h.rpc.estimateGas = async () => { throw error; };
+    await assert.rejects(h.worker(h.config,h.a,h.manager).runOnce());
+    assert.equal((await h.a.getLease(h.id)).preparationRetryAt,null); assert.equal(h.records.size,0);
+    assert.equal(h.calls.sign,0); assert.equal(h.calls.broadcast.length,0);
+  }
+  const h = await fixture(); h.state.actualChain = 3001n;
+  await assert.rejects(h.worker(h.config,h.a,h.manager).runOnce(),{ code: "CHAIN_ID_MISMATCH" });
+  assert.equal(await h.a.getLease(h.id),null);
+});
+
+test("invalid QC, Merkle, source, destination and package framing fail before estimate without defer", async () => {
+  for (const mutate of [p => { p.quorumCertificate.commits[0].signature = `0x${"ff".repeat(65)}`; },
+    p => { p.merkleProof.siblings[0] = `0x${"ee".repeat(32)}`; },
+    p => { p.message.sourceGateway = p.message.sourceSender; },
+    p => { p.message.destinationDomain = "3001"; },
+    p => { p.message.destinationGateway = p.message.destinationReceiver; },
+    p => { p.transportVersion = 2; }]) {
+    const h = await fixture({ mutate });
+    await assert.rejects(h.worker(h.config,h.a,h.manager).submitJob(h.id));
+    assert.equal((await h.a.getLease(h.id))?.preparationRetryAt ?? null,null);
+    assert.equal(h.calls.gas,0); assert.equal(h.calls.sign,0); assert.equal(h.records.size,0);
+  }
+});
+
+test("session loss after an estimate revert aborts before any defer write", async () => {
+  const h = await fixture(); let lost = false;
+  const leases = { ...h.a,async withWorker(operation) {
+    return h.a.withWorker(session => operation({ ...session,assertHeld() {
+      if (lost) throw Object.assign(new Error("RELAYER_SESSION_LOST"),{ code: "RELAYER_SESSION_LOST" });
+    } }));
+  } };
+  h.rpc.estimateGas = async () => { lost = true; throw executionRejection(); };
+  await assert.rejects(h.worker(h.config,leases,h.manager).submitJob(h.id),{ code: "RELAYER_SESSION_LOST" });
+  assert.equal((await h.a.getLease(h.id)).preparationRetryAt,null);
+  assert.equal(h.records.size,0); assert.equal(h.calls.sign,0); assert.equal(h.calls.broadcast.length,0);
+});
 
 test("foreign-first READY jobs cannot fill limit=1 ahead of the configured destination", async () => {
   const h = await fixture({ multiDestination: true,
@@ -275,6 +428,7 @@ test("corrupt evidence fails before nonce/signing and leaves immutable input int
   const leases = memoryLeaseFixture(h);
   await assert.rejects(createRelayerWorker({ config: h.config,queue: h.queue,leases: leases.repository(),transactionManager: h.manager }).runOnce());
   assert.equal(h.calls.sign,0); assert.equal(h.calls.broadcast.length,0); assert.equal(h.records.size,0);
+  assert.equal((await leases.repository().getLease(h.jobs[0].deliveryJobId)).preparationRetryAt,null);
 });
 
 test("pending not-yet-due jobs do not starve later new jobs before the per-worker limit", async () => {

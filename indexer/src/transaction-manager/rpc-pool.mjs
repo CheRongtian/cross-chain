@@ -27,7 +27,7 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
     label: `rpc-${index}`,client: createClient(url),status: "UNAVAILABLE",reason: null,lastErrorClass: null,
   }));
   async function raw(endpoint,method,params = []) {
-    const operation = method === "eth_sendRawTransaction" ? "broadcast" : "read";
+    const operation = method === "eth_sendRawTransaction" ? "broadcast" : method === "eth_estimateGas" ? "estimate" : "read";
     // Cover the complete response body too: the installed HTTP transport's
     // internal fetch timer ends when response headers arrive.
     const controller = new AbortController();
@@ -60,7 +60,7 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
     return new DestinationRpcError(code,{ errorClass: "TRANSIENT_RPC_ERROR" });
   }
   function safeRejection(endpoint,operation,error,observations) {
-    const normalized = normalizeRpcError(error,{ operation: operation === "broadcast" ? "broadcast" : "read" });
+    const normalized = normalizeRpcError(error,{ operation: operation === "broadcast" ? "broadcast" : operation === "eth_estimateGas" ? "estimate" : "read" });
     return new DestinationRpcError(normalized.errorCode,{
       ...normalized,observations: [...observations,observation(endpoint,operation,"REJECTED",normalized.errorClass,normalized)],
     });

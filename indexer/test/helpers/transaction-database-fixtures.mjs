@@ -1,19 +1,23 @@
 import { createBatchLifecycle } from "../../src/batch-lifecycle.mjs";
-import { createCanonicalStore, createDatabaseStore, createFinalityStore } from "../../src/db.mjs";
+import { createCanonicalStore, createDatabaseStore, createFinalityStore,readCursor } from "../../src/db.mjs";
 import { createDeliveryProjector } from "../../src/delivery/projector.mjs";
 import { deliveryFixture, fixtureHash } from "./delivery-fixtures.mjs";
 
-export async function persistReadyTransactionFixture({ config, pool, multiDestination = false }) {
-  await createDatabaseStore(pool, config.databaseSchema).loadOrInitializeCursor(config, 10n);
-  await createCanonicalStore(pool, config.databaseSchema).bootstrapCanonicalHistory(config, {
-    expectedNextBlock: 10n, blocks: [{ number: 9n, hash: fixtureHash(10), parentHash: fixtureHash(9) }] });
-  const fixture = await deliveryFixture({ multiDestination });
-  await createDatabaseStore(pool, config.databaseSchema).persistRange(config, { fromBlock: 10n, toBlock: 10n,
-    blocks: [{ number: 10n, hash: fixtureHash(11), parentHash: fixtureHash(10) }],
+export async function persistReadyTransactionFixture({ config, pool, multiDestination = false,count = 3,
+  epoch = 23n,messageOffset = 0,append = false }) {
+  if (!append) {
+    await createDatabaseStore(pool, config.databaseSchema).loadOrInitializeCursor(config, 10n);
+    await createCanonicalStore(pool, config.databaseSchema).bootstrapCanonicalHistory(config, {
+      expectedNextBlock: 10n, blocks: [{ number: 9n, hash: fixtureHash(10), parentHash: fixtureHash(9) }] });
+  }
+  const block = append ? BigInt((await readCursor(pool,config.databaseSchema,config)).next_block) : 10n;
+  const fixture = await deliveryFixture({ multiDestination,count,epoch,messageOffset,sourceBlockNumber: block });
+  await createDatabaseStore(pool, config.databaseSchema).persistRange(config, { fromBlock: block, toBlock: block,
+    blocks: [{ number: block, hash: fixtureHash(block + 1n), parentHash: fixtureHash(block) }],
     rows: fixture.batch.messages.map(message => ({ ...message, payload: Buffer.from(message.payload.slice(2), "hex") })) });
-  await createFinalityStore(pool, config.databaseSchema).advanceFinality(config, { headBlock: 10n, finalityBlockDepth: 0n });
+  await createFinalityStore(pool, config.databaseSchema).advanceFinality(config, { headBlock: block, finalityBlockDepth: 0n });
   const lifecycle = createBatchLifecycle({ config, pool });
-  const collected = await lifecycle.collectEligible({ initialEpoch: fixture.record.epoch });
+  const collected = await lifecycle.collectEligible(append ? {} : { initialEpoch: fixture.record.epoch });
   const id = collected.snapshot.record.batchRecordId;
   await lifecycle.sealBatch({ batchRecordId: id });
   await lifecycle.markConsensusPending({ batchRecordId: id });

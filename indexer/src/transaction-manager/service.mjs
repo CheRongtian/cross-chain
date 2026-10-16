@@ -13,7 +13,8 @@ import { operationTime, replacementDue, replacementFees } from "./retry-policy.m
 import { processTransactionRetriesOnce } from "./retry.mjs";
 import { TransactionError } from "./config.mjs";
 import { recoverTransactionsOnce } from "./recovery.mjs";
-import { BROADCAST_ERROR_CLASSES } from "./rpc-errors.mjs";
+import { BROADCAST_ERROR_CLASSES, ESTIMATE_EXECUTION_REVERT } from "./rpc-errors.mjs";
+import { DestinationRpcError } from "./rpc-pool.mjs";
 
 export function createTransactionManager({ config,pool,queue = createDeliveryRepository({ config,pool }),
   rpc = createTransactionRpc(config),account = privateKeyToAccount(config.privateKey),repository,
@@ -55,7 +56,17 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     if (historicalSubmission) return Object.freeze({ historicalSubmission,created: false });
     const existing = await store.getTransaction(id,intent);
     if (existing) return Object.freeze({ ...existing,created: false });
-    const gasLimit = protocolInteger(await rpc.estimateGas(intent),"gas limit");
+    let estimate;
+    try { estimate = await rpc.estimateGas(intent); }
+    catch (error) {
+      // This signal can originate only here, after validated evidence/identity
+      // and the absent-intent check, before fees, nonce, persistence or signing.
+      if (error instanceof DestinationRpcError && error.code === ESTIMATE_EXECUTION_REVERT && error.errorClass === "DETERMINISTIC_REJECTION") {
+        throw new TransactionError("PREPARATION_EXECUTION_REJECTED");
+      }
+      throw error;
+    }
+    const gasLimit = protocolInteger(estimate,"gas limit");
     const market = await rpc.fees();
     const maxFeePerGas = protocolInteger(market.maxFeePerGas,"max fee");
     const maxPriorityFeePerGas = protocolInteger(market.maxPriorityFeePerGas,"priority fee");

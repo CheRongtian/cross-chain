@@ -1,5 +1,6 @@
 export const BROADCAST_ERROR_CLASSES = Object.freeze(["TRANSIENT_RPC_ERROR","AMBIGUOUS_BROADCAST","ALREADY_KNOWN",
   "REPLACEMENT_UNDERPRICED","NONCE_TOO_LOW","DETERMINISTIC_REJECTION","RPC_RESPONSE_ERROR"]);
+export const ESTIMATE_EXECUTION_REVERT = "ESTIMATE_EXECUTION_REVERT";
 
 const responseCodes = new Set(["RPC_TRANSACTION_HASH_MISMATCH","RECEIPT_TRANSACTION_HASH_MISMATCH",
   "RECEIPT_TRANSACTION_CONTEXT_MISMATCH","INVALID_RECEIPT_STATUS","INVALID_RPC_ENDPOINT",
@@ -44,6 +45,12 @@ export function normalizeRpcError(error,{ operation = "broadcast" } = {}) {
   if (causes.some(e => ["InvalidSenderError","InvalidSignatureError","IntrinsicGasTooLowError","TransactionTypeNotSupportedError","TransactionRejectedRpcError"].includes(e.name))) return result("DETERMINISTIC_REJECTION");
   if (causes.some(e => ["TimeoutError","SocketClosedError"].includes(e.name))) return result(operation === "broadcast" ? "AMBIGUOUS_BROADCAST" : "TRANSIENT_RPC_ERROR","RPC_REQUEST_TIMEOUT");
   if (causes.some(e => ["InternalRpcError","ResourceUnavailableRpcError","LimitExceededRpcError","ProviderDisconnectedError"].includes(e.name))) return result("TRANSIENT_RPC_ERROR","RPC_PROVIDER_UNAVAILABLE");
+  // The supported Anvil JSON-RPC execution-revert response is code 3. Require
+  // a structured client RPC error and the estimate operation; arbitrary text,
+  // generic -32000, and errors from other methods do not acquire this meaning.
+  if (operation === "estimate" && causes.some(e => e.name === "RpcRequestError" && e.code === 3)) {
+    return result("DETERMINISTIC_REJECTION",ESTIMATE_EXECUTION_REVERT);
+  }
   // Bounded, normalized node-detail fallback for the real generic -32000 form
   // and libraries that supply no more specific structured metadata.
   const details = causes.flatMap(e => [e.details,e.shortMessage,e.message,typeof e.data === "string" ? e.data : e.data?.message])

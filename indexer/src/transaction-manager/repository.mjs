@@ -19,6 +19,7 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
   const intents = tableName(config.databaseSchema,"transaction_intents");
   const attempts = tableName(config.databaseSchema,"transaction_attempts");
   const events = tableName(config.databaseSchema,"transaction_broadcast_events");
+  const jobs = tableName(config.databaseSchema,"delivery_jobs");
   const accountKey = [config.destinationDomain.toString(),normalizeAddress(config.relayerAddress)];
 
   function intentRecord(row,expected) {
@@ -296,6 +297,9 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
       const now = operationTime(clock);
       return deliveryTransaction(pool,async client => {
         const account = await lockAccount(client,pendingNonce);
+        // Shared with preparation-defer writes, including unfenced explicit
+        // manager preparation. An absent intent cannot otherwise be row-locked.
+        await client.query(`SELECT delivery_job_id FROM ${jobs} WHERE delivery_job_id = $1 FOR NO KEY UPDATE`,[intent.deliveryJobId]);
         if (fence) await assertLeaseFence(client,config,intent.deliveryJobId,fence);
         const existing = await read(client,intent.deliveryJobId,intent);
         if (existing) return Object.freeze({ ...existing,created: false,nonceAdvancedFromRpc: false });

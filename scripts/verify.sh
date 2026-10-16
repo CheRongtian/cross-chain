@@ -777,6 +777,11 @@ printf '276. Reject QC/path/domain/receiver/envelope/expiry failures without con
 printf '277. Observe a real pre-signed business rejection as terminal REVERTED with Gateway replay rollback\n'
 printf '278. Preserve historical A/B/C/D/E, old batches/QCs/transactions and all earlier regressions\n'
 printf '279. Keep destination authorization in on-chain Gateway checks and business state in ApplicationB\n'
+printf '280. Classify only structured estimate execution reverts as preparation defer; preserve RPC/protocol/fence failures\n'
+printf '281. Verify zero intent, nonce allocation, signature, attempt, broadcast and receipt at the preparation rejection boundary\n'
+printf '282. Verify migration 016, fenced scheduling, concurrent intent creation, rollback and restart persistence\n'
+printf '283. Rotate ordinary and due deferred work across fresh processes, slow one-shots and continuous READY arrivals\n'
+printf '284. Observe real ApplicationB estimate rejection before signing, then execute another valid READY message\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -815,7 +820,7 @@ CURRENT_STEP="frozen PBFT certificate reference drift check"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node "$VALIDATOR_DIR/scripts/generate-pbft-certificate-vectors.mjs" --check
 
-CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, recovery, RPC error classification, batch, Merkle, golden compatibility, lifecycle, portable delivery package and destination-scoped lease unit tests"
+CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, recovery, RPC error classification, batch, Merkle, golden compatibility, lifecycle, portable delivery package, destination-scoped leases and preparation defer/fairness unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$INDEXER_DIR/test/forward-authorization.test.mjs" \
@@ -843,7 +848,7 @@ node --test \
     "$INDEXER_DIR/test/relayer-leases.test.mjs" \
     "$INDEXER_DIR/test/transaction-recovery.test.mjs"
 
-CURRENT_STEP="Chain A Indexer database, current migration sequence/reruns, fixed-snapshot concurrency, conditional reorg recovery, RPC retry/restart and response-class upgrade, batch eligibility, Merkle, lifecycle, epoch rollover, consensus binding, atomic delivery queue and destination-scoped lease tests"
+CURRENT_STEP="Chain A Indexer database, migration sequence/upgrades, fixed-snapshot concurrency, conditional reorg recovery, RPC retry/restart, batch eligibility, Merkle, lifecycle, consensus binding, delivery queue, destination-scoped leases and preparation defer/fresh-process fairness tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \

@@ -13,6 +13,7 @@ import { transactionConfig, transactionHarness, transientSendError } from "./hel
 import { persistReadyTransactionFixture } from "./helpers/transaction-database-fixtures.mjs";
 import { fixtureHash } from "./helpers/delivery-fixtures.mjs";
 import { sourceState } from "../../validator/test/helpers/four-process.mjs";
+import { DestinationRpcError } from "../src/transaction-manager/rpc-pool.mjs";
 
 const config = transactionConfig({ DATABASE_URL: process.env.DATABASE_URL,
   INDEXER_DB_SCHEMA: `${process.env.INDEXER_DB_SCHEMA ?? "cross_chain_indexer_database_test"}_tx`, RELAYER_MAX_JOBS_PER_RUN: "100" });
@@ -71,6 +72,21 @@ async function counts() {
   return (await pool.query(`SELECT (SELECT COUNT(*) FROM ${accounts})::int AS accounts,
     (SELECT COUNT(*) FROM ${intents})::int AS intents,(SELECT COUNT(*) FROM ${attempts})::int AS attempts`)).rows[0];
 }
+
+test("SQL estimate execution rejection creates no intent, nonce account, signature, attempt, journal or broadcast", async () => {
+  let signatures = 0;
+  const signer = privateKeyToAccount(config.privateKey);
+  const manager = managerFor(pool,{ account: { ...signer,async signTransaction(...args) {
+    signatures++; return signer.signTransaction(...args);
+  } },rpc: { ...h.rpc,async estimateGas() {
+    throw new DestinationRpcError("ESTIMATE_EXECUTION_REVERT",{ errorClass: "DETERMINISTIC_REJECTION",rpcCode: 3 });
+  } } });
+  await assert.rejects(manager.prepareDeliveryTransaction(jobs[0].deliveryJobId),{ code: "PREPARATION_EXECUTION_REJECTED" });
+  assert.deepEqual(await counts(),{ accounts: 0,intents: 0,attempts: 0 });
+  assert.equal(signatures,0); assert.equal(h.calls.fees,0); assert.equal(h.calls.pending,0); assert.equal(h.calls.broadcast.length,0);
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM ${tableName(config.databaseSchema,"transaction_broadcast_events")}`)).rows[0].count,0);
+  assert.deepEqual(await queue.listReadyDeliveryJobs(),jobs);
+});
 
 test("independent clients atomically allocate unique consecutive nonces and one intent for a concurrent duplicate job", async () => {
   const fresh = [createDatabasePool(config),createDatabasePool(config)];
@@ -159,7 +175,7 @@ test("migration reruns preserve historical direct submissions and production Rel
   const encoded = await encodeDestinationSubmission(await queue.getDeliveryPackage(id),{ validatorSets: config.validatorSets });
   const historical = await legacy.recordSubmission({ deliveryJobId: id,encoded,transactionHash: fixtureHash(888) });
   const migrations = await applyMigrations(pool,config.databaseSchema);
-  assert.equal(migrations.at(-1),"015_rpc_response_errors.sql");
+  assert.equal(migrations.at(-1),"016_relayer_preparation_defer.sql");
   assert.deepEqual(await applyMigrations(pool,config.databaseSchema),migrations);
   const manager = managerFor();
   assert.deepEqual((await manager.prepareDeliveryTransaction(id)).historicalSubmission,historical);
