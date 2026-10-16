@@ -365,6 +365,12 @@ export function createValidatorStore({ pool, config }) {
       await checkState(pool);
       return (await pool.query(`SELECT * FROM ${epochViews} WHERE local_validator_identity = $1 ORDER BY epoch`, [config.validatorAddress])).rows;
     },
+    async readViewState(epoch) {
+      const exact = protocolInteger(epoch).toString();
+      await checkState(pool);
+      return (await pool.query(`SELECT * FROM ${epochViews} WHERE local_validator_identity = $1 AND epoch = $2`,
+        [config.validatorAddress, exact])).rows[0] ?? null;
+    },
     async currentView(epoch) { await checkState(pool); return currentView(pool, epoch); },
     async checkSafeProposal(proposal) { await checkState(pool); return assertSafe(pool, proposal, ViewChangeError); },
     async checkActive(epoch, view, ErrorType = ViewChangeError) {

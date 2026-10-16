@@ -153,7 +153,9 @@ test("progress timeout uses an injected clock and never individually advances cu
   let now = 99; let timeouts = 0;
   const runtime = createConsensusRuntime({ config: { ...config, viewTimeoutMs: 100 },
     clock: { now: () => now, schedule() {}, cancel() {} }, sourcePool: { async query() { return { rows: [] }; } },
-    store: { async readViewStates() { return [state]; }, async readViewChangeTargets() { return []; } },
+    store: { async readViewStates() { return [state]; },
+      async readViewState(epoch) { assert.equal(epoch, state.epoch); return structuredClone(state); },
+      async readViewChangeTargets() { return []; } },
     viewChange: { async replay() {}, async retryIntent() {}, async timeout(_epoch, expected) {
       assert.equal(expected.view, "0"); assert.equal(expected.progressRevision, "0");
       timeouts++; state.changing_view = true; state.target_view = String(timeouts); state.view_change_at = new Date(now);
@@ -198,7 +200,9 @@ test("startup awaits validation and registration without scheduling or broadcast
     clock: { now: () => 10000, schedule() { schedules++; }, cancel() {} },
     sourcePool: { async query() { return { rows: [{ batch_record_id: snapshot.record.batchRecordId,
       batch_id: snapshot.record.batchId, epoch, status: "CONSENSUS_PENDING" }] }; } },
-    store: { async readViewStates() { return states; }, async registerEpoch(proposal) {
+    store: { async readViewStates() { return states; },
+      async readViewState(epoch) { return structuredClone(states.find(state => state.epoch === epoch) ?? null); },
+      async registerEpoch(proposal) {
       states.push({ epoch: proposal.epoch, batch_id: proposal.batchId, message_root: proposal.messageRoot,
         current_view: "0", progress_at: new Date(0), changing_view: false, finalized: false });
     } },
@@ -232,7 +236,8 @@ test("startup registration failure propagates without starting the scheduler", a
     clock: { now: () => 0, schedule() { schedules++; }, cancel() {} },
     sourcePool: { async query() { return { rows: [{ batch_record_id: snapshot.record.batchRecordId,
       batch_id: snapshot.record.batchId, epoch: snapshot.record.epoch.toString(), status: "CONSENSUS_PENDING" }] }; } },
-    store: { async readViewStates() { return []; }, async registerEpoch() { throw new Error("startup storage unavailable"); } },
+    store: { async readViewStates() { return []; }, async readViewState() { return null; },
+      async registerEpoch() { throw new Error("startup storage unavailable"); } },
     validation: { async validatePending() { return { result: "VALID", snapshot }; } },
   });
   try {
@@ -251,12 +256,154 @@ test("startup preserves recovered higher-view state without resetting to view ze
     sourcePool: { async query() { return { rows: [{ batch_record_id: snapshot.record.batchRecordId,
       batch_id: state.batch_id, epoch: state.epoch, status: "CONSENSUS_PENDING" }] }; } },
     store: { async readViewStates() { return [state]; },
+      async readViewState(epoch) { assert.equal(epoch, state.epoch); return structuredClone(state); },
       async registerEpoch() { assert.fail("startup rewrote a recovered epoch"); } },
     validation: { async validatePending() { assert.fail("startup revalidated an already registered epoch"); } },
     viewChange: { async timeout() { assert.fail("startup emitted intent before listening"); } },
   });
   try { await runtime.initialize(); assert.deepEqual(state, original); }
   finally { await runtime.close(); }
+});
+
+test("each discovery indexes its full historical snapshot and preserves ordered COMMITTED finalization", async () => {
+  const snapshot = await snapshotFixture();
+  const firstEpoch = snapshot.record.epoch;
+  assert.ok(firstEpoch > BigInt(Number.MAX_SAFE_INTEGER));
+  const rows = Array.from({ length: 6 }, (_, index) => ({ batch_record_id: String(index + 1),
+    batch_id: bytes(`a${index}`), epoch: (firstEpoch + BigInt(index)).toString(),
+    status: index < 4 ? "COMMITTED" : "CONSENSUS_PENDING" }));
+  const durable = new Map([0, 1, 2, 4].map(index => [rows[index].epoch,
+    { epoch: rows[index].epoch, batch_id: rows[index].batch_id, finalized: index === 1 }]));
+  // The lifecycle stub supplies opaque already-verified evidence. This test
+  // checks discovery/finalization routing; QC cryptography has its own suites.
+  const certificates = new Map(rows.slice(0, 4).map(row => [row.epoch, { epoch: row.epoch }]));
+  const finalized = []; const readBatches = []; const registered = []; const validations = [];
+  let fullReads = 0;
+  const runtime = createConsensusRuntime({ config,
+    sourcePool: { async query() { return { rows: structuredClone(rows) }; } },
+    store: {
+      async readViewStates() { fullReads++; return structuredClone([...durable.values()]); },
+      async readViewState() { assert.fail("discovery must use its own complete snapshot"); },
+      async finalizeEpoch(certificate) {
+        assert.equal(certificate, certificates.get(certificate.epoch));
+        finalized.push(certificate.epoch); durable.get(certificate.epoch).finalized = true;
+      },
+      async registerEpoch(proposal) {
+        registered.push(proposal);
+        durable.set(proposal.epoch, { epoch: proposal.epoch, batch_id: proposal.batchId, finalized: false });
+      },
+    },
+    lifecycle: { async readBatch({ batchRecordId }) {
+      readBatches.push(batchRecordId);
+      const row = rows.find(row => row.batch_record_id === batchRecordId);
+      return { quorumCertificate: certificates.get(row.epoch) };
+    } },
+    validation: { async validatePending(batchId) {
+      validations.push(batchId);
+      return { result: "VALID", snapshot: { record: { batchId, messageRoot: snapshot.tree.messageRoot } } };
+    } },
+  });
+  try {
+    await runtime.initialize();
+    assert.equal(fullReads, 1);
+    assert.deepEqual(readBatches, [rows[0].batch_record_id, rows[2].batch_record_id]);
+    assert.deepEqual(finalized, [rows[0].epoch, rows[2].epoch]);
+    assert.deepEqual(validations, [rows[5].batch_id]);
+    assert.deepEqual(registered, [{ epoch: rows[5].epoch, batchId: rows[5].batch_id, messageRoot: snapshot.tree.messageRoot }]);
+    // A later local registration must be seen by a fresh discovery. No prior
+    // Map can hide a historical COMMITTED state that was previously absent.
+    durable.set(rows[3].epoch, { epoch: rows[3].epoch, batch_id: rows[3].batch_id, finalized: false });
+    await runtime.initialize();
+    assert.equal(fullReads, 2);
+    assert.deepEqual(readBatches, [rows[0].batch_record_id, rows[2].batch_record_id, rows[3].batch_record_id]);
+    assert.deepEqual(finalized, [rows[0].epoch, rows[2].epoch, rows[3].epoch]);
+    await runtime.initialize();
+    assert.equal(fullReads, 3);
+    assert.equal(finalized.length, 3); assert.equal(registered.length, 1);
+  } finally { await runtime.close(); }
+});
+
+test("scoped refresh observes replay progress before timeout and reads fresh state on the next tick", async () => {
+  const snapshot = await snapshotFixture();
+  const state = { epoch: snapshot.record.epoch.toString(), batch_id: snapshot.record.batchId,
+    current_view: "0", target_view: "0", progress_revision: "0", progress_at: new Date(0),
+    changing_view: false, finalized: false, view_change_at: null };
+  let now = 100; let fullReads = 0; let replays = 0;
+  const scopedReads = []; const timeouts = [];
+  const runtime = createConsensusRuntime({ config: { ...config, viewTimeoutMs: 100 },
+    clock: { now: () => now, schedule() {}, cancel() {} }, sourcePool: { async query() { return { rows: [] }; } },
+    store: {
+      async readViewStates() { fullReads++; return [structuredClone(state)]; },
+      async readViewState(epoch) { scopedReads.push(epoch); assert.equal(epoch, state.epoch); return structuredClone(state); },
+      async readViewChangeTargets() { return []; },
+    },
+    viewChange: {
+      async replay() { replays++; Object.assign(state, { progress_at: new Date(now), progress_revision: "1" }); },
+      async timeout(epoch, expected) {
+        timeouts.push({ epoch, ...expected }); return { envelope: { targetView: "1" } };
+      },
+    },
+  });
+  try {
+    await runtime.tick(); assert.deepEqual(timeouts, []);
+    now = 200; await runtime.tick();
+    assert.equal(replays, 1);
+    assert.equal(fullReads, 4, "each tick retains discovery and its post-discovery full scan");
+    assert.deepEqual(scopedReads, [state.epoch, state.epoch]);
+    assert.deepEqual(timeouts, [{ epoch: state.epoch, view: "0", targetView: "0", progressRevision: "1", now: 200 }]);
+  } finally { await runtime.close(); }
+});
+
+test("a missing or newly finalized scoped state stops stale scheduler actions", async () => {
+  const snapshot = await snapshotFixture();
+  for (const missing of [false, true]) {
+    const state = { epoch: snapshot.record.epoch.toString(), batch_id: snapshot.record.batchId,
+      current_view: "0", finalized: false };
+    let durable = state; const reads = [];
+    const runtime = createConsensusRuntime({ config,
+      clock: { now: () => 0, schedule() {}, cancel() {} }, sourcePool: { async query() { return { rows: [] }; } },
+      store: {
+        async readViewStates() { return [structuredClone(state)]; },
+        async readViewState(epoch) { reads.push(epoch); return structuredClone(durable); },
+        async readViewChangeTargets() { assert.fail("stale state continued after a fresh missing/finalized read"); },
+      },
+      viewChange: { async replay() { durable = missing ? null : { ...state, finalized: true }; } },
+    });
+    try { await runtime.tick(); assert.deepEqual(reads, [state.epoch]); }
+    finally { await runtime.close(); }
+  }
+});
+
+test("close during replay or a scoped read stops advancement without further state actions", async () => {
+  const snapshot = await snapshotFixture();
+  for (const boundary of ["replay", "scoped-read"]) {
+    const state = { epoch: snapshot.record.epoch.toString(), batch_id: snapshot.record.batchId,
+      current_view: "0", finalized: false };
+    let enter; const entered = new Promise(resolve => { enter = resolve; });
+    let release; const gate = new Promise(resolve => { release = resolve; });
+    let scopedReads = 0;
+    const runtime = createConsensusRuntime({ config,
+      clock: { now: () => 0, schedule() {}, cancel() {} }, sourcePool: { async query() { return { rows: [] }; } },
+      store: {
+        async readViewStates() { return [structuredClone(state)]; },
+        async readViewState(epoch) {
+          assert.equal(epoch, state.epoch); scopedReads++;
+          if (boundary === "scoped-read") { enter(); await gate; }
+          return structuredClone(state);
+        },
+        async readViewChangeTargets() { assert.fail("closed scheduler continued after a durable refresh boundary"); },
+      },
+      viewChange: { async replay() { if (boundary === "replay") { enter(); await gate; } } },
+    });
+    const ticking = runtime.tick(); let closing;
+    try {
+      await Promise.race([entered, ticking.then(() => { throw new Error("scheduler finished before the close checkpoint"); })]);
+      closing = runtime.close(); release();
+      await Promise.all([ticking, closing]);
+      assert.equal(scopedReads, boundary === "replay" ? 0 : 1);
+      assert.equal(runtime.healthy(), false);
+    } finally { release(); await Promise.allSettled([ticking, closing]); await runtime.close(); }
+  }
 });
 
 test("NEW_VIEW persists before broadcast; a lost broadcast is retried with the same durable envelope", async () => {
@@ -351,7 +498,9 @@ test("a valid COMMITTED transition during NEW_VIEW replay finalizes locally with
   const state = { epoch: proposal.epoch, current_view: "1", target_view: "1", progress_revision: "1",
     progress_at: new Date(0), view_change_at: null, changing_view: false, finalized: false, batch_id: proposal.batchId };
   let reads = 0;
-  const store = { async readViewStates() { return [state]; }, async readLatestIssuedNewView() { return message; },
+  const store = { async readViewStates() { return [state]; },
+    async readViewState(epoch) { assert.equal(epoch, state.epoch); return structuredClone(state); },
+    async readLatestIssuedNewView() { return message; },
     async finalizeEpoch(qc) { assert.deepEqual(qc, certificate); state.finalized = true; } };
   const validation = {
     async validatePending() { return { result: "INVALID", reason: "BATCH_STATUS" }; },
@@ -378,7 +527,9 @@ test("waiting for a later view still replays the durable NEW_VIEW to lagging pee
     progress_at: new Date(0), view_change_at: new Date(0), changing_view: true, finalized: false, batch_id: proposal.batchId };
   const actions = [];
   const runtime = createConsensusRuntime({ config,
-    store: { async readViewStates() { return [state]; }, async readViewChangeTargets() { return []; } },
+    store: { async readViewStates() { return [state]; },
+      async readViewState(epoch) { assert.equal(epoch, state.epoch); return structuredClone(state); },
+      async readViewChangeTargets() { return []; } },
     sourcePool: { async query() { return { rows: [] }; } },
     clock: { now: () => 100000, schedule() {}, cancel() {} },
     viewChange: { async replay() { actions.push("NEW_VIEW"); }, async retryIntent() { actions.push("VIEW_CHANGE_RETRY"); } } });
@@ -392,14 +543,15 @@ test("replay and establishment refresh durable state before driving the certifie
   for (const boundary of ["replay","establish"]) {
     const state = { epoch: proposal.epoch,current_view: "0",target_view: "1",progress_revision: "0",
       progress_at: new Date(0),view_change_at: new Date(0),changing_view: true,finalized: false,batch_id: proposal.batchId };
-    const actions = []; let now = 1000;
+    const actions = []; const scopedReads = []; let fullReads = 0; let now = 1000;
     function enterCertifiedView() {
       actions.push("NEW_VIEW"); now = 1100;
       Object.assign(state,{ current_view: "1",changing_view: false,view_change_at: null,progress_at: new Date(now),progress_revision: "1" });
     }
     const runtime = createConsensusRuntime({ config: { ...primary,viewTimeoutMs: 100 },
       clock: { now: () => now,schedule() {},cancel() {} },sourcePool: { async query() { return { rows: [] }; } },
-      store: { async readViewStates() { return [structuredClone(state)]; },
+      store: { async readViewStates() { fullReads++; return [structuredClone(state)]; },
+        async readViewState(epoch) { scopedReads.push(epoch); assert.equal(epoch, state.epoch); return structuredClone(state); },
         async readViewChangeTargets() { return state.current_view === "0" ? ["1"] : []; },
         async readPrePrepare(_epoch,view) { assert.equal(view,"1"); return { envelope: proposal }; },
         async readPrepareState(_epoch,view) { assert.equal(view,"1"); return { prepared: {} }; },
@@ -412,7 +564,12 @@ test("replay and establishment refresh durable state before driving the certifie
       prepare: { async cast() { actions.push("PREPARE"); } },
       commit: { async cast() { actions.push("COMMIT"); },async submit() { actions.push("QC"); return { result: "ACCEPTED" }; } },
     });
-    try { await runtime.tick(); assert.deepEqual(actions,["NEW_VIEW","PRE-PREPARE","PREPARE","COMMIT","QC"]); }
+    try {
+      await runtime.tick();
+      assert.deepEqual(actions,["NEW_VIEW","PRE-PREPARE","PREPARE","COMMIT","QC"]);
+      assert.equal(fullReads, 2, "discovery and post-discovery scan stay complete; refreshes do not read history");
+      assert.deepEqual(scopedReads, Array(boundary === "establish" ? 2 : 1).fill(proposal.epoch));
+    }
     finally { await runtime.close(); }
   }
 });
@@ -424,7 +581,9 @@ test("a retained higher intent keeps its longer window after older NEW_VIEW repl
   let now = 150; let timeouts = 0; let retries = 0;
   const runtime = createConsensusRuntime({ config: { ...config,viewTimeoutMs: 100 },
     clock: { now: () => now,schedule() {},cancel() {} },sourcePool: { async query() { return { rows: [] }; } },
-    store: { async readViewStates() { return [structuredClone(state)]; },async readViewChangeTargets() { return []; } },
+    store: { async readViewStates() { return [structuredClone(state)]; },
+      async readViewState(epoch) { assert.equal(epoch, state.epoch); return structuredClone(state); },
+      async readViewChangeTargets() { return []; } },
     viewChange: { async replay() {},async retryIntent() { retries++; },async timeout(_epoch,expected) {
       assert.equal(expected.targetView,"2"); timeouts++;
       Object.assign(state,{ target_view: "3",view_change_at: new Date(now) }); return { envelope: { targetView: "3" } };

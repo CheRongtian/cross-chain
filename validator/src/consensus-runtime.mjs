@@ -28,8 +28,8 @@ export function createConsensusRuntime({ config, sourcePool, store, validation, 
     if (stopped) return;
     // Remote replay can overlap HTTP NEW_VIEW acceptance or finalization. Use
     // a fresh durable state before selecting a target or considering a timeout.
-    state = (await store.readViewStates()).find(row => row.epoch === epoch);
-    if (!state || state.finalized) return;
+    state = await store.readViewState(epoch);
+    if (stopped || !state || state.finalized) return;
 
     const candidates = await store.readViewChangeTargets(epoch);
     for (const target of candidates) {
@@ -37,8 +37,8 @@ export function createConsensusRuntime({ config, sourcePool, store, validation, 
       if (deterministicPrimary(committee, epoch, target) === config.validatorAddress) {
         await viewChange.establish(epoch, target, state.batch_id);
         if (stopped) return;
-        state = (await store.readViewStates()).find(row => row.epoch === epoch);
-        if (!state || state.finalized) return;
+        state = await store.readViewState(epoch);
+        if (stopped || !state || state.finalized) return;
         // Drive this certified round now, without another replay/timer tick
         // between NEW_VIEW persistence and its PRE-PREPARE/PREPARE work.
         break;
@@ -90,16 +90,16 @@ export function createConsensusRuntime({ config, sourcePool, store, validation, 
       WHERE source_domain = $1 AND source_gateway = $2 AND status IN ('CONSENSUS_PENDING','COMMITTED') ORDER BY epoch`,
       [config.chainDomain.toString(), config.sourceGateway])).rows;
     const states = await store.readViewStates();
-    const registered = new Set(states.map((state) => state.epoch));
+    const statesByEpoch = new Map(states.map((state) => [state.epoch, state]));
     for (const row of rows) {
       if (stopped) return;
       if (row.status === "COMMITTED") {
-        const local = states.find((state) => state.epoch === row.epoch);
+        const local = statesByEpoch.get(row.epoch);
         if (local && !local.finalized) {
           const snapshot = await lifecycle.readBatch({ batchRecordId: row.batch_record_id });
           await store.finalizeEpoch(snapshot.quorumCertificate);
         }
-      } else if (!registered.has(row.epoch)) {
+      } else if (!statesByEpoch.has(row.epoch)) {
         if (!config.validatorSets.resolveForBatchEpoch(row.epoch).validators.includes(config.validatorAddress)) continue;
         const result = await validation.validatePending(row.batch_id);
         if (result.result !== "VALID") continue;

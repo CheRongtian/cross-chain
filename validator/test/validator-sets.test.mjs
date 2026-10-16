@@ -167,20 +167,22 @@ test("version-two historical QC retains original ABI bytes and signatures after 
 test("replacement-view scheduler selects the pinned four-member committee from a five-entry directory", async () => {
   const current = await evidence("24","1");
   const config = configs[current.primary];
-  const actions = [];
+  const actions = []; const scopedReads = [];
   const state = { epoch: "24",current_view: "1",target_view: "1",protocol_version: 3,
     validator_epoch: "8",committee_digest: resolver.history[1].committeeDigest,batch_id: current.proposal.batchId,
     finalized: false,changing_view: false,progress_at: new Date(0),progress_revision: "0" };
   const runtime = createConsensusRuntime({ config,clock: { now: () => 1,schedule() {},cancel() {} },
     sourcePool: { async query() { return { rows: [] }; } },
-    store: { async readViewStates() { return [state]; },async readViewChangeTargets() { return []; },
+    store: { async readViewStates() { return [state]; },
+      async readViewState(epoch) { scopedReads.push(epoch); assert.equal(epoch, state.epoch); return structuredClone(state); },
+      async readViewChangeTargets() { return []; },
       async readPrePrepare() { return { envelope: current.proposal }; },async readPrepareState() { return { prepared: null }; },
       async readCommitState() { return { certificate: null }; } },
     viewChange: { async replay() { actions.push("replay"); } },
     prePrepare: { async propose() { actions.push("proposal"); return { result: "ACCEPTED" }; } },
     prepare: { async cast() { actions.push("prepare"); } },
   });
-  try { await runtime.tick(); assert.deepEqual(actions,["replay","proposal","prepare"]); }
+  try { await runtime.tick(); assert.deepEqual(actions,["replay","proposal","prepare"]); assert.deepEqual(scopedReads, ["24"]); }
   finally { await runtime.close(); }
 });
 
@@ -191,4 +193,37 @@ test("source database binding is independently checked against trusted history",
   for (const change of [{ validatorEpoch: "999" },{ committeeDigest: bytes("aa") },{ protocolVersion: "2" }]) {
     assert.throws(() => validateCandidateSnapshot({ ...snapshot,consensusBinding: { ...binding,...change } },configs[0],snapshot.record.batchId), { code: "CONSENSUS_BINDING" });
   }
+});
+
+test("scoped refresh retains legacy view state for an original member active after scheduled rotation", async () => {
+  const epoch = "24";
+  const initial = resolver.history[0].validators;
+  const scheduled = resolver.resolveForBatchEpoch(epoch).validators;
+  const view = ["1", "2", "3", "4"].find(view => {
+    const primary = deterministicPrimary(initial, epoch, view);
+    return scheduled.includes(primary);
+  });
+  assert.ok(view, "the legacy primary fixture must remain an active identity after rotation");
+  assert.notDeepEqual(initial, scheduled);
+  const config = configs.find(config => config.validatorAddress === deterministicPrimary(initial, epoch, view));
+  const state = { epoch, current_view: view, target_view: view, protocol_version: 2,
+    validator_epoch: null, committee_digest: null, batch_id: bytes("ab"), finalized: false,
+    changing_view: false, progress_at: new Date(0), progress_revision: "0" };
+  const reads = []; const actions = [];
+  const runtime = createConsensusRuntime({ config, clock: { now: () => 1, schedule() {}, cancel() {} },
+    sourcePool: { async query() { return { rows: [] }; } },
+    store: {
+      async readViewStates() { return [structuredClone(state)]; },
+      async readViewState(exact) { reads.push(exact); return structuredClone(state); },
+      async readViewChangeTargets() { return []; }, async readPrePrepare() { return {}; },
+      async readPrepareState() { return { prepared: null }; }, async readCommitState() { return { certificate: null }; },
+    },
+    viewChange: { async replay() { actions.push("replay"); } },
+    prePrepare: { async propose() { actions.push("initial-primary"); return { result: "ACCEPTED" }; } },
+    prepare: { async cast() { actions.push("prepare"); } },
+  });
+  try {
+    await runtime.tick(); assert.deepEqual(reads, [epoch]);
+    assert.deepEqual(actions, ["replay", "initial-primary", "prepare"]);
+  } finally { await runtime.close(); }
 });

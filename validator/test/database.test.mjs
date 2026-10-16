@@ -265,10 +265,13 @@ test("conflicting trusted committee history cannot overwrite persisted history o
     VALIDATOR_SET_HISTORY: JSON.stringify(alteredHistory),
   });
   assert.notDeepEqual(conflictingConfig.validatorSets.history[0].validators, configs[0].validatorSets.history[0].validators);
+  const conflictingStore = createValidatorStore({ pool: pools[0], config: conflictingConfig });
   await assert.rejects(
-    createValidatorStore({ pool: pools[0], config: conflictingConfig }).bindIdentity(),
+    conflictingStore.bindIdentity(),
     /conflicting persisted validator set/,
   );
+  await assert.rejects(conflictingStore.readViewStates(), { message: "validator committee mismatch" });
+  await assert.rejects(conflictingStore.readViewState(p.epoch), { message: "validator committee mismatch" });
   await stores[0].checkIdentity();
   assert.deepEqual((await pools[0].query(`SELECT * FROM ${historyTable} ORDER BY validator_epoch`)).rows, persistedHistory);
   assert.deepEqual(await stores[0].readPrePrepares(), [accepted]);
@@ -469,9 +472,60 @@ test("fresh pools recover their own observations and reject swapped keys/context
       await assert.rejects(swapped.bindIdentity(), /identity or source context mismatch/);
       const changedPolicy = createValidatorStore({ pool, config: { ...configs[index], finalityBlockDepth: 3n } });
       await assert.rejects(changedPolicy.bindIdentity(), /identity or source context mismatch/);
+      for (const invalid of [swapped, changedPolicy]) {
+        await assert.rejects(invalid.readViewStates(), { message: "validator state identity or source context mismatch" });
+        await assert.rejects(invalid.readViewState(snapshot.record.epoch), { message: "validator state identity or source context mismatch" });
+        await assert.rejects(invalid.readViewState("0"), { message: "validator state identity or source context mismatch" });
+      }
       assert.deepEqual(await restored.readObservations(), before);
     } finally { await pool.end(); }
   }
+});
+
+test("exact-epoch durable reads match full state rows, isolate local identity and preserve large epochs", async () => {
+  const epoch = snapshot.record.epoch.toString();
+  const nextEpoch = (snapshot.record.epoch + 1n).toString();
+  assert.ok(BigInt(epoch) > BigInt(Number.MAX_SAFE_INTEGER));
+  assert.deepEqual(await stores[0].readViewStates(), []);
+  assert.equal(await stores[0].readViewState(epoch), null);
+  await stores[0].registerEpoch({ epoch, batchId: snapshot.record.batchId, messageRoot: snapshot.tree.messageRoot });
+  const original = (await stores[0].readViewStates())[0];
+  const views = tableName(configs[0].databaseSchema, "pbft_epoch_views");
+  // Put another identity in the same relation, including an epoch absent for
+  // the local identity. Namespace separation alone cannot satisfy this test.
+  for (const otherEpoch of [epoch, nextEpoch]) {
+    await pools[0].query(`INSERT INTO ${views}
+      (local_validator_identity,epoch,batch_id,message_root,protocol_version,validator_epoch,committee_digest)
+      VALUES ($1,$2,$3,$4,3,$5,$6)`, [configs[1].validatorAddress, otherEpoch, snapshot.record.batchId,
+      snapshot.tree.messageRoot, original.validator_epoch, original.committee_digest]);
+  }
+  const queries = [];
+  const reader = createValidatorStore({ config: configs[0], pool: { async query(sql, parameters) {
+    const result = await pools[0].query(sql, parameters); queries.push({ sql, parameters, result }); return result;
+  } } });
+  assert.deepEqual(await reader.readViewState(BigInt(epoch)), original);
+  for (const name of ["validator_metadata", "validator_committee", "validator_set_history"]) {
+    assert.ok(queries.some(({ sql }) => sql.includes(`FROM ${tableName(configs[0].databaseSchema, name)}`)),
+      `scoped reads must retain the ${name} safety check`);
+  }
+  const selected = queries.filter(({ sql }) => sql.startsWith(`SELECT * FROM ${views}`));
+  assert.equal(selected.length, 1);
+  assert.deepEqual(selected[0].parameters, [configs[0].validatorAddress, epoch]);
+  assert.deepEqual(selected[0].result.rows, [original]);
+  assert.equal(await reader.readViewState(nextEpoch), null);
+  assert.equal(await reader.readViewState(snapshot.record.epoch + 2n), null);
+  assert.deepEqual(await reader.readViewStates(), [original]);
+  const previousReads = queries.length;
+  for (const value of [Number(epoch), "01", "-1", "1.5", undefined]) {
+    await assert.rejects(reader.readViewState(value), { message: "epoch must be an exact uint256" });
+  }
+  assert.equal(queries.length, previousReads, "invalid exact epochs do not reach SQL");
+  await acceptProposal();
+  const fresh = await reader.readViewState(epoch);
+  assert.ok(BigInt(fresh.progress_revision) > BigInt(original.progress_revision));
+  assert.deepEqual(fresh, (await stores[0].readViewStates())[0]);
+  assert.equal(fresh.local_validator_identity, configs[0].validatorAddress);
+  assert.equal(fresh.epoch, epoch);
 });
 
 test("same-head validation is idempotent; changed heads retain immutable history", async () => {
@@ -549,6 +603,9 @@ test("NEW_VIEW acceptance is atomic, monotonic, concurrent-idempotent, and survi
   try {
     const restored = createValidatorStore({ config: configs[0], pool: freshPool });
     assert.equal(await restored.currentView(original.epoch), "1");
+    const freshState = await restored.readViewState(original.epoch);
+    assert.equal(freshState.current_view, "1"); assert.equal(freshState.target_view, "1");
+    assert.deepEqual(freshState, (await restored.readViewStates())[0]);
     assert.deepEqual(await restored.readNewView(original.epoch, "1"), message);
     assert.deepEqual(await restored.preparedCertificate(original.epoch), prepared);
     const next = await signedProposal(snapshot.tree.messageRoot, "1");
@@ -656,11 +713,14 @@ test("trusted history appends idempotently, persists across restart and cannot r
     VALIDATOR_DATABASE_URL: process.env.DATABASE_URL,VALIDATOR_DB_SCHEMA: configs[0].databaseSchema,
     VALIDATOR_PEERS: JSON.stringify(peers),VALIDATOR_SET_HISTORY: JSON.stringify([initial,{ ...next,activationBatchEpoch: proposal.epoch }]) }));
   await assert.rejects(createValidatorStore({ pool: pools[0],config: retroactiveConfig }).bindIdentity(), /already-started/);
+  await assert.rejects(reloaded.readViewStates(), { message: "validator set history conflicts with trusted configuration" });
+  await assert.rejects(reloaded.readViewState(proposal.epoch), { message: "validator set history conflicts with trusted configuration" });
   await Promise.all([reloaded.bindIdentity(),reloaded.bindIdentity()]);
   const restarted = createValidatorStore({ pool: pools[0],config: reloadedConfig });
   await restarted.bindIdentity();
   assert.deepEqual(await restarted.readPrePrepare(proposal.epoch),oldRecord);
   const state = (await restarted.readViewStates())[0];
+  assert.deepEqual(await restarted.readViewState(proposal.epoch), state);
   assert.equal(state.validator_epoch,"0"); assert.equal(state.committee_digest,initial.committeeDigest);
   await assert.rejects(restarted.registerEpoch({ ...proposal,validatorEpoch: "1",committeeDigest: next.committeeDigest }), /WRONG_VALIDATOR_EPOCH/);
   const vote = await restarted.castViewChange(proposal.epoch);
@@ -680,7 +740,7 @@ test("trusted history appends idempotently, persists across restart and cannot r
 
 test("superseded timeout snapshots never sign for a newly accepted view or newly advanced progress", async () => {
   const proposal = await acceptProposal();
-  const snapshot = (await stores[0].readViewStates())[0];
+  const snapshot = await stores[0].readViewState(proposal.epoch);
   await stores[0].savePrepareVote(await signedVote(proposal, 1));
   const expired = { view: snapshot.current_view, targetView: snapshot.target_view,
     progressRevision: snapshot.progress_revision, now: snapshot.progress_at.getTime() + configs[0].viewTimeoutMs };
@@ -689,7 +749,7 @@ test("superseded timeout snapshots never sign for a newly accepted view or newly
   const next = await transition("1");
   await stores[0].acceptNewView(next.message, proposalIdentity(proposal));
   await assert.rejects(stores[0].castViewChange(proposal.epoch, expired), /STALE_VIEW/);
-  const state = (await stores[0].readViewStates())[0];
+  const state = await stores[0].readViewState(proposal.epoch);
   assert.equal(state.current_view, "1"); assert.equal(state.target_view, "1"); assert.equal(state.changing_view, false);
   assert.deepEqual(await stores[0].readViewChanges(proposal.epoch, "2"), []);
 });
