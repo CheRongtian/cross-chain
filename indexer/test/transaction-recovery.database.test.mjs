@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { after,before,beforeEach,test } from "node:test";
+import { privateKeyToAccount } from "viem/accounts";
+import { randomUUID } from "node:crypto";
+import { readdir,readFile } from "node:fs/promises";
 import { applyMigrations,createDatabasePool,resetIndexerTables,tableName } from "../src/db.mjs";
 import { createDeliveryRepository } from "../src/delivery/repository.mjs";
 import { createTransactionManager } from "../src/transaction-manager/service.mjs";
@@ -9,6 +12,7 @@ import { persistReadyTransactionFixture } from "./helpers/transaction-database-f
 import { destinationRpcFixture,transactionBody,rpcTimeout } from "./helpers/destination-rpc-fixtures.mjs";
 import { fixtureHash } from "./helpers/delivery-fixtures.mjs";
 import { sourceState } from "../../validator/test/helpers/four-process.mjs";
+import { developmentKeys } from "../../validator/test/helpers/fixtures.mjs";
 
 const config = transactionConfig({ DATABASE_URL: process.env.DATABASE_URL,
   INDEXER_DB_SCHEMA: `${process.env.INDEXER_DB_SCHEMA ?? "cross_chain_indexer_database_test"}_recovery`,
@@ -31,8 +35,8 @@ beforeEach(async () => {
   } }); reader = manager();
 });
 after(async () => { await pool.end(); });
-function manager({ db = pool,hooks = {},rpc = destination.rpc,account } = {}) {
-  return createTransactionManager({ config,pool: db,queue: createDeliveryRepository({ config,pool: db }),rpc,hooks,account,clock: h.clock });
+function manager({ db = pool,cfg = config,hooks = {},rpc = destination.rpc,account } = {}) {
+  return createTransactionManager({ config: cfg,pool: db,queue: createDeliveryRepository({ config: cfg,pool: db }),rpc,hooks,account,clock: h.clock });
 }
 function crashOnce() { let active = true; return async () => { if (active) { active = false; throw Object.assign(new Error("controlled database checkpoint"),{ code: "TEST_CHECKPOINT" }); } }; }
 async function mine(id,attemptId,status = 1) {
@@ -41,6 +45,218 @@ async function mine(id,attemptId,status = 1) {
   destination.transactions.set(winner.transactionHash,transactionBody(stored.intent,winner,100n,fixtureHash(1100)));
   destination.nodes.forEach(node => { node.head = 102n; node.latestNonce = BigInt(stored.intent.nonce) + 1n; });
 }
+
+const accountTable = tableName(config.databaseSchema,"transaction_accounts");
+async function scanProgress(db = pool,cfg = config) {
+  return (await db.query(`SELECT receipt_scan_cursor_nonce::text AS receipt,recovery_scan_cursor_nonce::text AS recovery,
+    next_nonce::text AS next_nonce,updated_at FROM ${accountTable} WHERE chain_id = $1 AND sender_address = $2`,
+    [cfg.destinationDomain.toString(),cfg.relayerAddress])).rows[0];
+}
+async function pendingPopulation() {
+  for (const job of jobs) await reader.submitDelivery(job.deliveryJobId);
+}
+async function incompleteEarlierReceipts() {
+  await pendingPopulation();
+  for (const job of jobs) {
+    const stored = await reader.repository.getTransaction(job.deliveryJobId);
+    await mine(job.deliveryJobId,stored.attempt.attemptId);
+    if (job !== jobs.at(-1)) destination.receipts.delete(stored.attempt.transactionHash);
+  }
+}
+
+test("SQL observation selectors wrap with exact large nonces and leave allocation, recovery versions and signed evidence unchanged", async () => {
+  assert.deepEqual(await reader.repository.listRecoveryIntents({ limit: 1 }),[]);
+  assert.deepEqual(await reader.repository.listTrackingIntents({ limit: 1 }),[]); assert.equal(await reader.repository.getAccount(),null);
+  const base = (1n << 200n) + 17n; destination.nodes.forEach(node => { node.pendingNonce = base; });
+  await pendingPopulation();
+  const ids = jobs.map(job => job.deliveryJobId);
+  const before = await Promise.all(ids.map(id => reader.repository.getRecoverySnapshot(id)));
+  const account = await reader.repository.getAccount(); const activity = destination.nodes.map(node => node.calls.length);
+  const fresh = createDatabasePool(config);
+  try {
+    for (const kind of ["receipt","recovery"]) {
+      const select = async limit => {
+        const repository = manager({ db: fresh }).repository;
+        return kind === "receipt" ? (await repository.listTrackingIntents({ limit })).map(r => r.intent.deliveryJobId) : repository.listRecoveryIntents({ limit });
+      };
+      assert.deepEqual(await select(1),[ids[0]]);
+      assert.equal((await scanProgress())[kind],base.toString());
+      assert.deepEqual(await select(1),[ids[1]]);
+      assert.deepEqual(await select(100),[ids[2],ids[0],ids[1]]);
+      const column = kind === "receipt" ? "receipt_scan_cursor_nonce" : "recovery_scan_cursor_nonce";
+      await pool.query(`UPDATE ${accountTable} SET ${column} = $3 WHERE chain_id = $1 AND sender_address = $2`,
+        [config.destinationDomain.toString(),config.relayerAddress,((1n << 256n) - 1n).toString()]);
+      assert.deepEqual(await select(100),ids);
+      assert.equal((await scanProgress())[kind],(base + 2n).toString());
+    }
+    assert.deepEqual(await Promise.all(ids.map(id => reader.repository.getRecoverySnapshot(id))),before);
+    assert.deepEqual(await reader.repository.getAccount(),account);
+    assert.deepEqual(destination.nodes.map(node => node.calls.length),activity);
+  } finally { await fresh.end(); }
+});
+
+for (const kind of ["receipt","recovery"]) {
+  test(`SQL ${kind} limit=1 fresh pools observe a later canonical receipt behind incomplete earlier evidence`, async () => {
+    await incompleteEarlierReceipts();
+    const offered = []; const activity = destination.nodes.flatMap(node => node.broadcasts).length;
+    for (let round = 0; round < jobs.length; round++) {
+      const fresh = createDatabasePool(config);
+      try {
+        const observer = manager({ db: fresh });
+        const result = kind === "receipt" ? await observer.checkReceiptsOnce({ limit: 1 }) : await observer.recoverTransactionsOnce({ limit: 1 });
+        assert.equal(kind === "receipt" ? result.checked : result.scanned,1);
+        offered.push(kind === "receipt" ? result.results[0].intent.deliveryJobId : result.results[0].deliveryJobId);
+        assert.equal(kind === "receipt" ? result.confirmed : result.finalized,round === 2 ? 1 : 0);
+      } finally { await fresh.end(); }
+    }
+    assert.deepEqual(offered,jobs.map(job => job.deliveryJobId));
+    assert.equal((await reader.repository.getTransaction(jobs[0].deliveryJobId)).intent.status,"PENDING");
+    assert.equal((await reader.repository.getTransaction(jobs[0].deliveryJobId)).intent.retryStoppedAt,null);
+    assert.equal((await reader.repository.getTransaction(jobs[2].deliveryJobId)).intent.status,"CONFIRMED");
+    assert.equal((await scanProgress())[kind === "receipt" ? "recovery" : "receipt"],null);
+    assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,activity);
+    if (kind === "recovery") {
+      const before = await scanProgress();
+      await reader.recoverTransactionsOnce({ deliveryJobId: jobs[0].deliveryJobId });
+      assert.deepEqual(await scanProgress(),before,"explicit recovery must not move either bulk cursor");
+    }
+  });
+}
+
+test("SQL concurrent cursor selection serializes ranges while receipt and recovery progress remain independent", async () => {
+  await pendingPopulation(); const fresh = createDatabasePool(config);
+  try {
+    const other = manager({ db: fresh });
+    const selected = await Promise.all([reader.repository.listRecoveryIntents({ limit: 1 }),other.repository.listRecoveryIntents({ limit: 1 })]);
+    assert.deepEqual(new Set(selected.flat()),new Set(jobs.slice(0,2).map(job => job.deliveryJobId)));
+    const nonces = await Promise.all(jobs.map(async job => (await reader.repository.getTransaction(job.deliveryJobId)).intent.nonce));
+    assert.equal((await scanProgress()).recovery,nonces[1]); assert.equal((await scanProgress()).receipt,null);
+    const [receipt,recovery] = await Promise.all([other.repository.listTrackingIntents({ limit: 1 }),reader.repository.listRecoveryIntents({ limit: 1 })]);
+    assert.equal(receipt[0].intent.deliveryJobId,jobs[0].deliveryJobId); assert.deepEqual(recovery,[jobs[2].deliveryJobId]);
+    const progress = await scanProgress(); assert.equal(progress.receipt,nonces[0]); assert.equal(progress.recovery,nonces[2]);
+  } finally { await fresh.end(); }
+});
+
+test("SQL observation account locks are released before receipt or recovery RPC access", async () => {
+  await pendingPopulation(); const fresh = createDatabasePool(config); let probes = 0;
+  try {
+    const rpc = { ...destination.rpc,async verifyChain() {
+      // NOWAIT makes an accidental account lock across RPC fail immediately.
+      await fresh.query(`SELECT chain_id FROM ${accountTable} WHERE chain_id = $1 AND sender_address = $2 FOR UPDATE NOWAIT`,
+        [config.destinationDomain.toString(),config.relayerAddress]); probes++;
+      return destination.rpc.verifyChain();
+    } };
+    await manager({ rpc }).checkReceiptsOnce({ limit: 1 });
+    await manager({ rpc }).recoverTransactionsOnce({ limit: 1 });
+    assert.ok(probes >= 2);
+  } finally { await fresh.end(); }
+});
+
+test("SQL cursors isolate senders and chains without creating an account or changing a nonce allocator", async () => {
+  for (const job of jobs.slice(0,2)) await reader.submitDelivery(job.deliveryJobId);
+  const key = developmentKeys(9)[8]; const account = privateKeyToAccount(key);
+  const cfg = { ...config,privateKey: key,relayerAddress: account.address.toLowerCase() };
+  const rpc = destinationRpcFixture({ config: cfg }); const other = manager({ cfg,rpc: rpc.rpc,account });
+  await other.submitDelivery(jobs[2].deliveryJobId);
+  assert.deepEqual(await reader.repository.listRecoveryIntents({ limit: 100 }),jobs.slice(0,2).map(job => job.deliveryJobId));
+  assert.equal((await scanProgress(pool,cfg)).recovery,null);
+  assert.deepEqual(await other.repository.listRecoveryIntents({ limit: 100 }),[jobs[2].deliveryJobId]);
+  assert.equal((await scanProgress()).receipt,null); assert.equal((await scanProgress(pool,cfg)).receipt,null);
+  const otherChain = manager({ cfg: { ...config,destinationDomain: 3001n } });
+  assert.deepEqual(await otherChain.repository.listRecoveryIntents({ limit: 1 }),[]);
+  assert.deepEqual(await otherChain.repository.listTrackingIntents({ limit: 1 }),[]);
+  assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM ${accountTable}`)).rows[0].count,2);
+});
+
+test("SQL observation sees a newly allocated highest nonce before wrapping to earlier pending work", async () => {
+  await pendingPopulation(); const ids = jobs.map(job => job.deliveryJobId);
+  await reader.repository.listRecoveryIntents({ limit: 2 }); await reader.repository.listTrackingIntents({ limit: 2 });
+  await persistReadyTransactionFixture({ config,pool,append: true,count: 1,epoch: 24n,messageOffset: 100 });
+  const next = (await queue.listReadyDeliveryJobs()).find(job => !ids.includes(job.deliveryJobId));
+  await reader.submitDelivery(next.deliveryJobId);
+  assert.deepEqual(await reader.repository.listRecoveryIntents({ limit: 3 }),[ids[2],next.deliveryJobId,ids[0]]);
+  assert.deepEqual((await reader.repository.listTrackingIntents({ limit: 3 })).map(r => r.intent.deliveryJobId),[ids[2],next.deliveryJobId,ids[0]]);
+});
+
+test("SQL wrap includes a newly eligible earlier nonce, drops terminal rows and repeats single pending work", async () => {
+  const prepared = [];
+  for (const job of jobs) prepared.push(await reader.prepareDeliveryTransaction(job.deliveryJobId));
+  // Only later hashes have become visible to the existing manager so far.
+  for (let index = 1; index < 3; index++) await reader.repository.markKnownAttempt(jobs[index].deliveryJobId,prepared[index].attempt.attemptId);
+  assert.equal((await reader.repository.listTrackingIntents({ limit: 2 }))[1].intent.deliveryJobId,jobs[2].deliveryJobId);
+  await reader.repository.markKnownAttempt(jobs[0].deliveryJobId,prepared[0].attempt.attemptId);
+  assert.equal((await reader.repository.listTrackingIntents({ limit: 1 }))[0].intent.deliveryJobId,jobs[0].deliveryJobId);
+  for (let index = 0; index < 2; index++) await reader.repository.recordOutcome(jobs[index].deliveryJobId,{
+    transactionHash: prepared[index].attempt.transactionHash,status: 1,blockNumber: 100n,blockHash: fixtureHash(1100),head: 102n });
+  for (let round = 0; round < 3; round++) assert.deepEqual(await reader.repository.listRecoveryIntents({ limit: 100 }),[jobs[2].deliveryJobId]);
+  await reader.repository.recordOutcome(jobs[2].deliveryJobId,{ transactionHash: prepared[2].attempt.transactionHash,
+    status: 0,blockNumber: 100n,blockHash: fixtureHash(1100),head: 102n });
+  const progress = await scanProgress();
+  assert.deepEqual(await reader.repository.listRecoveryIntents({ limit: 1 }),[]);
+  assert.deepEqual(await reader.repository.listTrackingIntents({ limit: 1 }),[]);
+  assert.deepEqual(await scanProgress(),progress);
+});
+
+test("observation migration preserves old accounts, allocator, winners, receipts, journal and recovery versions", async () => {
+  const schema = "scan_upgrade_" + randomUUID().replaceAll("-",""); const cfg = { ...config,databaseSchema: schema };
+  const client = await pool.connect(); let open = false; let failure;
+  try {
+    const names = (await readdir(new URL("../migrations/",import.meta.url))).filter(name => /^\d+_.*\.sql$/.test(name) && Number(name.slice(0,3)) <= 16).sort();
+    await client.query("BEGIN"); open = true; await client.query(`CREATE SCHEMA "${schema}"`);
+    await client.query(`SET LOCAL search_path TO "${schema}"`);
+    await client.query("CREATE TABLE schema_migrations (name TEXT PRIMARY KEY,applied_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)");
+    for (const name of names) {
+      await client.query(await readFile(new URL("../migrations/" + name,import.meta.url),"utf8"));
+      await client.query("INSERT INTO schema_migrations (name) VALUES ($1)",[name]);
+    }
+    await client.query("COMMIT"); open = false;
+    await persistReadyTransactionFixture({ config: cfg,pool });
+    const q = createDeliveryRepository({ config: cfg,pool }); const oldJobs = await q.listReadyDeliveryJobs();
+    let legacy;
+    const rpc = destinationRpcFixture({ config: cfg,async onBroadcast(raw) {
+      const row = (await pool.query(`SELECT delivery_job_id,attempt_id FROM ${tableName(schema,"transaction_attempts")} WHERE raw_signed_transaction = $1`,[raw])).rows[0];
+      const stored = await legacy.repository.getTransaction(row.delivery_job_id);
+      return transactionBody(stored.intent,stored.attempts.find(a => a.attemptId === row.attempt_id));
+    } });
+    legacy = manager({ cfg,rpc: rpc.rpc });
+    for (const job of oldJobs) await legacy.submitDelivery(job.deliveryJobId);
+    for (const [index,status] of [1,0].entries()) {
+      const stored = await legacy.repository.getTransaction(oldJobs[index].deliveryJobId);
+      await legacy.repository.recordOutcome(oldJobs[index].deliveryJobId,{ transactionHash: stored.attempt.transactionHash,
+        status,blockNumber: 100n,blockHash: fixtureHash(1100),head: 102n });
+    }
+    const accountName = tableName(schema,"transaction_accounts");
+    const account = (await pool.query(`SELECT * FROM ${accountName}`)).rows[0];
+    const snapshots = await Promise.all(oldJobs.map(job => legacy.repository.getRecoverySnapshot(job.deliveryJobId)));
+    const source = await sourceState(pool,schema);
+    assert.equal((await applyMigrations(pool,schema)).at(-1),"017_transaction_scan_progress.sql");
+    const { receipt_scan_cursor_nonce,recovery_scan_cursor_nonce,...unchanged } = (await pool.query(`SELECT * FROM ${accountName}`)).rows[0];
+    assert.equal(receipt_scan_cursor_nonce,null); assert.equal(recovery_scan_cursor_nonce,null); assert.deepEqual(unchanged,account);
+    await applyMigrations(pool,schema);
+    assert.deepEqual(await Promise.all(oldJobs.map(job => legacy.repository.getRecoverySnapshot(job.deliveryJobId))),snapshots);
+    assert.deepEqual(await sourceState(pool,schema),source);
+    const columns = (await pool.query(`SELECT column_name,data_type,numeric_precision,numeric_scale,is_nullable FROM information_schema.columns
+      WHERE table_schema = $1 AND table_name = 'transaction_accounts' AND column_name IN ('receipt_scan_cursor_nonce','recovery_scan_cursor_nonce')`,[schema])).rows;
+    assert.equal(columns.length,2);
+    for (const column of columns) {
+      assert.equal(column.data_type,"numeric"); assert.equal(column.numeric_precision,78); assert.equal(column.numeric_scale,0); assert.equal(column.is_nullable,"YES");
+    }
+    for (const value of ["-1",(1n << 256n).toString()]) await assert.rejects(pool.query(`UPDATE ${accountName} SET receipt_scan_cursor_nonce = $1`,[value]),
+      error => error.code === "23514" && error.constraint === "transaction_accounts_receipt_scan_cursor_nonce_check");
+    const progress = ((1n << 200n) + 123n).toString();
+    await pool.query(`UPDATE ${accountName} SET receipt_scan_cursor_nonce = $1`,[progress]);
+    await applyMigrations(pool,schema);
+    assert.equal((await pool.query(`SELECT receipt_scan_cursor_nonce::text AS cursor FROM ${accountName}`)).rows[0].cursor,progress);
+    assert.equal((await legacy.repository.getAccount()).nextNonce,account.next_nonce);
+  } catch (error) { failure = error; throw error; }
+  finally {
+    try {
+      if (open) await client.query("ROLLBACK");
+      await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    } catch (error) { if (!failure) throw error; console.error("observation upgrade cleanup failed: " + error.message); }
+    finally { client.release(); }
+  }
+});
 
 const immutableAttemptFields = ["attemptId","attemptNumber","replacementOfAttemptId","nonce","gasLimit",
   "maxFeePerGas","maxPriorityFeePerGas","rawSignedTransaction","transactionHash","createdAt"];

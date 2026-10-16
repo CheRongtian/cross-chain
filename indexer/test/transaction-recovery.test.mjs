@@ -12,6 +12,52 @@ function crashOnce() {
 const rawFields = ["nonce","rawSignedTransaction","transactionHash","gasLimit","maxFeePerGas","maxPriorityFeePerGas"];
 function sameAttempt(first,second) { for (const field of rawFields) assert.equal(second[field],first[field]); }
 
+test("recovery limit=1 rotates past unproductive mined bodies to a later canonical receipt without authorizing a send", async () => {
+  const h = await transactionHarness();
+  for (const job of h.jobs) { await h.manager.submitDelivery(job.deliveryJobId); h.mine(job.deliveryJobId); }
+  for (const job of h.jobs.slice(0,2)) h.state.receipts.delete(h.records.get(job.deliveryJobId).attempt.transactionHash);
+  h.state.head = 102n;
+  const before = preparationCalls(h); const account = await h.repository.getAccount();
+  for (let round = 0; round < 3; round++) {
+    const result = await createTransactionManager({ ...h.options,repository: { ...h.repository } }).recoverTransactionsOnce({ limit: 1 });
+    assert.equal(result.scanned,1); assert.equal(result.results[0].deliveryJobId,h.jobs[round].deliveryJobId);
+    assert.equal(result.finalized,round === 2 ? 1 : 0);
+  }
+  assert.equal(h.records.get(h.jobs[0].deliveryJobId).intent.retryStoppedAt,null);
+  assert.equal(h.records.get(h.jobs[2].deliveryJobId).intent.status,"CONFIRMED");
+  assert.equal(h.scanCursors.receipt,null); assert.deepEqual(preparationCalls(h),before);
+  assert.deepEqual(await h.repository.getAccount(),account); assert.equal(h.calls.broadcast.length,3);
+  const cursor = h.scanCursors.recovery;
+  await h.restart().recoverTransactionsOnce({ deliveryJobId: h.jobs[1].deliveryJobId });
+  assert.equal(h.scanCursors.recovery,cursor); assert.equal(h.scanCursors.receipt,null);
+});
+
+test("bulk recovery shares one fixed conservative view while later fresh passes may confirm", async () => {
+  const heads = []; let h;
+  h = await transactionHarness({ hooks: { afterReceiptObserved: async ({ head }) => { heads.push(head); h.state.head = 102n; } } });
+  for (const job of h.jobs) { await h.manager.submitDelivery(job.deliveryJobId); h.mine(job.deliveryJobId); }
+  const first = await h.manager.recoverTransactionsOnce({ limit: 3 });
+  assert.equal(first.scanned,3); assert.equal(first.finalized,0); assert.equal(h.calls.head,1);
+  assert.deepEqual(heads,[100n,100n,100n]);
+  assert.equal((await h.restart().recoverTransactionsOnce({ limit: 3 })).finalized,3); assert.equal(h.calls.head,2);
+});
+
+test("recovery selection interruption and independent receipt progress cannot lose the skipped intent", async () => {
+  let armed = true;
+  const h = await transactionHarness({ hooks: { afterObservationSelected: async ({ kind }) => {
+    if (kind === "recovery" && armed) { armed = false; throw Object.assign(new Error("selected recovery interruption"),{ code: "TEST_CHECKPOINT" }); }
+  } } });
+  for (const job of h.jobs) await h.manager.submitDelivery(job.deliveryJobId);
+  await assert.rejects(h.manager.recoverTransactionsOnce({ limit: 1 }),{ code: "TEST_CHECKPOINT" });
+  assert.equal(h.calls.head,0);
+  await h.manager.checkReceiptsOnce({ limit: 2 });
+  assert.equal(h.scanCursors.recovery,h.records.get(h.jobs[0].deliveryJobId).intent.nonce);
+  const seen = [];
+  for (let round = 0; round < 3; round++) seen.push((await h.restart().recoverTransactionsOnce({ limit: 1 })).results[0].deliveryJobId);
+  assert.deepEqual(seen,[h.jobs[1].deliveryJobId,h.jobs[2].deliveryJobId,h.jobs[0].deliveryJobId]);
+  assert.equal(h.scanCursors.receipt,h.records.get(h.jobs[1].deliveryJobId).intent.nonce);
+});
+
 const preparationCalls = h => ({ gas: h.calls.gas,fees: h.calls.fees,sign: h.calls.sign,pendingNonce: h.calls.pending });
 async function persistedReplacement(h) {
   const id = h.jobs[0].deliveryJobId;

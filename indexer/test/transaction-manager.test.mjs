@@ -11,6 +11,98 @@ import { transactionConfig, transactionHarness } from "./helpers/transaction-fix
 import { relayerEnvironment } from "./helpers/relayer-fixtures.mjs";
 import { fixtureHash } from "./helpers/delivery-fixtures.mjs";
 import { DestinationRpcError } from "../src/transaction-manager/rpc-pool.mjs";
+import { createTransactionManager } from "../src/transaction-manager/service.mjs";
+
+test("receipt limit=1 rotates through missing earlier receipts and confirms a later canonical transaction within N rounds", async () => {
+  const h = await transactionHarness();
+  for (const job of h.jobs) { await h.manager.submitDelivery(job.deliveryJobId); h.mine(job.deliveryJobId); }
+  for (const job of h.jobs.slice(0,2)) h.state.receipts.delete(h.records.get(job.deliveryJobId).attempt.transactionHash);
+  h.state.head = 102n;
+  const inspect = h.rpc.receiptEvidence; let observed = 0;
+  h.rpc.receiptEvidence = async (...args) => { observed++; return inspect(...args); };
+  for (let round = 0; round < 3; round++) {
+    const before = observed;
+    const manager = createTransactionManager({ ...h.options,repository: { ...h.repository } });
+    const result = await manager.checkReceiptsOnce({ limit: 1 });
+    assert.equal(result.checked,1); assert.equal(observed - before,1);
+    assert.equal(result.results[0].intent.deliveryJobId,h.jobs[round].deliveryJobId);
+    assert.equal(result.confirmed,round === 2 ? 1 : 0);
+  }
+  assert.equal(h.records.get(h.jobs[0].deliveryJobId).intent.status,"PENDING");
+  assert.equal(h.records.get(h.jobs[2].deliveryJobId).intent.status,"CONFIRMED");
+  assert.equal(h.scanCursors.recovery,null); assert.equal(h.calls.broadcast.length,3); assert.equal(h.calls.sign,3);
+});
+
+test("independent observation selectors wrap uniquely, preserve exact large nonces and mutate no transaction or allocator evidence", async () => {
+  const h = await transactionHarness();
+  assert.deepEqual(await h.repository.listRecoveryIntents({ limit: 1 }),[]);
+  assert.deepEqual(await h.repository.listTrackingIntents({ limit: 1 }),[]); assert.equal(await h.repository.getAccount(),null);
+  h.state.pendingNonce = (1n << 200n) + 17n;
+  for (const job of h.jobs) await h.manager.submitDelivery(job.deliveryJobId);
+  const before = structuredClone([...h.records]); const versions = [...h.versions];
+  const account = await h.repository.getAccount(); const activity = structuredClone(h.calls);
+  const ids = h.jobs.map(job => job.deliveryJobId);
+  const nonces = ids.map(id => h.records.get(id).intent.nonce);
+  for (const kind of ["receipt","recovery"]) {
+    const select = async limit => {
+      const repository = { ...h.repository };
+      return kind === "receipt" ? (await repository.listTrackingIntents({ limit })).map(record => record.intent.deliveryJobId) : repository.listRecoveryIntents({ limit });
+    };
+    assert.deepEqual(await select(1),[ids[0]]); assert.equal(h.scanCursors[kind],nonces[0]);
+    assert.deepEqual(await select(1),[ids[1]]); assert.equal(h.scanCursors[kind],nonces[1]);
+    assert.deepEqual(await select(100),[ids[2],ids[0],ids[1]]);
+    h.scanCursors[kind] = ((1n << 256n) - 1n).toString();
+    assert.deepEqual(await select(100),ids);
+    for (const limit of [0,1001,1.5,"1"]) await assert.rejects(select(limit),{ code: "INVALID_DELIVERY_LIMIT" });
+  }
+  assert.deepEqual([...h.records],before); assert.deepEqual([...h.versions],versions);
+  assert.deepEqual(await h.repository.getAccount(),account); assert.deepEqual(h.calls,activity);
+});
+
+test("receipt rotation handles terminal removal, new higher nonces, empty and single populations", async () => {
+  const h = await transactionHarness({ count: 4 });
+  const ids = h.jobs.map(job => job.deliveryJobId);
+  for (const id of ids.slice(0,3)) await h.manager.submitDelivery(id);
+  assert.equal((await h.repository.listTrackingIntents({ limit: 2 }))[1].intent.deliveryJobId,ids[1]);
+  await h.manager.submitDelivery(ids[3]);
+  assert.deepEqual((await h.repository.listTrackingIntents({ limit: 3 })).map(r => r.intent.deliveryJobId),[ids[2],ids[3],ids[0]]);
+  for (const id of ids.slice(0,3)) {
+    h.mine(id); h.state.head = 102n;
+    const stored = await h.repository.getTransaction(id);
+    await h.repository.recordOutcome(id,{ transactionHash: stored.attempt.transactionHash,status: 1,
+      blockNumber: 100n,blockHash: fixtureHash(1100),head: 102n });
+  }
+  for (let round = 0; round < 3; round++) assert.deepEqual((await h.repository.listTrackingIntents({ limit: 100 })).map(r => r.intent.deliveryJobId),[ids[3]]);
+  const stored = await h.repository.getTransaction(ids[3]);
+  await h.repository.recordOutcome(ids[3],{ transactionHash: stored.attempt.transactionHash,status: 0,
+    blockNumber: 100n,blockHash: fixtureHash(1100),head: 102n });
+  const cursor = h.scanCursors.receipt;
+  assert.deepEqual(await h.repository.listTrackingIntents({ limit: 1 }),[]); assert.equal(h.scanCursors.receipt,cursor);
+});
+
+test("a receipt selection interruption commits progress but wrap revisits the unobserved intent", async () => {
+  let armed = true;
+  const h = await transactionHarness({ hooks: { afterObservationSelected: async ({ kind }) => {
+    if (kind === "receipt" && armed) { armed = false; throw Object.assign(new Error("selected receipt interruption"),{ code: "TEST_CHECKPOINT" }); }
+  } } });
+  for (const job of h.jobs) await h.manager.submitDelivery(job.deliveryJobId);
+  await assert.rejects(h.manager.checkReceiptsOnce({ limit: 1 }),{ code: "TEST_CHECKPOINT" });
+  assert.equal(h.calls.head,0,"selection interruption happens before RPC observation");
+  const offered = [];
+  for (let round = 0; round < 3; round++) offered.push((await h.restart().checkReceiptsOnce({ limit: 1 })).results[0].intent.deliveryJobId);
+  assert.deepEqual(offered,[h.jobs[1].deliveryJobId,h.jobs[2].deliveryJobId,h.jobs[0].deliveryJobId]);
+  assert.equal(h.scanCursors.recovery,null);
+});
+
+test("explicit per-job receipt inspection and recovery leave both automatic cursors unchanged", async () => {
+  const h = await transactionHarness(); const id = h.jobs[0].deliveryJobId;
+  await h.manager.submitDelivery(id); h.mine(id); h.state.head = 102n; h.advance(h.config.replacementAfterMs);
+  const result = await h.manager.prepareReplacement(id);
+  assert.equal(result.created,false); assert.equal(result.intent.status,"CONFIRMED");
+  assert.deepEqual(h.scanCursors,{ receipt: null,recovery: null });
+  await h.restart().recoverTransactionsOnce({ deliveryJobId: id });
+  assert.deepEqual(h.scanCursors,{ receipt: null,recovery: null });
+});
 
 test("explicit estimate execution rejection precedes fees, pending nonce and all durable transaction side effects", async () => {
   const h = await transactionHarness(); const id = h.jobs[0].deliveryJobId;

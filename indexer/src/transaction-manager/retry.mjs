@@ -41,7 +41,13 @@ export async function processTransactionRetriesOnce({ config, store, rpc, verify
       }
       if (replacementDue(current.attempt,now,config)) {
         const prepared = await replace(id,current.attempt.attemptId,view,fence);
-        if (!prepared.created) { results.push({ deliveryJobId: id,action: prepared.intent.retryStoppedAt ? prepared.intent.retryStopReason : "NO_REPLACEMENT" }); continue; }
+        if (!prepared.created) {
+          if (prepared.intent.status === "PENDING" && prepared.intent.retryStoppedAt === null && prepared.attempt.attemptId === current.attempt.attemptId) {
+            await store.scheduleRetry(id,{ parentAttemptId: current.attempt.attemptId,expectedVersion: snapshot.version,fence });
+          }
+          results.push({ deliveryJobId: id,action: prepared.intent.retryStoppedAt ? prepared.intent.retryStopReason : "NO_REPLACEMENT" });
+          continue;
+        }
         replacements++;
         current = prepared;
       }

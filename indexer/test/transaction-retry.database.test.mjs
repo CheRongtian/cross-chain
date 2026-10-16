@@ -64,6 +64,47 @@ async function mine(manager,id,attemptId,status = 1) {
   h.state.latestNonce = BigInt(stored.intent.nonce) + 1n; h.state.head = 102n;
 }
 
+test("SQL NO_REPLACEMENT schedules bounded retry for a mined body with missing receipt without changing signed evidence", async () => {
+  const id = jobs[0].deliveryJobId; let signatures = 0;
+  const signer = h.options.account;
+  const active = managerFor(pool,{ account: { ...signer,async signTransaction(...args) { signatures++; return signer.signTransaction(...args); } } });
+  const first = await active.submitDelivery(id);
+  await mine(active,id,first.attempt.attemptId); h.state.receipts.clear();
+  h.advance(config.replacementAfterMs);
+  const before = await active.repository.getTransaction(id); const account = await active.repository.getAccount();
+  const sends = h.calls.broadcast.length;
+  const result = await active.processTransactionRetriesOnce({ limit: 1 });
+  assert.equal(result.results[0].action,"NO_REPLACEMENT"); assert.equal(result.replacements,0); assert.equal(result.broadcasts,0);
+  const after = await active.repository.getTransaction(id);
+  assert.equal(after.intent.status,"PENDING"); assert.ok(Date.parse(after.intent.nextActionAt) > h.clock.now());
+  assert.deepEqual(after.attempts,before.attempts); assert.deepEqual(await active.repository.getAccount(),account);
+  assert.equal(signatures,1); assert.equal(h.calls.broadcast.length,sends);
+  assert.equal((await active.processTransactionRetriesOnce({ limit: 1 })).processed,0);
+  // A stale snapshot cannot overwrite a concurrent same-parent action schedule.
+  const snapshot = await active.repository.getRecoverySnapshot(id);
+  await active.repository.scheduleRetry(id,{ parentAttemptId: first.attempt.attemptId });
+  const concurrent = await active.repository.getRecoverySnapshot(id);
+  await assert.rejects(active.repository.scheduleRetry(id,{ parentAttemptId: first.attempt.attemptId,expectedVersion: snapshot.version }),{ code: "RECOVERY_STATE_CHANGED" });
+  assert.deepEqual(await active.repository.getRecoverySnapshot(id),concurrent);
+});
+
+test("SQL stale-parent, stopped and final states reject no-replacement rescheduling without reopening history", async () => {
+  const id = jobs[0].deliveryJobId; const active = managerFor(); const first = await active.submitDelivery(id);
+  const original = await active.repository.getRecoverySnapshot(id); h.advance(config.replacementAfterMs);
+  const child = await active.prepareReplacement(id);
+  let before = await active.repository.getRecoverySnapshot(id);
+  await active.repository.scheduleRetry(id,{ parentAttemptId: first.attempt.attemptId,expectedVersion: original.version });
+  assert.deepEqual(await active.repository.getRecoverySnapshot(id),before);
+  await active.repository.stopRetry(id,"MAX_ATTEMPTS_REACHED"); before = await active.repository.getRecoverySnapshot(id);
+  await active.repository.scheduleRetry(id,{ parentAttemptId: child.attempt.attemptId,expectedVersion: original.version });
+  assert.deepEqual(await active.repository.getRecoverySnapshot(id),before);
+  await mine(active,id,first.attempt.attemptId);
+  await active.repository.recordOutcome(id,{ transactionHash: first.attempt.transactionHash,status: 1,blockNumber: 100n,blockHash: fixtureHash(1100),head: 102n });
+  before = await active.repository.getRecoverySnapshot(id);
+  await active.repository.scheduleRetry(id,{ parentAttemptId: child.attempt.attemptId,expectedVersion: original.version });
+  assert.deepEqual(await active.repository.getRecoverySnapshot(id),before);
+});
+
 test("durable exact retry counters and schedules recover through an independent pool", async () => {
   const id = jobs[0].deliveryJobId;
   const failed = managerFor(pool,{ rpc: { ...h.rpc,async broadcast() { throw transientSendError(); } } });
@@ -248,10 +289,18 @@ test("upgrade preserves original signed artifacts, final receipts, allocator and
       const restored = await manager.repository.getTransaction(id);
       assert.equal(restored.intent.nonce,"9"); assert.equal(restored.attempts.length,1);
       assert.equal(restored.intent.status,["SIGNED","BROADCAST"].includes(status) ? "PENDING" : status);
-      assert.deepEqual((await pool.query(`SELECT * FROM ${oldAccounts}`)).rows,allocation);
+      const migratedAllocation = (await pool.query(`SELECT * FROM ${oldAccounts}`)).rows;
+      const preservedAllocation = migratedAllocation.map(({ receipt_scan_cursor_nonce,recovery_scan_cursor_nonce,...account }) => {
+        assert.equal(receipt_scan_cursor_nonce,null,`upgrade must initialize ${status} receipt scan cursor`);
+        assert.equal(recovery_scan_cursor_nonce,null,`upgrade must initialize ${status} recovery scan cursor`);
+        return account;
+      });
+      assert.deepEqual(preservedAllocation,allocation,`upgrade must preserve ${status} allocation`);
       assert.deepEqual(await legacy.getSubmission(legacyId),oldSubmission);
       assert.deepEqual(await sourceState(pool,schema),sourceBefore);
       await applyMigrations(pool,schema);
+      assert.deepEqual((await pool.query(`SELECT * FROM ${oldAccounts}`)).rows,migratedAllocation,
+        `migration rerun must preserve ${status} allocation and scan cursors`);
     } finally {
       if (transactionOpen) await client.query("ROLLBACK");
       await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);

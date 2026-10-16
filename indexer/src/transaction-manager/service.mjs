@@ -261,8 +261,8 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     },
     async checkReceiptsOnce({ limit = config.maxJobs } = {}) {
       return protect(async () => {
-        await verifyChain(); const view = await rpc.readView(); const head = view.head;
         const records = await store.listTrackingIntents({ limit });
+        await verifyChain(); const view = await rpc.readView(); const head = view.head;
         const results = [];
         for (const stored of records) results.push((await inspect(stored,view)).stored);
         return Object.freeze({ head: head.toString(),checked: records.length,

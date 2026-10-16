@@ -69,11 +69,13 @@ async function rejectEstimatesFor(ids) {
 async function preparationDue(id) {
   await pool.query(`UPDATE ${leaseTable} SET preparation_retry_at = clock_timestamp() - interval '1 millisecond' WHERE delivery_job_id = $1`,[id]);
 }
-async function runInFreshProcess(rejectedIds) {
+async function runInFreshProcess(rejectedIds,{ kind,jobIds = [],receiptJobIds = [],interrupt = false } = {}) {
   return new Promise((resolve,reject) => {
-    const child = spawn(process.execPath,[fileURLToPath(new URL("./helpers/lease-selection-process.mjs",import.meta.url))],{
+    const child = spawn(process.execPath,[fileURLToPath(new URL("./helpers/lease-selection-process.mjs",import.meta.url)),
+      ...(kind ? [kind + (interrupt ? "-selected" : "")] : [])],{
       env: { ...process.env,DATABASE_URL: config.databaseUrl,INDEXER_DB_SCHEMA: config.databaseSchema,
-        PREPARATION_REJECT_JOB_IDS: JSON.stringify(rejectedIds) },
+        PREPARATION_REJECT_JOB_IDS: JSON.stringify(rejectedIds),OBSERVATION_JOB_IDS: JSON.stringify(jobIds),
+        OBSERVATION_RECEIPT_JOB_IDS: JSON.stringify(receiptJobIds) },
       stdio: ["ignore","pipe","pipe"],timeout: 30000,
     });
     let output = ""; let diagnostics = "";
@@ -81,9 +83,48 @@ async function runInFreshProcess(rejectedIds) {
     child.stderr.on("data",chunk => { diagnostics += chunk; });
     child.once("error",reject);
     child.once("close",code => {
-      if (code !== 0) return reject(new Error(`fresh Relayer process failed (${code}): ${diagnostics}`));
+      if (code !== (interrupt ? 73 : 0)) return reject(new Error(`fresh transaction process failed (${code}): ${diagnostics}`));
       try { resolve(JSON.parse(output)); } catch (error) { reject(error); }
     });
+  });
+}
+
+for (const kind of ["receipt","recovery"]) {
+  test(`fresh OS ${kind} passes rotate behind missing earlier receipts without new signatures or broadcasts`, async () => {
+    for (const job of jobs) await reader.submitDelivery(job.deliveryJobId);
+    const ids = jobs.map(job => job.deliveryJobId); const account = await reader.repository.getAccount();
+    const before = await sourceState(pool,config.databaseSchema);
+    const journal = tableName(config.databaseSchema,"transaction_broadcast_events");
+    const journalBefore = (await pool.query(`SELECT * FROM ${journal} ORDER BY event_id`)).rows;
+    for (let round = 0; round < 3; round++) {
+      const result = await runInFreshProcess([],{ kind,jobIds: ids,receiptJobIds: [ids[2]] });
+      assert.equal(result.scanned,1); assert.deepEqual(result.ids,[ids[round]]); assert.equal(result.finalized,round === 2 ? 1 : 0);
+    }
+    assert.equal((await reader.repository.getTransaction(ids[0])).intent.status,"PENDING");
+    assert.equal((await reader.repository.getTransaction(ids[2])).intent.status,"CONFIRMED");
+    assert.equal((await pool.query(`SELECT ${kind === "receipt" ? "recovery_scan_cursor_nonce" : "receipt_scan_cursor_nonce"}::text AS cursor
+      FROM ${tableName(config.databaseSchema,"transaction_accounts")}`)).rows[0].cursor,null);
+    assert.deepEqual(await reader.repository.getAccount(),account);
+    assert.deepEqual((await pool.query(`SELECT * FROM ${journal} ORDER BY event_id`)).rows,journalBefore);
+    assert.deepEqual(await counts(),{ intents: 3,attempts: 3 }); assert.deepEqual(await sourceState(pool,config.databaseSchema),before);
+  });
+
+  test(`fresh OS ${kind} selection crash is durable and wrap revisits the skipped intent within N rounds`, async () => {
+    for (const job of jobs) await reader.submitDelivery(job.deliveryJobId);
+    const ids = jobs.map(job => job.deliveryJobId);
+    const before = await Promise.all(ids.map(id => reader.repository.getRecoverySnapshot(id)));
+    const account = await reader.repository.getAccount();
+    const interrupted = await runInFreshProcess([],{ kind,jobIds: ids,interrupt: true });
+    assert.equal(interrupted.interrupted,true); assert.deepEqual(interrupted.selectedIds,[ids[0]]);
+    assert.deepEqual(await Promise.all(ids.map(id => reader.repository.getRecoverySnapshot(id))),before);
+    const revisited = [];
+    for (let round = 0; round < 3; round++) {
+      const result = await runInFreshProcess([],{ kind,jobIds: ids });
+      assert.equal(result.scanned,1); revisited.push(...result.ids);
+    }
+    assert.deepEqual(revisited,[ids[1],ids[2],ids[0]]);
+    assert.deepEqual(await reader.repository.getAccount(),account);
+    assert.deepEqual(await Promise.all(ids.map(id => reader.repository.getRecoverySnapshot(id))),before);
   });
 }
 
@@ -269,7 +310,7 @@ test("preparation migration upgrades existing leases and signed history without 
     const legacy = manager({ cfg,db: pool }); const signed = await legacy.prepareDeliveryTransaction(oldJobs[1].deliveryJobId);
     const account = await legacy.repository.getAccount(); const source = await sourceState(pool,schema);
     const before = (await pool.query(`SELECT * FROM ${tableName(schema,"relayer_job_leases")}`)).rows[0];
-    assert.equal((await applyMigrations(pool,schema)).at(-1),"016_relayer_preparation_defer.sql");
+    assert.ok((await applyMigrations(pool,schema)).includes("016_relayer_preparation_defer.sql"));
     const upgraded = (await pool.query(`SELECT * FROM ${tableName(schema,"relayer_job_leases")}`)).rows[0];
     const { preparation_retry_at,preparation_defer_reason,...unchanged } = upgraded;
     assert.equal(preparation_retry_at,null); assert.equal(preparation_defer_reason,null); assert.deepEqual(unchanged,before);

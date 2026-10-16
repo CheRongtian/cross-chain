@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { privateKeyToAccount } from "viem/accounts";
 import { toHex } from "viem";
-import { deliveryJson, buildDeliveryPackages } from "../../src/delivery/package.mjs";
+import { deliveryJson, buildDeliveryPackages, deliveryLimit } from "../../src/delivery/package.mjs";
 import { createTransactionManager } from "../../src/transaction-manager/service.mjs";
 import { loadTransactionConfig, TransactionError } from "../../src/transaction-manager/config.mjs";
 import { allocateNonce } from "../../src/transaction-manager/nonce-policy.mjs";
@@ -26,6 +26,7 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
   const queue = { async getDeliveryJob(id) { return jobs.find(job => job.deliveryJobId === id); },
     async getDeliveryPackage(id) { return packets.find(pack => pack.deliveryJobId === id); } };
   const records = new Map();
+  const scanCursors = { receipt: null,recovery: null };
   const historical = new Map();
   const journal = []; const versions = new Map(); const recoveryLocks = new Set(); let nextEvent = 1n;
   const touch = id => versions.set(id,(versions.get(id) ?? 0n) + 1n);
@@ -76,6 +77,19 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
     if (record.intent.status !== "PENDING" || record.intent.retryStoppedAt !== null) return;
     Object.assign(record.intent,{ retryStoppedAt: timestamp(),retryStopReason: reason,nextActionAt: null });
   }
+  async function selectObservation(kind,limit) {
+    deliveryLimit(limit);
+    const candidates = [...records.values()].filter(record => record.intent.status === "PENDING" &&
+      (kind === "recovery" || record.attempts.some(a => BigInt(a.broadcastAttemptCount) > 0n || a.broadcastAt !== null)))
+      .sort((a,b) => BigInt(a.intent.nonce) < BigInt(b.intent.nonce) ? -1 : 1);
+    const cursor = scanCursors[kind];
+    const selected = candidates.filter(record => cursor === null || BigInt(record.intent.nonce) > BigInt(cursor)).slice(0,limit);
+    if (cursor !== null && selected.length < limit) selected.push(...candidates.filter(record => BigInt(record.intent.nonce) <= BigInt(cursor)).slice(0,limit - selected.length));
+    if (selected.length) scanCursors[kind] = selected.at(-1).intent.nonce;
+    const ids = selected.map(record => record.intent.deliveryJobId);
+    await hooks.afterObservationSelected?.({ kind,ids: Object.freeze([...ids]) });
+    return ids;
+  }
   const repository = {
     async withRecoveryLock(id,operation,context) {
       if (context) { context.assertHeld(); return operation(context); }
@@ -89,7 +103,7 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
     async getRecoverySnapshot(id) {
       const stored = await strict(id); return stored ? { ...stored,version: versions.get(id).toString(),broadcastEvents: await this.getBroadcastEvents(id) } : null;
     },
-    async listRecoveryIntents({ limit }) { return [...records.values()].filter(r => r.intent.status === "PENDING").sort((a,b) => BigInt(a.intent.nonce) < BigInt(b.intent.nonce) ? -1 : 1).slice(0,limit).map(r => r.intent.deliveryJobId); },
+    async listRecoveryIntents({ limit }) { return selectObservation("recovery",limit); },
     async assertRecoverySnapshot(snapshot,{ fence } = {}) {
       if (fence) await this.assertFence(snapshot.intent.deliveryJobId,fence);
       if (snapshot.version !== versions.get(snapshot.intent.deliveryJobId).toString()) throw new TransactionError("RECOVERY_STATE_CHANGED");
@@ -121,8 +135,7 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
       return Promise.all(selected.map(record => strict(record.intent.deliveryJobId)));
     },
     async listTrackingIntents({ limit }) {
-      return Promise.all([...records.values()].filter(r => r.intent.status === "PENDING" && r.attempts.some(a => BigInt(a.broadcastAttemptCount) > 0n || a.broadcastAt !== null))
-        .slice(0,limit).map(r => strict(r.intent.deliveryJobId)));
+      return Promise.all((await selectObservation("receipt",limit)).map(id => strict(id)));
     },
     async listDueIntents({ now,limit }) {
       return Promise.all([...records.values()].filter(r => r.intent.status === "PENDING" && r.intent.retryStoppedAt === null && Date.parse(r.intent.nextActionAt) <= now)
@@ -223,10 +236,11 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
       touch(id);
       return strict(id);
     },
-    async scheduleRetry(id,{ reason = null,parentAttemptId,fence } = {}) {
+    async scheduleRetry(id,{ reason = null,parentAttemptId,expectedVersion,fence } = {}) {
       if (fence) await this.assertFence(id,fence);
       const record = records.get(id);
       if (record.intent.status === "PENDING" && record.intent.retryStoppedAt === null && (parentAttemptId === undefined || parentAttemptId === record.attempt.attemptId)) {
+        if (expectedVersion !== undefined && expectedVersion !== versions.get(id).toString()) throw new TransactionError("RECOVERY_STATE_CHANGED");
         record.intent.nextActionAt = nextAction(); if (reason) record.attempt.lastErrorClass = reason;
         touch(id);
       }
@@ -307,7 +321,7 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
     if (BigInt(intent.nonce) >= state.latestNonce) state.latestNonce = BigInt(intent.nonce) + 1n;
     return receipt;
   }
-  return { config,queue,jobs,packets,original,records,historical,journal,versions,calls,state,repository,rpc,options,clock,
+  return { config,queue,jobs,packets,original,records,historical,journal,versions,scanCursors,calls,state,repository,rpc,options,clock,
     advance: milliseconds => { time += milliseconds; },mine,
     manager: createTransactionManager(options),restart: () => createTransactionManager(options) };
 }

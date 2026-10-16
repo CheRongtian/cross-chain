@@ -13,7 +13,7 @@ export function classifyRecovery(snapshot) {
   return snapshot.attempt.attemptNumber ? "REPLACEMENT_PENDING" : "BROADCAST_PENDING";
 }
 
-export async function recoverTransaction({ id,store,rpc,config,send,hooks = {},fence,context,receiptView }) {
+export async function recoverTransaction({ id,store,rpc,config,send,hooks = {},fence,context,receiptView,captureView }) {
   let snapshot = await store.getRecoverySnapshot(id);
   const classification = classifyRecovery(snapshot);
   if (!snapshot || snapshot.intent.status !== "PENDING") return { deliveryJobId: id,action: "UNCHANGED",classification };
@@ -24,7 +24,7 @@ export async function recoverTransaction({ id,store,rpc,config,send,hooks = {},f
   if (await rpc.verifyChain() !== config.destinationDomain) throw new TransactionError("CHAIN_ID_MISMATCH");
   // A retry pass already owns its confirmation snapshot. Keep that view when
   // it delegates recovery; standalone recovery captures one view of its own.
-  const view = receiptView ?? await rpc.readView();
+  const view = receiptView ?? await (captureView ? captureView() : rpc.readView());
   const observation = await observeIntentReceipts({ stored: snapshot,rpc,config,view,forceAll: true,hooks });
   context.assertHeld();
   async function settleWinner(evidence) {
@@ -111,9 +111,17 @@ export async function recoverTransaction({ id,store,rpc,config,send,hooks = {},f
 export async function recoverTransactionsOnce({ store,rpc,config,send,hooks,limit = config.maxJobs,deliveryJobId,fence,receiptView }) {
   const ids = deliveryJobId === undefined ? await store.listRecoveryIntents({ limit }) : [deliveryJobId];
   const results = [];
+  let bulkView = receiptView;
+  const captureView = async () => {
+    if (bulkView == null) bulkView = await rpc.readView();
+    return bulkView;
+  };
   for (const id of ids) {
     try {
-      results.push(await store.withRecoveryLock(id,context => recoverTransaction({ id,store,rpc,config,send,hooks,fence,context,receiptView })));
+      // Selection is committed. Lazily share one view after the first strict
+      // snapshot and chain check; explicit recovery keeps its original view.
+      results.push(await store.withRecoveryLock(id,context => recoverTransaction({ id,store,rpc,config,send,hooks,fence,context,
+        receiptView,captureView: deliveryJobId === undefined ? captureView : undefined })));
     } catch (error) {
       if (["TRANSACTION_RECOVERY_BUSY","RECOVERY_STATE_CHANGED"].includes(error.code)) results.push({ deliveryJobId: id,action: "UNCHANGED",reason: error.code });
       else if (["RPC_UNAVAILABLE","INCONSISTENT_RPC_VIEW","RPC_VIEW_INCOMPLETE","NONCANONICAL_TRANSACTION_RECEIPT","CONFLICTING_CANONICAL_NONCE_WINNERS"].includes(error.code)) {

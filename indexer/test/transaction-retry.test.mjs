@@ -6,6 +6,49 @@ import { publicTransactionConfig } from "../src/transaction-manager/config.mjs";
 import { signDeliveryTransaction } from "../src/transaction-manager/transaction.mjs";
 import { transactionConfig, transactionHarness, transientSendError } from "./helpers/transaction-fixtures.mjs";
 import { fixtureHash } from "./helpers/delivery-fixtures.mjs";
+import { processTransactionRetriesOnce } from "../src/transaction-manager/retry.mjs";
+
+test("NO_REPLACEMENT with a mined body but no receipt schedules a future action without signing, sending or allocating", async () => {
+  const h = await transactionHarness(); const id = h.jobs[0].deliveryJobId;
+  await h.manager.submitDelivery(id); h.mine(id); h.state.receipts.clear(); h.state.head = 102n;
+  h.advance(h.config.replacementAfterMs);
+  const before = await h.repository.getTransaction(id); const account = await h.repository.getAccount();
+  const activity = { sign: h.calls.sign,gas: h.calls.gas,fees: h.calls.fees,sends: h.calls.broadcast.length };
+  const result = await h.manager.processTransactionRetriesOnce({ limit: 1 });
+  assert.equal(result.results[0].action,"NO_REPLACEMENT"); assert.equal(result.replacements,0); assert.equal(result.broadcasts,0);
+  const after = await h.repository.getTransaction(id);
+  assert.ok(Date.parse(after.intent.nextActionAt) > h.clock.now()); assert.equal(after.intent.status,"PENDING");
+  assert.deepEqual(after.attempts,before.attempts); assert.deepEqual(await h.repository.getAccount(),account);
+  assert.deepEqual({ sign: h.calls.sign,gas: h.calls.gas,fees: h.calls.fees,sends: h.calls.broadcast.length },activity);
+  assert.equal((await h.restart().processTransactionRetriesOnce({ limit: 1 })).processed,0);
+});
+
+for (const change of ["parent","confirmed","stopped","version"]) {
+  test(`NO_REPLACEMENT cannot reschedule a concurrently changed ${change} state`, async () => {
+    const h = await transactionHarness(); const id = h.jobs[0].deliveryJobId;
+    const initial = await h.manager.submitDelivery(id); h.advance(h.config.replacementAfterMs);
+    const schedule = h.repository.scheduleRetry.bind(h.repository); let writes = 0; let concurrent;
+    h.repository.scheduleRetry = async (...args) => { writes++; return schedule(...args); };
+    const result = await processTransactionRetriesOnce({ config: h.config,store: h.repository,rpc: h.rpc,clock: h.clock,limit: 1,
+      verifyChain: () => h.manager.verifyChain(),inspect: async stored => ({ stored,mined: false }),
+      send: async () => { throw new Error("stale no-replacement reached send"); },
+      replace: async () => {
+        if (change === "parent") await h.manager.prepareReplacement(id);
+        if (change === "confirmed") {
+          const receipt = h.mine(id);
+          await h.repository.recordOutcome(id,{ transactionHash: receipt.transactionHash,status: 1,blockNumber: 100n,blockHash: fixtureHash(1100),head: 102n });
+        }
+        if (change === "stopped") await h.repository.stopRetry(id,"MAX_ATTEMPTS_REACHED");
+        if (change === "version") await schedule(id,{ parentAttemptId: initial.attempt.attemptId });
+        concurrent = await h.repository.getRecoverySnapshot(id);
+        return { ...await h.repository.getTransaction(id),created: false };
+      } });
+    assert.equal(writes,change === "version" ? 1 : 0);
+    assert.equal(result.results[0].action,change === "version" ? "RECOVERY_STATE_CHANGED" : change === "stopped" ? "MAX_ATTEMPTS_REACHED" : "NO_REPLACEMENT");
+    assert.deepEqual(await h.repository.getRecoverySnapshot(id),concurrent);
+    assert.equal(h.calls.broadcast.length,1);
+  });
+}
 
 async function pending(options) {
   const h = await transactionHarness(options);

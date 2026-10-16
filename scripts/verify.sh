@@ -782,6 +782,11 @@ printf '281. Verify zero intent, nonce allocation, signature, attempt, broadcast
 printf '282. Verify migration 016, fenced scheduling, concurrent intent creation, rollback and restart persistence\n'
 printf '283. Rotate ordinary and due deferred work across fresh processes, slow one-shots and continuous READY arrivals\n'
 printf '284. Observe real ApplicationB estimate rejection before signing, then execute another valid READY message\n'
+printf '285. Rotate receipt observation with a durable per-chain/sender full-width nonce cursor\n'
+printf '286. Rotate recovery independently without changing send order, allocation or recovery versions\n'
+printf '287. Observe a later canonical receipt behind incomplete earlier evidence with limit 1\n'
+printf '288. Preserve progress across fresh processes, selection crashes, wrap, terminal removal and concurrent clients\n'
+printf '289. Schedule unchanged NO_REPLACEMENT work into the future without signing, sending or nonce allocation\n'
 
 CURRENT_STEP="Indexer prerequisite verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -820,7 +825,7 @@ CURRENT_STEP="frozen PBFT certificate reference drift check"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node "$VALIDATOR_DIR/scripts/generate-pbft-certificate-vectors.mjs" --check
 
-CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, recovery, RPC error classification, batch, Merkle, golden compatibility, lifecycle, portable delivery package, destination-scoped leases and preparation defer/fairness unit tests"
+CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, fair receipt/recovery observation, RPC classification, batch, Merkle, golden compatibility, lifecycle, portable delivery, destination-scoped leases and preparation defer/fairness unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$INDEXER_DIR/test/forward-authorization.test.mjs" \
@@ -848,7 +853,7 @@ node --test \
     "$INDEXER_DIR/test/relayer-leases.test.mjs" \
     "$INDEXER_DIR/test/transaction-recovery.test.mjs"
 
-CURRENT_STEP="Chain A Indexer database, migration sequence/upgrades, fixed-snapshot concurrency, conditional reorg recovery, RPC retry/restart, batch eligibility, Merkle, lifecycle, consensus binding, delivery queue, destination-scoped leases and preparation defer/fresh-process fairness tests"
+CURRENT_STEP="Chain A Indexer database, migration sequence/upgrades, fixed-snapshot concurrency, RPC retry/restart, batch/Merkle/lifecycle, delivery leases, preparation fairness and independent receipt/recovery cursors with fresh-process/crash/concurrency tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \

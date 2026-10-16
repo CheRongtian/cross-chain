@@ -111,6 +111,33 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
     if (!(await client.query(`SELECT chain_id FROM ${accounts} WHERE chain_id = $1 AND sender_address = $2 FOR UPDATE`,accountKey)).rowCount) throw new TransactionError("NONCE_STATE_MISSING");
     return accountRecord(client);
   }
+  async function selectObservationIds(kind,limit) {
+    deliveryLimit(limit);
+    const column = kind === "receipt" ? "receipt_scan_cursor_nonce" : "recovery_scan_cursor_nonce";
+    const tracking = kind === "receipt" ? `AND EXISTS (SELECT 1 FROM ${attempts} a
+      WHERE a.delivery_job_id = i.delivery_job_id AND (a.broadcast_attempt_count > 0 OR a.broadcast_at IS NOT NULL))` : "";
+    const ids = await deliveryTransaction(pool,async client => {
+      const account = (await client.query(`SELECT ${column}::text AS cursor FROM ${accounts}
+        WHERE chain_id = $1 AND sender_address = $2 FOR UPDATE`,accountKey)).rows[0];
+      // An observation never creates an account or reserves its first nonce.
+      if (!account) return [];
+      const cursor = account.cursor === null ? null : protocolInteger(account.cursor,"observation nonce cursor").toString();
+      const select = (comparison,position,capacity) => client.query(`SELECT i.delivery_job_id,i.nonce::text AS nonce
+        FROM ${intents} i WHERE i.chain_id = $1 AND i.sender_address = $2 AND i.status = 'PENDING' ${tracking}
+          AND ${comparison} ORDER BY i.nonce,i.delivery_job_id LIMIT $4`,[...accountKey,position,capacity]);
+      const selected = (await select("($3::numeric IS NULL OR i.nonce > $3::numeric)",cursor,limit)).rows;
+      // Complementary key ranges cannot duplicate a nonce. Both queries are
+      // SQL-bounded; no full-population load, OFFSET or JS rotation is used.
+      if (cursor !== null && selected.length < limit) selected.push(...(await select("i.nonce <= $3::numeric",cursor,limit - selected.length)).rows);
+      if (selected.length) await client.query(`UPDATE ${accounts} SET ${column} = $3
+        WHERE chain_id = $1 AND sender_address = $2`,[...accountKey,selected.at(-1).nonce]);
+      return selected.map(row => row.delivery_job_id);
+    });
+    // Selection is committed and the account lock released before observation
+    // (or an injected interruption). Wrap revisits work skipped by a crash.
+    await hooks.afterObservationSelected?.({ kind,ids: Object.freeze([...ids]) });
+    return Object.freeze(ids);
+  }
   async function locked(client,id,expected) {
     await lockAccount(client);
     await client.query(`SELECT delivery_job_id FROM ${intents} WHERE delivery_job_id = $1 FOR UPDATE`,[id]);
@@ -209,9 +236,7 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
       });
     },
     async listRecoveryIntents({ limit = config.maxJobs } = {}) {
-      deliveryLimit(limit);
-      return Object.freeze((await pool.query(`SELECT delivery_job_id FROM ${intents} WHERE chain_id = $1 AND sender_address = $2
-        AND status = 'PENDING' ORDER BY nonce,delivery_job_id LIMIT $3`,[...accountKey,limit])).rows.map(row => row.delivery_job_id));
+      return selectObservationIds("recovery",limit);
     },
     async applyRecoveryObservation(snapshotValue,{ knownAttempts = [],receipt,fence } = {}) {
       const id = snapshotValue.intent.deliveryJobId; const expected = await resolveIntent(id); const now = operationTime(clock);
@@ -274,12 +299,9 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
       return Object.freeze(records);
     },
     async listTrackingIntents({ limit = config.maxJobs } = {}) {
-      deliveryLimit(limit);
-      const rows = (await pool.query(`SELECT delivery_job_id FROM ${intents} i WHERE chain_id = $1 AND sender_address = $2 AND status = 'PENDING'
-        AND EXISTS (SELECT 1 FROM ${attempts} a WHERE a.delivery_job_id = i.delivery_job_id AND (a.broadcast_attempt_count > 0 OR a.broadcast_at IS NOT NULL))
-        ORDER BY nonce,delivery_job_id LIMIT $3`,[...accountKey,limit])).rows;
+      const ids = await selectObservationIds("receipt",limit);
       const records = [];
-      for (const row of rows) { const stored = await this.getTransaction(row.delivery_job_id); if (stored?.intent.status === "PENDING") records.push(stored); }
+      for (const id of ids) { const stored = await this.getTransaction(id); if (stored?.intent.status === "PENDING") records.push(stored); }
       return Object.freeze(records);
     },
     async listDueIntents({ now,limit = config.maxJobs } = {}) {
@@ -432,12 +454,13 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         return read(client,id,expected);
       });
     },
-    async scheduleRetry(id,{ reason = null,parentAttemptId,fence } = {}) {
+    async scheduleRetry(id,{ reason = null,parentAttemptId,expectedVersion,fence } = {}) {
       const expected = await resolveIntent(id); const now = operationTime(clock);
       return deliveryTransaction(pool,async client => {
         const stored = await locked(client,id,expected);
         if (fence) await assertLeaseFence(client,config,id,fence);
         if (stored.intent.status !== "PENDING" || stored.intent.retryStoppedAt !== null || (parentAttemptId !== undefined && stored.attempt.attemptId !== parentAttemptId)) return stored;
+        await verifyVersion(client,id,expectedVersion);
         if (reason) {
           if (!BROADCAST_ERROR_CLASSES.includes(reason)) throw new TransactionError("INVALID_RETRY_ERROR_CLASS");
           await client.query(`UPDATE ${attempts} SET last_error_class = $2 WHERE attempt_id = $1`,[stored.attempt.attemptId,reason]);
