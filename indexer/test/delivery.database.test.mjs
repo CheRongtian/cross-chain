@@ -62,6 +62,89 @@ async function counts() {
     (SELECT COUNT(*) FROM ${jobs})::int AS jobs`)).rows[0];
 }
 
+function observedDeliveryPool() {
+  const reads = { projection: new Map(),source: new Map(),members: new Map() };
+  const tables = { projection: batches,source: tableName(config.databaseSchema,"message_batches"),members: jobs };
+  return { reads,pool: { query: (...args) => pool.query(...args),async connect() {
+    const client = await pool.connect();
+    return { async query(sql,values) {
+      for (const [kind,table] of Object.entries(tables)) {
+        if (sql.startsWith(`SELECT * FROM ${table}`)) {
+          const id = String(values[0]);
+          reads[kind].set(id,(reads[kind].get(id) ?? 0) + 1);
+        }
+      }
+      return client.query(sql,values);
+    },release(error) { client.release(error); } };
+  } } };
+}
+
+test("same-batch bulk reads reconstruct one projection and every later operation revalidates", async () => {
+  const snapshot = await committedFixture();
+  const projected = await projector.materializeBatch({ batchRecordId: snapshot.record.batchRecordId });
+  const watched = observedDeliveryPool();
+  const reader = createDeliveryRepository({ config,pool: watched.pool });
+  const ids = projected.jobs.map(job => job.deliveryJobId).reverse();
+  const first = await reader.getDeliveryEntries(ids);
+  assert.deepEqual(first.map(entry => entry.job.deliveryJobId),ids);
+  for (const kind of Object.values(watched.reads)) assert.deepEqual([...kind],[[snapshot.record.batchRecordId,1]]);
+  assert.equal(Object.isFrozen(first),true);
+  assert.equal(Object.isFrozen(first[0].package.merkleProof.siblings),true);
+  const second = await reader.getDeliveryEntries(ids);
+  assert.deepEqual(second,first);
+  for (const kind of Object.values(watched.reads)) assert.deepEqual([...kind],[[snapshot.record.batchRecordId,2]]);
+  await reader.getDeliveryPackage(ids[0]);
+  for (const kind of Object.values(watched.reads)) assert.deepEqual([...kind],[[snapshot.record.batchRecordId,3]]);
+  assert.deepEqual(await reader.getDeliveryEntries([]),[]);
+  await assert.rejects(reader.getDeliveryEntries(["missing"]),{ code: "DELIVERY_JOB_NOT_FOUND" });
+  await assert.rejects(reader.getDeliveryEntries("not-an-array"),{ code: "INVALID_DELIVERY_JOB_IDS" });
+});
+
+test("interleaved jobs from three batches validate once per distinct batch without changing requested order", async () => {
+  const initial = await committedFixture();
+  const projected = [await projector.materializeBatch({ batchRecordId: initial.record.batchRecordId })];
+  for (const [count,blockNumber,offset] of [[2,11n,20],[1,12n,40]]) {
+    await persist(Array.from({ length: count },(_,index) => deliveryMessage(offset + index,{
+      sourceBlockNumber: blockNumber,sourceBlockHash: fixtureHash(blockNumber + 1n),
+    })),blockNumber);
+    const building = await lifecycle.collectEligible();
+    const snapshot = await commitBatch(lifecycle,building.snapshot.record.batchRecordId);
+    projected.push(await projector.materializeBatch({ batchRecordId: snapshot.record.batchRecordId }));
+  }
+  const [a,b,c] = projected.map(result => result.jobs);
+  const ids = [a[2],b[1],a[0],c[0],b[0],a[1]].map(job => job.deliveryJobId);
+  const watched = observedDeliveryPool();
+  const reader = createDeliveryRepository({ config,pool: watched.pool });
+  const entries = await reader.getDeliveryEntries(ids);
+  assert.deepEqual(entries.map(entry => entry.job.deliveryJobId),ids);
+  for (const kind of Object.values(watched.reads)) {
+    assert.equal(kind.size,3);
+    assert.deepEqual([...kind.values()],[1,1,1]);
+  }
+  assert.equal(entries.length,6);
+  assert.deepEqual((await repository.listReadyDeliveryJobs()).map(job => job.deliveryJobId),
+    projected.flatMap(result => result.jobs.map(job => job.deliveryJobId)));
+});
+
+test("projection insertion and stored readback share the same verified construction", async () => {
+  const snapshot = await committedFixture();
+  let resolutions = 0;
+  const validatorSets = { ...config.validatorSets,resolveForBatchEpoch(epoch) {
+    resolutions++;
+    return config.validatorSets.resolveForBatchEpoch(epoch);
+  } };
+  const cfg = { ...config,validatorSets };
+  const watched = observedDeliveryPool();
+  const projected = await createDeliveryProjector({ config: cfg,pool: watched.pool }).materializeBatch({ batchRecordId: snapshot.record.batchRecordId });
+  const creationResolutions = resolutions;
+  for (const kind of Object.values(watched.reads)) assert.deepEqual([...kind],[[snapshot.record.batchRecordId,1]]);
+  resolutions = 0;
+  const reader = createDeliveryRepository({ config: cfg,pool });
+  await reader.getDeliveryEntries([projected.jobs[0].deliveryJobId]);
+  assert.ok(resolutions > 0);
+  assert.equal(creationResolutions,resolutions,"write/readback must not reconstruct and verify packages twice");
+});
+
 test("queue migration reruns preserve complete READY jobs and strict fresh-client package reads", async () => {
   const snapshot = await committedFixture();
   const sourceBefore = await readMessages(pool,config.databaseSchema);
@@ -173,10 +256,10 @@ test("READY rows reject updates and deletions of operational and evidence fields
   assert.deepEqual(await counts(),{ batches: 1,jobs: 3 });
 });
 
-function rollbackOnlyPool(client) {
+function rollbackOnlyPool(client, onResult = (_sql,result) => result) {
   return { async connect() { return { async query(sql,values) {
     if (["BEGIN","COMMIT","ROLLBACK"].includes(sql)) return {};
-    return client.query(sql,values);
+    return client.query(sql,values).then(result => onResult(sql,result));
   },release() {} }; } };
 }
 
@@ -218,6 +301,7 @@ async function corruptedRead({ table,trigger,sql }, id, expected) {
     await client.query(sql);
     const readPool = rollbackOnlyPool(client);
     await assert.rejects(createDeliveryRepository({ config,pool: readPool }).getDeliveryPackage(id),expected);
+    await assert.rejects(createDeliveryRepository({ config,pool: readPool }).getDeliveryEntries([id]),expected);
     await assert.rejects(createDeliveryProjector({ config,pool: readPool }).materializeBatch({ batchRecordId }));
   } finally { await client.query("ROLLBACK"); client.release(); }
 }
@@ -241,6 +325,28 @@ test("strict reads reject corrupted queue paths, contexts, QC references and sou
   await corruptedRead({ sql: `UPDATE ${sources} SET payload = decode('ffff','hex') WHERE id = 1` },id,/payload hash/);
   assert.deepEqual(await counts(),{ batches: 1,jobs: 3 });
   assert.equal((await repository.getDeliveryPackage(id)).messageRoot,snapshot.tree.messageRoot);
+});
+
+test("a later corrupt stored path or batch/source reference cannot be hidden by a verified batch context", async () => {
+  const snapshot = await committedFixture();
+  const projected = await projector.materializeBatch({ batchRecordId: snapshot.record.batchRecordId });
+  const ids = projected.jobs.map(job => job.deliveryJobId);
+  for (const changes of [
+    { proof_siblings: [fixtureHash(999)] },{ batch_record_id: "999" },
+    { source_message_id: snapshot.members[0].sourceMessageId },
+    { message_id: fixtureHash(999) },{ message_index: "99" },
+  ]) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const readPool = rollbackOnlyPool(client,(sql,result) => sql.startsWith(`SELECT * FROM ${jobs}`) ? {
+        ...result,rows: result.rows.map((row,index) => index === 2 ? { ...row,...changes } : row),
+      } : result);
+      await assert.rejects(createDeliveryRepository({ config,pool: readPool }).getDeliveryEntries(ids),{ code: "CORRUPTED_DELIVERY_JOB" });
+    } finally { await client.query("ROLLBACK"); client.release(); }
+  }
+  assert.equal((await repository.getDeliveryEntries(ids)).length,3);
+  assert.deepEqual(await counts(),{ batches: 1,jobs: 3 });
 });
 
 test("old queued evidence remains unchanged after projecting a new validator epoch", async () => {

@@ -38,9 +38,9 @@ export function createRelayerWorker({ config,pool,queue,transactionManager,
     try {
       await afterLeaseAcquired(fence);
       assertHeld();
-      const job = await queue.getDeliveryJob(id);
+      const [{ job,package: deliveryPackage }] = await queue.getDeliveryEntries([id]);
       if (job.status !== "READY" || job.deliveryJobId !== id) throw new RelayerError("RELAYER_REQUIRES_READY");
-      const encoded = await encodeGatewaySubmission(await queue.getDeliveryPackage(id),verification);
+      const encoded = await encodeGatewaySubmission(deliveryPackage,verification);
       const pack = encoded.package;
       if (pack.deliveryJobId !== id || pack.message.destinationDomain !== config.destinationDomain.toString() ||
           job.destinationDomain !== pack.message.destinationDomain || normalizeAddress(job.destinationGateway) !== pack.message.destinationGateway) throw new RelayerError("DESTINATION_CONTEXT_MISMATCH");

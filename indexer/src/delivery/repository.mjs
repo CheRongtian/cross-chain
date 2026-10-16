@@ -24,15 +24,29 @@ export function deliveryLifecycle(config, pool) {
     committee: config.validatorSets.history[0].validators.map((address) => ({ address })) });
 }
 
-// Used by reads and idempotent materialization, inside their caller's transaction.
-export async function readDeliveryProjection({ config, client, lifecycle, batchRecordId, snapshot }) {
+// The callback owns this operation's verified evidence. No caller can supply
+// packages to the stored-row checker or reuse a context through the public API.
+export async function withDeliveryBatch({ config, client, lifecycle, batchRecordId, snapshot }, operation) {
+  const committed = snapshot ?? await lifecycle.readBatch({ batchRecordId }, client);
+  if (BigInt(committed.record.batchRecordId) !== BigInt(batchRecordId)) throw new DeliveryError("WRONG_COMMITTED_BATCH");
+  const packages = await buildDeliveryPackages(committed, { validatorSets: config.validatorSets,
+    sourceDomain: config.chainDomain, sourceGateway: config.sourceGateway });
+  const members = Object.freeze(committed.members.map(member => Object.freeze({ ...member })));
+  return operation(Object.freeze({ packages, readProjection: () => readStoredProjection({
+    config, client, batchRecordId, members, packages,
+  }) }));
+}
+
+// Used by strict reads inside their caller's transaction. Every call starts fresh.
+export async function readDeliveryProjection(options) {
+  return withDeliveryBatch(options, (context) => context.readProjection());
+}
+
+async function readStoredProjection({ config, client, batchRecordId, members, packages }) {
   const batches = tableName(config.databaseSchema, "delivery_batches");
   const jobsTable = tableName(config.databaseSchema, "delivery_jobs");
   const row = (await client.query(`SELECT * FROM ${batches} WHERE batch_record_id = $1`, [batchRecordId])).rows[0];
   if (!row) throw new DeliveryError("DELIVERY_PROJECTION_NOT_FOUND");
-  const committed = snapshot ?? await lifecycle.readBatch({ batchRecordId }, client);
-  const packages = await buildDeliveryPackages(committed, { validatorSets: config.validatorSets,
-    sourceDomain: config.chainDomain, sourceGateway: config.sourceGateway });
   const first = packages[0];
   const actual = { batchId: row.batch_id, sourceDomain: row.source_domain, sourceGateway: row.source_gateway,
     batchEpoch: row.batch_epoch, batchVersion: String(row.batch_version), messageRoot: row.message_root,
@@ -49,12 +63,12 @@ export async function readDeliveryProjection({ config, client, lifecycle, batchR
   for (let index = 0; index < rows.length; index++) {
     const stored = rows[index];
     const pack = packages[index];
-    const member = committed.members[index];
-    const fields = { id: stored.delivery_job_id, sourceMessageId: stored.source_message_id,
+    const member = members[index];
+    const fields = { id: stored.delivery_job_id, batchRecordId: stored.batch_record_id, sourceMessageId: stored.source_message_id,
       index: stored.message_index, messageId: stored.message_id, sourceDomain: stored.source_domain,
       sourceGateway: stored.source_gateway, destinationDomain: stored.destination_domain,
       destinationGateway: stored.destination_gateway, destinationReceiver: stored.destination_receiver, status: stored.status };
-    const required = { id: pack.deliveryJobId, sourceMessageId: member.sourceMessageId,
+    const required = { id: pack.deliveryJobId, batchRecordId: row.batch_record_id, sourceMessageId: member.sourceMessageId,
       index: String(pack.messageIndex), messageId: pack.message.messageId, sourceDomain: pack.message.sourceDomain,
       sourceGateway: pack.message.sourceGateway, destinationDomain: pack.message.destinationDomain,
       destinationGateway: pack.message.destinationGateway, destinationReceiver: pack.message.destinationReceiver, status: "READY" };
@@ -77,15 +91,34 @@ export function createDeliveryRepository({ config, pool }) {
   const scope = normalizeSourceScope(config);
   const jobs = tableName(config.databaseSchema, "delivery_jobs");
   const batches = tableName(config.databaseSchema, "delivery_batches");
-  async function entry(client, deliveryJobId) {
-    const row = (await client.query(`SELECT j.batch_record_id FROM ${jobs} j JOIN ${batches} b USING (batch_record_id)
-      WHERE j.delivery_job_id = $1 AND b.source_domain = $2 AND b.source_gateway = $3`,
-    [deliveryJobId, scope.chainDomain, scope.sourceGateway])).rows[0];
-    if (!row) throw new DeliveryError("DELIVERY_JOB_NOT_FOUND");
-    const entries = await readDeliveryProjection({ config, client, lifecycle, batchRecordId: row.batch_record_id });
-    const value = entries.find((value) => value.job.deliveryJobId === deliveryJobId);
-    if (!value) throw new DeliveryError("CORRUPTED_DELIVERY_JOB");
-    return value;
+  async function entriesForRows(client, rows) {
+    const projections = new Map();
+    const result = [];
+    for (const row of rows) {
+      if (!projections.has(row.batch_record_id)) projections.set(row.batch_record_id,
+        await readDeliveryProjection({ config, client, lifecycle, batchRecordId: row.batch_record_id }));
+      const value = projections.get(row.batch_record_id).find((entry) => entry.job.deliveryJobId === row.delivery_job_id);
+      if (!value) throw new DeliveryError("CORRUPTED_DELIVERY_JOB");
+      result.push(value);
+    }
+    return Object.freeze(result);
+  }
+  async function getDeliveryEntries(ids) {
+    if (!Array.isArray(ids) || ids.some(id => typeof id !== "string" || id.length === 0)) throw new DeliveryError("INVALID_DELIVERY_JOB_IDS");
+    if (!ids.length) return Object.freeze([]);
+    deliveryLimit(ids.length);
+    return deliveryTransaction(pool, async client => {
+      const rows = (await client.query(`SELECT j.delivery_job_id,j.batch_record_id FROM ${jobs} j
+        JOIN ${batches} b USING (batch_record_id) WHERE j.delivery_job_id = ANY($1::text[])
+        AND b.source_domain = $2 AND b.source_gateway = $3`, [ids, scope.chainDomain, scope.sourceGateway])).rows;
+      const byId = new Map(rows.map(row => [row.delivery_job_id,row]));
+      const ordered = ids.map(id => {
+        const row = byId.get(id);
+        if (!row) throw new DeliveryError("DELIVERY_JOB_NOT_FOUND");
+        return row;
+      });
+      return entriesForRows(client, ordered);
+    });
   }
   return {
     async listReadyDeliveryJobs({ limit = 100 } = {}) {
@@ -95,19 +128,11 @@ export function createDeliveryRepository({ config, pool }) {
           JOIN ${batches} b USING (batch_record_id)
           WHERE b.source_domain = $1 AND b.source_gateway = $2 AND j.status = 'READY'
           ORDER BY b.batch_epoch,j.message_index,j.delivery_job_id LIMIT $3`, [scope.chainDomain, scope.sourceGateway, limit])).rows;
-        const projections = new Map();
-        const result = [];
-        for (const row of rows) {
-          if (!projections.has(row.batch_record_id)) projections.set(row.batch_record_id,
-            await readDeliveryProjection({ config, client, lifecycle, batchRecordId: row.batch_record_id }));
-          const value = projections.get(row.batch_record_id).find((value) => value.job.deliveryJobId === row.delivery_job_id);
-          if (!value) throw new DeliveryError("CORRUPTED_DELIVERY_JOB");
-          result.push(value.job);
-        }
-        return Object.freeze(result);
+        return Object.freeze((await entriesForRows(client, rows)).map(entry => entry.job));
       });
     },
-    async getDeliveryJob(deliveryJobId) { return deliveryTransaction(pool, async (client) => (await entry(client, deliveryJobId)).job); },
-    async getDeliveryPackage(deliveryJobId) { return deliveryTransaction(pool, async (client) => (await entry(client, deliveryJobId)).package); },
+    getDeliveryEntries,
+    async getDeliveryJob(deliveryJobId) { return (await getDeliveryEntries([deliveryJobId]))[0].job; },
+    async getDeliveryPackage(deliveryJobId) { return (await getDeliveryEntries([deliveryJobId]))[0].package; },
   };
 }

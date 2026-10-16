@@ -42,8 +42,7 @@ export function buildMessageMerkleTree(batch) {
   return buildMessageMerkleTreeFromCommitment(canonical);
 }
 
-export function buildMessageMerkleTreeFromCommitment(input) {
-  const canonical = validateMessageBatchCommitment(input);
+function merkleLevels(canonical) {
   const leaves = canonical.messageIds.map((messageId, index) => computeMessageMerkleLeaf({
     batchId: canonical.batchId,
     index,
@@ -61,7 +60,19 @@ export function buildMessageMerkleTreeFromCommitment(input) {
     }
     levels.push(parents);
   }
+  return levels;
+}
 
+// Root reconstruction shares the tree algorithm without allocating any proofs.
+export function computeMessageMerkleRoot(input) {
+  const canonical = validateMessageBatchCommitment(input);
+  return merkleLevels(canonical).at(-1)[0];
+}
+
+export function buildMessageMerkleTreeFromCommitment(input) {
+  const canonical = validateMessageBatchCommitment(input);
+  const levels = merkleLevels(canonical);
+  const leaves = levels[0];
   const proofs = canonical.messageIds.map((messageId, index) => {
     let position = index;
     const siblings = [];
@@ -166,7 +177,7 @@ export function verifyCommittedMessageMerkleProof({ commitment, message, proof, 
     if (candidate.payload === undefined || candidate.sourceDomain !== canonical.sourceDomain ||
         candidate.sourceGateway !== canonical.sourceGateway) return false;
     const root = normalizeBytes32(messageRoot, "Message Root");
-    if (buildMessageMerkleTreeFromCommitment(canonical).messageRoot !== root) return false;
+    if (computeMessageMerkleRoot(canonical) !== root) return false;
     return verifyMessageMerklePath(canonical, candidate.messageId, proof, root);
   } catch {
     return false;

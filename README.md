@@ -1389,6 +1389,8 @@ Unique `(batch_record_id, message_index)` membership enforces one job per sealed
 
 `createDeliveryProjector({ config, pool }).materializeBatch({ batchRecordId })` locks the existing source batch, strictly revalidates it and all packages, and persists the complete projection in one transaction. A failure rolls back the delivery batch and every job. Concurrent projectors serialize on the same batch row. Retrying an existing projection strictly verifies its complete stored contents and preserves its original jobs and timestamps; partial or conflicting data fails closed and is never patched into place.
 
+Within one package-construction pass, batch identity, ordered membership, root and historical QC are validated once, and all member proofs are derived from one ordered tree. Each member still undergoes canonical message, position and identity checks. The projector retains this verified construction only for its current transaction's writes and stored-row readback; the strict source lifecycle read remains an independent evidence check. Stored paths and source-member references must match the verified construction, including later members of the same batch. A reconstructed correct path never replaces a corrupted stored path.
+
 `projectCommittedBatches()` finds COMMITTED batches without a delivery projection through bounded, explicitly ordered database queries. It uses durable eligibility rather than a queue cursor or in-memory restart position. Failure before commit leaves no partial jobs; loss of the worker's report after commit leaves the canonical jobs discoverable without duplication. The `delivery:once` npm entry invokes this database-only worker against an already migrated schema. Configuration uses `DATABASE_URL`, `INDEXER_DB_SCHEMA`, `CHAIN_A_DOMAIN`, `SOURCE_GATEWAY_ADDRESS` and exactly one existing validator-history source. It requires no validator private key or destination RPC configuration.
 
 ### Strict queue reads and historical committees
@@ -1400,8 +1402,13 @@ Unique `(batch_record_id, message_index)` membership enforces one job per sealed
 | `listReadyDeliveryJobs({ limit })` | Non-destructive strict listing, ordered by batch epoch, message index and job ID; default 100, maximum 1000 |
 | `getDeliveryJob(deliveryJobId)` | Read verified operational metadata for one job |
 | `getDeliveryPackage(deliveryJobId)` | Reconstruct and verify the complete portable package |
+| `getDeliveryEntries(deliveryJobIds)` | Strict combined `{ job, package }` reads for at most 1000 requested IDs, preserving caller order and verifying each distinct batch projection once within the call |
 
 Reads reject mismatched job identity, membership, destination fields, proof paths, roots, QC references or validator-epoch metadata. They also reverify underlying source message integrity and QC cryptography. Queue persistence is an operational projection and does not become cross-chain authority.
+
+READY selection uses the same operation-local grouping as bulk queue reads. It returns only the selected identities and does not lease other members merely because their batch was read. Destination filtering, ordering, selection limits, preparation scheduling and per-job fencing remain independent of this immutable-evidence reuse. Each later lookup or worker operation starts fresh; no process-global or durable validity cache is used. Relayer and Transaction Manager use combined job/package reads at their own boundaries and independently verify portable evidence before acting; one cannot supply the other's trusted context.
+
+Portable `verifyDeliveryPackage` remains a complete verifier without a caller-supplied trust or skip flag. Its Merkle root reconstruction shares the existing leaf/node algorithm but does not allocate every member's proof. The supplied path is still checked independently against the authenticated membership, position, count and root. Ordered hashing, odd-node duplication, historical QC formats, transport bytes and existing golden vectors are unchanged.
 
 Old packages retain their exact historical epoch and canonical first QC after rotation. Verification resolves the QC's historical committee and checks its activation schedule; it never uses the latest committee as a substitute or requests replacement signatures. Legacy v1/v2 certificates retain their original bytes and signatures, are verified using the explicitly configured initial committee, and expose `validatorEpoch: null` because those formats did not sign an epoch. No queue migration invents epoch-bound evidence.
 

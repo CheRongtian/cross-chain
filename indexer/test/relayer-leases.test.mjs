@@ -26,6 +26,20 @@ function rejectEstimateFor(h,ids) {
   };
 }
 
+test("the manager revalidates portable evidence independently after the Relayer accepted its own package", async () => {
+  const h = await fixture();
+  let managerReached = false;
+  const manager = { ...h.manager,async prepareDeliveryTransaction(id,options) {
+    managerReached = true;
+    h.packets[0].merkleProof.siblings[0] = `0x${"ee".repeat(32)}`;
+    return h.manager.prepareDeliveryTransaction(id,options);
+  } };
+  await assert.rejects(h.worker(h.config,h.a,manager).submitJob(h.id),{ code: "INVALID_DELIVERY_MERKLE_PROOF" });
+  assert.equal(managerReached,true);
+  assert.equal(h.records.size,0); assert.equal(h.calls.gas,0); assert.equal(h.calls.sign,0);
+  assert.equal(h.calls.broadcast.length,0); assert.equal(await h.repository.getAccount(),null);
+});
+
 test("explicit preparation defer is durable READY scheduling with zero intent, nonce, signature, attempt, broadcast or receipt", async () => {
   const h = await fixture(); rejectEstimateFor(h,new Set([h.id]));
   const worker = () => h.worker(h.config,h.leases.repository(),h.restart());

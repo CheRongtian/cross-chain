@@ -33,9 +33,9 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     if (await rpc.verifyChain() !== config.destinationDomain) throw new TransactionError("CHAIN_ID_MISMATCH");
   }
   async function resolveIntent(id) {
-    const job = await queue.getDeliveryJob(id);
+    const [{ job,package: deliveryPackage }] = await queue.getDeliveryEntries([id]);
     if (job.deliveryJobId !== id || job.status !== "READY") throw new TransactionError("TRANSACTION_REQUIRES_READY");
-    const encoded = await encodeGatewaySubmission(await queue.getDeliveryPackage(id),verification);
+    const encoded = await encodeGatewaySubmission(deliveryPackage,verification);
     const message = encoded.package.message;
     if (encoded.package.deliveryJobId !== id || message.destinationDomain !== config.destinationDomain.toString() ||
         job.destinationDomain !== message.destinationDomain || normalizeAddress(job.destinationGateway) !== message.destinationGateway) throw new TransactionError("DESTINATION_CONTEXT_MISMATCH");

@@ -7,6 +7,7 @@ import { computeCanonicalMessageId, computePayloadHash } from "../src/canonical-
 import { buildMessageBatch, MESSAGE_BATCH_TYPEHASH } from "../src/message-batch.mjs";
 import {
   buildMessageMerkleTree,
+  computeMessageMerkleRoot,
   computeMessageMerkleLeaf,
   computeMessageMerkleNode,
   MESSAGE_MERKLE_LEAF_DOMAIN,
@@ -63,6 +64,22 @@ function proofInput(batch, tree, index = 0) {
     proof: tree.proofs[index],
     messageRoot: tree.messageRoot,
   };
+}
+
+for (const count of [1, 3, 5, 128]) {
+  test(`${count} members: root-only reconstruction equals the full ordered tree without a proof collection`, () => {
+    const batch = makeBatch(count);
+    const before = structuredClone(batch);
+    const tree = buildMessageMerkleTree(batch);
+    const root = computeMessageMerkleRoot(batch);
+    assert.equal(typeof root, "string");
+    assert.equal(root, tree.messageRoot);
+    assert.deepEqual(batch, before);
+    for (const index of new Set([0, count - 1])) {
+      assert.equal(verifyMessageMerkleProof(proofInput(batch, tree, index)), true);
+    }
+    assert.throws(() => computeMessageMerkleRoot({ ...batch, batchId: hash(999n) }), /batch ID/);
+  });
 }
 
 test("leaf and node use distinct ABI domains and exact left/right encoding", () => {

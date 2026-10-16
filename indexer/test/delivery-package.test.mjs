@@ -8,6 +8,52 @@ import { deliveryFixture, deliveryValidatorSets, fixtureHash } from "./helpers/d
 const options = { validatorSets: deliveryValidatorSets };
 const copy = (value) => JSON.parse(deliveryJson(value));
 
+for (const count of [1,3,5,128]) {
+  test(`${count} members share one package-construction QC verification and fresh operations revalidate`, async () => {
+    const snapshot = await deliveryFixture({ count });
+    const expected = await buildDeliveryPackages(snapshot,options);
+    let resolutions = 0;
+    const validatorSets = { ...deliveryValidatorSets,resolveForBatchEpoch(epoch) {
+      resolutions++;
+      return deliveryValidatorSets.resolveForBatchEpoch(epoch);
+    } };
+    // A full independent consumer establishes the resolver work of exactly one
+    // QC verification, including the existing per-signer committee checks.
+    await verifyDeliveryPackage(copy(expected[0]),{ validatorSets });
+    const oneCertificate = resolutions;
+    assert.ok(oneCertificate > 0);
+    resolutions = 0;
+    const actual = await buildDeliveryPackages(snapshot,{ validatorSets });
+    assert.equal(resolutions,oneCertificate,"batch construction must not verify the QC per member");
+    assert.deepEqual(actual,expected);
+    assert.equal(deliveryJson(actual),deliveryJson(expected));
+    assert.equal(actual.length,count);
+    await buildDeliveryPackages(snapshot,{ validatorSets });
+    assert.equal(resolutions,2 * oneCertificate,"a later operation must perform a fresh full verification");
+    const portable = await verifyDeliveryPackage(copy(actual.at(-1)),{ validatorSets });
+    assert.equal(resolutions,3 * oneCertificate,"portable consumers never inherit the constructor's trust");
+    assert.equal(deliveryJson(portable),deliveryJson(actual.at(-1)));
+    assert.equal(Object.isFrozen(actual.at(-1).quorumCertificate.commits),true);
+  });
+}
+
+test("a verified batch cannot hide later member corruption or grant portable verification bypass", async () => {
+  const snapshot = await deliveryFixture();
+  const packages = await buildDeliveryPackages(snapshot,options);
+  for (const change of [{ position: 0n },{ messageId: fixtureHash(999) }]) {
+    const members = snapshot.members.map((member,index) => index === 2 ? { ...member,...change } : member);
+    await assert.rejects(buildDeliveryPackages({ ...snapshot,members },options),{ code: "WRONG_DELIVERY_MEMBERSHIP" });
+  }
+  const invalid = copy(packages[1]);
+  invalid.quorumCertificate.commits.pop();
+  await assert.rejects(verifyDeliveryPackage(invalid,{ ...options,skipVerification: true,trustedBatch: packages[0] }),
+    { code: "INSUFFICIENT_OR_INVALID_QC_EVIDENCE" });
+  invalid.quorumCertificate = copy(packages[1].quorumCertificate);
+  invalid.merkleProof.siblings[0] = fixtureHash(999);
+  await assert.rejects(verifyDeliveryPackage(invalid,{ ...options,skipVerification: true,trustedBatch: packages[0] }),
+    { code: "INVALID_DELIVERY_MERKLE_PROOF" });
+});
+
 test("committed packages are portable, ordered, immutable and use exact opaque canonical data", async () => {
   const snapshot = await deliveryFixture({ multiDestination: true, epoch: (1n << 200n) + 1n });
   const packages = await buildDeliveryPackages(snapshot, options);

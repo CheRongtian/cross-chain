@@ -24,7 +24,10 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
   const jobs = packets.map(pack => ({ deliveryJobId: pack.deliveryJobId,status: "READY",
     destinationDomain: pack.message.destinationDomain,destinationGateway: pack.message.destinationGateway }));
   const queue = { async getDeliveryJob(id) { return jobs.find(job => job.deliveryJobId === id); },
-    async getDeliveryPackage(id) { return packets.find(pack => pack.deliveryJobId === id); } };
+    async getDeliveryPackage(id) { return packets.find(pack => pack.deliveryJobId === id); },
+    async getDeliveryEntries(ids) { return Promise.all(ids.map(async id => ({
+      job: await this.getDeliveryJob(id),package: await this.getDeliveryPackage(id),
+    }))); } };
   const records = new Map();
   const scanCursors = { receipt: null,recovery: null };
   const historical = new Map();

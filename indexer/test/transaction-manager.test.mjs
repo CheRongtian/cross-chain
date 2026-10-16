@@ -182,6 +182,22 @@ test("same delivery intent recovers exact SIGNED state without estimating, signi
   await assert.rejects(h.restart().prepareDeliveryTransaction(id),{ code: "CONFLICTING_TRANSACTION_INTENT" });
 });
 
+test("each manager intent resolution reads a fresh combined entry and independently rejects later proof corruption", async () => {
+  const h = await transactionHarness();
+  const id = h.jobs[0].deliveryJobId;
+  const getEntries = h.queue.getDeliveryEntries.bind(h.queue);
+  let reads = 0;
+  h.queue.getDeliveryEntries = async ids => { reads++; return getEntries(ids); };
+  const original = await h.manager.resolveIntent(id);
+  assert.equal(reads,1);
+  assert.deepEqual(await h.manager.resolveIntent(id),original);
+  assert.equal(reads,2);
+  h.packets[0].merkleProof.siblings[0] = fixtureHash(999);
+  await assert.rejects(h.manager.resolveIntent(id),{ code: "INVALID_DELIVERY_MERKLE_PROOF" });
+  assert.equal(reads,3);
+  assert.equal(h.records.size,0); assert.equal(h.calls.sign,0); assert.equal(h.calls.gas,0);
+});
+
 test("corrupt packages and wrong destination RPC allocate no nonce and produce no signed transaction", async () => {
   for (const mutate of [p => { p.message.payload = "0xffff"; },p => { p.message.messageId = fixtureHash(99); },
     p => { p.messageRoot = fixtureHash(99); },p => { p.merkleProof.siblings[0] = fixtureHash(99); },

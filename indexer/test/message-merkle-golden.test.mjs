@@ -6,7 +6,7 @@ import { encodeAbiParameters, encodePacked, keccak256, parseAbiParameters } from
 
 import { buildMessageBatch } from "../src/message-batch.mjs";
 import {
-  buildMessageMerkleTree, computeMessageMerkleLeaf, computeMessageMerkleNode,
+  buildMessageMerkleTree, computeMessageMerkleRoot, computeMessageMerkleLeaf, computeMessageMerkleNode,
   MESSAGE_MERKLE_LEAF_DOMAIN, MESSAGE_MERKLE_LEAF_TYPE,
   MESSAGE_MERKLE_NODE_DOMAIN, MESSAGE_MERKLE_NODE_TYPE, verifyMessageMerkleProof,
 } from "../src/message-merkle.mjs";
@@ -45,6 +45,7 @@ for (const [vectorIndex, vector] of fixture.vectors.entries()) {
     const batch = buildMessageBatch(vector.batch);
     assert.equal(serializeMerkleVectors(batch), serializeMerkleVectors(vector.batch));
     const tree = buildMessageMerkleTree(batch);
+    assert.equal(computeMessageMerkleRoot(batch), vector.messageRoot);
     assert.deepEqual(tree.leaves, vector.leaves);
     assert.equal(tree.messageRoot, vector.messageRoot);
     assert.deepEqual(tree.proofs.map((proof) => ({ ...proof, expectedValid: true })), vector.proofs);

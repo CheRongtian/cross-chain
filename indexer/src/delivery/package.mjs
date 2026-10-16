@@ -57,6 +57,23 @@ function canonicalMessage(input) {
   return validateCanonicalMessage(input, input.messageId);
 }
 
+async function verifyDeliveryCertificate(input, message, { batchEpoch, batchId, messageRoot, committeeDigest }, validatorSets) {
+  const certificate = input.quorumCertificate;
+  if (!certificate || !["1", "2", "3"].includes(certificate.protocolVersion)) throw new DeliveryError("INVALID_DELIVERY_QC");
+  const validatorEpoch = certificate.protocolVersion === "3" ? protocolInteger(input.validatorEpoch, "validator epoch").toString() : null;
+  if (certificate.protocolVersion !== "3" && input.validatorEpoch !== null) throw new DeliveryError("UNSIGNED_VALIDATOR_EPOCH");
+  if (certificate.protocolVersion === "3" && certificate.validatorEpoch !== validatorEpoch) throw new DeliveryError("WRONG_DELIVERY_VALIDATOR_EPOCH");
+  if (certificate.committeeDigest !== committeeDigest) throw new DeliveryError("WRONG_DELIVERY_COMMITTEE");
+  // Trusted public history is supplied by the operator, never by the package.
+  const peers = validatorSets.history[0].validators.map((address) => ({ address }));
+  const quorumCertificate = await verifyQuorumCertificate(certificate, { peers, validatorSets, expected: {
+    protocolVersion: certificate.protocolVersion, sourceDomain: message.sourceDomain,
+    sourceGateway: message.sourceGateway, epoch: batchEpoch, view: certificate.view ?? "0",
+    validatorEpoch, committeeDigest, batchId, messageRoot,
+  } });
+  return { validatorEpoch, quorumCertificate };
+}
+
 export async function verifyDeliveryPackage(input, { validatorSets, sourceDomain, sourceGateway } = {}) {
   if (!validatorSets) throw new DeliveryError("VALIDATOR_HISTORY_REQUIRED");
   exactFields(input, PACKAGE_FIELDS);
@@ -76,19 +93,8 @@ export async function verifyDeliveryPackage(input, { validatorSets, sourceDomain
   const commitment = { version: batchVersion, sourceDomain: message.sourceDomain, sourceGateway: message.sourceGateway,
     epoch: batchEpoch, batchId, messageIds: input.batchMessageIds };
   if (!verifyCommittedMessageMerkleProof({ commitment, message, proof: input.merkleProof, messageRoot })) throw new DeliveryError("INVALID_DELIVERY_MERKLE_PROOF");
-  const certificate = input.quorumCertificate;
-  if (!certificate || !["1", "2", "3"].includes(certificate.protocolVersion)) throw new DeliveryError("INVALID_DELIVERY_QC");
-  const validatorEpoch = certificate.protocolVersion === "3" ? protocolInteger(input.validatorEpoch, "validator epoch").toString() : null;
-  if (certificate.protocolVersion !== "3" && input.validatorEpoch !== null) throw new DeliveryError("UNSIGNED_VALIDATOR_EPOCH");
-  if (certificate.protocolVersion === "3" && certificate.validatorEpoch !== validatorEpoch) throw new DeliveryError("WRONG_DELIVERY_VALIDATOR_EPOCH");
-  if (certificate.committeeDigest !== committeeDigest) throw new DeliveryError("WRONG_DELIVERY_COMMITTEE");
-  // Trusted public history is supplied by the operator, never by the package.
-  const peers = validatorSets.history[0].validators.map((address) => ({ address }));
-  const quorumCertificate = await verifyQuorumCertificate(certificate, { peers, validatorSets, expected: {
-    protocolVersion: certificate.protocolVersion, sourceDomain: message.sourceDomain,
-    sourceGateway: message.sourceGateway, epoch: batchEpoch, view: certificate.view ?? "0",
-    validatorEpoch, committeeDigest, batchId, messageRoot,
-  } });
+  const { validatorEpoch, quorumCertificate } = await verifyDeliveryCertificate(input, message,
+    { batchEpoch, batchId, messageRoot, committeeDigest }, validatorSets);
   const id = deliveryJobId({ ...message, batchId, messageIndex: input.messageIndex });
   if (input.deliveryJobId !== id) throw new DeliveryError("WRONG_DELIVERY_JOB_ID");
   const merkleProof = { ...input.merkleProof, batchId, messageId: message.messageId,
@@ -98,7 +104,9 @@ export async function verifyDeliveryPackage(input, { validatorSets, sourceDomain
     leafCount: input.leafCount, messageRoot, merkleProof, validatorEpoch, committeeDigest, quorumCertificate })));
 }
 
-export async function buildDeliveryPackages(snapshot, options) {
+// Only this private constructor creates reusable batch evidence. It never
+// accepts caller-provided validation flags or retains state across operations.
+async function verifiedBatch(snapshot, { validatorSets, sourceDomain, sourceGateway } = {}) {
   if (snapshot?.record?.status !== "COMMITTED") throw new DeliveryError("DELIVERY_REQUIRES_COMMITTED");
   if (!snapshot.quorumCertificate) throw new DeliveryError("DELIVERY_REQUIRES_QC");
   const batch = validateMessageBatch(snapshot.batch);
@@ -112,18 +120,35 @@ export async function buildDeliveryPackages(snapshot, options) {
   const certificate = snapshot.quorumCertificate;
   if (certificate.protocolVersion === "3" && (!snapshot.consensusBinding || snapshot.consensusBinding.protocolVersion !== "3" ||
       snapshot.consensusBinding.validatorEpoch !== certificate.validatorEpoch || snapshot.consensusBinding.committeeDigest !== certificate.committeeDigest)) throw new DeliveryError("WRONG_DELIVERY_VALIDATOR_EPOCH");
+  if (!validatorSets) throw new DeliveryError("VALIDATOR_HISTORY_REQUIRED");
+  if (sourceDomain !== undefined && batch.sourceDomain !== protocolInteger(sourceDomain, "source domain")) throw new DeliveryError("WRONG_DELIVERY_SOURCE");
+  if (sourceGateway !== undefined && batch.sourceGateway !== normalizeAddress(sourceGateway)) throw new DeliveryError("WRONG_DELIVERY_SOURCE");
+  const common = { batchVersion: batch.version.toString(), batchEpoch: batch.epoch.toString(), batchId: batch.batchId,
+    batchMessageIds: batch.messageIds, leafCount: batch.messages.length, messageRoot: tree.messageRoot,
+    committeeDigest: normalizeBytes32(certificate.committeeDigest, "committee digest") };
+  const evidence = await verifyDeliveryCertificate({ quorumCertificate: certificate, validatorEpoch: certificate.validatorEpoch ?? null },
+    batch, common, validatorSets);
+  return immutable({ batch, tree, common, ...evidence });
+}
+
+export async function buildDeliveryPackages(snapshot, options) {
+  const context = await verifiedBatch(snapshot, options);
+  const { batch, tree, common, validatorEpoch, quorumCertificate } = context;
   const packages = [];
   for (let index = 0; index < batch.messages.length; index++) {
     const member = snapshot.members[index];
     if (protocolInteger(member.position, "sealed position") !== BigInt(index) ||
         normalizeBytes32(member.messageId) !== batch.messageIds[index]) throw new DeliveryError("WRONG_DELIVERY_MEMBERSHIP");
-    const message = Object.fromEntries(MESSAGE_FIELDS.map((field) => [field, batch.messages[index][field]]));
-    packages.push(await verifyDeliveryPackage({
+    const message = canonicalMessage(Object.fromEntries(MESSAGE_FIELDS.map((field) => [field, batch.messages[index][field]])));
+    // The proof is derived from this operation's verified tree, not supplied by
+    // a portable caller. Stored paths are still compared by the repository.
+    packages.push(immutable(JSON.parse(deliveryJson({
       deliveryJobId: deliveryJobId({ ...message, batchId: batch.batchId, messageIndex: index }), message,
-      batchVersion: batch.version, batchEpoch: batch.epoch, batchId: batch.batchId, batchMessageIds: batch.messageIds,
-      messageIndex: index, leafCount: batch.messages.length, messageRoot: tree.messageRoot, merkleProof: tree.proofs[index],
-      validatorEpoch: certificate.validatorEpoch ?? null, committeeDigest: certificate.committeeDigest, quorumCertificate: certificate,
-    }, options));
+      batchVersion: common.batchVersion, batchEpoch: common.batchEpoch, batchId: common.batchId,
+      batchMessageIds: common.batchMessageIds, messageIndex: index, leafCount: common.leafCount,
+      messageRoot: common.messageRoot, merkleProof: tree.proofs[index], validatorEpoch,
+      committeeDigest: common.committeeDigest, quorumCertificate,
+    }))));
   }
   return Object.freeze(packages);
 }

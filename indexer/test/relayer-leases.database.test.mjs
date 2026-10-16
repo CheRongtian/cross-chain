@@ -52,6 +52,22 @@ async function counts() {
     (SELECT COUNT(*) FROM ${attemptTable})::int AS attempts`)).rows[0];
 }
 
+test("SQL READY selection bulk-reads only selected identities and never expands a batch into leases", async () => {
+  const reads = [];
+  const observedQueue = { ...queue,
+    async getDeliveryJob() { assert.fail("selection must use the grouped queue read"); },
+    async getDeliveryEntries(ids) { reads.push([...ids]); return queue.getDeliveryEntries(ids); },
+  };
+  const selectedLeases = createRelayerLeaseRepository({ config,pool,queue: observedQueue });
+  await selectedLeases.withWorker(async session => {
+    assert.deepEqual(await selectedLeases.listClaimableJobs({ session,limit: 3 }),jobs);
+    assert.deepEqual(reads,[jobs.map(job => job.deliveryJobId)]);
+    assert.deepEqual(await selectedLeases.listClaimableJobs({ session,limit: 1 }),[jobs[0]]);
+    assert.deepEqual(reads[1],[jobs[0].deliveryJobId]);
+    assert.equal((await pool.query(`SELECT COUNT(*)::int AS count FROM ${leaseTable}`)).rows[0].count,0);
+  });
+});
+
 async function useMultiDestinationFixture() {
   await resetIndexerTables(pool,config.databaseSchema);
   await persistReadyTransactionFixture({ config,pool,multiDestination: true });
@@ -282,7 +298,11 @@ test("SQL infrastructure errors and invalid evidence stay fail-fast without prep
   destination.nodes.forEach(node => node.faults.set("eth_estimateGas",() => { throw rpcUnavailable(); }));
   await assert.rejects(createRelayerWorker({ config,pool,queue,transactionManager: reader }).runOnce(),{ code: "RPC_UNAVAILABLE" });
   assert.equal((await leases.getLease(jobs[0].deliveryJobId)).preparationRetryAt,null);
-  const invalidQueue = { ...queue,async getDeliveryPackage(id) { const pack = structuredClone(await queue.getDeliveryPackage(id)); pack.messageRoot = `0x${"ff".repeat(32)}`; return pack; } };
+  const invalidQueue = { ...queue,async getDeliveryEntries(ids) {
+    const entries = structuredClone(await queue.getDeliveryEntries(ids));
+    entries[0].package.messageRoot = `0x${"ff".repeat(32)}`;
+    return entries;
+  } };
   await assert.rejects(createRelayerWorker({ config,pool,queue: invalidQueue,transactionManager: reader }).submitJob(jobs[0].deliveryJobId));
   assert.equal((await leases.getLease(jobs[0].deliveryJobId)).preparationRetryAt,null);
   assert.deepEqual(await counts(),{ intents: 0,attempts: 0 }); assert.equal(await reader.repository.getAccount(),null);

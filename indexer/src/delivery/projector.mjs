@@ -1,6 +1,6 @@
 import { normalizeSourceScope, tableName } from "../db.mjs";
-import { buildDeliveryPackages, DeliveryError, deliveryJson } from "./package.mjs";
-import { deliveryLifecycle, deliveryTransaction, readDeliveryProjection } from "./repository.mjs";
+import { DeliveryError, deliveryJson } from "./package.mjs";
+import { deliveryLifecycle, deliveryTransaction, withDeliveryBatch } from "./repository.mjs";
 
 export function createDeliveryProjector({ config, pool, afterJobPersisted = async () => {} }) {
   const lifecycle = deliveryLifecycle(config, pool);
@@ -18,31 +18,32 @@ export function createDeliveryProjector({ config, pool, afterJobPersisted = asyn
       if (!source) throw new DeliveryError("DELIVERY_BATCH_NOT_FOUND");
       if (source.status !== "COMMITTED") throw new DeliveryError("DELIVERY_REQUIRES_COMMITTED");
       const snapshot = await lifecycle.readBatch({ batchRecordId }, client);
-      const existing = await client.query(`SELECT batch_record_id FROM ${batches} WHERE batch_record_id = $1`, [batchRecordId]);
-      if (existing.rowCount) {
-        const entries = await readDeliveryProjection({ config, client, lifecycle, batchRecordId, snapshot });
-        return Object.freeze({ createdJobs: 0, materialized: false, jobs: Object.freeze(entries.map((entry) => entry.job)) });
-      }
-      const packages = await buildDeliveryPackages(snapshot, { validatorSets: config.validatorSets,
-        sourceDomain: config.chainDomain, sourceGateway: config.sourceGateway });
-      const pack = packages[0];
-      await client.query(`INSERT INTO ${batches} (batch_record_id,batch_id,source_domain,source_gateway,batch_epoch,
-        batch_version,message_root,leaf_count,protocol_version,validator_epoch,committee_digest,qc_digest)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, [batchRecordId, pack.batchId,
-        pack.message.sourceDomain, pack.message.sourceGateway, pack.batchEpoch, Number(pack.batchVersion),
-        pack.messageRoot, String(pack.leafCount), Number(pack.quorumCertificate.protocolVersion), pack.validatorEpoch,
-        pack.committeeDigest, pack.quorumCertificate.qcDigest]);
-      for (const pack of packages) {
-        await client.query(`INSERT INTO ${jobs} (delivery_job_id,batch_record_id,source_message_id,message_index,
-          message_id,source_domain,source_gateway,destination_domain,destination_gateway,destination_receiver,proof_siblings)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)`, [pack.deliveryJobId, batchRecordId,
-          snapshot.members[pack.messageIndex].sourceMessageId, String(pack.messageIndex), pack.message.messageId,
-          pack.message.sourceDomain, pack.message.sourceGateway, pack.message.destinationDomain,
-          pack.message.destinationGateway, pack.message.destinationReceiver, deliveryJson(pack.merkleProof.siblings)]);
-        await afterJobPersisted({ batchRecordId, messageIndex: pack.messageIndex });
-      }
-      const entries = await readDeliveryProjection({ config, client, lifecycle, batchRecordId, snapshot });
-      return Object.freeze({ createdJobs: packages.length, materialized: true, jobs: Object.freeze(entries.map((entry) => entry.job)) });
+      return withDeliveryBatch({ config, client, lifecycle, batchRecordId, snapshot }, async context => {
+        const existing = await client.query(`SELECT batch_record_id FROM ${batches} WHERE batch_record_id = $1`, [batchRecordId]);
+        if (existing.rowCount) {
+          const entries = await context.readProjection();
+          return Object.freeze({ createdJobs: 0, materialized: false, jobs: Object.freeze(entries.map((entry) => entry.job)) });
+        }
+        const packages = context.packages;
+        const pack = packages[0];
+        await client.query(`INSERT INTO ${batches} (batch_record_id,batch_id,source_domain,source_gateway,batch_epoch,
+          batch_version,message_root,leaf_count,protocol_version,validator_epoch,committee_digest,qc_digest)
+          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`, [batchRecordId, pack.batchId,
+          pack.message.sourceDomain, pack.message.sourceGateway, pack.batchEpoch, Number(pack.batchVersion),
+          pack.messageRoot, String(pack.leafCount), Number(pack.quorumCertificate.protocolVersion), pack.validatorEpoch,
+          pack.committeeDigest, pack.quorumCertificate.qcDigest]);
+        for (const pack of packages) {
+          await client.query(`INSERT INTO ${jobs} (delivery_job_id,batch_record_id,source_message_id,message_index,
+            message_id,source_domain,source_gateway,destination_domain,destination_gateway,destination_receiver,proof_siblings)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)`, [pack.deliveryJobId, batchRecordId,
+            snapshot.members[pack.messageIndex].sourceMessageId, String(pack.messageIndex), pack.message.messageId,
+            pack.message.sourceDomain, pack.message.sourceGateway, pack.message.destinationDomain,
+            pack.message.destinationGateway, pack.message.destinationReceiver, deliveryJson(pack.merkleProof.siblings)]);
+          await afterJobPersisted({ batchRecordId, messageIndex: pack.messageIndex });
+        }
+        const entries = await context.readProjection();
+        return Object.freeze({ createdJobs: packages.length, materialized: true, jobs: Object.freeze(entries.map((entry) => entry.job)) });
+      });
     });
   }
 

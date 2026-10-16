@@ -107,7 +107,8 @@ export function createRelayerLeaseRepository({ config,pool,queue }) {
           [session.workerId,!selected.at(-1).deferred]);
         return selected;
       });
-      return Object.freeze(await Promise.all(rows.map(row => queue.getDeliveryJob(row.delivery_job_id))));
+      const entries = await queue.getDeliveryEntries(rows.map(row => row.delivery_job_id));
+      return Object.freeze(entries.map(entry => entry.job));
     },
     async tryAcquireLease(id,session) {
       session.assertHeld(); normalizeWorkerId(session.workerId);
