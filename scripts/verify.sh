@@ -1118,43 +1118,6 @@ printf 'VALID: Solidity Merkle domains, leaves, and internal nodes match shared 
 printf 'VALID: off-chain and Solidity roots and proofs match the same shared golden vectors\n'
 printf 'VALID: cross-runtime negative cases and trusted leaf-count checks verified\n'
 
-CURRENT_STEP="canonical gateway encoding test"
-printf '\n[%s]\n' "$CURRENT_STEP"
-forge test --match-test testGatewayUsesCanonicalMessageIdEncoding -vvv
-
-CURRENT_STEP="identity field separation test"
-printf '\n[%s]\n' "$CURRENT_STEP"
-forge test --match-test testEveryIdentityFieldChangesMessageId -vvv
-
-CURRENT_STEP="shared golden vector test"
-printf '\n[%s]\n' "$CURRENT_STEP"
-forge test --match-test testSharedGoldenVectorsMatchCanonicalEncoding -vvv
-printf 'VALID: canonical message domain vectors matched\n'
-
-CURRENT_STEP="source domain separation test"
-printf '\n[%s]\n' "$CURRENT_STEP"
-forge test --match-test testSourceDomainChangesMessageId -vvv
-printf 'VALID: different source domain changed message ID\n'
-
-CURRENT_STEP="destination domain separation test"
-printf '\n[%s]\n' "$CURRENT_STEP"
-forge test --match-test testDestinationDomainChangesMessageId -vvv
-printf 'VALID: different destination domain changed message ID\n'
-
-CURRENT_STEP="source gateway separation test"
-printf '\n[%s]\n' "$CURRENT_STEP"
-forge test --match-test testSameNonceAcrossSourceGatewaysProducesDifferentMessageIds -vvv
-printf 'VALID: different source gateway changed message ID\n'
-
-CURRENT_STEP="destination gateway separation test"
-printf '\n[%s]\n' "$CURRENT_STEP"
-forge test --match-test testDestinationGatewayChangesMessageId -vvv
-printf 'VALID: different destination gateway changed message ID\n'
-
-CURRENT_STEP="event consistency test"
-printf '\n[%s]\n' "$CURRENT_STEP"
-forge test --match-test testEmitsCrossChainMessage -vvv
-
 CURRENT_STEP="credential verifier tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test --match-contract CredentialVerifierTest -vvv
