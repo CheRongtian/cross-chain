@@ -951,6 +951,7 @@ node --test \
     "$INDEXER_DIR/test/relayer-config.test.mjs" \
     "$INDEXER_DIR/test/relayer-encoding.test.mjs" \
     "$INDEXER_DIR/test/relayer-service.test.mjs" \
+    "$INDEXER_DIR/test/relayer-summary.test.mjs" \
     "$INDEXER_DIR/test/transaction-manager.test.mjs" \
     "$INDEXER_DIR/test/transaction-retry.test.mjs" \
     "$INDEXER_DIR/test/rpc-pool.test.mjs" \

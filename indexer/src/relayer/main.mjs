@@ -6,6 +6,7 @@ import { loadTransactionConfig, publicTransactionConfig } from "../transaction-m
 import { createTransactionManager } from "../transaction-manager/service.mjs";
 import { createRelaySubmissionRepository } from "./repository.mjs";
 import { createRelayerWorker } from "./service.mjs";
+import { formatRelayerSummary } from "./summary.mjs";
 
 let config;
 let pool;
@@ -17,11 +18,9 @@ try {
   console.log(`Relayer worker: ${deliveryJson(publicTransactionConfig(config))}`);
   const transactionManager = createTransactionManager({ config, pool, queue, legacy: repository });
   const result = await createRelayerWorker({ config,pool,queue,transactionManager }).runOnce();
-  console.log(deliveryJson({ ...result, results: result.results.map((record) => ({ deliveryJobId: record.intent?.deliveryJobId ?? record.historicalSubmission?.deliveryJobId ?? record.deliveryJobId,
-    transactionHash: record.attempt?.transactionHash ?? record.historicalSubmission?.transactionHash,
-    ...(record.attempt ? { nonce: record.attempt.nonce } : {}),
-    reason: record.reason,retryAt: record.retryAt,status: record.attempt?.status ?? record.action ?? "HISTORICAL",workerId: record.workerId,
-    fencingToken: record.fencingToken,submitted: record.submitted })) }));
+  console.log(deliveryJson({ workerId: result.workerId,relayerAddress: result.relayerAddress,
+    destinationDomain: result.destinationDomain,selected: result.selected,submitted: result.submitted,
+    deferred: result.deferred,skipped: result.skipped,results: result.results.map(formatRelayerSummary) }));
 } catch (error) {
   console.error(`Relayer worker failed: ${safeRelayerMessage(error,config)}`);
   if (error.observations?.length) console.error(`Destination RPC observations: ${deliveryJson(error.observations)}`);

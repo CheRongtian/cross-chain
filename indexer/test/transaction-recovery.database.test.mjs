@@ -5,6 +5,8 @@ import { randomUUID } from "node:crypto";
 import { readdir,readFile } from "node:fs/promises";
 import { applyMigrations,createDatabasePool,resetIndexerTables,tableName } from "../src/db.mjs";
 import { createDeliveryRepository } from "../src/delivery/repository.mjs";
+import { deliveryJson } from "../src/delivery/package.mjs";
+import { formatRelayerSummary } from "../src/relayer/summary.mjs";
 import { createTransactionManager } from "../src/transaction-manager/service.mjs";
 import { verifySignedTransaction } from "../src/transaction-manager/transaction.mjs";
 import { transactionConfig,transactionHarness } from "./helpers/transaction-fixtures.mjs";
@@ -355,6 +357,12 @@ for (const confirmed of [false,true]) {
       const stored = await recovered.repository.getTransaction(id);
       assert.equal(stored.intent.status,confirmed ? "CONFIRMED" : "PENDING");
       if (confirmed) { assert.equal(stored.intent.winningAttemptId,parent.attempt.attemptId); assert.equal(stored.winningAttempt.receiptBlockNumber,"100"); }
+      assert.deepEqual(JSON.parse(deliveryJson(formatRelayerSummary(stored))),{
+        deliveryJobId: id,transactionHash: confirmed ? parent.attempt.transactionHash : replacement.attempt.transactionHash,
+        nonce: parent.attempt.nonce,intentStatus: confirmed ? "CONFIRMED" : "PENDING",
+        latestAttempt: { transactionHash: replacement.attempt.transactionHash,status: confirmed ? "REPLACED" : "SIGNED",attemptNumber: 1 },
+        status: confirmed ? "CONFIRMED" : "PENDING",
+      },"summary must show the repository's historical winner while retaining the latest candidate diagnostic");
       sameSignedAttempt(replacement.attempt,stored.attempt); assert.equal(stored.attempt.broadcastAttemptCount,"0");
       assert.equal((await recovered.repository.getBroadcastEvents(id)).some(event => event.attemptId === replacement.attempt.attemptId),false);
       assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,1);
