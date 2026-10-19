@@ -885,6 +885,8 @@ printf '289. Schedule unchanged NO_REPLACEMENT work into the future without sign
 printf '     Replace a real Chain A branch while a fresh authorized source occurrence is FINALIZING\n'
 printf '     Preserve terminal REORGED evidence and prove zero downstream batch/QC/READY/transaction/destination propagation\n'
 printf '     Resume a canonical replacement through the same schema, live validator cluster and production Gateway/ApplicationB\n'
+printf '     Stop a deterministic non-primary before votes and complete same-view 3-of-4 consensus and destination execution\n'
+printf '     Restart the same identity/store without backfilling votes or replacing its first QC, then prove later consensus participation\n'
 
 CURRENT_STEP="full verification finality profile validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -2024,7 +2026,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
+CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \
