@@ -10,6 +10,7 @@ import { encodeGatewaySubmission } from "../../src/relayer/encoding.mjs";
 import { verifyRpcTransaction } from "../../src/transaction-manager/receipts.mjs";
 import { verifySignedTransaction } from "../../src/transaction-manager/transaction.mjs";
 import { withAutomineDisabled } from "./transaction-retry-integration.mjs";
+import { createDestinationRpcPool } from "../../src/transaction-manager/rpc-pool.mjs";
 
 const ENTRY = fileURLToPath(new URL("./relayer-process.mjs",import.meta.url));
 export function createRelayerProcesses({ environment,pidFile }) {
@@ -36,7 +37,7 @@ export function createRelayerProcesses({ environment,pidFile }) {
     child.on("message",message => { record.messages.push(message); for (const listener of record.listeners) listener(); });
     child.stdout.on("data",chunk => { record.stdout += chunk.toString(); process.stdout.write(chunk); });
     child.stderr.on("data",chunk => { record.stderr += chunk.toString(); process.stderr.write(chunk); });
-    record.wait = async (type,predicate = () => true) => {
+    record.wait = async (type,predicate = () => true,timeoutMs = 30000) => {
       let timer; let listener;
       const next = new Promise(resolve => {
         listener = () => { const message = record.messages.find(message => message.type === type && predicate(message)); if (message) resolve(message); };
@@ -44,7 +45,7 @@ export function createRelayerProcesses({ environment,pidFile }) {
       });
       try {
         return await Promise.race([next,record.closed.then(result => { throw result.error ?? new Error(`Relayer ${workerId} exited before ${type} (${result.code}): ${record.stderr}`); }),
-          new Promise((_,reject) => { timer = setTimeout(() => reject(new Error(`Relayer ${workerId} timed out waiting for ${type}`)),30000); })]);
+          new Promise((_,reject) => { timer = setTimeout(() => reject(new Error(`Relayer ${workerId} timed out waiting for ${type}`)),timeoutMs); })]);
       } finally { clearTimeout(timer); record.listeners.delete(listener); }
     };
     record.send = message => new Promise((resolve,reject) => child.send(message,error => error ? reject(error) : resolve()));
@@ -415,6 +416,225 @@ export async function verifyDuplicateTransportRace({ processes,pool,config,manag
       }
     }
   });
+}
+
+export async function verifyDestinationRpcOutage({ processes,pool,config,manager,queue,client,paths,observer,jobs,assertNoDestinationExecution }) {
+  assert.equal(jobs.length,2); assert.ok(paths.length >= 2);
+  assert.deepEqual(config.destinationRpcUrls,[...paths.map(path => new URL(path.url).href)]);
+  const packages = await Promise.all(jobs.map(job => queue.getDeliveryPackage(job.deliveryJobId)));
+  const encoded = await Promise.all(packages.map(pack => encodeGatewaySubmission(pack,{ validatorSets: config.validatorSets,
+    sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway })));
+  const ids = jobs.map(job => job.deliveryJobId);
+  const journals = tableName(config.databaseSchema,"transaction_broadcast_events");
+  const attempts = tableName(config.databaseSchema,"transaction_attempts");
+  const rpc = createDestinationRpcPool({ config });
+  const gateway = packages[0].message.destinationGateway;
+  const gatewayCode = await client.request({ method: "eth_getCode",params: [gateway,"latest"] });
+  assert.notEqual(gatewayCode,"0x");
+  for (let index = 0; index < paths.length; index++) assert.equal((await rpc.probeEndpoint(index)).status,"HEALTHY");
+  for (const id of ids) assert.equal(await manager.repository.getTransaction(id),null);
+  let record; let failure;
+  const timeoutMs = config.rebroadcastIntervalMs + 60000;
+  async function journal(id) {
+    return (await pool.query(`SELECT e.* FROM ${journals} e JOIN ${attempts} a USING (attempt_id)
+      WHERE a.delivery_job_id = $1 ORDER BY e.event_id`,[id])).rows;
+  }
+  function assertAlive() { assert.ok(record && !record.exited,"the same scheduled Relayer process must remain alive"); }
+  async function waitFor(label,predicate) {
+    const deadline = Date.now() + timeoutMs;
+    for (;;) {
+      assertAlive();
+      const value = await predicate();
+      if (value) return value;
+      assert.ok(Date.now() < deadline,`${label} did not complete within the configured retry interval plus watchdog`);
+      await pause(25);
+    }
+  }
+  async function assertJobs() {
+    assert.deepEqual(await queue.getDeliveryEntries(ids),jobs.map((job,index) => ({ job,package: packages[index] })));
+  }
+  function assertIdentity(actual,original) {
+    assert.equal(actual.intent.status,"PENDING"); assert.equal(actual.intent.retryStoppedAt,null);
+    assert.equal(actual.attempt.status,"SIGNED"); assert.equal(actual.attempts.length,1);
+    assert.equal(actual.attempt.receiptBlockHash,null); assert.equal(actual.intent.winningAttemptId,null);
+    for (const field of ["intentId","senderAddress","nonce","value","destinationGateway","calldata","packageDigest","createdAt"]) {
+      assert.ok(actual.intent[field] === original.intent[field],`outage must preserve intent ${field}`);
+    }
+    for (const field of ["attemptId","attemptNumber","replacementOfAttemptId","nonce","gasLimit","maxFeePerGas","maxPriorityFeePerGas",
+      "transactionType","rawSignedTransaction","transactionHash","createdAt"]) {
+      assert.ok(actual.attempt[field] === original.attempt[field],`outage must preserve signed ${field}`);
+    }
+  }
+  try {
+    // No job ID is supplied. Production selection chooses the fault target;
+    // the only IPC pause is the first committed pre-external-send marker.
+    record = processes.start("relayer-a",{ mode: "rpc-outage-poll" }); await record.started;
+    const boundary = await record.wait("checkpoint",message => message.name === "broadcast-start");
+    assert.equal(boundary.pid,record.child.pid); assert.equal(boundary.workerId,"relayer-a");
+    assert.equal(boundary.id,ids[0],"ordinary canonical selection must choose the first fresh delivery job");
+    const [faultTarget,following] = jobs;
+    const original = await manager.repository.getTransaction(boundary.id);
+    assert.ok(isDeepStrictEqual(boundary.stored,original),"the pre-send marker and signed state must be committed");
+    assert.equal(original.attempt.status,"SIGNED"); assert.equal(original.attempt.broadcastAt,null);
+    assert.equal(original.attempt.attemptNumber,0); assert.equal(original.attempts.length,1);
+    assert.equal(original.attempt.replacementOfAttemptId,null); assert.equal(original.attempt.transactionType,2);
+    const prepared = record.messages.find(message => message.type === "signed" && message.fence.deliveryJobId === boundary.id);
+    assert.ok(prepared); assert.equal(prepared.stored.created,true);
+    assert.equal(prepared.stored.attempt.broadcastAttemptCount,"0");
+    const beforeJournal = await journal(boundary.id);
+    assert.equal(beforeJournal.length,1); assert.equal(beforeJournal[0].completed_at,null);
+    assert.equal(beforeJournal[0].event_id,boundary.event.eventId);
+    assert.equal(beforeJournal[0].parent_event_id,null);
+    assert.equal(original.attempt.broadcastAttemptCount,"1","one committed manager action is not an external send");
+    assert.equal(observer.calls.filter(call => call.method === "eth_sendRawTransaction").length,0);
+    assert.equal(await manager.repository.getTransaction(following.deliveryJobId),null);
+    const account = await manager.repository.getAccount();
+    assert.equal(account.nextNonce,(BigInt(original.intent.nonce) + 1n).toString());
+    await assertJobs(); await assertNoDestinationExecution(); assertAlive();
+    console.log(`VALID: fault-target job ${boundary.id} durably persisted one canonical intent, nonce ${original.intent.nonce} and exact SIGNED transaction ${original.attempt.transactionHash} before external broadcast; PID ${record.child.pid}`);
+    console.log("VALID: both delivery jobs were durable before the destination RPC outage; the committed broadcast-start marker still has zero external sends");
+
+    for (const path of paths) path.state.available = false;
+    let unavailable;
+    await assert.rejects(() => rpc.verifyChain(),error => {
+      if (error.code !== "RPC_UNAVAILABLE") return false;
+      unavailable = error.observations;
+      return unavailable.length === paths.length && unavailable.every(value => value.outcome === "UNAVAILABLE" && value.errorClass === "TRANSIENT_RPC_ERROR");
+    });
+    assert.equal(new Set(unavailable.map(value => value.endpointLabel)).size,paths.length);
+    assert.equal(BigInt(await client.request({ method: "eth_chainId",params: [] })),config.destinationDomain);
+    assert.equal((await client.request({ method: "eth_getBlockByNumber",params: ["0x0",false] })).hash,config.destinationGenesisHash);
+    assert.ok((await client.request({ method: "eth_getCode",params: [gateway,"latest"] })) === gatewayCode);
+    console.log(`VALID: every configured destination RPC access path (${paths.length}) was unavailable while the underlying Chain B remained alive; only the harness has the independent read-only control path`);
+    await record.send({ type: "continue" });
+    const error = await record.wait("poll-error",value => value.operation === "delivery" && value.errorCode === "RPC_UNAVAILABLE");
+    assert.equal(error.pid,record.child.pid); assert.equal(error.observations.length,paths.length);
+    assert.ok(error.observations.every(value => value.outcome === "UNAVAILABLE" && value.errorClass === "TRANSIENT_RPC_ERROR"));
+    const retry = await record.wait("poll-pass",value => value.operation === "retries" && value.summary.results.some(result =>
+      result.deliveryJobId === boundary.id && result.action === "RETRY_SCHEDULED" && result.errorClass === "TRANSIENT_RPC_ERROR"),timeoutMs);
+    assert.equal(retry.pid,record.child.pid); assertAlive();
+    const outage = await manager.repository.getTransaction(boundary.id);
+    assertIdentity(outage,original);
+    assert.equal(outage.attempt.lastErrorClass,"TRANSIENT_RPC_ERROR");
+    assert.ok(outage.intent.nextActionAt && Date.parse(outage.intent.nextActionAt) > Date.parse(original.intent.nextActionAt),
+      "a normal retry pass must commit its later retry schedule without clock overrides or SQL edits");
+    assert.equal(outage.attempt.broadcastAttemptCount,"1");
+    assert.deepEqual(await manager.repository.getAccount(),account);
+    const failedJournal = await journal(boundary.id);
+    assert.equal(failedJournal.length,1); assert.notEqual(failedJournal[0].completed_at,null);
+    assert.equal(failedJournal[0].result_class,"ERROR"); assert.equal(failedJournal[0].error_class,"TRANSIENT_RPC_ERROR");
+    assert.equal(failedJournal[0].returned_tx_hash,null);
+    assert.equal(await manager.repository.getTransaction(following.deliveryJobId),null);
+    assert.equal(observer.calls.filter(call => call.method === "eth_sendRawTransaction").length,0);
+    assert.equal(await client.request({ method: "eth_getTransactionByHash",params: [original.attempt.transactionHash] }),null);
+    assert.equal(await client.request({ method: "eth_getTransactionReceipt",params: [original.attempt.transactionHash] }),null);
+    await assertJobs(); await assertNoDestinationExecution(); assertAlive();
+    console.log("EXPECTED TRANSIENT FAILURE: production delivery observed all-path destination RPC_UNAVAILABLE; the normal retry pass persisted TRANSIENT_RPC_ERROR and a later next-action time");
+    console.log("VALID: all delivery jobs remained durable during the RPC outage; no READY/package/source/QC evidence was deleted");
+    console.log("VALID: RPC outage preserved the exact delivery intent, sender, nonce, raw signed bytes and transaction hash; no new nonce, signature or replacement");
+    console.log("VALID: RPC outage produced no fabricated CONFIRMED/REVERTED outcome and no destination business execution; the later delivery job remained queued and unlost");
+
+    // After this restoration there are NO per-job IPC commands, submits,
+    // recovery calls, database writes, time overrides or process restarts.
+    for (const path of paths) path.state.available = true;
+    for (let index = 0; index < paths.length; index++) assert.equal((await rpc.probeEndpoint(index)).status,"HEALTHY");
+    assert.ok((await client.request({ method: "eth_getCode",params: [gateway,"latest"] })) === gatewayCode);
+    console.log("VALID: all destination RPC paths recovered with the same expected Chain B chain ID/genesis and unchanged production Gateway code");
+    const mined = await waitFor("ordinary polling delivered both retained jobs",async () => {
+      const values = [];
+      for (const id of ids) {
+        const stored = await manager.repository.getTransaction(id);
+        if (!stored) return null;
+        assert.equal(stored.intent.retryStoppedAt,null); assert.equal(stored.attempts.length,1);
+        const receipt = await client.request({ method: "eth_getTransactionReceipt",params: [stored.attempt.transactionHash] });
+        if (!receipt) return null;
+        assert.equal(BigInt(receipt.status),1n); values.push({ stored,receipt });
+      }
+      return values;
+    });
+    // Local confirmation blocks are environmental progress only; the live
+    // scheduler itself selects receipts and commits both terminal outcomes.
+    await client.request({ method: "anvil_mine",params: [`0x${config.destinationConfirmations.toString(16)}`] });
+    const final = await waitFor("ordinary receipt/recovery polling confirmed both retained jobs",async () => {
+      const values = await Promise.all(ids.map(id => manager.repository.getTransaction(id)));
+      for (const value of values) assert.equal(value.intent.retryStoppedAt,null);
+      return values.every(value => value.intent.status === "CONFIRMED") ? values : null;
+    });
+    assertAlive();
+    // Finish the current ordinary pass and drain its IPC evidence before
+    // counting activity. Both target transactions are already CONFIRMED.
+    await record.send({ type: "stop-polling" }); await record.wait("result"); await record.finish();
+    const preparationEvents = record.messages.filter(message => message.type === "preparation");
+    for (const [index,value] of final.entries()) {
+      assert.equal(value.attempts.length,1); assert.equal(value.attempt.attemptNumber,0);
+      assert.equal(value.attempt.replacementOfAttemptId,null);
+      assert.equal(value.intent.packageDigest,encoded[index].packageDigest); assert.equal(value.intent.calldata,encoded[index].calldata);
+      assert.ok(BigInt(value.attempt.confirmedHead) - BigInt(value.attempt.receiptBlockNumber) + 1n >= config.destinationConfirmations);
+      const preparedMessages = record.messages.filter(message => message.type === "signed" && message.fence.deliveryJobId === ids[index]);
+      const id = ids[index];
+      const activity = preparationEvents.filter(message => message.deliveryJobId === id);
+      assert.equal(preparedMessages.filter(message => message.stored.created).length,1,
+        `job ${id}: exactly one initial signature must be persisted`);
+      assert.equal(activity.filter(message => message.outcome === "SIGNED").length,1,
+        `job ${id}: exactly one preparation must commit the initial signed transaction`);
+      let signed = false; let blocked = 0;
+      for (const event of activity) {
+        assert.equal(event.pid,record.child.pid,`job ${id}: preparation must stay in the same process`);
+        if (event.outcome === "SIGNED") {
+          assert.equal(signed,false,`job ${id}: initial preparation must not repeat after persistence`);
+          assert.deepEqual([event.estimates,event.feeQuotes,event.signatures],[1,1,1],
+            `job ${id}: initial signed preparation must estimate, quote fees and sign exactly once`);
+          signed = true;
+        } else if (event.outcome === "BLOCKED_BY_EARLIER_NONCE") {
+          assert.equal(signed,false,`job ${id}: nonce-blocked initial preparation must precede persistence`);
+          assert.deepEqual([event.estimates,event.feeQuotes,event.signatures],[1,1,0],
+            `job ${id}: nonce-blocked preparation may query gas/fees but must not sign`);
+          blocked++;
+        } else {
+          assert.equal(event.outcome,"REUSED",`job ${id}: unexpected preparation outcome ${event.outcome}`);
+          assert.equal(signed,true,`job ${id}: reuse must follow its initial signed preparation`);
+          assert.deepEqual([event.estimates,event.feeQuotes,event.signatures],[0,0,0],
+            `job ${id}: persisted transaction reuse must not re-estimate, reprice or sign`);
+        }
+      }
+      if (index === 0) assert.equal(blocked,0,`fault-target job ${id}: its single initial preparation must precede the RPC outage`);
+      assert.equal(observer.calls.filter(call => call.method === "eth_estimateGas" && call.params[0].data === encoded[index].calldata).length,
+        activity.reduce((total,event) => total + event.estimates,0),
+        `job ${id}: wire gas estimates must match initial and pre-sign nonce-blocked preparation evidence`);
+      assert.equal(observer.calls.filter(call => call.method === "eth_sendRawTransaction" && call.params[0] === value.attempt.rawSignedTransaction).length,1,
+        `job ${id}: the exact persisted signed transaction must be externally sent once`);
+      console.log(`VALID: job ${id} had ${blocked} pre-sign nonce-blocked preparation(s), one initial persisted signature and zero post-persistence gas estimates, fee quotes or signatures`);
+    }
+    for (const field of ["intentId","senderAddress","nonce","value","destinationGateway","calldata","packageDigest","createdAt"]) {
+      assert.ok(final[0].intent[field] === original.intent[field],`automatic recovery must reuse intent ${field}`);
+    }
+    for (const field of ["attemptId","nonce","gasLimit","transactionType","maxFeePerGas","maxPriorityFeePerGas","rawSignedTransaction","transactionHash","createdAt"]) {
+      assert.ok(final[0].attempt[field] === original.attempt[field],`automatic recovery must reuse signed ${field}`);
+    }
+    assert.equal(observer.calls.filter(call => call.method === "eth_maxPriorityFeePerGas").length,
+      preparationEvents.reduce((total,event) => total + event.feeQuotes,0),
+      "wire fee quotes must match recorded preparation calls, including retries blocked before signing; no retry/recovery repricing");
+    assert.equal(observer.calls.filter(call => call.method === "eth_sendRawTransaction").length,2);
+    assert.equal(observer.errors.length,0);
+    for (const path of paths) assert.equal(path.errors.length,0);
+    const completedJournal = await journal(boundary.id);
+    assert.ok(isDeepStrictEqual(completedJournal.find(row => row.event_id === failedJournal[0].event_id),failedJournal[0]),
+      "the completed outage ERROR journal must remain intact after success");
+    assert.ok(completedJournal.some(row => row.parent_event_id === null && row.result_class === "ACCEPTED"));
+    assert.ok(completedJournal.some(row => row.endpoint_label !== null && row.result_class === "ACCEPTED"));
+    await assertJobs();
+    console.log(`VALID: normal production retry/recovery polling in unchanged PID ${record.child.pid} resumed the persisted delivery automatically after RPC recovery with no manual job submission or database reset`);
+    console.log("VALID: recovery reused the same intent, nonce, signed bytes and transaction hash with zero re-estimation, repricing or re-signing; the retained following job was selected by ordinary production flow");
+    return { faultTarget,following,original,outage,final,mined,failedJournal,pid: record.child.pid };
+  } catch (error) { failure = error; throw error; }
+  finally {
+    for (const path of paths) path.state.available = true;
+    try { await processes.close(); }
+    catch (error) {
+      if (failure) throw new AggregateError([failure,error],"RPC-outage scenario and worker cleanup failed");
+      throw error;
+    }
+  }
 }
 
 export async function verifyConcurrentRelayers({ processes,pool,config,manager,jobs }) {

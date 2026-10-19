@@ -1508,6 +1508,12 @@ Retry settings are optional in the ignored root `.env`; `.env.example` lists saf
 
 Intervals and counts are bounded positive integers; replacement age cannot be shorter than the rebroadcast interval, the multiplier must exceed one, and priority cap cannot exceed max fee cap. The real replacement verification requires at least two allowed attempts and fee caps that accommodate its development transactions.
 
+### Complete destination RPC outages
+
+Destination delivery remains durable when every configured RPC access path is unavailable. READY jobs, verified packages, transaction intents, nonce reservations and exact signed transactions persist independently of RPC availability. Transient all-endpoint failures cannot authorize execution, fabricate a confirmed or reverted receipt, or discard queued work. Committed failed broadcast-action journals remain available after later successful delivery.
+
+When access to the same expected Chain B identity recovers, ordinary scheduled delivery, retry, recovery and receipt passes resume from persisted state without a per-job resubmission or database reset. An existing signed transaction retains its sender, nonce, calldata, gas, fees, signed bytes and hash; later queued work still follows normal nonce-ordering and lease/fencing rules. These are bounded one-shot APIs suitable for periodic invocation, not a built-in production daemon. RPC recovery alone does not establish destination finality or replace the Gateway's authorization and replay checks.
+
 ### Versioned transport encoding
 
 `encodeDestinationSubmission(package, options)` independently verifies the package before encoding its inner envelope. Transport version 1 is plain Solidity ABI encoding with domain string `CrossChainDeliveryPackage`; that inner envelope has no function selector. The production Relayer uses `encodeGatewaySubmission` to wrap these unchanged bytes in the standard `execute(bytes)` call before transaction preparation. The envelope is not JSON text encoded as transaction data.
