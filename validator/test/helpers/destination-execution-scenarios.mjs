@@ -40,6 +40,7 @@ import { destinationAccessPath } from "../../../indexer/test/helpers/rpc-failove
 import { rpcObserver } from "./process-cluster.mjs";
 import { withAutomineDisabled } from "../../../indexer/test/helpers/transaction-retry-integration.mjs";
 import { verifyPostgresRestart } from "./postgres-restart-scenarios.mjs";
+import { verifyMultiComponentRecovery } from "./multi-component-recovery-scenario.mjs";
 
 const artifact = name => JSON.parse(readFileSync(new URL(`../../../contracts/out/${name}.sol/${name}.json`, import.meta.url), "utf8"));
 const normalizeError = value => typeof value === "string" && /^0x[0-9a-f]{40}$/i.test(value) ? value.toLowerCase() : value;
@@ -446,7 +447,7 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   await verifyDestinationTransactionReorg();
   await verifyPrimaryFailure();
   await verifyPostgresRestart({ config, pool, validatorSets, produceMessage, client, chainA, gateway, application,
-    gatewayAbi, appAbi, rpcUrl, registryChecks, certificateChecks });
+    gatewayAbi, appAbi, rpcUrl, registryChecks, certificateChecks, afterVerification: verifyMultiComponentRecovery });
   console.log("COMPLETE END-TO-END EXECUTION EVIDENCE RECORDED: fresh ZK intent → source event → real finality/batch/PBFT/READY → production Relayer/Tx Manager → atomic Gateway/ApplicationB; duplicate rejection and business rollback; historical snapshots unchanged");
 
   async function verifyDestinationTransactionReorg() {

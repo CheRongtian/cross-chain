@@ -1668,6 +1668,18 @@ The helper and root shell trap clean up only the cluster, files and processes ow
 
 This recovery model assumes PostgreSQL's persistent data remains intact. Permanent database loss is a separate disaster-recovery problem; the chains cannot reconstruct all historical off-chain votes, journals and operational state. Database replication, HA and automatic failover are outside this implementation.
 
+### Recovery across component failures
+
+Recovery can span the existing consensus, delivery and transaction components for the same source-authorized message. A four-member pinned committee can commit with one non-primary validator unavailable and exactly three live signers. Its authenticated READY package remains durable after the signing Relayer process crashes. A second Relayer waits for PostgreSQL-time lease expiry, acquires a higher fencing token, and loads the original intent, nonce, gas, fees, signed bytes and transaction hash. The old owner's fence cannot authorize protected mutations.
+
+Complete verification appends `[Multi-component Recovery]` after the independent fault scenarios. It uses a fresh exact-intent ZK-authorized source message, a distinct supplier and the next batch epoch in the already-restored verification-owned database and validator namespace. It first verifies OBSERVED, FINALIZING and FINALIZED, then stops one deterministically selected active non-primary OS process before any target vote. The remaining three real validators form a view-zero QC; the offline validator contributes no PREPARE or COMMIT. No committee, threshold, source occurrence, root or certificate is replaced to obtain progress.
+
+Independent Relayer A pauses after committing SIGNED, before any broadcast journal or external send, and is killed with `SIGKILL`. The same independent B process polls normally before and after natural lease expiry. Once B has valid ownership and has loaded the original candidate, all of its configured destination RPC paths become unavailable. B must observe structured `RPC_UNAVAILABLE`; the READY package, intent, reserved nonce, signed candidate and empty broadcast journal remain intact, with no destination execution. The underlying Chain B, Chain A and PostgreSQL remain available throughout this composed scenario. No database restart, source/destination reorg, Byzantine vote, primary failure or view change is injected here.
+
+Restoring those same access paths to the same canonical Chain B lets B's ordinary bounded production worker and receipt-observation passes continue automatically. The harness provides no subsequent per-job submit/recovery command, new source authorization, proof, PBFT round, intent, nonce, estimate or signature. Its only chain advancement is mining the configured confirmation depth. Verification requires the exact retained hash, one accepted external send, one canonical Gateway event and one ApplicationB supplier transition, while preserving previous transaction and consensus history. One-time barriers and scheduling live only in test helpers; the production worker retains its normal lease/fence and recovery checks. Owned Relayers and RPC gates are cleaned up, and the surrounding resource owner then disposes its validator processes and temporary database.
+
+This bounded scenario assumes the three remaining validators, persistent database, second Relayer and canonical chains remain functional, and destination access eventually returns. It establishes no liveness or distributed exactly-once guarantee for arbitrary simultaneous failures or permanent dependency loss. The validator quorum authorizes batch consensus; Relayers remain untrusted transport; PostgreSQL supplies operational durability; RPC endpoints supply access and evidence. The production DestinationGateway remains the final destination authorization and replay boundary.
+
 ### Verification and destination boundary
 
 The unified flow preserves source, ZK, Merkle, PBFT, queue and direct-submission checks. Additional unit/database cases cover exact retries, error classification, fee arithmetic and limits, concurrent replacement, rollback, migration of old artifacts, old/new winners, canonical reverts and stopped-state recovery.
@@ -1874,6 +1886,7 @@ The script uses strict error handling and verifies the following boundaries:
 - **Consensus and historical authority:** independent validator source checks, four-member committees with three-voter quorum, PRE-PREPARE/PREPARE/COMMIT/QC, durable vote locks, crash/partition/heal and view recovery, five development identities across separate historical committees, and exact Chain B registry/QC verification.
 - **Durable delivery:** strict COMMITTED-to-READY projection, independently verified packages, destination-scoped leased workers, preparation-defer fairness, persistent signing/nonce allocation, exact retries and same-nonce replacement, fair receipt/recovery scans, RPC failover and fresh-process crash reconciliation.
 - **PostgreSQL service recovery:** a genuine owned-server stop after real destination acceptance, failed database-dependent progress, same-PGDATA WAL recovery, unchanged source/consensus/delivery/transaction history, valid new ownership and canonical reconciliation of the original signed transaction without a duplicate business execution.
+- **Composed recovery:** one fresh message completes same-view consensus with one non-primary offline, survives the signing Relayer's actual pre-send crash, transfers through natural lease expiry and higher fencing, remains intact during all-path destination RPC unavailability, and finishes through the same polling B process after access returns. No new authorization, batch, transaction identity or signature is introduced to recover delivery.
 - **Destination execution:** actual Chain B registries/verifiers and production `DestinationGateway`/`ApplicationB` deployment, canonical transport-v1 `execute(bytes)` parity and limits, QC → Merkle → full-message/domain checks, message-ID replay, exact receiver authority, atomic rollback/retry and supplier-state/event readback.
 - **Compatibility and negative boundaries:** unchanged legacy v1/v2 and current v3 certificates, historical signed transactions and opaque payloads, independent stateless/test-harness checks, precise invalid-evidence rejection and full real source-to-application execution through production Relayer/Transaction Manager APIs.
 
@@ -2102,6 +2115,7 @@ Cross-Chain/
 │   │   │   ├── read-delivery.mjs
 │   │   │   ├── relayer-fixtures.mjs
 │   │   │   ├── relayer-integration.mjs
+│   │   │   ├── relayer-polling.mjs
 │   │   │   ├── relayer-process.mjs
 │   │   │   ├── rpc-failover-integration.mjs
 │   │   │   ├── transaction-database-fixtures.mjs
@@ -2118,6 +2132,7 @@ Cross-Chain/
 │   │   ├── relayer-encoding.test.mjs
 │   │   ├── relayer-leases.database.test.mjs
 │   │   ├── relayer-leases.test.mjs
+│   │   ├── relayer-polling.test.mjs
 │   │   ├── relayer-service.test.mjs
 │   │   ├── relayer-summary.test.mjs
 │   │   ├── relayer.database.test.mjs
@@ -2216,6 +2231,7 @@ Cross-Chain/
 │   │       ├── fixtures.mjs
 │   │       ├── message-domain-scenarios.mjs
 │   │       ├── message-replay-scenarios.mjs
+│   │       ├── multi-component-recovery-scenario.mjs
 │   │       ├── four-process.mjs
 │   │       ├── pbft-certificate.mjs
 │   │       ├── pbft-certificate-contract.mjs

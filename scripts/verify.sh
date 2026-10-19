@@ -909,6 +909,16 @@ printf '298. Observe real database-dependent failures while both chains remain a
 printf '299. Preserve source/batch/QC/PBFT history, cursors, counters, signed candidate and unresolved broadcast journal\n'
 printf '300. Resume fresh production workers through natural lease expiry, higher fencing and canonical transaction reconciliation\n'
 printf '301. Confirm the original transaction without another signature/send and require one Gateway/ApplicationB execution\n'
+printf '302. Continue in the live owned database with one new exact-intent authorized message and the next batch epoch\n'
+printf '303. Stop a deterministic active non-primary process before any target-epoch PREPARE or COMMIT\n'
+printf '304. Commit the same batch/root in view zero with exactly three live QC signers and zero offline votes\n'
+printf '305. Materialize one READY job; let independent Relayer A durably sign without any broadcast marker/send\n'
+printf '306. SIGKILL A; let the same polling Relayer B wait for natural database-time expiry and acquire higher fencing\n'
+printf '307. Reuse the original signed candidate and reject stale A before blocking every configured destination RPC path\n'
+printf '308. Require B to observe structured RPC_UNAVAILABLE while both chains/database stay online and all state is retained\n'
+printf '309. Restore the same Chain B access paths; let B autonomously deliver and confirm without per-job manual recovery\n'
+printf '310. Require one original intent/nonce/hash, one external send and one canonical Gateway/ApplicationB execution\n'
+printf '311. Preserve source/batch/Merkle/QC, validator safety and prior transaction history; clean up owned workers/gates\n'
 printf '     Replace a real Chain A branch while a fresh authorized source occurrence is FINALIZING\n'
 printf '     Preserve terminal REORGED evidence and prove zero downstream batch/QC/READY/transaction/destination propagation\n'
 printf '     Resume a canonical replacement through the same schema, live validator cluster and production Gateway/ApplicationB\n'
@@ -997,6 +1007,7 @@ node --test \
     "$INDEXER_DIR/test/relayer-config.test.mjs" \
     "$INDEXER_DIR/test/relayer-encoding.test.mjs" \
     "$INDEXER_DIR/test/relayer-service.test.mjs" \
+    "$INDEXER_DIR/test/relayer-polling.test.mjs" \
     "$INDEXER_DIR/test/relayer-summary.test.mjs" \
     "$INDEXER_DIR/test/transaction-manager.test.mjs" \
     "$INDEXER_DIR/test/transaction-retry.test.mjs" \
@@ -2074,7 +2085,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, non-primary Byzantine safety and canonical execution E2E, relayer process failure/natural-expiry signed takeover E2E, two-process duplicate-delivery race E2E, all-path destination RPC outage/automatic resumption E2E, confirmed destination transaction reorg/reconfirmation E2E, primary failure/view-change E2E, owned PostgreSQL stop/same-storage restart and canonical transaction recovery E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
+CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, non-primary Byzantine safety and canonical execution E2E, relayer process failure/natural-expiry signed takeover E2E, two-process duplicate-delivery race E2E, all-path destination RPC outage/automatic resumption E2E, confirmed destination transaction reorg/reconfirmation E2E, primary failure/view-change E2E, owned PostgreSQL stop/same-storage restart and canonical transaction recovery E2E, continuous one-message validator/relayer/all-path RPC composed recovery E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 printf '%s\n' 'RPC recovery accounting: distinguish pre-sign nonce-blocked preparation from persisted transaction reuse; reject post-persistence gas estimation, fee repricing or signing.'
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \

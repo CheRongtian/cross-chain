@@ -53,10 +53,11 @@ async function until(label, condition, timeoutMs = 30000) {
 // A real server outage on a separate owned cluster. All state machines below
 // are the existing production implementations, with their real schemas.
 export async function verifyPostgresRestart({ config: originalConfig, pool: originalPool, validatorSets, produceMessage,
-  client, chainA, gateway, application, gatewayAbi, appAbi, rpcUrl, registryChecks, certificateChecks }) {
+  client, chainA, gateway, application, gatewayAbi, appAbi, rpcUrl, registryChecks, certificateChecks, afterVerification }) {
   console.log("\n[PostgreSQL Restart Recovery]");
   const registryPath = process.env.POSTGRES_VERIFICATION_REGISTRY_FILE;
   assert.ok(registryPath, "root verification must provide its owned PostgreSQL registry");
+  assert.equal(typeof afterVerification, "function", "root verification must supply its following composed scenario");
   const resources = { pools: [], reservations: [] };
   let cluster; let validatorProcesses; let relayers; let observer; let failure;
   const poolErrors = [];
@@ -337,6 +338,14 @@ export async function verifyPostgresRestart({ config: originalConfig, pool: orig
     console.log("VALID: PostgreSQL restart preserved validator safety state and exactly one durable committed root; production Gateway/ApplicationB executed the message exactly once");
     console.log("VALID: recovered transaction reached canonical CONFIRMED; zero lost messages, zero duplicate business executions and zero PBFT state corruption in this restart scenario");
     assert.equal(observer.errors.length, 0);
+    // Keep the verified database and four healthy validator processes alive.
+    // The following scenario gets normal production resources, never a handle
+    // to the database fault controller. Its batch advances the same history.
+    await relayers.close();
+    await afterVerification({ config, pool: freshPool, lifecycle: freshLifecycle, queue: freshQueue, validatorSets,
+      peers, active, states, records, processes: validatorProcesses, request, produceMessage,
+      client, chainA, gateway, application, gatewayAbi, appAbi, rpcUrl, registryChecks, certificateChecks });
+    same(await sourceState(originalPool, originalConfig.databaseSchema), originalSource, "composed verification must preserve the ordinary database's original source state");
   } catch (error) { failure = error; throw error; }
   finally {
     // Stop owned workers before stopping/removing their owned database. The

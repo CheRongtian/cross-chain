@@ -12,24 +12,20 @@ import { encodeGatewaySubmission } from "../../src/relayer/encoding.mjs";
 import { createTransactionRpc } from "../../src/transaction-manager/rpc.mjs";
 import { signDeliveryTransaction } from "../../src/transaction-manager/transaction.mjs";
 import { formatRelayerSummary } from "../../src/relayer/summary.mjs";
+import { createRelayerCheckpoint, isRelayerPolling, relayerPollingPasses } from "./relayer-polling.mjs";
 
 // IPC barriers exist only in this integration helper. Production has no pause,
 // force-expiry, stale-fence or test-mode environment switches.
 let config; let pool; let request; const messages = []; const waiters = [];
-let pollingStopped = false; let outageCheckpointUsed = false;
+let pollingStopped = false; let shouldPause;
 process.on("message",message => {
-  if (request?.mode === "rpc-outage-poll" && message.type === "stop-polling") { pollingStopped = true; return; }
+  if (isRelayerPolling(request?.mode) && message.type === "stop-polling") { pollingStopped = true; return; }
   const waiter = waiters.shift(); if (waiter) waiter(message); else messages.push(message);
 });
 const receive = () => messages.length ? Promise.resolve(messages.shift()) : new Promise(resolve => waiters.push(resolve));
 const notify = value => new Promise((resolve,reject) => process.send(value,error => error ? reject(error) : resolve()));
 async function checkpoint(name,payload) {
-  if (request?.mode === "rpc-outage-poll") {
-    // Pause the first ordinarily selected send only. Once released, all later
-    // passes run autonomously without per-job commands or another barrier.
-    if (name !== "broadcast-start" || outageCheckpointUsed) return;
-    outageCheckpointUsed = true;
-  } else if (request?.checkpoint !== name) return;
+  if (!shouldPause?.(name)) return;
   await notify({ type: "checkpoint",name,pid: process.pid,workerId: config.workerId,...JSON.parse(deliveryJson(payload)) });
   if ((await receive()).type !== "continue") throw new Error("invalid crash checkpoint command");
 }
@@ -46,7 +42,7 @@ try {
   const persistedJobs = new Set();
   let preparation;
   function recordPreparationRpc(field,id = preparation?.deliveryJobId) {
-    if (!["rpc-outage-poll","database-restart"].includes(request?.mode)) return;
+    if (!isRelayerPolling(request?.mode) && request?.mode !== "database-restart") return;
     assert.ok(preparation && preparation.deliveryJobId === id,
       `${field} must belong to the active initial preparation; retry/recovery must reuse persisted transaction fields`);
     assert.ok(!persistedJobs.has(id),`job ${id}: ${field} attempted after the signed transaction was persisted`);
@@ -72,6 +68,7 @@ try {
     } });
   await notify({ type: "ready",pid: process.pid,workerId: config.workerId });
   request = await receive();
+  shouldPause = createRelayerCheckpoint(request);
   if (request.mode === "race") {
     await notify({ type: "claim-ready",pid: process.pid,workerId: config.workerId });
     if ((await receive()).type !== "continue") throw new Error("invalid claim barrier command");
@@ -126,7 +123,7 @@ try {
   } else {
     // Observe the production preparation call without changing its job
     // selection, RPC results, nonce ordering, persistence or error handling.
-    const transactionManager = ["rpc-outage-poll","database-restart"].includes(request.mode) ? { ...manager,
+    const transactionManager = (isRelayerPolling(request.mode) || request.mode === "database-restart") ? { ...manager,
       async prepareDeliveryTransaction(id,options) {
         assert.equal(preparation,undefined,"scheduled preparation calls must remain sequential");
         const activity = { deliveryJobId: id,estimates: 0,feeQuotes: 0,signatures: 0,outcome: "FAILED" };
@@ -168,16 +165,11 @@ try {
           if ((await receive()).type !== "continue") throw new Error("invalid integration barrier command");
         }
       } });
-    if (request.mode === "rpc-outage-poll") {
+    if (isRelayerPolling(request.mode)) {
       // Production exposes bounded one-shot operations. This test scheduler
       // repeatedly invokes those SAME operations, never a job-ID operation.
       assert.equal(request.id,undefined);
-      const passes = [
-        ["delivery",() => worker.runOnce()],
-        ["retries",() => manager.processTransactionRetriesOnce()],
-        ["recovery",() => manager.recoverTransactionsOnce()],
-        ["receipts",() => manager.checkReceiptsOnce()],
-      ];
+      const passes = relayerPollingPasses(request.mode,worker,manager);
       let iteration = 0;
       while (!pollingStopped) {
         iteration++;
