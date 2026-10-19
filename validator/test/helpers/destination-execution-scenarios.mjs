@@ -34,6 +34,8 @@ import { createPeerProxy, createTransportGate } from "./fault-transport.mjs";
 import { snapshotContext, encodeCertificate } from "./pbft-certificate.mjs";
 import { snapshotInclusions } from "../../../indexer/test/helpers/merkle-inclusion-contract.mjs";
 import { canonicalDomainMessage } from "../../../indexer/test/helpers/message-domain-contract.mjs";
+import { createRelayerProcesses, verifySignedTakeoverAfterExpiry } from "../../../indexer/test/helpers/multi-relayer-integration.mjs";
+import { rpcObserver } from "./process-cluster.mjs";
 
 const artifact = name => JSON.parse(readFileSync(new URL(`../../../contracts/out/${name}.sol/${name}.json`, import.meta.url), "utf8"));
 const normalizeError = value => typeof value === "string" && /^0x[0-9a-f]{40}$/i.test(value) ? value.toLowerCase() : value;
@@ -434,8 +436,233 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   await verifySourceReorgRecovery();
   await verifyValidatorFailureRecovery();
   await verifyByzantineSafety();
+  await verifyRelayerFailure();
   await verifyPrimaryFailure();
   console.log("COMPLETE END-TO-END EXECUTION EVIDENCE RECORDED: fresh ZK intent → source event → real finality/batch/PBFT/READY → production Relayer/Tx Manager → atomic Gateway/ApplicationB; duplicate rejection and business rollback; historical snapshots unchanged");
+
+  async function verifyRelayerFailure() {
+    const targetSupplier = "0x0000000000000000000000000000000000009051";
+    const targetPayload = encodeAbiParameters([{ type: "uint8" }, { type: "uint8" }, { type: "address" }], [1, 1, targetSupplier]);
+    assert.equal(await readApp("isVerifiedSupplier", [targetSupplier]), false);
+    const sourceBatches = tableName(config.databaseSchema, "message_batches");
+    const jobs = tableName(config.databaseSchema, "delivery_jobs");
+    const intents = tableName(config.databaseSchema, "transaction_intents");
+    const attempts = tableName(config.databaseSchema, "transaction_attempts");
+    const journals = tableName(config.databaseSchema, "transaction_broadcast_events");
+    const leases = tableName(config.databaseSchema, "relayer_job_leases");
+    const previousRows = await readMessages(pool, config.databaseSchema);
+    const previousIds = new Set(previousRows.map(row => row.id));
+    const previousBatches = [];
+    for (const row of (await pool.query(`SELECT batch_record_id FROM ${sourceBatches}
+      WHERE source_domain = $1 AND source_gateway = $2 ORDER BY epoch`,
+    [config.chainDomain.toString(), config.sourceGateway])).rows) {
+      previousBatches.push(await lifecycle.readBatch({ batchRecordId: row.batch_record_id }));
+    }
+    async function transportRows() {
+      return { jobs: (await pool.query(`SELECT * FROM ${jobs} ORDER BY delivery_job_id`)).rows,
+        intents: (await pool.query(`SELECT * FROM ${intents} ORDER BY delivery_job_id`)).rows,
+        attempts: (await pool.query(`SELECT * FROM ${attempts} ORDER BY attempt_id`)).rows,
+        journals: (await pool.query(`SELECT * FROM ${journals} ORDER BY event_id`)).rows };
+    }
+    const beforeTransport = await transportRows();
+    const accountBefore = await manager.repository.getAccount();
+    assert.ok(accountBefore);
+    const pendingNonceBefore = BigInt(await client.request({ method: "eth_getTransactionCount", params: [relayConfig.relayerAddress, "pending"] }));
+    const validatorPids = new Map(active.map(index => [index, validators[index].child.pid]));
+    async function assertHealthyValidators() {
+      for (const index of active) {
+        assert.equal(validators[index].exited, false); assert.equal(validators[index].child.pid, validatorPids.get(index));
+        const health = await request(index, "/health");
+        assert.equal(health.status, 200); assert.equal(health.body.ready, true);
+      }
+    }
+    await assertHealthyValidators();
+    const event = await produceAndFinalize(targetPayload);
+    const committed = await commitFresh([event]);
+    assert.equal(committed.record.status, "COMMITTED");
+    const selected = validatorSets.resolveByValidatorEpoch(committed.consensusBinding.validatorEpoch);
+    assert.equal(selected.validatorEpoch, validatorSets.resolveForBatchEpoch(committed.record.epoch).validatorEpoch);
+    assert.equal(selected.committeeDigest, committed.consensusBinding.committeeDigest);
+    assert.equal(selected.validators.length, 4);
+    assert.equal(committed.quorumCertificate.view, "0", "relayer failure must not introduce a consensus fault");
+    await certificateChecks.snapshot(committed, "healthy pinned committee committed the relayer-failure target before transport failure");
+    const projected = await projector.materializeBatch({ batchRecordId: committed.record.batchRecordId });
+    assert.equal(projected.createdJobs, 1);
+    const packs = await buildDeliveryPackages(committed, { validatorSets });
+    assert.equal(packs.length, 1);
+    const [pack] = packs;
+    assert.equal(pack.message.messageId, event.messageId); assert.equal(pack.message.payload, targetPayload);
+    assert.equal(pack.message.destinationGateway, gateway); assert.equal(pack.message.destinationReceiver, application);
+    const job = await queue.getDeliveryJob(pack.deliveryJobId);
+    assert.equal(job.status, "READY"); assert.deepEqual(await queue.getDeliveryPackage(pack.deliveryJobId), pack);
+    const sourceRows = await rowsFor([event.messageId]);
+    assert.equal(sourceRows.length, 1); assert.equal(sourceRows[0].status, "FINALIZED");
+    async function assertOneReady() {
+      const rows = (await pool.query(`SELECT delivery_job_id,status FROM ${jobs}
+        WHERE source_domain = $1 AND source_gateway = $2 AND message_id = $3`,
+      [config.chainDomain.toString(), config.sourceGateway, event.messageId])).rows;
+      assert.deepEqual(rows, [{ delivery_job_id: pack.deliveryJobId, status: "READY" }]);
+      assert.deepEqual(await queue.getDeliveryJob(pack.deliveryJobId), job);
+      assert.deepEqual(await queue.getDeliveryPackage(pack.deliveryJobId), pack);
+    }
+    await assertOneReady();
+    assert.equal(await readGateway("isMessageExecuted", [event.messageId]), false);
+    assert.equal(await readApp("isVerifiedSupplier", [targetSupplier]), false);
+    const encoded = await encodeGatewaySubmission(pack, { validatorSets });
+    const decoded = decodeFunctionData({ abi: DESTINATION_GATEWAY_ABI, data: encoded.calldata });
+    assert.equal(decoded.functionName, "execute"); assert.equal(decoded.args[0], encoded.data);
+    console.log(`VALID: relayer-failure target ${event.messageId} reached one canonical READY job ${pack.deliveryJobId}; batch ${committed.record.batchId}, root ${committed.tree.messageRoot}, QC ${committed.quorumCertificate.qcDigest}, validator epoch ${selected.validatorEpoch}`);
+
+    let observer; let relayers; let failure;
+    try {
+      const sendOwners = []; const replies = [];
+      // Transparent observation only: the sole injected fault is A's SIGKILL.
+      observer = await rpcObserver(rpcUrl, {
+        async beforeForward(message) {
+          if (message.method !== "eth_sendRawTransaction") return;
+          const owner = (await pool.query(`SELECT owner_id,owner_session_id,fencing_token FROM ${leases}
+            WHERE delivery_job_id = $1 AND released_at IS NULL AND lease_expires_at > clock_timestamp()`, [pack.deliveryJobId])).rows[0];
+          assert.ok(owner, "broadcast must have a live database-time lease"); assert.equal(owner.owner_id, "relayer-b");
+          const stored = await manager.repository.getTransaction(pack.deliveryJobId);
+          assert.ok(message.params[0] === stored.attempt.rawSignedTransaction, "only the durable signed bytes may cross the healthy RPC observer");
+          assert.equal(stored.attempt.status, "SIGNED"); assert.equal(stored.attempt.broadcastAttemptCount, "1");
+          const started = (await pool.query(`SELECT e.* FROM ${journals} e JOIN ${attempts} a USING (attempt_id)
+            WHERE a.delivery_job_id = $1 ORDER BY e.event_id`, [pack.deliveryJobId])).rows;
+          // The journal persists both the logical send and its endpoint send
+          // before external I/O; these are two rows for ONE broadcast.
+          assert.equal(started.length, 2);
+          const logical = started.filter(row => row.parent_event_id === null);
+          const endpoints = started.filter(row => row.parent_event_id !== null);
+          assert.equal(logical.length, 1); assert.equal(endpoints.length, 1);
+          assert.equal(endpoints[0].parent_event_id, logical[0].event_id); assert.equal(endpoints[0].endpoint_label, "rpc-0");
+          for (const row of started) { assert.equal(row.completed_at, null); assert.equal(row.attempt_id, stored.attempt.attemptId); }
+          sendOwners.push(owner);
+        },
+        async afterForward(message, reply) {
+          if (message.method !== "eth_sendRawTransaction") return;
+          assert.ok(reply && !reply.error, "the healthy destination RPC must accept B's exact persisted transaction");
+          replies.push(reply.result);
+        },
+      });
+      const environment = { ...process.env, DATABASE_URL: config.databaseUrl, INDEXER_DB_SCHEMA: config.databaseSchema,
+        CHAIN_A_DOMAIN: config.chainDomain.toString(), SOURCE_GATEWAY_ADDRESS: config.sourceGateway,
+        CHAIN_B_RPC_URL: observer.url, CHAIN_B_RPC_URLS: JSON.stringify([observer.url]),
+        CHAIN_B_CHAIN_ID: relayConfig.destinationDomain.toString(), CHAIN_B_GENESIS_HASH: relayConfig.destinationGenesisHash,
+        RELAYER_LEASE_MS: relayConfig.leaseMs.toString(), VALIDATOR_SET_HISTORY_FILE: "",
+        VALIDATOR_SET_HISTORY: JSON.stringify(validatorSets.history) };
+      const takeoverConfig = loadTransactionConfig(environment);
+      assert.equal(takeoverConfig.relayerAddress, relayConfig.relayerAddress);
+      assert.equal(takeoverConfig.leaseMs, relayConfig.leaseMs);
+      relayers = createRelayerProcesses({ environment, pidFile: process.env.RELAYER_VERIFICATION_PID_FILE });
+      const observedManager = createTransactionManager({ config: takeoverConfig, pool, queue });
+      const takeover = await verifySignedTakeoverAfterExpiry({ processes: relayers, pool, config: takeoverConfig,
+        manager: observedManager, queue, client, observer, id: pack.deliveryJobId });
+      const original = takeover.signed;
+      const reserved = BigInt(accountBefore.nextNonce);
+      const expectedNonce = reserved > pendingNonceBefore ? reserved : pendingNonceBefore;
+      assert.equal(original.intent.nonce, expectedNonce.toString());
+      assert.equal(original.intent.destinationGateway, gateway); assert.equal(original.intent.chainId, "2001");
+      assert.equal(original.intent.senderAddress, relayConfig.relayerAddress); assert.equal(original.intent.value, "0");
+      assert.equal(original.intent.packageDigest, encoded.packageDigest); assert.equal(original.intent.calldata, encoded.calldata);
+      assert.equal(sendOwners.length, 1); assert.deepEqual(replies, [original.attempt.transactionHash]);
+      assert.equal(sendOwners[0].fencing_token, takeover.fenceB.fencingToken);
+      assert.equal(sendOwners[0].owner_session_id, takeover.fenceB.ownerSessionId);
+      const receipt = await client.waitForTransactionReceipt({ hash: original.attempt.transactionHash });
+      assert.equal(receipt.status, "success"); assert.equal(receipt.transactionHash, original.attempt.transactionHash);
+      // Keep the RPC hex nonce full-width instead of passing through viem's
+      // formatted transaction nonce (Number).
+      const transaction = await client.request({ method: "eth_getTransactionByHash", params: [receipt.transactionHash] });
+      assert.ok(transaction); assert.equal(transaction.hash, receipt.transactionHash);
+      assert.equal(BigInt(transaction.type), 2n); assert.equal(BigInt(transaction.chainId), relayConfig.destinationDomain);
+      assert.equal(transaction.from.toLowerCase(), original.intent.senderAddress);
+      assert.equal(transaction.to.toLowerCase(), gateway); assert.equal(BigInt(transaction.value), 0n);
+      assert.equal(BigInt(transaction.nonce), BigInt(original.intent.nonce)); assert.equal(transaction.input, encoded.calldata);
+      assert.equal(BigInt(transaction.gas), BigInt(original.attempt.gasLimit));
+      assert.equal(BigInt(transaction.maxFeePerGas), BigInt(original.attempt.maxFeePerGas));
+      assert.equal(BigInt(transaction.maxPriorityFeePerGas), BigInt(original.attempt.maxPriorityFeePerGas));
+      assert.equal((await client.getBlock({ blockNumber: receipt.blockNumber })).hash, receipt.blockHash);
+      const executions = receipt.logs.filter(log => log.address.toLowerCase() === gateway).map(log => decodeEventLog({ abi: gatewayAbi, ...log }));
+      const grants = receipt.logs.filter(log => log.address.toLowerCase() === application).map(log => decodeEventLog({ abi: appAbi, ...log }));
+      assert.equal(executions.length, 1); assert.equal(executions[0].eventName, "CrossChainMessageExecuted");
+      assert.equal(executions[0].args.messageId, event.messageId); assert.equal(executions[0].args.batchId, committed.record.batchId);
+      assert.equal(executions[0].args.sourceDomain, config.chainDomain); assert.equal(executions[0].args.destinationReceiver.toLowerCase(), application);
+      assert.equal(grants.length, 1); assert.equal(grants[0].eventName, "VerifiedSupplierGranted");
+      assert.equal(grants[0].args.messageId, event.messageId); assert.equal(grants[0].args.supplier.toLowerCase(), targetSupplier);
+      assert.equal(await readGateway("isMessageExecuted", [event.messageId]), true);
+      assert.equal(await readApp("isVerifiedSupplier", [targetSupplier]), true);
+      await client.request({ method: "anvil_mine", params: [toHex(relayConfig.destinationConfirmations)] });
+      // The architecture permits an independent receipt observer. Target only
+      // this intent so the new closure cannot advance unrelated historical work.
+      const confirmed = await observedManager.recoverTransactionsOnce({ deliveryJobId: pack.deliveryJobId });
+      assert.equal(confirmed.scanned, 1); assert.equal(confirmed.finalized, 1); assert.equal(confirmed.rebroadcast, 0);
+      assert.equal(confirmed.results[0].action, "FINALIZED"); assert.equal(confirmed.results[0].status, "CONFIRMED");
+      const final = await manager.repository.getTransaction(pack.deliveryJobId);
+      assert.equal(final.intent.status, "CONFIRMED"); assert.equal(final.attempt.status, "CONFIRMED");
+      assert.equal(final.intent.winningAttemptId, original.attempt.attemptId); assert.equal(final.attempts.length, 1);
+      assert.equal(final.attempt.replacementOfAttemptId, null); assert.equal(final.attempt.attemptNumber, 0);
+      assert.equal(final.attempt.receiptBlockNumber, receipt.blockNumber.toString()); assert.equal(final.attempt.receiptBlockHash, receipt.blockHash);
+      assert.equal(final.attempt.receiptStatus, 1); assert.equal(final.attempt.broadcastAttemptCount, "1");
+      assert.ok(BigInt(final.attempt.confirmedHead) >= receipt.blockNumber + relayConfig.destinationConfirmations - 1n);
+      for (const field of ["intentId", "nonce", "senderAddress", "destinationGateway", "calldata", "packageDigest", "value"]) {
+        assert.ok(final.intent[field] === original.intent[field], `confirmation must preserve original intent ${field}`);
+      }
+      for (const field of ["attemptId", "nonce", "rawSignedTransaction", "transactionHash", "gasLimit", "maxFeePerGas", "maxPriorityFeePerGas"]) {
+        assert.ok(final.attempt[field] === original.attempt[field], `confirmation must preserve original signed ${field}`);
+      }
+      assert.deepEqual(await manager.repository.getAccount(), takeover.accountSigned);
+      assert.equal(BigInt(await client.request({ method: "eth_getTransactionCount", params: [relayConfig.relayerAddress, "pending"] })), expectedNonce + 1n);
+      assert.equal(takeover.a.exited, true); assert.equal((await takeover.a.closed).signal, "SIGKILL");
+      assert.equal(takeover.b.messages.filter(message => message.type === "lease").length, 1);
+      const counts = (await pool.query(`SELECT
+        (SELECT COUNT(*) FROM ${intents} WHERE delivery_job_id = $1)::text AS intents,
+        COUNT(DISTINCT nonce)::text AS nonces,COUNT(*)::text AS attempts,
+        COUNT(*) FILTER (WHERE attempt_number = 0)::text AS initial,
+        COUNT(*) FILTER (WHERE replacement_of_attempt_id IS NOT NULL)::text AS replacements,
+        COUNT(DISTINCT transaction_hash)::text AS hashes FROM ${attempts} WHERE delivery_job_id = $1`, [pack.deliveryJobId])).rows[0];
+      assert.deepEqual(counts, { intents: "1", nonces: "1", attempts: "1", initial: "1", replacements: "0", hashes: "1" });
+      await assertOneReady();
+      for (const [address, abi, eventName] of [[gateway, gatewayAbi, "CrossChainMessageExecuted"], [application, appAbi, "VerifiedSupplierGranted"]]) {
+        const events = await client.getContractEvents({ address, abi, eventName, args: { messageId: event.messageId }, fromBlock: 0n, toBlock: "latest", strict: true });
+        assert.equal(events.length, 1); assert.equal(events[0].transactionHash, original.attempt.transactionHash);
+      }
+      const targetJournals = (await pool.query(`SELECT e.* FROM ${journals} e JOIN ${attempts} a USING (attempt_id)
+        WHERE a.delivery_job_id = $1 ORDER BY e.event_id`, [pack.deliveryJobId])).rows;
+      assert.equal(targetJournals.length, 2);
+      assert.equal(targetJournals.filter(row => row.parent_event_id === null).length, 1);
+      assert.equal(targetJournals.filter(row => row.parent_event_id !== null).length, 1);
+      for (const row of targetJournals) {
+        assert.notEqual(row.completed_at, null); assert.equal(row.result_class, "ACCEPTED");
+        assert.equal(row.error_class, null); assert.equal(row.returned_tx_hash, original.attempt.transactionHash);
+      }
+      assert.equal(observer.calls.filter(call => call.method === "eth_sendRawTransaction").length, 1);
+      assert.equal(observer.errors.length, 0);
+      const repeated = await projector.materializeBatch({ batchRecordId: committed.record.batchRecordId });
+      assert.equal(repeated.materialized, false); assert.equal(repeated.createdJobs, 0);
+      assert.deepEqual(await lifecycle.readBatch({ batchRecordId: committed.record.batchRecordId }), committed);
+      assert.deepEqual(await rowsFor([event.messageId]), sourceRows);
+      for (const previous of previousBatches) assert.deepEqual(await lifecycle.readBatch({ batchRecordId: previous.record.batchRecordId }), previous);
+      assert.deepEqual((await readMessages(pool, config.databaseSchema)).filter(row => previousIds.has(row.id)), previousRows);
+      const afterTransport = await transportRows();
+      const targetAttempts = new Set(afterTransport.attempts.filter(row => row.delivery_job_id === pack.deliveryJobId).map(row => row.attempt_id));
+      for (const name of ["jobs", "intents", "attempts"]) {
+        assert.ok(isDeepStrictEqual(afterTransport[name].filter(row => row.delivery_job_id !== pack.deliveryJobId), beforeTransport[name]), `historical ${name} remain unchanged`);
+      }
+      assert.ok(isDeepStrictEqual(afterTransport.journals.filter(row => !targetAttempts.has(row.attempt_id)), beforeTransport.journals), "historical broadcast evidence remains unchanged");
+      await assertHealthyValidators();
+      console.log(`VALID: Relayer B completed the persisted transaction ${receipt.transactionHash} through production Tx Manager, DestinationGateway and ApplicationB; CONFIRMED with configured canonical depth ${relayConfig.destinationConfirmations}`);
+      console.log(`VALID: the target message ${event.messageId} was not lost across Relayer A process failure; A remained offline until confirmation and business execution`);
+      console.log("VALID: one READY identity, one delivery intent, one nonce, one initial signed attempt, zero replacements, one canonical transaction and one business execution; source occurrence, batch/root, membership, pinned committee, QC and historical evidence unchanged");
+    } catch (error) { failure = error; throw error; }
+    finally {
+      // Stop owned workers before their RPC observer. The outer cluster owns
+      // the shared pool and validators; this closure must not close those.
+      const cleanupErrors = [];
+      if (relayers) try { await relayers.close(); } catch (error) { cleanupErrors.push(error); }
+      if (observer) try { await observer.close(); } catch (error) { cleanupErrors.push(error); }
+      if (observer) cleanupErrors.push(...observer.errors);
+      if (cleanupErrors.length) throw new AggregateError(failure ? [failure, ...cleanupErrors] : cleanupErrors, "relayer-failure observation or cleanup failed");
+    }
+  }
 
   async function verifyPrimaryFailure() {
     const targetSupplier = "0x0000000000000000000000000000000000009041";

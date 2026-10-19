@@ -889,6 +889,8 @@ printf '     Stop a deterministic non-primary before votes and complete same-vie
 printf '     Restart the same identity/store without backfilling votes or replacing its first QC, then prove later consensus participation\n'
 printf '     Exercise genuine non-primary Byzantine signatures, cross-peer equivocation, conflicting-root votes and invalid QCs\n'
 printf '     Require one durable canonical committed root, three honest signers, zero conflicting delivery authority and production ApplicationB execution\n'
+printf '     Kill real Relayer A after committed SIGNED and before send; retain the same live B process through database-time lease expiry\n'
+printf '     Require higher-fence B takeover, exact intent/nonce/signed-byte reuse, stale-A rejection and one confirmed Gateway/ApplicationB execution\n'
 printf '     Stop the actual primary after durable, subset-only PRE-PREPARE delivery and before old-view quorum\n'
 printf '     Recover the same batch/root through real timeout, three-signer VIEW_CHANGE, verified NEW_VIEW and higher-view destination execution\n'
 
@@ -2030,7 +2032,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, non-primary Byzantine safety and canonical execution E2E, primary failure/view-change E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
+CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, non-primary Byzantine safety and canonical execution E2E, relayer process failure/natural-expiry signed takeover E2E, primary failure/view-change E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

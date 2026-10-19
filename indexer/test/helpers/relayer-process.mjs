@@ -79,7 +79,17 @@ try {
         }
       } });
     try {
-      const result = await worker.submitJob(request.id);
+      let result = await worker.submitJob(request.id);
+      // Keep the same B process alive across the crash and database-time
+      // expiry. Each retry is an explicit parent IPC command, never a timer.
+      if (request.mode === "takeover") {
+        let attempt = 0;
+        while (result.action === "BUSY") {
+          await notify({ type: "busy",attempt: ++attempt,result,pid: process.pid,workerId: config.workerId });
+          if ((await receive()).type !== "continue") throw new Error("invalid takeover retry command");
+          result = await worker.submitJob(request.id);
+        }
+      }
       if (request.mode === "race") await notify({ type: "ownership",fence: null,pid: process.pid,workerId: config.workerId });
       await notify({ type: "result",result,pid: process.pid,workerId: config.workerId });
     } catch (error) {
