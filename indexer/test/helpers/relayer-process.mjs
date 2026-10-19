@@ -35,12 +35,18 @@ async function checkpoint(name,payload) {
 }
 try {
   config = loadTransactionConfig(); pool = createDatabasePool(config);
+  pool.on("error", error => {
+    if (request?.mode !== "database-restart") throw error;
+    // Keep the verification IPC barrier alive while the real server is down.
+    // Production operations still fail; no connection/state recovery is done here.
+    console.log(`EXPECTED FAILURE: idle database connection lost (${error.code ?? "CONNECTION_LOST"})`);
+  });
   const queue = createDeliveryRepository({ config,pool });
   const liveRpc = createTransactionRpc(config);
   const persistedJobs = new Set();
   let preparation;
   function recordPreparationRpc(field,id = preparation?.deliveryJobId) {
-    if (request?.mode !== "rpc-outage-poll") return;
+    if (!["rpc-outage-poll","database-restart"].includes(request?.mode)) return;
     assert.ok(preparation && preparation.deliveryJobId === id,
       `${field} must belong to the active initial preparation; retry/recovery must reuse persisted transaction fields`);
     assert.ok(!persistedJobs.has(id),`job ${id}: ${field} attempted after the signed transaction was persisted`);
@@ -120,7 +126,7 @@ try {
   } else {
     // Observe the production preparation call without changing its job
     // selection, RPC results, nonce ordering, persistence or error handling.
-    const transactionManager = request.mode === "rpc-outage-poll" ? { ...manager,
+    const transactionManager = ["rpc-outage-poll","database-restart"].includes(request.mode) ? { ...manager,
       async prepareDeliveryTransaction(id,options) {
         assert.equal(preparation,undefined,"scheduled preparation calls must remain sequential");
         const activity = { deliveryJobId: id,estimates: 0,feeQuotes: 0,signatures: 0,outcome: "FAILED" };
@@ -202,7 +208,7 @@ try {
       await notify({ type: "result",pid: process.pid,workerId: config.workerId,iterations: iteration });
     } else {
       try {
-        let result = await worker.submitJob(request.id);
+        let result = request.mode === "database-restart" ? await worker.runOnce() : await worker.submitJob(request.id);
         // Keep the same B process alive across the crash and database-time
         // expiry. Each retry is an explicit parent IPC command, never a timer.
         if (request.mode === "takeover") {

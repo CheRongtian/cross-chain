@@ -74,6 +74,9 @@ CHAINS_PID=""
 TEMP_DIR=""
 VALIDATOR_PID_FILE=""
 RELAYER_PID_FILE=""
+POSTGRES_REGISTRY_FILE=""
+POSTGRES_VALIDATOR_PID_FILE=""
+POSTGRES_RELAYER_PID_FILE=""
 CURRENT_STEP="initialization"
 LAST_TX_HASH=""
 
@@ -477,7 +480,7 @@ cleanup() {
     trap - EXIT INT TERM
     set +e
 
-    for worker_pid_file in "$VALIDATOR_PID_FILE" "$RELAYER_PID_FILE"; do
+    for worker_pid_file in "$VALIDATOR_PID_FILE" "$RELAYER_PID_FILE" "$POSTGRES_VALIDATOR_PID_FILE" "$POSTGRES_RELAYER_PID_FILE"; do
       if [[ -n "$worker_pid_file" ]] && [[ -f "$worker_pid_file" ]]; then
         while IFS= read -r validator_pid; do
             if [[ "$validator_pid" =~ ^[1-9][0-9]*$ ]]; then
@@ -502,6 +505,14 @@ cleanup() {
       fi
     done
 
+    if [[ -n "$POSTGRES_REGISTRY_FILE" ]] && [[ -f "$POSTGRES_REGISTRY_FILE" ]]; then
+        printf '\nCleaning up the verification-owned PostgreSQL cluster...\n'
+        if ! node "$VALIDATOR_DIR/test/helpers/postgres-cluster.mjs" --dispose "$POSTGRES_REGISTRY_FILE"; then
+            printf 'ERROR: owned PostgreSQL cleanup failed; its ownership registry and data directory are retained.\n' >&2
+            exit_code=1
+        fi
+    fi
+
     if [[ "$STARTED_CHAINS" == "true" ]] && [[ -n "$CHAINS_PID" ]]; then
         printf '\nStopping the local chains started by this verification...\n'
         kill "$CHAINS_PID" 2>/dev/null || true
@@ -524,6 +535,8 @@ cleanup() {
             "$TEMP_DIR/destination-gateway-addresses.env" \
             "$TEMP_DIR/validator-pids" \
             "$TEMP_DIR/relayer-pids" \
+            "$TEMP_DIR/postgres-validator-pids" \
+            "$TEMP_DIR/postgres-relayer-pids" \
             "$TEMP_DIR/forwarding-calldata.txt"
         rmdir "$TEMP_DIR" 2>/dev/null || true
     fi
@@ -889,6 +902,13 @@ printf '     Verify exact timestamp scheduling after proven reorgs while stopped
 printf '292. Confirm a fresh real Gateway/ApplicationB execution, then replace only its destination branch using a local snapshot\n'
 printf '293. Require positive replacement-block evidence, all-candidate reconciliation and Gateway replay checks before recovery\n'
 printf '294. Reuse the exact persisted signed transaction, reconfirm on the replacement branch and count one canonical business execution\n'
+printf '295. Create a verification-owned loopback PostgreSQL cluster with existing server binaries and current production schemas\n'
+printf '296. Finalize a fresh ZK-authorized source message, commit its real four-validator QC and persist one READY job\n'
+printf '297. Stop only the owned PostgreSQL server after real Chain B acceptance and before send-result persistence\n'
+printf '298. Observe real database-dependent failures while both chains remain available; restart the same PGDATA\n'
+printf '299. Preserve source/batch/QC/PBFT history, cursors, counters, signed candidate and unresolved broadcast journal\n'
+printf '300. Resume fresh production workers through natural lease expiry, higher fencing and canonical transaction reconciliation\n'
+printf '301. Confirm the original transaction without another signature/send and require one Gateway/ApplicationB execution\n'
 printf '     Replace a real Chain A branch while a fresh authorized source occurrence is FINALIZING\n'
 printf '     Preserve terminal REORGED evidence and prove zero downstream batch/QC/READY/transaction/destination propagation\n'
 printf '     Resume a canonical replacement through the same schema, live validator cluster and production Gateway/ApplicationB\n'
@@ -930,6 +950,10 @@ NODE_MAJOR_VERSION="$(node -p 'Number(process.versions.node.split(".")[0])')"
     || fail "Validator dependencies are missing. Prepare the validator package dependencies before verification; this script does not install them."
 printf 'Verified Node.js version: %s\n' "$(node --version)"
 printf 'Verified Indexer dependency directories.\n'
+
+CURRENT_STEP="verification-owned PostgreSQL server tooling"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node "$VALIDATOR_DIR/test/helpers/postgres-cluster.mjs" --check-tools
 
 CURRENT_STEP="PostgreSQL connectivity verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1010,6 +1034,10 @@ node --test \
     "$VALIDATOR_DIR/test/validator-sets.test.mjs" \
     "$VALIDATOR_DIR/test/validator-set-golden.test.mjs" \
     "$VALIDATOR_DIR/test/pbft-certificate-golden.test.mjs"
+
+CURRENT_STEP="verification-owned PostgreSQL helper ownership, same-directory lifecycle and restart failure unit tests"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test "$VALIDATOR_DIR/test/postgres-cluster.test.mjs"
 
 CURRENT_STEP="isolated validator migrations, endpoint/history separation, consistent PREPARE reads, COMMIT locks, and quorum persistence tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1152,6 +1180,9 @@ CURRENT_STEP="on-chain ZK nullifier and revocation lifecycle"
 printf '\n[%s]\n' "$CURRENT_STEP"
 TEMP_PARENT="${TMPDIR:-/tmp}"
 TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-verification.XXXXXX")"
+POSTGRES_REGISTRY_FILE="$TEMP_DIR/postgres-cluster.json"
+POSTGRES_VALIDATOR_PID_FILE="$TEMP_DIR/postgres-validator-pids"
+POSTGRES_RELAYER_PID_FILE="$TEMP_DIR/postgres-relayer-pids"
 DEPLOYMENT_ADDRESSES_FILE="$TEMP_DIR/deployment-addresses.env"
 REMOTE_REGISTRY_ADDRESSES_FILE="$TEMP_DIR/remote-registry-addresses.env"
 VALIDATOR_REGISTRY_ADDRESSES_FILE="$TEMP_DIR/validator-registry-addresses.env"
@@ -2043,7 +2074,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, non-primary Byzantine safety and canonical execution E2E, relayer process failure/natural-expiry signed takeover E2E, two-process duplicate-delivery race E2E, all-path destination RPC outage/automatic resumption E2E, confirmed destination transaction reorg/reconfirmation E2E, primary failure/view-change E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
+CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, non-primary Byzantine safety and canonical execution E2E, relayer process failure/natural-expiry signed takeover E2E, two-process duplicate-delivery race E2E, all-path destination RPC outage/automatic resumption E2E, confirmed destination transaction reorg/reconfirmation E2E, primary failure/view-change E2E, owned PostgreSQL stop/same-storage restart and canonical transaction recovery E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 printf '%s\n' 'RPC recovery accounting: distinguish pre-sign nonce-blocked preparation from persisted transaction reuse; reject post-persistence gas estimation, fee repricing or signing.'
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
@@ -2063,6 +2094,7 @@ INDEXER_INTEGRATION_DESTINATION_GATEWAY="$DESTINATION_GATEWAY" \
 INDEXER_INTEGRATION_DESTINATION_RECEIVER="$DESTINATION_RECEIVER" \
 VALIDATOR_VERIFICATION_PID_FILE="$VALIDATOR_PID_FILE" \
 RELAYER_VERIFICATION_PID_FILE="$RELAYER_PID_FILE" \
+POSTGRES_VERIFICATION_REGISTRY_FILE="$POSTGRES_REGISTRY_FILE" \
 VALIDATOR_SET_REGISTRY_ADDRESS="$VALIDATOR_SET_REGISTRY" \
 PBFT_CERTIFICATE_VERIFIER_ADDRESS="$PBFT_CERTIFICATE_VERIFIER" \
 MERKLE_INCLUSION_VERIFIER_ADDRESS="$MERKLE_INCLUSION_VERIFIER" \

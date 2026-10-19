@@ -54,6 +54,7 @@ The current implementation can:
 - recover the Indexer from a persisted next-block cursor after graceful or abrupt process loss;
 - preserve `OBSERVED`, `FINALIZING`, `FINALIZED`, and `REORGED` lifecycle data across worker restarts;
 - recreate a failed or closed PostgreSQL client and continue from durable database state;
+- recover from a temporary PostgreSQL server outage using the same persistent storage, original consensus evidence and canonical destination-chain reconciliation;
 - run four independent validator processes with distinct secp256k1 identities and isolated state;
 - authenticate configured peer identities with source-bound challenge-response signatures;
 - independently verify canonical source blocks, receipts, raw event logs, and fixed-head finality;
@@ -1651,6 +1652,22 @@ When execution disappeared, ordinary leased Relayer/Tx Manager operations can re
 
 Unified verification includes `[Destination Transaction Reorg Recovery]`: a fresh authenticated message reaches CONFIRMED through the real source/finality/batch/PBFT/Relayer/Gateway/ApplicationB pipeline. A local destination snapshot immediately before its external send preserves prior deployments and executions. Snapshot rollback, removal of only the displaced target from the local pending pool when necessary, and deterministic alternate-block mining remove that message's execution. Normal receipt scans discover the changed canonical block, retain the old receipt, and reopen recovery. Fresh database clients resume the same signed transaction; final confirmation requires one canonical Gateway event and one ApplicationB transition. Source, QC, queue and historical evidence remain unchanged. The scenario does not stop a database service, kill a relayer, introduce another chain or inject another consensus/RPC fault.
 
+### PostgreSQL service restart recovery
+
+Protocol workers derive restart recovery from durable PostgreSQL state rather than process memory. Database-dependent operations fail closed during a temporary server outage: no in-memory cursor, vote, job ownership, nonce reservation or transaction outcome substitutes for a successful durable write. Existing Indexer/Finality passes fail, and a validator scheduler may halt or its process may exit when database connections disappear. Once the same database becomes available, an operator or supervisor can restart the existing production processes with the same identities, configuration and schemas. The repository does not provide a database availability supervisor or an automatic worker-restart service.
+
+Source occurrences and lifecycles, sealed batch membership and Message Roots, historical committee bindings, PBFT safety locks/votes/views/certificates, delivery jobs, transaction intents, reserved nonces, retry schedules and broadcast/receipt history remain in their existing stores. They are read and validated again through the production components. PostgreSQL provides operational durability; it grants no cross-chain authorization and does not replace source canonical/finality checks, QC/Merkle/package authentication or destination canonical receipt/replay checks.
+
+A database restart releases session/advisory locks, without erasing durable leases or fencing counters. A fresh Relayer establishes a new session and uses the existing database-time lease-expiry/acquisition rules; an old fence cannot authorize a mutation after a higher token has been issued. If Chain B accepted a signed transaction before the local send-result write failed, the existing recovery journal and persisted hash direct canonical receipt/transaction reconciliation before any repeat send. Restart alone does not authorize a new intent, nonce, signature or replacement. Receipt, recovery and terminal-canonicality scan cursors are durable operational progress, not destination finality authority.
+
+Complete verification includes `[PostgreSQL Restart Recovery]` on a separately owned temporary PostgreSQL cluster. Existing server binaries initialize this disposable cluster once, with an independent local port, loopback-only TCP access, synchronous durable writes and no shared user-database storage. Current Indexer and validator migrations create the real schemas. Four active production validator processes form a genuine QC for a fresh exact-intent ZK-authorized message; production delivery/transaction components persist its intent, nonce, signed candidate and endpoint journal before the actual Chain B send.
+
+The existing accepted-endpoint IPC barrier pauses before result persistence. Verification stops only its own PostgreSQL server with `pg_ctl -m immediate`, verifies that it is unavailable, and lets a normal database-dependent operation and the interrupted Relayer fail. Both chains remain available. It restarts the same PGDATA without another `initdb`, migrations, table reseeding or SQL lifecycle repair. Fresh connections compare the original persisted state; affected validators resume with the same identities/stores, and a fresh Relayer acquires valid ownership and reconciles the original accepted transaction. Confirmation and event readback require one canonical Gateway consumption and one ApplicationB supplier transition, with no second signature or send. This is the verified restart scenario, not a global exactly-once guarantee under arbitrary failures.
+
+The helper and root shell trap clean up only the cluster, files and processes owned by that verification run. They never stop a Homebrew/system PostgreSQL service or operate on PGDATA derived from the configured user `DATABASE_URL`. The temporary local cluster uses host trust authentication only on its ephemeral loopback listener; it is a local verification fixture, not production database configuration. Missing server binaries fail verification clearly without a fake client-only restart or an installation attempt.
+
+This recovery model assumes PostgreSQL's persistent data remains intact. Permanent database loss is a separate disaster-recovery problem; the chains cannot reconstruct all historical off-chain votes, journals and operational state. Database replication, HA and automatic failover are outside this implementation.
+
 ### Verification and destination boundary
 
 The unified flow preserves source, ZK, Merkle, PBFT, queue and direct-submission checks. Additional unit/database cases cover exact retries, error classification, fee arithmetic and limits, concurrent replacement, rollback, migration of old artifacts, old/new winners, canonical reverts and stopped-state recovery.
@@ -1698,7 +1715,7 @@ Install these tools before using the repository:
 - Node.js 22 or later;
 - npm;
 - Python 3;
-- PostgreSQL with a disposable or local project database.
+- PostgreSQL with a disposable or local project database, plus its existing `initdb`, `pg_ctl` and `pg_isready` server tools for the isolated restart scenario. Tools are resolved from the same installation through `PATH` or `pg_config --bindir`.
 
 Check the local environment:
 
@@ -1849,17 +1866,18 @@ For an optional early-rejection check, temporarily set the effective `FINALITY_B
 
 The script uses strict error handling and verifies the following boundaries:
 
-- **Environment and persistence:** the fixed full-verification finality profile, existing dependencies, PostgreSQL connectivity, ordered migrations, atomic rollback and recovery through fresh clients. It performs no dependency installation or database creation.
+- **Environment and persistence:** the fixed full-verification finality profile, existing dependencies/server tools, PostgreSQL connectivity, ordered migrations, atomic rollback and recovery through fresh clients. No dependencies are installed and no database is created on the user's configured server; only the separately owned restart cluster is initialized for its fault scenario.
 - **Credential authorization:** credential/state/nullifier models, Groth16 proof generation and Solidity verifier export, exact forwarding-intent binding, policy/expiry/revocation checks and rejected replay or altered public inputs.
 - **Source contracts:** the full Solidity suite with strict build/lint gates, source-application admission, canonical message/domain/Gateway separation, precise routing/deadline errors, atomic nullifier/nonce behavior and real source events.
 - **Indexing and source finality:** fixed-head scans, exact-log idempotency, eventless canonical blocks, worker restarts, offline catch-up, source-fork reconciliation and FINALIZED-only batch eligibility.
 - **Batch and Merkle commitments:** bounded deterministic collection, immutable sealing and historical snapshots, concurrent retries/rollback, shared JavaScript/Solidity golden vectors and real sealed-batch inclusion proofs.
 - **Consensus and historical authority:** independent validator source checks, four-member committees with three-voter quorum, PRE-PREPARE/PREPARE/COMMIT/QC, durable vote locks, crash/partition/heal and view recovery, five development identities across separate historical committees, and exact Chain B registry/QC verification.
 - **Durable delivery:** strict COMMITTED-to-READY projection, independently verified packages, destination-scoped leased workers, preparation-defer fairness, persistent signing/nonce allocation, exact retries and same-nonce replacement, fair receipt/recovery scans, RPC failover and fresh-process crash reconciliation.
+- **PostgreSQL service recovery:** a genuine owned-server stop after real destination acceptance, failed database-dependent progress, same-PGDATA WAL recovery, unchanged source/consensus/delivery/transaction history, valid new ownership and canonical reconciliation of the original signed transaction without a duplicate business execution.
 - **Destination execution:** actual Chain B registries/verifiers and production `DestinationGateway`/`ApplicationB` deployment, canonical transport-v1 `execute(bytes)` parity and limits, QC → Merkle → full-message/domain checks, message-ID replay, exact receiver authority, atomic rollback/retry and supplier-state/event readback.
 - **Compatibility and negative boundaries:** unchanged legacy v1/v2 and current v3 certificates, historical signed transactions and opaque payloads, independent stateless/test-harness checks, precise invalid-evidence rejection and full real source-to-application execution through production Relayer/Transaction Manager APIs.
 
-`DATABASE_URL` is required and should point to a database intended for local verification. The flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database, install npm packages, or generate an Indexer lockfile.
+`DATABASE_URL` is required and should point to a database intended for local verification. The ordinary flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database on the configured user server, install npm packages, or generate an Indexer lockfile. The restart scenario separately creates one disposable verification-owned cluster and removes only that cluster after its processes have stopped. Its isolated connection URL is derived at runtime; no additional password or setup commands are required.
 
 If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
 
@@ -1879,6 +1897,8 @@ Complete End-to-End Cross-Chain Execution
 ```
 
 ### Expected error output
+
+Within `[PostgreSQL Restart Recovery]`, the marked database-outage window deliberately produces connection failures and may halt or exit validators that depend on the owned server. These diagnostics are expected only within that controlled window. The scenario must subsequently prove same-storage recovery, fresh-worker continuation and exact business-event counts; an unrelated error or missing recovery assertion still fails the root script.
 
 Complete verification intentionally executes negative cases, so a passing log can contain:
 
@@ -2177,6 +2197,7 @@ Cross-Chain/
 │   │   ├── validator-set-golden.test.mjs
 │   │   ├── validator-sets.test.mjs
 │   │   ├── pbft-certificate-golden.test.mjs
+│   │   ├── postgres-cluster.test.mjs
 │   │   ├── view-change.test.mjs
 │   │   ├── commit.test.mjs
 │   │   ├── config.test.mjs
@@ -2199,6 +2220,8 @@ Cross-Chain/
 │   │       ├── pbft-certificate.mjs
 │   │       ├── pbft-certificate-contract.mjs
 │   │       ├── process-cluster.mjs
+│   │       ├── postgres-cluster.mjs
+│   │       ├── postgres-restart-scenarios.mjs
 │   │       ├── rotation-scenarios.mjs
 │   │       ├── validator-set-registry.mjs
 │   │       └── view-change-scenarios.mjs
@@ -2254,7 +2277,7 @@ Cross-Chain/
 - An unfinalized orphan is retained as terminal `REORGED` data and is never batch eligible. A replacement occurrence has its own block-hash identity and lifecycle.
 - A fork that reaches a `FINALIZED` occurrence fails closed and requires operator investigation; configured block depth therefore remains a policy choice with real reorganization risk.
 - Transactional block, message, cursor, reorganization, and finality writes support single-node worker restart recovery after graceful or abrupt process loss. Database-enforced source-event uniqueness makes exact-log retries and rescans idempotent without overwriting first-observation data or lifecycle status.
-- PostgreSQL client errors fail the active pass. Recovery requires a fresh client or worker process connected to the same durable database; the project does not manage PostgreSQL server availability, replication, or automatic failover.
+- PostgreSQL connection errors fail database-dependent work. Recovery requires fresh connections or normal worker restarts against the same durable database; the owned-server restart verification preserves operational and PBFT state and reconciles an ambiguous accepted destination transaction. Permanent data loss, PostgreSQL availability management, replication and automatic failover remain separate concerns.
 - The runtime supports one active Indexer and one active Finality Watcher concurrently. Each watcher pass evaluates a fixed head snapshot, preserves canonical Indexer progress beyond it, and leaves newer occurrences for a later pass. Multi-instance coordination, distributed locking, active-active failover, and zero-downtime orchestration remain unimplemented.
 - The current message binds its protocol type, source domain, source gateway, source sender, destination domain, destination gateway, destination receiver, nonce, payload hash, and deadline.
 - A committed destination gateway is caller-selected. `SourceGateway` does not validate remote deployment, domain ownership, or trust. Chain B's `RemoteGatewayRegistry` supplies current administrator-configured source-domain/SourceGateway authority to `MessageDomainVerifier`; the production Gateway supplies address(this) as the independent expected destination target.
