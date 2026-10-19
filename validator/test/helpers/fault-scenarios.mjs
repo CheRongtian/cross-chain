@@ -230,7 +230,7 @@ async function nonPrimaryCrash(ctx) {
   console.log("VALID: restarted offline validator independently verified the committed QC without claiming historical votes");
 }
 
-async function signAdversarial(ctx, index, fields, digestFunction) {
+export async function signAdversarial(ctx, index, fields, digestFunction) {
   const digest = digestFunction(fields);
   const signature = await validatorAccount(ctx.keys[index]).signMessage({ message: { raw: digest } });
   const signer = (await recoverMessageAddress({ message: { raw: digest }, signature })).toLowerCase();

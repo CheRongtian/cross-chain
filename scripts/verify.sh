@@ -887,6 +887,8 @@ printf '     Preserve terminal REORGED evidence and prove zero downstream batch/
 printf '     Resume a canonical replacement through the same schema, live validator cluster and production Gateway/ApplicationB\n'
 printf '     Stop a deterministic non-primary before votes and complete same-view 3-of-4 consensus and destination execution\n'
 printf '     Restart the same identity/store without backfilling votes or replacing its first QC, then prove later consensus participation\n'
+printf '     Exercise genuine non-primary Byzantine signatures, cross-peer equivocation, conflicting-root votes and invalid QCs\n'
+printf '     Require one durable canonical committed root, three honest signers, zero conflicting delivery authority and production ApplicationB execution\n'
 
 CURRENT_STEP="full verification finality profile validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -2026,7 +2028,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
+CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, non-primary Byzantine safety and canonical execution E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

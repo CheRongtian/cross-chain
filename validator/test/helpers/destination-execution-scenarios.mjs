@@ -22,7 +22,12 @@ import { loadTransactionConfig } from "../../../indexer/src/transaction-manager/
 import { createTransactionManager } from "../../../indexer/src/transaction-manager/service.mjs";
 import { createTransactionRpc } from "../../../indexer/src/transaction-manager/rpc.mjs";
 import { deterministicPrimary } from "../../src/committee.mjs";
+import { prePrepareDigest } from "../../src/pre-prepare.mjs";
+import { authenticatePrepare, prepareDigest } from "../../src/prepare.mjs";
+import { authenticateCommit, commitDigest } from "../../src/commit.mjs";
+import { expectedCommitStatement, qcDigest, verifyQuorumCertificate } from "../../src/quorum-certificate.mjs";
 import { developmentKeys } from "./fixtures.mjs";
+import { signAdversarial } from "./fault-scenarios.mjs";
 import { snapshotContext, encodeCertificate } from "./pbft-certificate.mjs";
 import { snapshotInclusions } from "../../../indexer/test/helpers/merkle-inclusion-contract.mjs";
 import { canonicalDomainMessage } from "../../../indexer/test/helpers/message-domain-contract.mjs";
@@ -124,6 +129,10 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
     assert.ok(participants.includes(primary));
     assert.equal((await request(primary, "/pbft/propose", { batchId: pending.record.batchId })).status, 200);
     for (const index of participants) assert.equal((await request(index, "/pbft/prepare/cast", { epoch: pending.record.epoch.toString() })).status, 200);
+    return commitPrepared(pending, participants);
+  }
+
+  async function commitPrepared(pending, participants) {
     for (const index of participants.slice(0, 3)) assert.equal((await request(index, "/pbft/commit/cast", { epoch: pending.record.epoch.toString() })).status, 200);
     const qc = (await request(participants[0], "/pbft/qc", { epoch: pending.record.epoch.toString() })).body.certificate;
     assert.ok(qc);
@@ -133,7 +142,7 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
       return value.record.status === "COMMITTED" ? value : null;
     }, participants);
     await registryChecks.assertQcBinding(committed.quorumCertificate);
-    console.log(`VALID: bounded canonical batch ${committed.record.batchId}; Message Root ${committed.record.messageRoot}; validator epoch ${selected.validatorEpoch}; real PBFT QC → COMMITTED`);
+    console.log(`VALID: bounded canonical batch ${committed.record.batchId}; Message Root ${committed.record.messageRoot}; validator epoch ${committed.consensusBinding.validatorEpoch}; real PBFT QC → COMMITTED`);
     return committed;
   }
 
@@ -416,7 +425,309 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   console.log("VALID: following fresh READY job progressed through the real Relayer/Gateway/ApplicationB within the two-group bound; earlier actual mined REVERTED remained final; deferred message has no transaction outcome");
   await verifySourceReorgRecovery();
   await verifyValidatorFailureRecovery();
+  await verifyByzantineSafety();
   console.log("COMPLETE END-TO-END EXECUTION EVIDENCE RECORDED: fresh ZK intent → source event → real finality/batch/PBFT/READY → production Relayer/Tx Manager → atomic Gateway/ApplicationB; duplicate rejection and business rollback; historical snapshots unchanged");
+
+  async function verifyByzantineSafety() {
+    const targetSupplier = "0x0000000000000000000000000000000000009031";
+    const grant = supplier => encodeAbiParameters([{ type: "uint8" }, { type: "uint8" }, { type: "address" }], [1, 1, supplier]);
+    assert.equal(grant(supplier), payload);
+    assert.equal(await readApp("isVerifiedSupplier", [targetSupplier]), false);
+    const sourceBatches = tableName(config.databaseSchema, "message_batches");
+    const certificates = tableName(config.databaseSchema, "batch_quorum_certificates");
+    const projections = tableName(config.databaseSchema, "delivery_batches");
+    const jobs = tableName(config.databaseSchema, "delivery_jobs");
+    const attempts = tableName(config.databaseSchema, "transaction_attempts");
+    const intents = tableName(config.databaseSchema, "transaction_intents");
+    const journals = tableName(config.databaseSchema, "transaction_broadcast_events");
+    const scope = [config.chainDomain.toString(), config.sourceGateway];
+    const previousRows = await readMessages(pool, config.databaseSchema);
+    const previousIds = new Set(previousRows.map(row => row.id));
+    const previousBatches = [];
+    for (const row of (await pool.query(`SELECT batch_record_id FROM ${sourceBatches}
+      WHERE source_domain = $1 AND source_gateway = $2 ORDER BY epoch`, scope)).rows) {
+      previousBatches.push(await lifecycle.readBatch({ batchRecordId: row.batch_record_id }));
+    }
+    async function transportEvidence() {
+      return { account: await manager.repository.getAccount(),
+        pendingNonce: BigInt(await client.request({ method: "eth_getTransactionCount", params: [relayConfig.relayerAddress, "pending"] })),
+        intents: (await pool.query(`SELECT * FROM ${intents} ORDER BY delivery_job_id`)).rows,
+        attempts: (await pool.query(`SELECT * FROM ${attempts} ORDER BY attempt_id`)).rows,
+        journals: (await pool.query(`SELECT * FROM ${journals} ORDER BY event_id`)).rows };
+    }
+    const beforeTransport = await transportEvidence();
+    assert.ok(beforeTransport.account);
+    const event = await produceAndFinalize(grant(targetSupplier));
+    const pending = await prepareFreshBatch([event]);
+    assert.equal(pending.record.status, "CONSENSUS_PENDING");
+    assert.equal(pending.consensusBinding.protocolVersion, "3");
+    const selected = validatorSets.resolveByValidatorEpoch(pending.consensusBinding.validatorEpoch);
+    assert.equal(selected.validatorEpoch, validatorSets.resolveForBatchEpoch(pending.record.epoch).validatorEpoch);
+    assert.equal(selected.committeeDigest, pending.consensusBinding.committeeDigest);
+    assert.equal(selected.validators.length, 4);
+    const members = selected.validators.map(address => peers.findIndex(peer => peer.address === address));
+    assert.ok(members.every(index => index >= 0));
+    assert.equal(new Set(members.map(index => states[index].config.databaseSchema)).size, 4);
+    const originalPids = new Map(members.map(index => [index, validators[index].child.pid]));
+    async function assertReady() {
+      for (const index of members) {
+        assert.equal(validators[index].exited, false);
+        assert.equal(validators[index].child.pid, originalPids.get(index));
+        const health = await request(index, "/health");
+        assert.equal(health.status, 200); assert.equal(health.body.ready, true);
+        assert.equal(health.body.pid, originalPids.get(index));
+        assert.equal(health.body.validatorAddress, peers[index].address);
+      }
+    }
+    await assertReady();
+    const registered = await until("all four validators registered the Byzantine target batch", async () => {
+      const views = await Promise.all(members.map(index => states[index].store.readViewState(pending.record.epoch)));
+      return views.every(Boolean) ? views : null;
+    }, members);
+    const view = registered[0].current_view;
+    assert.equal(view, "0", "an honest available primary must not need a view change here");
+    const primaryAddress = deterministicPrimary(selected.validators, pending.record.epoch, view);
+    const primary = peers.findIndex(peer => peer.address === primaryAddress);
+    const adversaryAddress = selected.validators.find(address => address !== primaryAddress);
+    const adversary = peers.findIndex(peer => peer.address === adversaryAddress);
+    const honest = members.filter(index => index !== adversary);
+    assert.ok(members.includes(adversary)); assert.notEqual(adversary, primary);
+    assert.equal(honest.length, 3); assert.ok(honest.includes(primary));
+    const honestAddresses = honest.map(index => peers[index].address).sort();
+    const statement = expectedCommitStatement({ ...pending.consensusBinding, view,
+      sourceDomain: config.chainDomain, sourceGateway: config.sourceGateway, epoch: pending.record.epoch,
+      batchId: pending.record.batchId, messageRoot: pending.tree.messageRoot }, { peers, validatorSets });
+    function assertContext(state) {
+      assert.equal(state.epoch, statement.epoch); assert.equal(state.batch_id, statement.batchId);
+      assert.equal(state.message_root, statement.messageRoot); assert.equal(state.protocol_version, 3);
+      assert.equal(state.validator_epoch, statement.validatorEpoch); assert.equal(state.committee_digest, statement.committeeDigest);
+      assert.equal(state.current_view, view); assert.equal(state.target_view, view); assert.equal(state.changing_view, false);
+    }
+    for (const state of registered) { assertContext(state); assert.equal(state.finalized, false); }
+    console.log(`VALID: Byzantine target ${statement.batchId} is CONSENSUS_PENDING; source ${statement.sourceDomain}/${statement.sourceGateway}, batch epoch ${statement.epoch}, validator epoch ${statement.validatorEpoch}, view ${view}; canonical root ${statement.messageRoot}; committee digest ${statement.committeeDigest}; four pinned members ${selected.validators.join(", ")}; quorum 3`);
+    console.log(`VALID: canonical-first non-primary Byzantine member ${adversaryAddress}, PID ${originalPids.get(adversary)}, endpoint ${peers[adversary].url}; honest primary ${primaryAddress}; three honest members ${honestAddresses.join(", ")}; all four processes stay online`);
+    const proposed = await request(primary, "/pbft/propose", { batchId: statement.batchId });
+    assert.equal(proposed.status, 200); assert.equal(proposed.body.result, "ACCEPTED");
+    assert.equal(proposed.body.proposalDigest, statement.proposalDigest);
+    const locks = new Map();
+    for (const index of members) {
+      const accepted = await states[index].store.readPrePrepare(statement.epoch, view);
+      assert.ok(accepted); assert.equal(accepted.envelope.messageRoot, statement.messageRoot);
+      assert.equal(accepted.envelope.proposalDigest, statement.proposalDigest);
+      assert.equal(accepted.envelope.primaryIdentity, primaryAddress);
+      locks.set(index, accepted);
+      assert.ok((await states[index].store.readObservations()).some(row => row.batch_id === statement.batchId && row.result === "VALID"));
+    }
+    async function assertLocks() {
+      await assertReady();
+      for (const index of members) {
+        assert.deepEqual(await states[index].store.readPrePrepare(statement.epoch, view), locks.get(index));
+        assertContext(await states[index].store.readViewState(statement.epoch));
+      }
+    }
+    async function reject(index, route, input, reason) {
+      const response = await request(index, route, input);
+      assert.equal(response.status, 422); assert.equal(response.body.validatorAddress, peers[index].address);
+      assert.equal(response.body.result, "REJECTED"); assert.equal(response.body.reason, reason);
+    }
+    async function assertWeights(prepareVoters, commitVoters) {
+      const expectedPrepares = prepareVoters.map(index => peers[index].address).sort();
+      const expectedCommits = commitVoters.map(index => peers[index].address).sort();
+      for (const index of members) {
+        const prepared = await states[index].store.readPrepareState(statement.epoch, view);
+        const committed = await states[index].store.readCommitState(statement.epoch, view);
+        assert.equal(prepared.voteCount, prepareVoters.length); assert.equal(committed.voteCount, commitVoters.length);
+        assert.deepEqual(prepared.votes.map(vote => vote.voterIdentity).sort(), expectedPrepares);
+        assert.deepEqual(committed.votes.map(vote => vote.voterIdentity).sort(), expectedCommits);
+        assert.equal(prepared.prepared !== null, prepareVoters.length === 3);
+        assert.equal(committed.quorum !== null, commitVoters.length === 3);
+        assert.equal(committed.certificate !== null, commitVoters.length === 3);
+        if (prepared.prepared) assert.deepEqual([...prepared.prepared.quorumVoters].sort(), honestAddresses);
+        if (committed.quorum) assert.deepEqual([...committed.quorum.quorumVoters].sort(), honestAddresses);
+        for (const vote of [...prepared.votes, ...committed.votes]) {
+          for (const [field, value] of Object.entries(statement)) assert.equal(vote[field], value);
+          assert.ok(honestAddresses.includes(vote.voterIdentity));
+        }
+      }
+    }
+    async function assertDurableAuthority(isCommitted, isProjected = false) {
+      await assertLocks();
+      const context = [...scope, statement.epoch];
+      const rows = (await pool.query(`SELECT batch_record_id,batch_id,message_root,status FROM ${sourceBatches}
+        WHERE source_domain = $1 AND source_gateway = $2 AND epoch = $3`, context)).rows;
+      assert.deepEqual(rows, [{ batch_record_id: pending.record.batchRecordId, batch_id: statement.batchId,
+        message_root: statement.messageRoot, status: isCommitted ? "COMMITTED" : "CONSENSUS_PENDING" }]);
+      const rootCount = (await pool.query(`SELECT COUNT(DISTINCT message_root)::text AS count FROM ${sourceBatches}
+        WHERE source_domain = $1 AND source_gateway = $2 AND epoch = $3 AND status = 'COMMITTED'`, context)).rows[0].count;
+      assert.equal(rootCount, isCommitted ? "1" : "0");
+      const qcs = (await pool.query(`SELECT batch_id,message_root,protocol_version,validator_epoch,view,committee_digest,qc_digest
+        FROM ${certificates} WHERE source_domain = $1 AND source_gateway = $2 AND epoch = $3`, context)).rows;
+      assert.deepEqual(qcs, isCommitted ? [{ batch_id: statement.batchId, message_root: statement.messageRoot,
+        protocol_version: 3, validator_epoch: statement.validatorEpoch, view, committee_digest: statement.committeeDigest,
+        qc_digest: qcDigest(statement) }] : []);
+      const projected = (await pool.query(`SELECT batch_record_id,batch_id,message_root,validator_epoch,committee_digest,qc_digest
+        FROM ${projections} WHERE source_domain = $1 AND source_gateway = $2 AND batch_epoch = $3`, context)).rows;
+      assert.deepEqual(projected, isProjected ? [{ batch_record_id: pending.record.batchRecordId,
+        batch_id: statement.batchId, message_root: statement.messageRoot, validator_epoch: statement.validatorEpoch,
+        committee_digest: statement.committeeDigest, qc_digest: qcDigest(statement) }] : []);
+      for (const state of states) {
+        // Read the complete protected epoch, then inspect each binding/view/root.
+        // Filtering by the expected root would hide exactly the evidence under attack.
+        const schema = state.config.databaseSchema;
+        const references = (await state.pool.query(["pbft_epoch_views", "pbft_pre_prepares", "pbft_prepare_votes", "pbft_prepared_states",
+          "pbft_commit_votes", "pbft_commit_quorums"].map(name =>
+          `SELECT batch_id,message_root,protocol_version,validator_epoch,committee_digest,${name === "pbft_epoch_views" ? "current_view" : "view"} AS view FROM ${tableName(schema, name)}
+            WHERE local_validator_identity = $1 AND epoch = $2`).join(" UNION ALL "),
+        [state.config.validatorAddress, statement.epoch])).rows;
+        for (const row of references) assert.deepEqual(row, { batch_id: statement.batchId, message_root: statement.messageRoot,
+          protocol_version: 3, validator_epoch: statement.validatorEpoch, committee_digest: statement.committeeDigest, view });
+        const predicate = "local_validator_identity = $1 AND epoch = $2 AND batch_id = $3 AND validator_epoch = $4 AND view = $5 AND voter_identity = $6 AND protocol_version = 3";
+        const counts = (await state.pool.query(`SELECT
+          (SELECT COUNT(*) FROM ${tableName(schema, "pbft_prepare_votes")} WHERE ${predicate})::text AS prepares,
+          (SELECT COUNT(*) FROM ${tableName(schema, "pbft_commit_votes")} WHERE ${predicate})::text AS commits`,
+        [state.config.validatorAddress, statement.epoch, statement.batchId, statement.validatorEpoch, view, adversaryAddress])).rows[0];
+        assert.deepEqual(counts, { prepares: "0", commits: "0" });
+      }
+    }
+    await assertWeights([], []);
+    // Reuse the existing adversarial signer with ONLY this member's own key.
+    const signingContext = { peers, keys: { [adversary]: environments[adversary].VALIDATOR_PRIVATE_KEY } };
+    const roots = [1n, 2n].map(mask => `0x${(BigInt(statement.messageRoot) ^ mask).toString(16).padStart(64, "0")}`);
+    assert.equal(new Set([statement.messageRoot, ...roots]).size, 3);
+    const badStatements = roots.map(messageRoot => expectedCommitStatement({ ...statement, messageRoot,
+      proposalDigest: undefined }, { peers, validatorSets }));
+    const badProposal = await signAdversarial(signingContext, adversary, { messageType: "PRE_PREPARE",
+      protocolVersion: "3", sourceDomain: statement.sourceDomain, sourceGateway: statement.sourceGateway,
+      epoch: statement.epoch, view, validatorEpoch: statement.validatorEpoch, committeeDigest: statement.committeeDigest,
+      batchId: statement.batchId, messageRoot: roots[0], primaryIdentity: adversaryAddress }, prePrepareDigest);
+    for (const index of honest) await reject(index, "/pbft/pre-prepare", badProposal, "WRONG_PRIMARY");
+    await assertLocks(); await assertWeights([], []);
+    console.log(`EXPECTED FAILURE: genuine Byzantine PRE-PREPARE from ${adversaryAddress} rejected by every honest member with WRONG_PRIMARY; canonical proposal locks unchanged`);
+    const badPrepares = [];
+    const badCommits = [];
+    for (const bad of badStatements) {
+      const prepare = await signAdversarial(signingContext, adversary,
+        { messageType: "PREPARE", ...bad, voterIdentity: adversaryAddress }, prepareDigest);
+      const commit = await signAdversarial(signingContext, adversary,
+        { messageType: "COMMIT", ...bad, voterIdentity: adversaryAddress }, commitDigest);
+      // Prove valid recovered membership/signatures separately from rejection
+      // by the receiving process's canonical proposal and PREPARED state.
+      assert.deepEqual(await authenticatePrepare(states[honest[0]].config, prepare), prepare);
+      assert.deepEqual(await authenticateCommit(states[honest[0]].config, commit), commit);
+      badPrepares.push(prepare); badCommits.push(commit);
+    }
+    for (const field of ["voterIdentity", "sourceDomain", "sourceGateway", "epoch", "view", "batchId", "validatorEpoch", "committeeDigest"]) {
+      assert.equal(badPrepares[0][field], badPrepares[1][field]);
+    }
+    assert.notEqual(badPrepares[0].messageRoot, badPrepares[1].messageRoot);
+    assert.notEqual(badPrepares[0].prepareDigest, badPrepares[1].prepareDigest);
+    await reject(honest[0], "/pbft/prepare", badPrepares[0], "WRONG_ROOT");
+    await reject(honest[1], "/pbft/prepare", badPrepares[1], "WRONG_ROOT");
+    await assertLocks(); await assertWeights([], []);
+    console.log(`EXPECTED FAILURE: ${adversaryAddress} equivocated in batch epoch ${statement.epoch}, validator epoch ${statement.validatorEpoch}, view ${view}: root ${roots[0]} to ${peers[honest[0]].address}, root ${roots[1]} to ${peers[honest[1]].address}; both returned WRONG_ROOT and retained canonical locks`);
+    for (const index of honest.slice(0, 2)) {
+      assert.equal((await request(index, "/pbft/prepare/cast", { epoch: statement.epoch })).status, 200);
+    }
+    for (const index of honest) for (const bad of badPrepares) {
+      await reject(index, "/pbft/prepare", bad, "WRONG_ROOT");
+    }
+    await reject(honest[0], "/pbft/prepare", badPrepares[0], "WRONG_ROOT");
+    await assertWeights(honest.slice(0, 2), []);
+    await assertDurableAuthority(false);
+    assert.deepEqual(await lifecycle.readBatch({ batchRecordId: pending.record.batchRecordId }), pending);
+    assert.ok(isDeepStrictEqual(await transportEvidence(), beforeTransport), "malicious evidence must not allocate a nonce, intent, signed attempt or broadcast");
+    console.log("EXPECTED FAILURE: conflicting and repeated Byzantine PREPARE evidence added zero weight; two honest voters remained unprepared, with zero QC, COMMITTED root, READY projection or transaction allocation");
+    assert.equal((await request(honest[2], "/pbft/prepare/cast", { epoch: statement.epoch })).status, 200);
+    await assertWeights(honest, []);
+    const preparedBefore = new Map();
+    for (const index of members) preparedBefore.set(index, await states[index].store.readPrepareState(statement.epoch, view));
+    for (const index of honest) for (const bad of badCommits) {
+      await reject(index, "/pbft/commit", bad, "WRONG_ROOT");
+    }
+    await reject(honest[0], "/pbft/commit", badCommits[0], "WRONG_ROOT");
+    for (const index of members) assert.deepEqual(await states[index].store.readPrepareState(statement.epoch, view), preparedBefore.get(index));
+    await assertWeights(honest, []);
+    console.log("EXPECTED FAILURE: genuine conflicting-root COMMIT signatures returned WRONG_ROOT after honest PREPARED; duplicate malicious evidence added zero COMMIT weight and preserved PREPARED locks");
+    const forged = { messageType: "QUORUM_CERTIFICATE", ...badStatements[0], qcDigest: qcDigest(badStatements[0]), commits: [badCommits[0]] };
+    const duplicate = { ...forged, commits: [badCommits[0], badCommits[0], badCommits[0]] };
+    for (const [certificate, reason] of [[forged, "INSUFFICIENT_OR_INVALID_QC_EVIDENCE"], [duplicate, "DUPLICATE_QC_SIGNER"]]) {
+      await assert.rejects(() => verifyQuorumCertificate(certificate, { peers, validatorSets, expected: badStatements[0] }), { code: reason });
+      await reject(honest[0], "/pbft/qc/verify", certificate, reason);
+      await reject(honest[0], "/pbft/qc/submit", certificate, "WRONG_QC_MESSAGEROOT");
+    }
+    await assertDurableAuthority(false); await assertWeights(honest, []);
+    assert.deepEqual(await lifecycle.readBatch({ batchRecordId: pending.record.batchRecordId }), pending);
+    assert.ok(isDeepStrictEqual(await transportEvidence(), beforeTransport), "invalid QCs must not create transport authority or spend a nonce");
+    console.log("EXPECTED FAILURE: single-signer and repeated-signer malicious QCs failed exact production evidence checks and could not commit the conflicting root");
+    const committed = await commitPrepared(pending, honest);
+    const verified = await verifyQuorumCertificate(committed.quorumCertificate, { peers, validatorSets, expected: statement });
+    assert.deepEqual(verified, committed.quorumCertificate);
+    assert.equal(verified.commits.length, 3);
+    assert.deepEqual(verified.commits.map(vote => vote.voterIdentity).sort(), honestAddresses);
+    await assertWeights(honest, honest); await assertDurableAuthority(true);
+    await certificateChecks.snapshot(committed, "three honest signers committed the sole canonical root despite genuine Byzantine messages");
+    const reused = { ...forged, commits: verified.commits };
+    await assert.rejects(() => verifyQuorumCertificate(reused, { peers, validatorSets, expected: badStatements[0] }), { code: "MISMATCHED_COMMIT" });
+    await reject(honest[0], "/pbft/qc/verify", reused, "MISMATCHED_COMMIT");
+    await reject(honest[0], "/pbft/qc/submit", reused, "WRONG_QC_MESSAGEROOT");
+    assert.deepEqual(await lifecycle.readBatch({ batchRecordId: pending.record.batchRecordId }), committed);
+    console.log("EXPECTED FAILURE: canonical honest signatures reused under a conflicting QC statement returned MISMATCHED_COMMIT / WRONG_QC_MESSAGEROOT; the first durable QC stayed unchanged");
+    console.log(`VALID: exactly three honest PREPARE/COMMIT voters ${honestAddresses.join(", ")} formed QC ${verified.qcDigest}; sole committed root ${statement.messageRoot} in unchanged view ${view}; malicious roots ${roots.join(", ")} have zero QC or COMMITTED state`);
+    const projected = await projector.materializeBatch({ batchRecordId: committed.record.batchRecordId });
+    assert.equal(projected.createdJobs, 1);
+    const [pack] = await buildDeliveryPackages(committed, { validatorSets });
+    assert.equal(pack.message.messageId, event.messageId); assert.equal(pack.messageRoot, statement.messageRoot);
+    assert.deepEqual(pack.quorumCertificate, verified);
+    assert.equal((await queue.getDeliveryJob(pack.deliveryJobId)).status, "READY");
+    assert.equal(await readGateway("isMessageExecuted", [event.messageId]), false);
+    const encoded = await encodeGatewaySubmission(pack, { validatorSets });
+    await worker.submitJob(pack.deliveryJobId);
+    const sent = await manager.repository.getTransaction(pack.deliveryJobId);
+    assert.equal(sent.attempts.length, 1);
+    const receipt = await client.waitForTransactionReceipt({ hash: sent.attempt.transactionHash });
+    assert.equal(receipt.status, "success");
+    const transaction = await client.getTransaction({ hash: receipt.transactionHash });
+    assert.equal(transaction.to.toLowerCase(), gateway); assert.equal(transaction.value, 0n);
+    assert.equal(transaction.input, encoded.calldata); assert.equal(sent.intent.packageDigest, encoded.packageDigest);
+    const reserved = BigInt(beforeTransport.account.nextNonce);
+    const expectedNonce = reserved > beforeTransport.pendingNonce ? reserved : beforeTransport.pendingNonce;
+    assert.equal(BigInt(sent.intent.nonce), expectedNonce); assert.equal(BigInt(transaction.nonce), expectedNonce);
+    const executions = receipt.logs.filter(log => log.address.toLowerCase() === gateway).map(log => decodeEventLog({ abi: gatewayAbi, ...log }));
+    const grants = receipt.logs.filter(log => log.address.toLowerCase() === application).map(log => decodeEventLog({ abi: appAbi, ...log }));
+    assert.equal(executions.length, 1); assert.equal(executions[0].eventName, "CrossChainMessageExecuted");
+    assert.equal(executions[0].args.messageId, event.messageId); assert.equal(executions[0].args.batchId, statement.batchId);
+    assert.equal(executions[0].args.sourceDomain, config.chainDomain); assert.equal(executions[0].args.destinationReceiver.toLowerCase(), application);
+    assert.equal(grants.length, 1); assert.equal(grants[0].eventName, "VerifiedSupplierGranted");
+    assert.equal(grants[0].args.messageId, event.messageId); assert.equal(grants[0].args.supplier.toLowerCase(), targetSupplier);
+    assert.equal(await readGateway("isMessageExecuted", [event.messageId]), true);
+    assert.equal(await readApp("isVerifiedSupplier", [targetSupplier]), true);
+    await client.request({ method: "anvil_mine", params: [toHex(relayConfig.destinationConfirmations)] });
+    await manager.checkReceiptsOnce();
+    assert.equal((await manager.repository.getTransaction(pack.deliveryJobId)).intent.status, "CONFIRMED");
+    await assertDurableAuthority(true, true); await assertWeights(honest, honest);
+    assert.deepEqual(await lifecycle.readBatch({ batchRecordId: pending.record.batchRecordId }), committed);
+    const targetJobs = (await pool.query(`SELECT j.delivery_job_id,j.message_id FROM ${jobs} j JOIN ${projections} p USING (batch_record_id)
+      WHERE p.source_domain = $1 AND p.source_gateway = $2 AND p.batch_epoch = $3`, [...scope, statement.epoch])).rows;
+    assert.deepEqual(targetJobs, [{ delivery_job_id: pack.deliveryJobId, message_id: event.messageId }]);
+    for (const [address, abi, eventName] of [[gateway, gatewayAbi, "CrossChainMessageExecuted"], [application, appAbi, "VerifiedSupplierGranted"]]) {
+      assert.equal((await client.getContractEvents({ address, abi, eventName, args: { messageId: event.messageId },
+        fromBlock: 0n, toBlock: "latest", strict: true })).length, 1);
+    }
+    const afterTransport = await transportEvidence();
+    assert.equal(afterTransport.pendingNonce, expectedNonce + 1n);
+    assert.equal(BigInt(afterTransport.account.nextNonce), expectedNonce + 1n);
+    const targetAttempts = afterTransport.attempts.filter(row => row.delivery_job_id === pack.deliveryJobId);
+    assert.equal(targetAttempts.length, 1);
+    assert.equal(afterTransport.intents.filter(row => row.delivery_job_id === pack.deliveryJobId).length, 1);
+    const targetAttemptIds = new Set(targetAttempts.map(row => row.attempt_id));
+    assert.ok(isDeepStrictEqual(afterTransport.intents.filter(row => row.delivery_job_id !== pack.deliveryJobId), beforeTransport.intents), "historical transaction intents stay unchanged");
+    assert.ok(isDeepStrictEqual(afterTransport.attempts.filter(row => row.delivery_job_id !== pack.deliveryJobId), beforeTransport.attempts), "historical signed transaction bytes stay unchanged");
+    assert.ok(isDeepStrictEqual(afterTransport.journals.filter(row => !targetAttemptIds.has(row.attempt_id)), beforeTransport.journals), "historical broadcast journals stay unchanged");
+    assert.deepEqual((await readMessages(pool, config.databaseSchema)).filter(row => previousIds.has(row.id)), previousRows);
+    for (const previous of previousBatches) assert.deepEqual(await lifecycle.readBatch({ batchRecordId: previous.record.batchRecordId }), previous);
+    console.log(`VALID: one canonical READY job ${pack.deliveryJobId} and transaction lineage ${receipt.transactionHash} completed production Relayer/Tx Manager/Gateway/ApplicationB grant for ${event.messageId}; CONFIRMED; conflicting roots allocated zero extra nonce, intent, signed attempt, broadcast or destination execution`);
+    console.log("VALID: exactly one durable committed root for the protected target scope; four original processes remained online, honest primary/view and canonical QC stayed unchanged, historical source/QC/signed-transaction evidence preserved");
+  }
 
   async function verifyValidatorFailureRecovery() {
     const failureSupplier = "0x0000000000000000000000000000000000009021";
