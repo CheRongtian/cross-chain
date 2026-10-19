@@ -22,12 +22,15 @@ import { loadTransactionConfig } from "../../../indexer/src/transaction-manager/
 import { createTransactionManager } from "../../../indexer/src/transaction-manager/service.mjs";
 import { createTransactionRpc } from "../../../indexer/src/transaction-manager/rpc.mjs";
 import { deterministicPrimary } from "../../src/committee.mjs";
-import { prePrepareDigest } from "../../src/pre-prepare.mjs";
+import { authenticatePrePrepare, prePrepareDigest } from "../../src/pre-prepare.mjs";
 import { authenticatePrepare, prepareDigest } from "../../src/prepare.mjs";
 import { authenticateCommit, commitDigest } from "../../src/commit.mjs";
 import { expectedCommitStatement, qcDigest, verifyQuorumCertificate } from "../../src/quorum-certificate.mjs";
+import { authenticateNewView, authenticateViewChange } from "../../src/view-change.mjs";
+import { proposalIdentity } from "../../src/prepared-certificate.mjs";
 import { developmentKeys } from "./fixtures.mjs";
 import { signAdversarial } from "./fault-scenarios.mjs";
+import { createPeerProxy, createTransportGate } from "./fault-transport.mjs";
 import { snapshotContext, encodeCertificate } from "./pbft-certificate.mjs";
 import { snapshotInclusions } from "../../../indexer/test/helpers/merkle-inclusion-contract.mjs";
 import { canonicalDomainMessage } from "../../../indexer/test/helpers/message-domain-contract.mjs";
@@ -38,7 +41,7 @@ const quiet = { log() {}, warn() {}, error() {} };
 
 // Extends the existing real rotation cluster after its historical/fault assertions have completed.
 export async function verifyDestinationExecution({ config, pool, lifecycle, validatorSets, peers, states, environments,
-  validators, processes, request, until, produceMessage, historical, rpcUrl, registryChecks,
+  validators, processes, peerProxies, request, until, produceMessage, historical, rpcUrl, registryChecks,
   certificateChecks, merkleChecks, domainVerifierAddress }) {
   assert.equal(typeof produceMessage, "function", "fresh source authorization producer is required");
   const gateway = normalizeAddress(process.env.PRODUCTION_DESTINATION_GATEWAY_ADDRESS);
@@ -110,11 +113,16 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
     return event;
   }
 
-  async function prepareFreshBatch(events) {
+  async function sealFreshBatch(events) {
     const collected = await lifecycle.collectEligible();
     assert.equal(collected.assignedCount, events.length);
     const sealed = await lifecycle.sealBatch({ batchRecordId: collected.snapshot.record.batchRecordId });
     assert.deepEqual(sealed.batch.messageIds, events.map(event => event.messageId));
+    return sealed;
+  }
+
+  async function prepareFreshBatch(events) {
+    const sealed = await sealFreshBatch(events);
     return lifecycle.markConsensusPending({ batchRecordId: sealed.record.batchRecordId });
   }
 
@@ -426,7 +434,348 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   await verifySourceReorgRecovery();
   await verifyValidatorFailureRecovery();
   await verifyByzantineSafety();
+  await verifyPrimaryFailure();
   console.log("COMPLETE END-TO-END EXECUTION EVIDENCE RECORDED: fresh ZK intent → source event → real finality/batch/PBFT/READY → production Relayer/Tx Manager → atomic Gateway/ApplicationB; duplicate rejection and business rollback; historical snapshots unchanged");
+
+  async function verifyPrimaryFailure() {
+    const targetSupplier = "0x0000000000000000000000000000000000009041";
+    const grant = supplier => encodeAbiParameters([{ type: "uint8" }, { type: "uint8" }, { type: "address" }], [1, 1, supplier]);
+    assert.equal(grant(supplier), payload);
+    assert.equal(await readApp("isVerifiedSupplier", [targetSupplier]), false);
+    const sourceBatches = tableName(config.databaseSchema, "message_batches");
+    const certificates = tableName(config.databaseSchema, "batch_quorum_certificates");
+    const projections = tableName(config.databaseSchema, "delivery_batches");
+    const jobs = tableName(config.databaseSchema, "delivery_jobs");
+    const intents = tableName(config.databaseSchema, "transaction_intents");
+    const attempts = tableName(config.databaseSchema, "transaction_attempts");
+    const journals = tableName(config.databaseSchema, "transaction_broadcast_events");
+    const scope = [config.chainDomain.toString(), config.sourceGateway];
+    const previousRows = await readMessages(pool, config.databaseSchema);
+    const previousIds = new Set(previousRows.map(row => row.id));
+    const previousBatches = [];
+    for (const row of (await pool.query(`SELECT batch_record_id FROM ${sourceBatches}
+      WHERE source_domain = $1 AND source_gateway = $2 ORDER BY epoch`, scope)).rows) {
+      previousBatches.push(await lifecycle.readBatch({ batchRecordId: row.batch_record_id }));
+    }
+    async function transportEvidence() {
+      return { account: await manager.repository.getAccount(),
+        pendingNonce: BigInt(await client.request({ method: "eth_getTransactionCount", params: [relayConfig.relayerAddress, "pending"] })),
+        intents: (await pool.query(`SELECT * FROM ${intents} ORDER BY delivery_job_id`)).rows,
+        attempts: (await pool.query(`SELECT * FROM ${attempts} ORDER BY attempt_id`)).rows,
+        journals: (await pool.query(`SELECT * FROM ${journals} ORDER BY event_id`)).rows };
+    }
+    const beforeTransport = await transportEvidence();
+    assert.ok(beforeTransport.account);
+    const event = await produceAndFinalize(grant(targetSupplier));
+    const sealed = await sealFreshBatch([event]);
+    assert.equal(sealed.record.status, "SEALED");
+    const selected = validatorSets.resolveForBatchEpoch(sealed.record.epoch);
+    assert.equal(selected.validators.length, 4);
+    const members = selected.validators.map(address => peers.findIndex(peer => peer.address === address));
+    assert.ok(members.every(index => index >= 0));
+    assert.equal(new Set(members.map(index => states[index].config.databaseSchema)).size, 4);
+    assert.deepEqual((await pool.query(`SELECT batch_record_id FROM ${sourceBatches}
+      WHERE source_domain = $1 AND source_gateway = $2 AND status = 'CONSENSUS_PENDING'`, scope)).rows, []);
+
+    // Configure the existing identities/stores while the new batch is still
+    // SEALED. No live participant is restarted after the primary fault.
+    assert.ok(Array.isArray(peerProxies), "the existing cluster must own proxy cleanup");
+    const gate = createTransportGate(selected.validators);
+    const links = new Map(members.map(index => [index, new Map()]));
+    for (const from of members) for (const to of members) {
+      if (from === to) continue;
+      const proxy = await createPeerProxy({ from: peers[from].address, to: peers[to].address,
+        targetUrl: peers[to].url, gate, signal: processes.signal });
+      peerProxies.push(proxy); links.get(from).set(to, proxy);
+    }
+    for (const index of members) {
+      environments[index].VALIDATOR_PEERS = JSON.stringify(peers.map((peer, to) => ({ ...peer,
+        url: links.get(index).get(to)?.url ?? peer.url })));
+      environments[index].PBFT_VIEW_TIMEOUT_MS = "30000";
+      await processes.stop(validators[index]);
+      validators[index] = await processes.start(environments[index]);
+    }
+    const originalPids = new Map(members.map(index => [index, validators[index].child.pid]));
+    async function assertReady(indices) {
+      for (const index of indices) {
+        assert.equal(validators[index].exited, false);
+        assert.equal(validators[index].child.pid, originalPids.get(index));
+        const health = await request(index, "/health");
+        assert.equal(health.status, 200); assert.equal(health.body.ready, true);
+        assert.equal(health.body.pid, originalPids.get(index));
+        assert.equal(health.body.validatorAddress, peers[index].address);
+      }
+    }
+    await assertReady(members);
+    const pending = await lifecycle.markConsensusPending({ batchRecordId: sealed.record.batchRecordId });
+    assert.equal(pending.record.status, "CONSENSUS_PENDING");
+    assert.equal(pending.consensusBinding.protocolVersion, "3");
+    assert.equal(pending.consensusBinding.validatorEpoch, selected.validatorEpoch);
+    assert.equal(pending.consensusBinding.committeeDigest, selected.committeeDigest);
+    assert.deepEqual(validatorSets.resolveByValidatorEpoch(pending.consensusBinding.validatorEpoch), selected);
+    const registered = await until("all four validators registered the primary-failure batch", async () => {
+      const views = await Promise.all(members.map(index => states[index].store.readViewState(pending.record.epoch)));
+      return views.every(Boolean) ? views : null;
+    }, members);
+    const oldView = registered[0].current_view;
+    assert.equal(oldView, "0");
+    const newView = (BigInt(oldView) + 1n).toString();
+    const oldPrimaryAddress = deterministicPrimary(selected.validators, pending.record.epoch, oldView);
+    const oldPrimary = peers.findIndex(peer => peer.address === oldPrimaryAddress);
+    const live = members.filter(index => index !== oldPrimary);
+    assert.ok(members.includes(oldPrimary)); assert.equal(live.length, 3);
+    const liveAddresses = live.map(index => peers[index].address).sort();
+    const recipient = live[0];
+    const blocked = live.slice(1);
+    const newPrimaryAddress = deterministicPrimary(selected.validators, pending.record.epoch, newView);
+    const newPrimary = peers.findIndex(peer => peer.address === newPrimaryAddress);
+    assert.notEqual(newPrimary, oldPrimary); assert.ok(live.includes(newPrimary));
+    const oldStatement = expectedCommitStatement({ ...pending.consensusBinding, view: oldView,
+      sourceDomain: config.chainDomain, sourceGateway: config.sourceGateway, epoch: pending.record.epoch,
+      batchId: pending.record.batchId, messageRoot: pending.tree.messageRoot }, { peers, validatorSets });
+    const canonical = proposalIdentity(oldStatement);
+    function assertContext(state, view) {
+      assert.equal(state.epoch, oldStatement.epoch); assert.equal(state.batch_id, oldStatement.batchId);
+      assert.equal(state.message_root, oldStatement.messageRoot); assert.equal(state.protocol_version, 3);
+      assert.equal(state.validator_epoch, selected.validatorEpoch); assert.equal(state.committee_digest, selected.committeeDigest);
+      assert.equal(state.current_view, view); assert.equal(state.target_view, view); assert.equal(state.changing_view, false);
+    }
+    for (const state of registered) { assertContext(state, oldView); assert.equal(state.finalized, false); }
+    console.log(`VALID: primary-failure message ${event.messageId}, batch ${oldStatement.batchId}, batch epoch ${oldStatement.epoch}, validator epoch ${selected.validatorEpoch}, committee digest ${selected.committeeDigest}, canonical root ${oldStatement.messageRoot}; pinned members ${selected.validators.join(", ")}; quorum 3; old view ${oldView}, primary ${oldPrimaryAddress}, next view ${newView}, primary ${newPrimaryAddress}`);
+    for (const to of blocked) gate.blockRoute(oldPrimaryAddress, peers[to].address, "/pbft/pre-prepare");
+    const proposed = await request(oldPrimary, "/pbft/propose", { batchId: oldStatement.batchId });
+    assert.equal(proposed.status, 200); assert.equal(proposed.body.result, "ACCEPTED");
+    assert.equal(proposed.body.proposalDigest, oldStatement.proposalDigest);
+    assert.equal(proposed.body.deliveries.length, 3);
+    for (const to of live) {
+      const delivery = proposed.body.deliveries.find(entry => entry.peerAddress === peers[to].address);
+      assert.ok(delivery);
+      assert.equal(delivery.delivery, to === recipient ? "DELIVERED" : "FAILED");
+      if (to === recipient) assert.equal(delivery.result, "ACCEPTED");
+      const records = links.get(oldPrimary).get(to).records.filter(record => record.route === "/pbft/pre-prepare");
+      assert.equal(records.length, 1);
+      assert.equal(records[0].delivery, to === recipient ? "FORWARDED" : "BLOCKED");
+    }
+    const oldLocks = new Map();
+    for (const index of members) {
+      const accepted = await states[index].store.readPrePrepare(oldStatement.epoch, oldView);
+      if (index === oldPrimary || index === recipient) {
+        assert.ok(accepted);
+        assert.equal(accepted.envelope.proposalDigest, oldStatement.proposalDigest);
+        assert.equal(accepted.envelope.messageRoot, oldStatement.messageRoot);
+        await authenticatePrePrepare(states[index].config, accepted.envelope);
+      } else assert.equal(accepted, null);
+      oldLocks.set(index, accepted);
+      assertContext(await states[index].store.readViewState(oldStatement.epoch), oldView);
+      assert.deepEqual(await states[index].store.readViewChanges(oldStatement.epoch, newView), []);
+    }
+    const oldProposal = oldLocks.get(oldPrimary).envelope;
+    async function assertOldViewIncomplete() {
+      for (const index of members) {
+        assert.deepEqual(await states[index].store.readPrePrepare(oldStatement.epoch, oldView), oldLocks.get(index));
+        const prepares = await states[index].store.readPrepareState(oldStatement.epoch, oldView);
+        const commits = await states[index].store.readCommitState(oldStatement.epoch, oldView);
+        assert.equal(prepares.voteCount, 0); assert.equal(prepares.prepared, null);
+        assert.equal(commits.voteCount, 0); assert.equal(commits.quorum, null); assert.equal(commits.certificate, null);
+      }
+    }
+    await assertReady(members); await assertOldViewIncomplete();
+    assert.deepEqual(await lifecycle.readBatch({ batchRecordId: pending.record.batchRecordId }), pending);
+    assert.ok(isDeepStrictEqual(await transportEvidence(), beforeTransport), "incomplete old view must not allocate transaction authority");
+    assert.deepEqual((await pool.query(`SELECT batch_record_id FROM ${projections}
+      WHERE source_domain = $1 AND source_gateway = $2 AND batch_epoch = $3`, [...scope, oldStatement.epoch])).rows, []);
+    const offlineStore = states[oldPrimary].store;
+    const offlinePool = states[oldPrimary].pool;
+    const offlineSchema = states[oldPrimary].config.databaseSchema;
+    async function primaryEvidence() {
+      return { view: await offlineStore.readViewState(oldStatement.epoch),
+        proposal: await offlineStore.readPrePrepare(oldStatement.epoch, oldView),
+        prepares: await offlineStore.readPrepareState(oldStatement.epoch, oldView),
+        commits: await offlineStore.readCommitState(oldStatement.epoch, oldView),
+        viewChanges: await offlineStore.readViewChanges(oldStatement.epoch, newView),
+        newView: await offlineStore.readNewView(oldStatement.epoch, newView),
+        metadata: (await offlinePool.query(`SELECT * FROM ${tableName(offlineSchema, "validator_metadata")} WHERE singleton = true`)).rows,
+        history: (await offlinePool.query(`SELECT * FROM ${tableName(offlineSchema, "validator_set_history")} ORDER BY validator_epoch`)).rows };
+    }
+    const beforeStop = await primaryEvidence();
+    assertContext(beforeStop.view, oldView); assert.equal(beforeStop.view.finalized, false);
+    const stopped = validators[oldPrimary];
+    try { await processes.stop(stopped); }
+    finally { gate.heal(); }
+    async function assertOffline() {
+      assert.equal(validators[oldPrimary], stopped); assert.equal(stopped.exited, true);
+      const exit = await stopped.closed;
+      assert.ok(exit.code === 0 || exit.signal === "SIGTERM" || exit.signal === "SIGKILL");
+      await assertReady(live);
+      assert.equal(members.filter(index => !validators[index].exited).length, 3);
+      assert.deepEqual(await primaryEvidence(), beforeStop);
+      for (const state of states) {
+        const schema = state.config.databaseSchema;
+        const predicate = "local_validator_identity = $1 AND epoch = $2 AND validator_epoch = $3 AND voter_identity = $4 AND protocol_version = 3";
+        const counts = (await state.pool.query(`SELECT
+          (SELECT COUNT(*) FROM ${tableName(schema, "pbft_prepare_votes")} WHERE ${predicate} AND batch_id = $5 AND view IN ($6,$7))::text AS prepares,
+          (SELECT COUNT(*) FROM ${tableName(schema, "pbft_commit_votes")} WHERE ${predicate} AND batch_id = $5 AND view IN ($6,$7))::text AS commits,
+          (SELECT COUNT(*) FROM ${tableName(schema, "pbft_view_change_votes")} WHERE ${predicate} AND target_view = $7)::text AS view_changes`,
+        [state.config.validatorAddress, oldStatement.epoch, selected.validatorEpoch, oldPrimaryAddress,
+          oldStatement.batchId, oldView, newView])).rows[0];
+        assert.deepEqual(counts, { prepares: "0", commits: "0", view_changes: "0" });
+      }
+    }
+    await assertOffline();
+    await assert.rejects(() => request(oldPrimary, "/health"), error => error.cause?.code === "ECONNREFUSED");
+    await assertOldViewIncomplete();
+    assert.deepEqual(await lifecycle.readBatch({ batchRecordId: pending.record.batchRecordId }), pending);
+    console.log(`VALID: deterministic primary ${oldPrimaryAddress}, PID ${stopped.child.pid}, endpoint ${peers[oldPrimary].url}, store ${offlineSchema} stopped after durable PRE-PREPARE reached only backup ${peers[recipient].address}; view ${oldView} has zero PREPARE/COMMIT votes or QC; proposal locks and store preserved; gate healed and exactly three members remain ready`);
+    for (const index of live) {
+      const selection = await request(index, "/pbft/primary", { epoch: oldStatement.epoch, view: newView });
+      assert.equal(selection.status, 200); assert.equal(selection.body.primaryIdentity, newPrimaryAddress);
+      assert.equal(selection.body.validatorEpoch, selected.validatorEpoch);
+      assert.equal(selection.body.committeeDigest, selected.committeeDigest);
+      assert.deepEqual(selection.body.committee, selected.validators);
+    }
+    console.log("Waiting for real protocol progress timeout (30000 ms base), signed VIEW_CHANGE quorum and automatic higher-view consensus; no manual view or vote mutation");
+    const committed = await until("primary failover and automatic higher-view COMMITTED", async () => {
+      assert.equal(stopped.exited, true);
+      const snapshot = await lifecycle.readBatch({ batchRecordId: pending.record.batchRecordId });
+      return snapshot.record.status === "COMMITTED" ? snapshot : null;
+    }, live, 90000);
+    assert.equal(committed.quorumCertificate.view, newView);
+    assert.deepEqual(committed.consensusBinding, pending.consensusBinding);
+    assert.deepEqual(committed.batch, pending.batch); assert.deepEqual(committed.members, pending.members);
+    assert.deepEqual(committed.tree, pending.tree);
+    const newStatement = expectedCommitStatement({ ...oldStatement, view: newView, proposalDigest: undefined }, { peers, validatorSets });
+    const qc = await verifyQuorumCertificate(committed.quorumCertificate, { peers, validatorSets, expected: newStatement });
+    assert.deepEqual(qc, committed.quorumCertificate); assert.equal(qc.commits.length, 3);
+    assert.deepEqual(qc.commits.map(vote => vote.voterIdentity).sort(), liveAddresses);
+    await until("three live validators finalized in the certified higher view", async () => {
+      const views = await Promise.all(live.map(index => states[index].store.readViewState(oldStatement.epoch)));
+      return views.every(state => state?.current_view === newView && state.finalized) ? views : null;
+    }, live);
+    const established = await states[newPrimary].store.readNewView(oldStatement.epoch, newView);
+    assert.ok(established);
+    assert.equal(established.primaryIdentity, newPrimaryAddress); assert.equal(established.viewChanges.length, 3);
+    assert.deepEqual(established.viewChanges.map(vote => vote.voterIdentity).sort(), liveAddresses);
+    const quorumNodes = [];
+    for (const index of live) {
+      const current = await states[index].store.readViewState(oldStatement.epoch);
+      assertContext(current, newView); assert.equal(current.finalized, true);
+      const acceptedView = await states[index].store.readNewView(oldStatement.epoch, newView);
+      assert.deepEqual(await authenticateNewView(states[index].config, acceptedView, canonical), established);
+      assert.deepEqual(acceptedView.selectedProposal, canonical);
+      const ownIntent = (await states[index].store.readViewChanges(oldStatement.epoch, newView))
+        .find(vote => vote.voterIdentity === peers[index].address);
+      assert.ok(ownIntent);
+      assert.deepEqual(await authenticateViewChange(states[index].config, ownIntent), ownIntent);
+      assert.deepEqual(ownIntent, established.viewChanges.find(vote => vote.voterIdentity === peers[index].address));
+      assert.equal(ownIntent.targetView, newView); assert.equal(ownIntent.preparedCertificate, null);
+      assert.deepEqual(ownIntent.acceptedProposal, oldLocks.get(index)?.envelope ?? null);
+      const accepted = await states[index].store.readPrePrepare(oldStatement.epoch, newView);
+      assert.ok(accepted);
+      await authenticatePrePrepare(states[index].config, accepted.envelope);
+      assert.equal(accepted.envelope.primaryIdentity, newPrimaryAddress);
+      for (const [field, value] of Object.entries(newStatement)) assert.equal(accepted.envelope[field], value);
+      const prepared = await states[index].store.readPrepareState(oldStatement.epoch, newView);
+      const commits = await states[index].store.readCommitState(oldStatement.epoch, newView);
+      assert.equal(prepared.voteCount, 3); assert.ok(prepared.prepared);
+      assert.deepEqual(prepared.votes.map(vote => vote.voterIdentity).sort(), liveAddresses);
+      assert.deepEqual([...prepared.prepared.quorumVoters].sort(), liveAddresses);
+      // An early COMMIT may reach a peer before its local PREPARED boundary.
+      // Finality does not backfill that peer's missing received vote. Require
+      // each genuine self-vote and an actual persisted quorum at its producer.
+      assert.ok(commits.voteCount >= 1 && commits.voteCount <= 3);
+      const ownCommit = commits.votes.find(vote => vote.voterIdentity === peers[index].address);
+      assert.ok(ownCommit);
+      assert.deepEqual(ownCommit, qc.commits.find(vote => vote.voterIdentity === peers[index].address));
+      if (commits.certificate) {
+        assert.equal(commits.voteCount, 3);
+        assert.deepEqual(commits.votes.map(vote => vote.voterIdentity).sort(), liveAddresses);
+        assert.deepEqual([...commits.quorum.quorumVoters].sort(), liveAddresses);
+        assert.deepEqual(commits.certificate, qc);
+        quorumNodes.push(peers[index].address);
+      }
+      for (const vote of [...prepared.votes, ...commits.votes]) {
+        for (const [field, value] of Object.entries(newStatement)) assert.equal(vote[field], value);
+        assert.ok(liveAddresses.includes(vote.voterIdentity));
+      }
+    }
+    assert.ok(quorumNodes.length > 0, "the final QC must originate from real durable COMMIT quorum evidence");
+    await assertOffline(); await assertOldViewIncomplete();
+    await registryChecks.assertQcBinding(qc);
+    await certificateChecks.snapshot(committed, "real primary failover QC binds the higher view and unchanged pinned canonical root");
+    const stale = await request(live[0], "/pbft/pre-prepare", oldProposal);
+    assert.equal(stale.status, 422); assert.equal(stale.body.reason, "STALE_VIEW");
+    console.log(`EXPECTED FAILURE: authentic cached old-primary PRE-PREPARE from view ${oldView} returned STALE_VIEW after durable view ${newView}; old locks and final QC unchanged`);
+    console.log(`VALID: genuine durable VIEW_CHANGE signers ${liveAddresses.join(", ")} formed quorum 3; same-committee primary ${newPrimaryAddress} issued independently verified NEW_VIEW ${newView}, preserving batch/root ${canonical.batchId}/${canonical.messageRoot} with no fabricated prepared certificate`);
+    console.log(`VALID: three live PREPARE/COMMIT voters formed QC ${qc.qcDigest} in view ${newView}; durable COMMIT quorum at ${quorumNodes.join(", ")}; old primary contributed no new vote and remained offline; validator epoch ${qc.validatorEpoch} and committee digest ${qc.committeeDigest} unchanged`);
+    async function assertOneCommittedRoot() {
+      const context = [...scope, oldStatement.epoch];
+      const roots = (await pool.query(`SELECT batch_record_id,batch_id,message_root FROM ${sourceBatches}
+        WHERE source_domain = $1 AND source_gateway = $2 AND epoch = $3 AND status = 'COMMITTED'`, context)).rows;
+      assert.deepEqual(roots, [{ batch_record_id: pending.record.batchRecordId, batch_id: canonical.batchId, message_root: canonical.messageRoot }]);
+      const qcs = (await pool.query(`SELECT batch_id,message_root,protocol_version,validator_epoch,committee_digest,view,qc_digest
+        FROM ${certificates} WHERE source_domain = $1 AND source_gateway = $2 AND epoch = $3`, context)).rows;
+      assert.deepEqual(qcs, [{ batch_id: canonical.batchId, message_root: canonical.messageRoot, protocol_version: 3,
+        validator_epoch: selected.validatorEpoch, committee_digest: selected.committeeDigest, view: newView, qc_digest: qc.qcDigest }]);
+      assert.deepEqual(await lifecycle.readBatch({ batchRecordId: pending.record.batchRecordId }), committed);
+    }
+    await assertOneCommittedRoot();
+    console.log(`VALID: protected source ${canonical.sourceDomain}/${canonical.sourceGateway}, batch epoch ${canonical.epoch} has exactly one durable committed root ${canonical.messageRoot} and one final QC in view ${newView}; old-view QC absent`);
+    const projected = await projector.materializeBatch({ batchRecordId: committed.record.batchRecordId });
+    assert.equal(projected.createdJobs, 1);
+    const [pack] = await buildDeliveryPackages(committed, { validatorSets });
+    assert.equal(pack.message.messageId, event.messageId); assert.equal(pack.messageRoot, canonical.messageRoot);
+    assert.deepEqual(pack.quorumCertificate, qc); assert.equal(pack.quorumCertificate.view, newView);
+    assert.equal((await queue.getDeliveryJob(pack.deliveryJobId)).status, "READY");
+    assert.equal(await readGateway("isMessageExecuted", [event.messageId]), false);
+    const encoded = await encodeGatewaySubmission(pack, { validatorSets });
+    await worker.submitJob(pack.deliveryJobId);
+    const sent = await manager.repository.getTransaction(pack.deliveryJobId);
+    assert.equal(sent.attempts.length, 1);
+    const receipt = await client.waitForTransactionReceipt({ hash: sent.attempt.transactionHash });
+    assert.equal(receipt.status, "success");
+    const transaction = await client.getTransaction({ hash: receipt.transactionHash });
+    assert.equal(transaction.to.toLowerCase(), gateway); assert.equal(transaction.value, 0n);
+    assert.equal(transaction.input, encoded.calldata); assert.equal(sent.intent.packageDigest, encoded.packageDigest);
+    const reserved = BigInt(beforeTransport.account.nextNonce);
+    const expectedNonce = reserved > beforeTransport.pendingNonce ? reserved : beforeTransport.pendingNonce;
+    assert.equal(BigInt(sent.intent.nonce), expectedNonce); assert.equal(BigInt(transaction.nonce), expectedNonce);
+    const executions = receipt.logs.filter(log => log.address.toLowerCase() === gateway).map(log => decodeEventLog({ abi: gatewayAbi, ...log }));
+    const grants = receipt.logs.filter(log => log.address.toLowerCase() === application).map(log => decodeEventLog({ abi: appAbi, ...log }));
+    assert.equal(executions.length, 1); assert.equal(executions[0].eventName, "CrossChainMessageExecuted");
+    assert.equal(executions[0].args.messageId, event.messageId); assert.equal(executions[0].args.batchId, canonical.batchId);
+    assert.equal(executions[0].args.sourceDomain, config.chainDomain); assert.equal(executions[0].args.destinationReceiver.toLowerCase(), application);
+    assert.equal(grants.length, 1); assert.equal(grants[0].eventName, "VerifiedSupplierGranted");
+    assert.equal(grants[0].args.messageId, event.messageId); assert.equal(grants[0].args.supplier.toLowerCase(), targetSupplier);
+    assert.equal(await readGateway("isMessageExecuted", [event.messageId]), true);
+    assert.equal(await readApp("isVerifiedSupplier", [targetSupplier]), true);
+    await client.request({ method: "anvil_mine", params: [toHex(relayConfig.destinationConfirmations)] });
+    await manager.checkReceiptsOnce();
+    assert.equal((await manager.repository.getTransaction(pack.deliveryJobId)).intent.status, "CONFIRMED");
+    await assertOffline(); await assertOldViewIncomplete(); await assertOneCommittedRoot();
+    const targetJobs = (await pool.query(`SELECT j.delivery_job_id,j.message_id,d.message_root,q.view
+      FROM ${jobs} j JOIN ${projections} d USING (batch_record_id) JOIN ${certificates} q USING (batch_record_id)
+      WHERE d.source_domain = $1 AND d.source_gateway = $2 AND d.batch_epoch = $3`, [...scope, canonical.epoch])).rows;
+    assert.deepEqual(targetJobs, [{ delivery_job_id: pack.deliveryJobId, message_id: event.messageId,
+      message_root: canonical.messageRoot, view: newView }]);
+    for (const [address, abi, eventName] of [[gateway, gatewayAbi, "CrossChainMessageExecuted"], [application, appAbi, "VerifiedSupplierGranted"]]) {
+      assert.equal((await client.getContractEvents({ address, abi, eventName, args: { messageId: event.messageId },
+        fromBlock: 0n, toBlock: "latest", strict: true })).length, 1);
+    }
+    const afterTransport = await transportEvidence();
+    assert.equal(afterTransport.pendingNonce, expectedNonce + 1n);
+    assert.equal(BigInt(afterTransport.account.nextNonce), expectedNonce + 1n);
+    const targetAttempts = afterTransport.attempts.filter(row => row.delivery_job_id === pack.deliveryJobId);
+    assert.equal(targetAttempts.length, 1);
+    assert.equal(afterTransport.intents.filter(row => row.delivery_job_id === pack.deliveryJobId).length, 1);
+    const targetAttemptIds = new Set(targetAttempts.map(row => row.attempt_id));
+    assert.ok(isDeepStrictEqual(afterTransport.intents.filter(row => row.delivery_job_id !== pack.deliveryJobId), beforeTransport.intents), "historical transaction intents remain unchanged");
+    assert.ok(isDeepStrictEqual(afterTransport.attempts.filter(row => row.delivery_job_id !== pack.deliveryJobId), beforeTransport.attempts), "historical signed Ethereum transaction bytes remain unchanged");
+    assert.ok(isDeepStrictEqual(afterTransport.journals.filter(row => !targetAttemptIds.has(row.attempt_id)), beforeTransport.journals), "historical broadcast evidence remains unchanged");
+    assert.deepEqual((await readMessages(pool, config.databaseSchema)).filter(row => previousIds.has(row.id)), previousRows);
+    for (const previous of previousBatches) assert.deepEqual(await lifecycle.readBatch({ batchRecordId: previous.record.batchRecordId }), previous);
+    console.log(`VALID: primary failover completed one READY job ${pack.deliveryJobId}, higher-view production Relayer/Tx Manager transaction ${receipt.transactionHash}, CONFIRMED Gateway/ApplicationB execution for ${event.messageId}; exactly one nonce/intent/attempt/business event; original primary stayed offline without restart`);
+    console.log("VALID: source-reorg, non-primary recovery and Byzantine historical evidence preserved; one controlled primary failure, genuine timeout/view-change recovery, unchanged canonical root/committee and no duplicate destination authority");
+  }
 
   async function verifyByzantineSafety() {
     const targetSupplier = "0x0000000000000000000000000000000000009031";

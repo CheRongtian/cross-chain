@@ -34,7 +34,7 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
   const config = { ...sourceConfig,databaseSchema: "cross_chain_rotation_source",
     sourceGatewayStartBlock: snapshot.batch.messages.reduce((first,message) => message.sourceBlockNumber < first ? message.sourceBlockNumber : first,snapshot.batch.messages[0].sourceBlockNumber) };
   const keys = developmentKeys(5);
-  const reservations = []; const rpcProxies = []; const pools = [];
+  const reservations = []; const rpcProxies = []; const peerProxies = []; const pools = [];
   const processes = createValidatorProcesses({ keys,pidFile });
   const validators = []; const states = []; const environments = [];
   let failed = false;
@@ -100,8 +100,8 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     assert.equal(new Set(peers.map((peer) => peer.address)).size,5);
     assert.equal(new Set(states.map((state) => state.config.databaseSchema)).size,5);
     const request = (index,route,body) => processes.request(peers[index].url,route,body);
-    async function until(label,predicate,live) {
-      const deadline = Date.now() + 30000;
+    async function until(label,predicate,live,timeoutMs = 30000) {
+      const deadline = Date.now() + timeoutMs;
       do {
         for (const index of live) {
           assert.equal(validators[index].exited,false);
@@ -303,7 +303,7 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     console.log("VALID: historical epoch 7 QC remained valid after rotation and V1 shutdown; old and new votes never mixed and both committed batches retained their immutable roots");
     // All old-history equality assertions above remain intact. New business history is additive.
     await verifyDestinationExecution({ config, pool, lifecycle, validatorSets, peers, states, environments,
-      validators, processes, request, until, produceMessage: produceBusinessMessage,
+      validators, processes, peerProxies, request, until, produceMessage: produceBusinessMessage,
       historical: [oldCommitted, newCommitted], rpcUrl: registryRpcUrl, registryChecks,
       certificateChecks, merkleChecks, domainVerifierAddress: messageDomainContext.verifierAddress });
   } catch (error) {
@@ -317,7 +317,7 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     }
     throw error;
   } finally {
-    try { await closeScenarioResources({ processes,peerProxies: [],rpcProxies,reservations,pools }); }
+    try { await closeScenarioResources({ processes,peerProxies,rpcProxies,reservations,pools }); }
     catch (error) { if (!failed) throw error; console.error(`Cleanup also failed: ${error.message}`); }
   }
   assert.deepEqual(await sourceState(sourcePool,sourceConfig.databaseSchema),original);
