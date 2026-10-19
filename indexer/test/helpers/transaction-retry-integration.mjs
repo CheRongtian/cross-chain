@@ -3,6 +3,25 @@ import { toHex } from "viem";
 import { createTransactionManager } from "../../src/transaction-manager/service.mjs";
 import { verifyRpcTransaction } from "../../src/transaction-manager/receipts.mjs";
 
+// Shared local-chain fixture: workers must be stopped inside operation's own
+// finally before mining mode is restored. This never resets destination state.
+export async function withAutomineDisabled(destination,operation) {
+  const automine = await destination.request({ method: "anvil_getAutomine",params: [] });
+  assert.equal(typeof automine,"boolean");
+  let failure;
+  try {
+    await destination.request({ method: "evm_setAutomine",params: [false] });
+    return await operation();
+  } catch (error) { failure = error; throw error; }
+  finally {
+    try { await destination.request({ method: "evm_setAutomine",params: [automine] }); }
+    catch (error) {
+      if (failure) throw new AggregateError([failure,error],"scenario failed and restoring Chain B automine also failed");
+      throw error;
+    }
+  }
+}
+
 // Invoked by the existing real-chain integration; never by production workers.
 export async function verifyPendingReplacement({ config,pool,queue,legacy,destination,jobId,run,onReplacementPrepared = async () => {},prepareAndBroadcast }) {
   let now = Date.now();
@@ -10,11 +29,7 @@ export async function verifyPendingReplacement({ config,pool,queue,legacy,destin
   const manager = createTransactionManager({ config,pool,queue,legacy,clock });
   const signedFields = ["attemptId","attemptNumber","replacementOfAttemptId","nonce","gasLimit","transactionType",
     "maxFeePerGas","maxPriorityFeePerGas","rawSignedTransaction","transactionHash","createdAt"];
-  const automine = await destination.request({ method: "anvil_getAutomine",params: [] });
-  assert.equal(typeof automine,"boolean");
-  let failure;
-  try {
-    await destination.request({ method: "evm_setAutomine",params: [false] });
+  return withAutomineDisabled(destination,async () => {
     let first;
     if (prepareAndBroadcast) first = await prepareAndBroadcast();
     else {
@@ -113,12 +128,5 @@ export async function verifyPendingReplacement({ config,pool,queue,legacy,destin
     assert.equal((await manager.prepareReplacement(jobId)).created,false);
     console.log("VALID: real pending Chain B transaction was replaced at the same nonce with higher fees; fresh processes recovered exact history and its canonical winner");
     return finalized;
-  } catch (error) { failure = error; throw error; }
-  finally {
-    try { await destination.request({ method: "evm_setAutomine",params: [automine] }); }
-    catch (error) {
-      if (!failure) throw error;
-      console.error(`Restoring Chain B automine also failed: ${error.message}`);
-    }
-  }
+  });
 }

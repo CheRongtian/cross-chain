@@ -1,3 +1,5 @@
+import assert from "node:assert/strict";
+import { privateKeyToAccount } from "viem/accounts";
 import { createDatabasePool } from "../../src/db.mjs";
 import { createDeliveryRepository } from "../../src/delivery/repository.mjs";
 import { createRelayerWorker } from "../../src/relayer/service.mjs";
@@ -5,6 +7,9 @@ import { createTransactionManager } from "../../src/transaction-manager/service.
 import { loadTransactionConfig } from "../../src/transaction-manager/config.mjs";
 import { safeRelayerMessage } from "../../src/relayer/config.mjs";
 import { deliveryJson } from "../../src/delivery/package.mjs";
+import { encodeGatewaySubmission } from "../../src/relayer/encoding.mjs";
+import { createTransactionRpc } from "../../src/transaction-manager/rpc.mjs";
+import { signDeliveryTransaction } from "../../src/transaction-manager/transaction.mjs";
 
 // IPC barriers exist only in this integration helper. Production has no pause,
 // force-expiry, stale-fence or test-mode environment switches.
@@ -50,6 +55,32 @@ try {
         "EXPECTED FAILURE: restarted worker's stale fence rejected before intent mutation");
       await notify({ type: "result",action: "STALE_FENCE",pid: process.pid,workerId: config.workerId });
     }
+  } else if (request.mode === "duplicate-transport") {
+    // Intentional duplicate network delivery is isolated to this test entry.
+    // Strict reads/encoding and signing reuse production primitives, but this
+    // contender never claims a lease or writes a canonical intent/account.
+    const pack = await queue.getDeliveryPackage(request.id);
+    const encoded = await encodeGatewaySubmission(pack,{ validatorSets: config.validatorSets,
+      sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway });
+    const canonical = await manager.resolveIntent(request.id);
+    assert.equal(canonical.calldata,encoded.calldata); assert.equal(canonical.packageDigest,encoded.packageDigest);
+    const rpc = createTransactionRpc(config);
+    assert.equal(await rpc.verifyChain(),config.destinationDomain);
+    const gasLimit = await rpc.estimateGas(canonical);
+    const fees = await rpc.fees();
+    assert.ok(fees.maxFeePerGas <= config.maxFeePerGasCap && fees.maxPriorityFeePerGas <= config.maxPriorityFeePerGasCap);
+    const nonce = await rpc.pendingNonce();
+    const intent = { ...canonical,nonce: nonce.toString() };
+    const attempt = await signDeliveryTransaction(intent,{ nonce,gasLimit,...fees },privateKeyToAccount(config.privateKey));
+    const evidence = JSON.parse(deliveryJson({ intent,attempt,package: encoded.package }));
+    await notify({ type: "transport-ready",pid: process.pid,workerId: config.workerId,...evidence });
+    if ((await receive()).type !== "continue") throw new Error("invalid duplicate pre-send barrier command");
+    const hash = await rpc.broadcast(attempt.rawSignedTransaction,attempt.transactionHash);
+    assert.equal(hash,attempt.transactionHash);
+    await notify({ type: "transport-broadcast",pid: process.pid,workerId: config.workerId,transactionHash: hash });
+    // Stay alive until the parent has observed BOTH accepted external sends.
+    if ((await receive()).type !== "continue") throw new Error("invalid duplicate post-send barrier command");
+    await notify({ type: "result",pid: process.pid,workerId: config.workerId,transactionHash: hash });
   } else if (request.mode === "transaction") {
     let result;
     if (request.operation === "prepare") result = await manager.prepareDeliveryTransaction(request.id);
@@ -89,6 +120,13 @@ try {
           if ((await receive()).type !== "continue") throw new Error("invalid takeover retry command");
           result = await worker.submitJob(request.id);
         }
+      }
+      if (request.mode === "duplicate-canonical") {
+        assert.ok(result.submitted && result.attempt?.transactionHash,
+          "canonical duplicate contender must complete its actual broadcast before the post-send barrier");
+        await notify({ type: "transport-broadcast",pid: process.pid,workerId: config.workerId,
+          transactionHash: result.attempt.transactionHash,result: JSON.parse(deliveryJson(result)) });
+        if ((await receive()).type !== "continue") throw new Error("invalid canonical post-send barrier command");
       }
       if (request.mode === "race") await notify({ type: "ownership",fence: null,pid: process.pid,workerId: config.workerId });
       await notify({ type: "result",result,pid: process.pid,workerId: config.workerId });

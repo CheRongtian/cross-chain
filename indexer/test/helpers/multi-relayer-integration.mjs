@@ -6,6 +6,10 @@ import { setTimeout as pause } from "node:timers/promises";
 import { isDeepStrictEqual } from "node:util";
 import { tableName } from "../../src/db.mjs";
 import { createRelayerLeaseRepository } from "../../src/relayer/leases.mjs";
+import { encodeGatewaySubmission } from "../../src/relayer/encoding.mjs";
+import { verifyRpcTransaction } from "../../src/transaction-manager/receipts.mjs";
+import { verifySignedTransaction } from "../../src/transaction-manager/transaction.mjs";
+import { withAutomineDisabled } from "./transaction-retry-integration.mjs";
 
 const ENTRY = fileURLToPath(new URL("./relayer-process.mjs",import.meta.url));
 export function createRelayerProcesses({ environment,pidFile }) {
@@ -21,8 +25,9 @@ export function createRelayerProcesses({ environment,pidFile }) {
     const timer = setTimeout(() => { if (!record.exited) record.child.kill("SIGKILL"); },5000);
     try { await record.closed; } finally { clearTimeout(timer); await save(); }
   }
-  function start(workerId,request) {
-    const child = spawn(process.execPath,[ENTRY],{ env: { ...environment,RELAYER_WORKER_ID: workerId },stdio: ["ignore","pipe","pipe","ipc"] });
+  function start(workerId,request,{ privateKey = environment.RELAYER_A_PRIVATE_KEY } = {}) {
+    const workerEnvironment = { ...environment,RELAYER_WORKER_ID: workerId,RELAYER_A_PRIVATE_KEY: privateKey };
+    const child = spawn(process.execPath,[ENTRY],{ env: workerEnvironment,stdio: ["ignore","pipe","pipe","ipc"] });
     const record = { child,exited: false,stdout: "",stderr: "",messages: [],listeners: new Set() };
     record.closed = new Promise(resolve => {
       child.once("error",error => { record.exited = true; resolve({ code: null,error }); });
@@ -53,7 +58,7 @@ export function createRelayerProcesses({ environment,pidFile }) {
           assert.ok(record.stderr.includes(expectedError));
           console.log(`EXPECTED FAILURE VERIFIED: ${expectedError}`);
         }
-        for (const secret of [environment.RELAYER_A_PRIVATE_KEY,environment.DATABASE_URL]) if (secret) {
+        for (const secret of [privateKey,environment.RELAYER_A_PRIVATE_KEY,environment.DATABASE_URL]) if (secret) {
           assert.ok(!record.stdout.includes(secret) && !record.stderr.includes(secret),"worker output must redact secrets");
         }
         return record.messages.find(message => message.type === "result");
@@ -287,6 +292,129 @@ export async function verifySignedTakeoverAfterExpiry({ processes,pool,config,ma
   assert.equal(released.ownerId,"relayer-b"); assert.equal(released.fencingToken,acquired.fence.fencingToken);
   assert.notEqual(released.releasedAt,null);
   return { signed,accountSigned,a,b,fenceA: prepared.fence,fenceB: acquired.fence };
+}
+
+export async function verifyDuplicateTransportRace({ processes,pool,config,manager,queue,client,observer,id,duplicatePrivateKey }) {
+  const pack = await queue.getDeliveryPackage(id);
+  const encoded = await encodeGatewaySubmission(pack,{ validatorSets: config.validatorSets,
+    sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway });
+  const job = await queue.getDeliveryJob(id);
+  assert.equal(job.status,"READY"); assert.equal(await manager.repository.getTransaction(id),null);
+  const leases = createRelayerLeaseRepository({ config,pool,queue });
+  assert.equal(await leases.getLease(id),null);
+  let failure;
+  return withAutomineDisabled(client,async () => {
+    try {
+      const a = processes.start("relayer-a",{ id,mode: "duplicate-canonical",pause: "signed" });
+      const b = processes.start("relayer-b",{ id,mode: "duplicate-transport" },{ privateKey: duplicatePrivateKey });
+      await Promise.all([a.started,b.started]);
+      const [prepared,contender] = await Promise.all([a.wait("signed"),b.wait("transport-ready")]);
+      assert.notEqual(a.child.pid,b.child.pid);
+      assert.equal(prepared.pid,a.child.pid); assert.equal(contender.pid,b.child.pid);
+      assert.equal(prepared.workerId,"relayer-a"); assert.equal(contender.workerId,"relayer-b");
+      const canonical = await manager.repository.getTransaction(id);
+      assert.equal(prepared.stored.created,true);
+      assert.ok(isDeepStrictEqual(prepared.stored.intent,canonical.intent),"canonical A intent must be committed before release");
+      assert.ok(isDeepStrictEqual(prepared.stored.attempts,canonical.attempts),"canonical A signed identity must be committed before release");
+      assert.equal(canonical.attempt.status,"SIGNED"); assert.equal(canonical.attempt.broadcastAttemptCount,"0");
+      assert.equal(canonical.attempts.length,1); assert.equal(canonical.attempt.attemptNumber,0);
+      assert.deepEqual(contender.package,pack);
+      const identities = [
+        { workerId: "relayer-a",pid: a.child.pid,intent: canonical.intent,attempt: canonical.attempt },
+        { workerId: "relayer-b",pid: b.child.pid,intent: contender.intent,attempt: contender.attempt },
+      ];
+      assert.notEqual(identities[0].intent.senderAddress,identities[1].intent.senderAddress);
+      assert.notEqual(identities[0].attempt.transactionHash,identities[1].attempt.transactionHash);
+      for (const identity of identities) {
+        assert.equal(identity.intent.deliveryJobId,id); assert.equal(identity.intent.chainId,config.destinationDomain.toString());
+        assert.equal(identity.intent.destinationGateway,pack.message.destinationGateway); assert.equal(identity.intent.value,"0");
+        assert.equal(identity.intent.packageDigest,encoded.packageDigest); assert.equal(identity.intent.calldata,encoded.calldata);
+        await verifySignedTransaction(identity.intent,identity.attempt);
+        assert.equal(await client.request({ method: "eth_getTransactionByHash",params: [identity.attempt.transactionHash] }),null);
+        assert.equal(await client.request({ method: "eth_getTransactionReceipt",params: [identity.attempt.transactionHash] }),null);
+        const balance = await client.request({ method: "eth_getBalance",params: [identity.intent.senderAddress,"latest"] });
+        assert.ok(BigInt(balance) >= BigInt(identity.attempt.gasLimit) * BigInt(identity.attempt.maxFeePerGas),
+          "each independent sender must have enough gas funds before the duplicate race");
+      }
+      const block = await client.request({ method: "eth_getBlockByNumber",params: ["latest",false] });
+      assert.ok(identities.reduce((total,identity) => total + BigInt(identity.attempt.gasLimit),0n) <= BigInt(block.gasLimit),
+        "both contender gas limits must fit the existing local Chain B block budget");
+      async function assertAlive() { assert.equal(a.exited,false); assert.equal(b.exited,false); }
+      await assertAlive();
+      const lease = await leases.getLease(id);
+      assert.equal(lease.ownerId,"relayer-a"); assert.equal(lease.fencingToken,prepared.fence.fencingToken);
+      assert.equal(lease.releasedAt,null);
+      assert.equal((await pool.query(`SELECT COUNT(*)::text AS count FROM ${tableName(config.databaseSchema,"transaction_intents")}
+        WHERE delivery_job_id = $1`,[id])).rows[0].count,"1");
+      assert.equal(observer.calls.filter(call => call.method === "eth_sendRawTransaction").length,0);
+      assert.equal(observer.errors.length,0);
+      console.log(`VALID: Relayer A and Relayer B loaded the same canonical message ${pack.message.messageId}, batch/root/QC and byte-identical Gateway calldata; package digest ${encoded.packageDigest}`);
+      console.log(`VALID: duplicate-delivery contenders are independent Relayer A/B OS processes with distinct PIDs ${a.child.pid}/${b.child.pid}; senders ${identities.map(identity => identity.intent.senderAddress).join(" / ")}`);
+      console.log("VALID: canonical operational Relayer A owns the sole lease/intent; Relayer B is an intentional test-only duplicate transport contender with no canonical intent or nonce reservation");
+      console.log("VALID: both relayers reached the deterministic pre-broadcast barrier before either destination result was observed");
+      // Both IPC sends are issued without awaiting either child's broadcast.
+      // Automine stays off until BOTH actors report actual external acceptance.
+      await Promise.all([a.send({ type: "continue" }),b.send({ type: "continue" })]);
+      const broadcasts = await Promise.all([a.wait("transport-broadcast"),b.wait("transport-broadcast")]);
+      await assertAlive();
+      assert.equal(broadcasts[0].pid,a.child.pid); assert.equal(broadcasts[1].pid,b.child.pid);
+      for (const [index,broadcast] of broadcasts.entries()) {
+        assert.equal(broadcast.workerId,identities[index].workerId);
+        assert.equal(broadcast.transactionHash,identities[index].attempt.transactionHash);
+      }
+      assert.equal(broadcasts[0].result.submitted,true); assert.equal(broadcasts[0].result.attempt.status,"BROADCAST");
+      assert.equal(broadcasts[0].result.workerId,"relayer-a");
+      assert.equal(broadcasts[0].result.fencingToken,prepared.fence.fencingToken);
+      const sends = observer.calls.filter(call => call.method === "eth_sendRawTransaction");
+      assert.equal(sends.length,2);
+      for (const identity of identities) {
+        assert.equal(sends.filter(call => call.params[0] === identity.attempt.rawSignedTransaction).length,1,
+          "each contender must externally send its exact signed bytes once");
+        const pending = await client.request({ method: "eth_getTransactionByHash",params: [identity.attempt.transactionHash] });
+        verifyRpcTransaction(identity.intent,identity.attempt,pending);
+        assert.equal(pending.blockNumber,null);
+        assert.equal(await client.request({ method: "eth_getTransactionReceipt",params: [identity.attempt.transactionHash] }),null);
+      }
+      assert.equal(observer.errors.length,0);
+      console.log("VALID: both relayers independently broadcast a destination transaction for the same message; both remain alive with accepted pending transactions before any receipt is used");
+      console.log(`VALID: duplicate contenders produced two distinct Chain B transaction hashes ${identities.map(identity => identity.attempt.transactionHash).join(" / ")} with identical DestinationGateway calldata`);
+      await Promise.all([a.send({ type: "continue" }),b.send({ type: "continue" })]);
+      await Promise.all([a.wait("result"),b.wait("result")]);
+      await Promise.all([a.finish(),b.finish()]);
+      await client.request({ method: "anvil_mine",params: ["0x1"] });
+      const receipts = [];
+      for (const identity of identities) {
+        const receipt = await client.request({ method: "eth_getTransactionReceipt",params: [identity.attempt.transactionHash] });
+        assert.ok(receipt,"both accepted duplicate transactions must be mined by the controlled block");
+        assert.equal(receipt.transactionHash,identity.attempt.transactionHash);
+        const transaction = await client.request({ method: "eth_getTransactionByHash",params: [identity.attempt.transactionHash] });
+        verifyRpcTransaction(identity.intent,identity.attempt,transaction,receipt);
+        const block = await client.request({ method: "eth_getBlockByNumber",params: [receipt.blockNumber,false] });
+        assert.equal(block.hash,receipt.blockHash); assert.equal(BigInt(block.number),BigInt(receipt.blockNumber));
+        assert.ok(BigInt(block.timestamp) < BigInt(pack.message.deadline));
+        receipts.push({ ...identity,receipt,transaction });
+      }
+      assert.equal(receipts[0].receipt.blockHash,receipts[1].receipt.blockHash,"both pending contenders must fit the same controlled block");
+      assert.equal(receipts.filter(value => BigInt(value.receipt.status) === 1n).length,1);
+      assert.equal(receipts.filter(value => BigInt(value.receipt.status) === 0n).length,1);
+      const winner = receipts.find(value => BigInt(value.receipt.status) === 1n);
+      const loser = receipts.find(value => BigInt(value.receipt.status) === 0n);
+      assert.ok(BigInt(winner.receipt.transactionIndex) < BigInt(loser.receipt.transactionIndex));
+      assert.equal(loser.receipt.logs.length,0);
+      assert.ok(BigInt(loser.receipt.gasUsed) < BigInt(loser.transaction.gas),"the duplicate must not fail by exhausting its transaction gas");
+      assert.deepEqual(await queue.getDeliveryJob(id),job);
+      return { canonical,identities,winner,loser };
+    } catch (error) { failure = error; throw error; }
+    finally {
+      // No child can send after the shared mining mode is restored, including
+      // failure paths where only one actor reached a barrier.
+      try { await processes.close(); }
+      catch (error) {
+        if (failure) throw new AggregateError([failure,error],"duplicate transport and worker cleanup failed");
+        throw error;
+      }
+    }
+  });
 }
 
 export async function verifyConcurrentRelayers({ processes,pool,config,manager,jobs }) {
