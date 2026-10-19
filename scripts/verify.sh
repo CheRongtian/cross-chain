@@ -882,6 +882,9 @@ printf '286. Rotate recovery independently without changing send order, allocati
 printf '287. Observe a later canonical receipt behind incomplete earlier evidence with limit 1\n'
 printf '288. Preserve progress across fresh processes, selection crashes, wrap, terminal removal and concurrent clients\n'
 printf '289. Schedule unchanged NO_REPLACEMENT work into the future without signing, sending or nonce allocation\n'
+printf '     Replace a real Chain A branch while a fresh authorized source occurrence is FINALIZING\n'
+printf '     Preserve terminal REORGED evidence and prove zero downstream batch/QC/READY/transaction/destination propagation\n'
+printf '     Resume a canonical replacement through the same schema, live validator cluster and production Gateway/ApplicationB\n'
 
 CURRENT_STEP="full verification finality profile validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -2021,7 +2024,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source/consensus/transport recovery, historical QC/Merkle/message verification and destination replay/rollback integration"
+CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
 CHAIN_A_DOMAIN="$CHAIN_A_ID" \

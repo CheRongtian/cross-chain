@@ -5,7 +5,8 @@ import { createPublicClient, createWalletClient, decodeAbiParameters, decodeEven
 import { privateKeyToAccount } from "viem/accounts";
 import { normalizeAddress, computeCanonicalMessageId, computePayloadHash } from "../../../indexer/src/canonical-message.mjs";
 import { computeMessageMerkleLeaf, computeMessageMerkleNode } from "../../../indexer/src/message-merkle.mjs";
-import { readMessages, tableName } from "../../../indexer/src/db.mjs";
+import { createDatabasePool, createFinalityStore, readCursor, readIndexedSourceBlocks, readMessages, tableName } from "../../../indexer/src/db.mjs";
+import { createBatchLifecycle } from "../../../indexer/src/batch-lifecycle.mjs";
 import { createIndexer } from "../../../indexer/src/indexer.mjs";
 import { createFinalityWatcher } from "../../../indexer/src/finality-watcher.mjs";
 import { buildDeliveryPackages } from "../../../indexer/src/delivery/package.mjs";
@@ -75,7 +76,7 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   const finality = createFinalityWatcher({ config, pool, logger: quiet });
   const rowsFor = async ids => (await readMessages(pool, config.databaseSchema)).filter(row => ids.includes(row.message_id));
 
-  async function produceAndFinalize(payload, target = application) {
+  async function produceSourceMessage(payload, target = application) {
     const event = await produceMessage(payload, { destinationGateway: gateway, destinationReceiver: target,
       deadlineFloor: (await client.getBlock()).timestamp + 3600n });
     const sourceAbi = parseAbi(["function computeMessageId(address,uint256,address,address,uint256,bytes32,uint256) view returns (bytes32)"]);
@@ -83,6 +84,11 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
       args: [event.sourceSender, event.destinationDomain, event.destinationGateway, event.destinationReceiver,
         event.nonce, event.payloadHash, event.deadline] }), event.messageId);
     assert.ok(event.deadline > (await client.getBlock()).timestamp);
+    return event;
+  }
+
+  async function produceAndFinalize(payload, target = application) {
+    const event = await produceSourceMessage(payload, target);
     await indexer.catchUpOnce();
     let [row] = await rowsFor([event.messageId]);
     assert.equal(row.status, "OBSERVED");
@@ -396,5 +402,284 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   assert.equal((await manager.repository.getTransaction(failurePack.deliveryJobId)).intent.status, "REVERTED");
   for (const old of historical) assert.deepEqual(await lifecycle.readBatch({ batchRecordId: old.record.batchRecordId }), old);
   console.log("VALID: following fresh READY job progressed through the real Relayer/Gateway/ApplicationB within the two-group bound; earlier actual mined REVERTED remained final; deferred message has no transaction outcome");
+  await verifySourceReorgRecovery();
   console.log("COMPLETE END-TO-END EXECUTION EVIDENCE RECORDED: fresh ZK intent → source event → real finality/batch/PBFT/READY → production Relayer/Tx Manager → atomic Gateway/ApplicationB; duplicate rejection and business rollback; historical snapshots unchanged");
+
+  async function verifySourceReorgRecovery() {
+    // Reuse the live cluster, deployed contracts and this same durable schema.
+    // Only Chain A is rewound; no destination snapshot or process fault is used.
+    const recoveryPool = createDatabasePool(config);
+    let primaryError;
+    try {
+      const scope = { chainDomain: config.chainDomain, sourceGateway: config.sourceGateway };
+      const recoveryLifecycle = createBatchLifecycle({ config, pool: recoveryPool, validatorSets });
+      const recoveryQueue = createDeliveryRepository({ config: deliveryConfig, pool: recoveryPool });
+      const recoveryProjector = createDeliveryProjector({ config: deliveryConfig, pool: recoveryPool });
+      const recoveryManager = createTransactionManager({ config: relayConfig, pool: recoveryPool, queue: recoveryQueue });
+      const recoveryWorker = createRelayerWorker({ config: relayConfig, pool: recoveryPool,
+        queue: recoveryQueue, transactionManager: recoveryManager });
+      const sourceTable = tableName(config.databaseSchema, "source_messages");
+      const batchTable = tableName(config.databaseSchema, "message_batches");
+      const members = tableName(config.databaseSchema, "message_batch_members");
+      const certificates = tableName(config.databaseSchema, "batch_quorum_certificates");
+      const jobs = tableName(config.databaseSchema, "delivery_jobs");
+      const intents = tableName(config.databaseSchema, "transaction_intents");
+      const attempts = tableName(config.databaseSchema, "transaction_attempts");
+      const journals = tableName(config.databaseSchema, "transaction_broadcast_events");
+      const orphanSupplier = "0x0000000000000000000000000000000000009011";
+      const replacementSupplier = "0x0000000000000000000000000000000000009012";
+      const grant = supplier => encodeAbiParameters([{ type: "uint8" }, { type: "uint8" }, { type: "address" }], [1, 1, supplier]);
+      assert.equal(grant(supplier), payload, "reorg commands retain the frozen ApplicationB encoding");
+      for (const supplier of [orphanSupplier, replacementSupplier]) assert.equal(await readApp("isVerifiedSupplier", [supplier]), false);
+      const activePids = active.map(index => validators[index].child.pid);
+      async function assertLiveValidators() {
+        for (const [position, index] of active.entries()) {
+          assert.equal(validators[index].child.pid, activePids[position]);
+          assert.equal(validators[index].exited, false);
+          const health = await request(index, "/health");
+          assert.equal(health.status, 200); assert.equal(health.body.ready, true);
+        }
+      }
+      async function readOccurrence(event) {
+        const result = await recoveryPool.query(`SELECT * FROM ${sourceTable}
+          WHERE source_domain = $1 AND source_gateway = $2 AND source_block_hash = $3
+            AND source_tx_hash = $4 AND source_log_index = $5`,
+        [config.chainDomain.toString(), config.sourceGateway, event.sourceBlockHash,
+          event.sourceTransactionHash, event.sourceLogIndex.toString()]);
+        assert.equal(result.rowCount, 1, "exact source occurrence must remain durable");
+        assert.equal(result.rows[0].message_id, event.messageId);
+        return result.rows[0];
+      }
+      async function readBatches() {
+        const records = (await recoveryPool.query(`SELECT batch_record_id FROM ${batchTable}
+          WHERE source_domain = $1 AND source_gateway = $2 ORDER BY epoch`,
+        [config.chainDomain.toString(), config.sourceGateway])).rows;
+        const result = [];
+        for (const row of records) result.push(await recoveryLifecycle.readBatch({ batchRecordId: row.batch_record_id }));
+        return result;
+      }
+      async function transportEvidence() {
+        return { ...await evidence(),
+          journals: (await recoveryPool.query(`SELECT * FROM ${journals} ORDER BY event_id`)).rows,
+          pendingNonce: BigInt(await client.request({ method: "eth_getTransactionCount", params: [relayConfig.relayerAddress, "pending"] })) };
+      }
+      const applicationAddress = normalizeAddress(process.env.IDENTITY_APPLICATION_ADDRESS);
+      const identityAbi = artifact("IdentityApplicationA").abi;
+      const sourceAbi = parseAbi(["function nextNonce() view returns (uint256)"]);
+      const sourceNonce = () => chainA.readContract({ address: config.sourceGateway, abi: sourceAbi, functionName: "nextNonce" });
+      const usedNullifier = nullifier => chainA.readContract({ address: applicationAddress, abi: identityAbi,
+        functionName: "usedNullifiers", args: [nullifier] });
+      async function sourceAuthorization(event) {
+        const receipt = await chainA.getTransactionReceipt({ hash: event.sourceTransactionHash });
+        assert.equal(receipt.status, "success"); assert.equal(receipt.blockHash.toLowerCase(), event.sourceBlockHash);
+        assert.equal(receipt.blockNumber, event.sourceBlockNumber);
+        assert.equal((await chainA.getBlock({ blockNumber: event.sourceBlockNumber })).hash.toLowerCase(), event.sourceBlockHash);
+        const links = receipt.logs.filter(log => log.address.toLowerCase() === applicationAddress)
+          .map(log => decodeEventLog({ abi: identityAbi, ...log }))
+          .filter(log => log.eventName === "AuthorizedMessageForwarded" && log.args.messageId === event.messageId);
+        assert.equal(links.length, 1);
+        assert.equal(await usedNullifier(links[0].args.nullifier), true);
+        return links[0].args.nullifier;
+      }
+
+      await assertLiveValidators();
+      await indexer.catchUpOnce(); await finality.runFinalityPass();
+      const historicalRows = await readMessages(recoveryPool, config.databaseSchema);
+      const historicalBlocks = await readIndexedSourceBlocks(recoveryPool, config.databaseSchema, scope);
+      const historicalBatches = await readBatches();
+      const beforeTransport = await transportEvidence();
+      assert.ok(beforeTransport.account, "the existing E2E manager already owns durable nonce state");
+      const commonAncestor = await chainA.getBlock({ blockTag: "latest" });
+      const branchSnapshot = await chainA.request({ method: "evm_snapshot" });
+      const nonceBefore = await sourceNonce();
+      const orphan = await produceSourceMessage(grant(orphanSupplier));
+      assert.equal(orphan.sourceBlockNumber, commonAncestor.number + 1n);
+      const orphanNullifier = await sourceAuthorization(orphan);
+      assert.equal(await sourceNonce(), nonceBefore + 1n);
+      await indexer.catchUpOnce();
+      assert.equal((await readOccurrence(orphan)).status, "OBSERVED");
+      await finality.runFinalityPass();
+      const beforeReorg = await readOccurrence(orphan);
+      assert.equal(beforeReorg.status, "FINALIZING");
+      assert.ok(beforeReorg.finalizing_at instanceof Date); assert.equal(beforeReorg.finalized_at, null);
+      await chainA.request({ method: "anvil_mine", params: ["0x1"] });
+      await indexer.catchUpOnce();
+      const oldHead = await chainA.getBlock({ blockTag: "latest" });
+      assert.ok(oldHead.number - orphan.sourceBlockNumber < config.finalityBlockDepth, "fault must precede source finality");
+      assert.equal(oldHead.transactions.length, 0, "the old branch includes a persisted eventless block");
+      const oldBlocks = await readIndexedSourceBlocks(recoveryPool, config.databaseSchema, scope);
+      assert.equal(oldBlocks.at(-1).block_number, oldHead.number.toString());
+      assert.equal(oldBlocks.at(-1).block_hash, oldHead.hash.toLowerCase());
+
+      async function assertExcluded(expectedOccurrence) {
+        assert.deepEqual(await readOccurrence(orphan), expectedOccurrence);
+        const counts = (await recoveryPool.query(`WITH orphan_jobs AS (
+          SELECT delivery_job_id FROM ${jobs} WHERE source_message_id = $1 OR message_id = $2
+        ), orphan_attempts AS (
+          SELECT * FROM ${attempts} WHERE delivery_job_id IN (SELECT delivery_job_id FROM orphan_jobs)
+        ) SELECT
+          (SELECT COUNT(*) FROM ${members} WHERE source_message_id = $1 OR message_id = $2)::text AS membership,
+          (SELECT COUNT(*) FROM ${certificates} q JOIN ${members} m USING (batch_record_id)
+            WHERE m.source_message_id = $1 OR m.message_id = $2)::text AS qc_membership,
+          (SELECT COUNT(*) FROM orphan_jobs)::text AS ready,
+          (SELECT COUNT(*) FROM ${intents} WHERE delivery_job_id IN (SELECT delivery_job_id FROM orphan_jobs))::text AS intents,
+          (SELECT COUNT(*) FROM orphan_attempts)::text AS signed_attempts,
+          (SELECT COUNT(*) FROM ${journals} WHERE attempt_id IN (SELECT attempt_id FROM orphan_attempts))::text AS broadcasts,
+          (SELECT COUNT(*) FROM orphan_attempts WHERE receipt_block_number IS NOT NULL)::text AS receipts`,
+        [beforeReorg.id, orphan.messageId])).rows[0];
+        assert.deepEqual(counts, { membership: "0", qc_membership: "0", ready: "0", intents: "0",
+          signed_attempts: "0", broadcasts: "0", receipts: "0" });
+        const eligible = await createFinalityStore(recoveryPool, config.databaseSchema).listBatchEligibleMessages(scope);
+        assert.ok(eligible.every(row => row.id !== beforeReorg.id && row.message_id !== orphan.messageId));
+        // Authenticate every referenced batch from current durable membership/QC,
+        // rather than looking for the message ID in consensus log strings.
+        const batches = new Map();
+        for (const current of await readBatches()) {
+          assert.ok(current.members.every(member => member.sourceMessageId !== beforeReorg.id && member.messageId !== orphan.messageId));
+          if (current.batch) {
+            assert.ok(!current.batch.messageIds.includes(orphan.messageId));
+            batches.set(current.batch.batchId, current);
+          }
+        }
+        const consensusTables = ["validated_batch_bindings", "pbft_epoch_views", "pbft_pre_prepares",
+          "pbft_prepare_votes", "pbft_prepared_states", "pbft_commit_votes", "pbft_commit_quorums"];
+        for (const state of states) {
+          const references = (await state.pool.query(consensusTables.map(name =>
+            `SELECT batch_id,message_root FROM ${tableName(state.config.databaseSchema, name)}`).join(" UNION "))).rows;
+          for (const reference of references) {
+            const current = batches.get(reference.batch_id);
+            assert.ok(current, "durable validator weight must reference an actual sealed source batch");
+            assert.equal(reference.message_root, current.tree.messageRoot);
+          }
+        }
+        assert.equal(await readGateway("isMessageExecuted", [orphan.messageId]), false);
+        assert.equal(await readApp("isVerifiedSupplier", [orphanSupplier]), false);
+        for (const [address, abi, eventName] of [[gateway, gatewayAbi, "CrossChainMessageExecuted"], [application, appAbi, "VerifiedSupplierGranted"]]) {
+          assert.equal((await client.getContractEvents({ address, abi, eventName, args: { messageId: orphan.messageId },
+            fromBlock: 0n, toBlock: "latest", strict: true })).length, 0);
+        }
+        await assertLiveValidators();
+      }
+
+      await assertExcluded(beforeReorg);
+      console.log(`VALID: real source event ${orphan.messageId} persisted FINALIZING below depth ${config.finalityBlockDepth}; no batch/QC/READY/intent before reorg`);
+      assert.equal(await chainA.request({ method: "evm_revert", params: [branchSnapshot] }), true);
+      assert.equal(BigInt(await chainA.request({ method: "eth_blockNumber" })), commonAncestor.number);
+      assert.equal(await sourceNonce(), nonceBefore);
+      assert.equal(await usedNullifier(orphanNullifier), false, "orphaned source authorization rolls back with its EVM transaction");
+      const replacement = await produceSourceMessage(grant(replacementSupplier));
+      assert.equal(replacement.sourceBlockNumber, orphan.sourceBlockNumber);
+      assert.equal(replacement.nonce, orphan.nonce);
+      assert.notEqual(replacement.sourceBlockHash, orphan.sourceBlockHash);
+      assert.notEqual(replacement.messageId, orphan.messageId);
+      assert.notEqual(await sourceAuthorization(replacement), orphanNullifier);
+      assert.equal(await usedNullifier(orphanNullifier), false);
+      console.log("VALID: real source EVM rollback restored Gateway nonce and cleared the orphan's nullifier; replacement used a fresh intent-bound proof");
+      await chainA.request({ method: "anvil_mine", params: ["0x1"] });
+      const replacementEmpty = await chainA.getBlock({ blockTag: "latest" });
+      assert.equal(replacementEmpty.number, oldHead.number);
+      assert.equal(replacementEmpty.transactions.length, 0);
+      assert.notEqual(replacementEmpty.hash.toLowerCase(), oldHead.hash.toLowerCase());
+      assert.notEqual((await chainA.getBlock({ blockNumber: orphan.sourceBlockNumber })).hash.toLowerCase(), orphan.sourceBlockHash);
+      assert.equal(await chainA.request({ method: "eth_getTransactionReceipt", params: [orphan.sourceTransactionHash] }), null);
+
+      const reconciliation = [];
+      const recoveryLogger = { log: message => reconciliation.push(message), error: message => console.error(message) };
+      const recoveredWatcher = createFinalityWatcher({ config, pool: recoveryPool, publicClient: chainA, logger: recoveryLogger });
+      const recoveredIndexer = createIndexer({ config, pool: recoveryPool, publicClient: chainA, logger: recoveryLogger });
+      await recoveredWatcher.runFinalityPass();
+      assert.ok(reconciliation.includes(`Common ancestor: ${commonAncestor.number}`));
+      assert.ok(reconciliation.includes("Unfinalized messages marked REORGED: 1"));
+      const orphaned = await readOccurrence(orphan);
+      assert.equal(orphaned.status, "REORGED"); assert.ok(orphaned.reorged_at instanceof Date);
+      assert.deepEqual({ ...orphaned, status: beforeReorg.status, reorged_at: beforeReorg.reorged_at }, beforeReorg);
+      assert.equal(BigInt((await readCursor(recoveryPool, config.databaseSchema, scope)).next_block), commonAncestor.number + 1n);
+      assert.deepEqual(await readIndexedSourceBlocks(recoveryPool, config.databaseSchema, scope), historicalBlocks);
+      const reindexed = await recoveredIndexer.catchUpOnce();
+      assert.equal(reindexed.initialNextBlock, commonAncestor.number + 1n);
+      assert.equal(reindexed.nextBlock, replacementEmpty.number + 1n);
+      const canonicalBlocks = await readIndexedSourceBlocks(recoveryPool, config.databaseSchema, scope);
+      assert.equal(canonicalBlocks.at(-1).block_hash, replacementEmpty.hash.toLowerCase());
+      assert.equal(canonicalBlocks.at(-1).block_number, replacementEmpty.number.toString());
+      assert.equal((await readOccurrence(replacement)).status, "OBSERVED");
+      await recoveredWatcher.runFinalityPass();
+      assert.equal((await readOccurrence(replacement)).status, "FINALIZING");
+      const emptyCollection = await recoveryLifecycle.collectEligible();
+      assert.equal(emptyCollection.assignedCount, 0);
+      assert.equal(emptyCollection.snapshot.members.length, 0);
+      const beforeRepeat = await readMessages(recoveryPool, config.databaseSchema);
+      const repeated = await recoveredIndexer.catchUpOnce();
+      assert.equal(repeated.insertedRows, 0);
+      await recoveredWatcher.runFinalityPass();
+      assert.deepEqual(await readMessages(recoveryPool, config.databaseSchema), beforeRepeat);
+      // Actually drive the existing downstream workers while the replacement is
+      // still unfinalized. Old unrelated READY/deferred jobs may exist.
+      await recoveryWorker.runOnce();
+      assert.deepEqual(await transportEvidence(), beforeTransport, "the orphan must reserve/sign/broadcast no transaction or nonce");
+      await assertExcluded(orphaned);
+      console.log(`VALID: real Chain A branch replaced after ancestor ${commonAncestor.number}; original occurrence ${beforeReorg.id} preserved terminal REORGED with unchanged provenance`);
+      console.log("VALID: orphaned occurrence has zero batch/Merkle/PBFT/QC/READY/intent/signed-attempt/broadcast/receipt/destination evidence with live validators and Relayer/Tx Manager");
+
+      await chainA.request({ method: "anvil_mine", params: [toHex(config.finalityBlockDepth)] });
+      await recoveredIndexer.catchUpOnce(); await recoveredWatcher.runFinalityPass();
+      assert.equal((await readOccurrence(replacement)).status, "FINALIZED");
+      const committed = await commitFresh([replacement]);
+      assert.equal(committed.quorumCertificate.commits.length, 3);
+      assert.equal(new Set(committed.quorumCertificate.commits.map(vote => vote.voterIdentity)).size, 3);
+      const projection = await recoveryProjector.materializeBatch({ batchRecordId: committed.record.batchRecordId });
+      assert.equal(projection.createdJobs, 1);
+      const [pack] = await buildDeliveryPackages(committed, { validatorSets });
+      assert.equal(pack.message.messageId, replacement.messageId);
+      assert.equal((await recoveryQueue.getDeliveryJob(pack.deliveryJobId)).status, "READY");
+      const encoded = await encodeGatewaySubmission(pack, { validatorSets });
+      await recoveryWorker.submitJob(pack.deliveryJobId);
+      const sent = await recoveryManager.repository.getTransaction(pack.deliveryJobId);
+      assert.equal(sent.attempts.length, 1);
+      const receipt = await client.waitForTransactionReceipt({ hash: sent.attempt.transactionHash });
+      assert.equal(receipt.status, "success");
+      const transaction = await client.getTransaction({ hash: receipt.transactionHash });
+      assert.equal(transaction.to.toLowerCase(), gateway); assert.equal(transaction.value, 0n);
+      assert.equal(transaction.input, encoded.calldata); assert.equal(sent.intent.packageDigest, encoded.packageDigest);
+      const nextReserved = BigInt(beforeTransport.account.nextNonce);
+      const expectedNonce = nextReserved > beforeTransport.pendingNonce ? nextReserved : beforeTransport.pendingNonce;
+      assert.equal(BigInt(sent.intent.nonce), expectedNonce); assert.equal(BigInt(transaction.nonce), expectedNonce);
+      const executions = receipt.logs.filter(log => log.address.toLowerCase() === gateway).map(log => decodeEventLog({ abi: gatewayAbi, ...log }));
+      const grants = receipt.logs.filter(log => log.address.toLowerCase() === application).map(log => decodeEventLog({ abi: appAbi, ...log }));
+      assert.equal(executions.length, 1); assert.equal(executions[0].eventName, "CrossChainMessageExecuted");
+      assert.equal(executions[0].args.messageId, replacement.messageId); assert.equal(executions[0].args.batchId, committed.record.batchId);
+      assert.equal(executions[0].args.sourceDomain, config.chainDomain); assert.equal(executions[0].args.destinationReceiver.toLowerCase(), application);
+      assert.equal(grants.length, 1); assert.equal(grants[0].eventName, "VerifiedSupplierGranted");
+      assert.equal(grants[0].args.messageId, replacement.messageId); assert.equal(grants[0].args.supplier.toLowerCase(), replacementSupplier);
+      assert.equal(await readGateway("isMessageExecuted", [replacement.messageId]), true);
+      assert.equal(await readApp("isVerifiedSupplier", [replacementSupplier]), true);
+      await client.request({ method: "anvil_mine", params: [toHex(relayConfig.destinationConfirmations)] });
+      await recoveryManager.checkReceiptsOnce();
+      assert.equal((await recoveryManager.repository.getTransaction(pack.deliveryJobId)).intent.status, "CONFIRMED");
+      assert.equal(BigInt((await recoveryManager.repository.getAccount()).nextNonce), expectedNonce + 1n);
+      const repeatProjection = await recoveryProjector.materializeBatch({ batchRecordId: committed.record.batchRecordId });
+      assert.equal(repeatProjection.materialized, false); assert.equal(repeatProjection.createdJobs, 0);
+      await recoveredIndexer.catchUpOnce(); await recoveredWatcher.runFinalityPass();
+      await assertExcluded(orphaned);
+      const rowsAfter = await readMessages(recoveryPool, config.databaseSchema);
+      assert.deepEqual(rowsAfter.filter(row => historicalRows.some(previous => previous.id === row.id)), historicalRows);
+      for (const previous of historicalBatches) assert.deepEqual(await recoveryLifecycle.readBatch({ batchRecordId: previous.record.batchRecordId }), previous);
+      const afterTransport = await transportEvidence();
+      assert.equal(afterTransport.pendingNonce, expectedNonce + 1n, "only the legitimate replacement consumes a destination nonce");
+      assert.deepEqual(afterTransport.intents.filter(row => row.delivery_job_id !== pack.deliveryJobId), beforeTransport.intents);
+      assert.deepEqual(afterTransport.attempts.filter(row => row.delivery_job_id !== pack.deliveryJobId), beforeTransport.attempts);
+      const newAttemptIds = new Set((await recoveryManager.repository.getTransaction(pack.deliveryJobId)).attempts.map(attempt => attempt.attemptId));
+      assert.deepEqual(afterTransport.journals.filter(row => !newAttemptIds.has(row.attempt_id)), beforeTransport.journals);
+      console.log(`VALID: canonical source recovery completed real E2E: message ${replacement.messageId}; batch ${committed.record.batchId}; root ${committed.tree.messageRoot}; validator epoch ${committed.quorumCertificate.validatorEpoch}; QC ${committed.quorumCertificate.qcDigest}; job ${pack.deliveryJobId}; destination tx ${receipt.transactionHash}`);
+      console.log("VALID: replacement reached production Gateway/ApplicationB; original orphan remained REORGED and unexecuted; historical source/batch/QC/signed-transaction evidence unchanged");
+    } catch (error) {
+      primaryError = error;
+      throw error;
+    } finally {
+      try { await recoveryPool.end(); }
+      catch (error) {
+        if (!primaryError) throw error;
+        console.error(`Source reorg client cleanup also failed (${error.code ?? error.name})`);
+      }
+    }
+  }
 }
