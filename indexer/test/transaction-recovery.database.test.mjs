@@ -8,7 +8,7 @@ import { createDeliveryRepository } from "../src/delivery/repository.mjs";
 import { deliveryJson } from "../src/delivery/package.mjs";
 import { formatRelayerSummary } from "../src/relayer/summary.mjs";
 import { createTransactionManager } from "../src/transaction-manager/service.mjs";
-import { verifySignedTransaction } from "../src/transaction-manager/transaction.mjs";
+import { verifySignedTransaction,signDeliveryTransaction } from "../src/transaction-manager/transaction.mjs";
 import { transactionConfig,transactionHarness } from "./helpers/transaction-fixtures.mjs";
 import { persistReadyTransactionFixture } from "./helpers/transaction-database-fixtures.mjs";
 import { destinationRpcFixture,transactionBody,rpcTimeout } from "./helpers/destination-rpc-fixtures.mjs";
@@ -214,26 +214,57 @@ test("observation migration preserves old accounts, allocator, winners, receipts
     await client.query("COMMIT"); open = false;
     await persistReadyTransactionFixture({ config: cfg,pool });
     const q = createDeliveryRepository({ config: cfg,pool }); const oldJobs = await q.listReadyDeliveryJobs();
-    let legacy;
-    const rpc = destinationRpcFixture({ config: cfg,async onBroadcast(raw) {
-      const row = (await pool.query(`SELECT delivery_job_id,attempt_id FROM ${tableName(schema,"transaction_attempts")} WHERE raw_signed_transaction = $1`,[raw])).rows[0];
-      const stored = await legacy.repository.getTransaction(row.delivery_job_id);
-      return transactionBody(stored.intent,stored.attempts.find(a => a.attemptId === row.attempt_id));
-    } });
-    legacy = manager({ cfg,rpc: rpc.rpc });
-    for (const job of oldJobs) await legacy.submitDelivery(job.deliveryJobId);
+    const legacy = manager({ cfg });
+    // Freeze the pre-upgrade data shape with the existing signing primitive
+    // and old SQL guards. Do not run a new-schema manager against old tables.
+    await client.query("BEGIN"); open = true;
+    await client.query(`INSERT INTO ${tableName(schema,"transaction_accounts")} (chain_id,sender_address,next_nonce) VALUES ($1,$2,9)`,
+      [cfg.destinationDomain.toString(),cfg.relayerAddress]);
+    for (const [index,job] of oldJobs.entries()) {
+      const intent = await legacy.resolveIntent(job.deliveryJobId); const nonce = 9n + BigInt(index);
+      const signed = await signDeliveryTransaction({ ...intent,nonce: nonce.toString() },{
+        nonce,gasLimit: 123456n,maxFeePerGas: 3000000000n,maxPriorityFeePerGas: 1000000000n },privateKeyToAccount(cfg.privateKey));
+      await client.query(`UPDATE ${tableName(schema,"transaction_accounts")} SET next_nonce = $1`,[(nonce + 1n).toString()]);
+      await client.query(`INSERT INTO ${tableName(schema,"transaction_intents")} (delivery_job_id,package_digest,chain_id,sender_address,
+        destination_gateway,value,calldata,nonce,next_action_at) VALUES ($1,$2,$3,$4,$5,0,$6,$7,$8)`,
+      [job.deliveryJobId,intent.packageDigest,intent.chainId,intent.senderAddress,intent.destinationGateway,intent.calldata,nonce.toString(),new Date(h.clock.now())]);
+      const a = (await client.query(`INSERT INTO ${tableName(schema,"transaction_attempts")} (delivery_job_id,chain_id,sender_address,status,nonce,gas_limit,
+        max_fee_per_gas,max_priority_fee_per_gas,transaction_type,raw_signed_transaction,transaction_hash)
+        VALUES ($1,$2,$3,'SIGNED',$4,123456,3000000000,1000000000,2,$5,$6) RETURNING attempt_id`,
+      [job.deliveryJobId,intent.chainId,intent.senderAddress,nonce.toString(),signed.rawSignedTransaction,signed.transactionHash])).rows[0];
+      await client.query(`UPDATE ${tableName(schema,"transaction_attempts")} SET status = 'BROADCAST',broadcast_at = $2,
+        broadcast_attempt_count = 1,last_broadcast_attempt_at = $2 WHERE attempt_id = $1`,[a.attempt_id,new Date(h.clock.now())]);
+      const event = (await client.query(`INSERT INTO ${tableName(schema,"transaction_broadcast_events")} (attempt_id,broadcast_sequence) VALUES ($1,1) RETURNING event_id`,[a.attempt_id])).rows[0];
+      await client.query(`UPDATE ${tableName(schema,"transaction_broadcast_events")} SET completed_at = clock_timestamp(),result_class = 'ACCEPTED',returned_tx_hash = $2
+        WHERE event_id = $1`,[event.event_id,signed.transactionHash]);
+    }
+    await client.query("COMMIT"); open = false;
     for (const [index,status] of [1,0].entries()) {
       const stored = await legacy.repository.getTransaction(oldJobs[index].deliveryJobId);
-      await legacy.repository.recordOutcome(oldJobs[index].deliveryJobId,{ transactionHash: stored.attempt.transactionHash,
-        status,blockNumber: 100n,blockHash: fixtureHash(1100),head: 102n });
+      // Construct a genuine pre-upgrade terminal cache using that schema's
+      // existing guards; the current manager requires the new migration.
+      await client.query("BEGIN"); open = true;
+      await client.query(`UPDATE ${tableName(schema,"transaction_attempts")} SET status = $2,receipt_block_number = 100,
+        receipt_block_hash = $3,receipt_status = $4,confirmed_head = 102,confirmed_at = $5 WHERE attempt_id = $1`,
+      [stored.attempt.attemptId,status === 1 ? "CONFIRMED" : "REVERTED",fixtureHash(1100),status,new Date(h.clock.now())]);
+      await client.query(`UPDATE ${tableName(schema,"transaction_intents")} SET status = $2,winning_attempt_id = $3,next_action_at = NULL WHERE delivery_job_id = $1`,
+      [oldJobs[index].deliveryJobId,status === 1 ? "CONFIRMED" : "REVERTED",stored.attempt.attemptId]);
+      await client.query("COMMIT"); open = false;
     }
     const accountName = tableName(schema,"transaction_accounts");
     const account = (await pool.query(`SELECT * FROM ${accountName}`)).rows[0];
     const snapshots = await Promise.all(oldJobs.map(job => legacy.repository.getRecoverySnapshot(job.deliveryJobId)));
     const source = await sourceState(pool,schema);
-    assert.equal((await applyMigrations(pool,schema)).at(-1),"017_transaction_scan_progress.sql");
-    const { receipt_scan_cursor_nonce,recovery_scan_cursor_nonce,...unchanged } = (await pool.query(`SELECT * FROM ${accountName}`)).rows[0];
-    assert.equal(receipt_scan_cursor_nonce,null); assert.equal(recovery_scan_cursor_nonce,null); assert.deepEqual(unchanged,account);
+    assert.equal((await applyMigrations(pool,schema)).at(-1),"018_destination_receipt_reconciliation.sql");
+    const { receipt_scan_cursor_nonce,recovery_scan_cursor_nonce,terminal_scan_cursor_nonce,...unchanged } = (await pool.query(`SELECT * FROM ${accountName}`)).rows[0];
+    assert.equal(receipt_scan_cursor_nonce,null); assert.equal(recovery_scan_cursor_nonce,null); assert.equal(terminal_scan_cursor_nonce,null); assert.deepEqual(unchanged,account);
+    for (const [index,status] of [1,0].entries()) {
+      const history = await legacy.repository.getReceiptObservations(oldJobs[index].deliveryJobId);
+      assert.equal(history.length,1); assert.equal(history[0].status,status); assert.equal(history[0].orphaned,false);
+      assert.equal(history[0].transactionHash,snapshots[index].winningAttempt.transactionHash);
+      assert.equal(history[0].blockHash,snapshots[index].winningAttempt.receiptBlockHash);
+      assert.equal(history[0].confirmedAt,snapshots[index].winningAttempt.confirmedAt);
+    }
     await applyMigrations(pool,schema);
     assert.deepEqual(await Promise.all(oldJobs.map(job => legacy.repository.getRecoverySnapshot(job.deliveryJobId))),snapshots);
     assert.deepEqual(await sourceState(pool,schema),source);
@@ -262,6 +293,155 @@ test("observation migration preserves old accounts, allocator, winners, receipts
 
 const immutableAttemptFields = ["attemptId","attemptNumber","replacementOfAttemptId","nonce","gasLimit",
   "maxFeePerGas","maxPriorityFeePerGas","rawSignedTransaction","transactionHash","createdAt"];
+
+async function terminalSqlFixture(status = 1) {
+  const id = jobs[0].deliveryJobId; const sent = await reader.submitDelivery(id);
+  await mine(id,sent.attempt.attemptId,status); await reader.checkReceiptsOnce();
+  const original = await reader.repository.getTransaction(id);
+  assert.equal(original.intent.status,status ? "CONFIRMED" : "REVERTED");
+  return { id,original,account: await reader.repository.getAccount(),source: await sourceState(pool,config.databaseSchema),
+    history: await reader.repository.getReceiptObservations(id),journal: await reader.repository.getBroadcastEvents(id) };
+}
+function orphanSqlBranch(original,{ replay = false } = {}) {
+  destination.receipts.clear(); destination.transactions.clear();
+  destination.nodes.forEach(node => {
+    node.blocks.set("100",{ number: "0x64",hash: fixtureHash(7000) });
+    node.latestNonce = BigInt(original.intent.nonce); node.pendingNonce = BigInt(original.intent.nonce); node.replay = replay;
+  });
+}
+
+for (const status of [1,0]) test(`SQL proven reorg preserves ${status ? "CONFIRMED" : "REVERTED"} history and recovers exact signed bytes through fresh clients`, async () => {
+  const f = await terminalSqlFixture(status); const { id,original,account,history } = f;
+  const intentTable = tableName(config.databaseSchema,"transaction_intents");
+  await assert.rejects(pool.query(`UPDATE ${intentTable} SET status = 'PENDING',winning_attempt_id = NULL,
+    current_receipt_observation_id = NULL,next_action_at = clock_timestamp() WHERE delivery_job_id = $1`,[id]),/proven-reorg/);
+  await assert.rejects(pool.query(`UPDATE ${attemptTable} SET status = 'BROADCAST' WHERE delivery_job_id = $1`,[id]),/illegal transaction status transition/);
+  const receiptTable = tableName(config.databaseSchema,"transaction_receipt_observations");
+  await assert.rejects(pool.query(`DELETE FROM ${receiptTable} WHERE delivery_job_id = $1`,[id]),/append-only/);
+  await assert.rejects(pool.query(`UPDATE ${receiptTable} SET block_hash = $2 WHERE delivery_job_id = $1`,[id,fixtureHash(9000)]),/append-only/);
+  orphanSqlBranch(original);
+  const activity = destination.nodes.flatMap(node => node.calls).filter(call => ["eth_estimateGas","eth_maxPriorityFeePerGas"].includes(call.method)).length;
+  const fresh = createDatabasePool(config);
+  try {
+    const restarted = manager({ db: fresh });
+    assert.equal((await restarted.checkReceiptsOnce()).terminal.results[0].action,"REORG_RECOVERY");
+    const recovering = await restarted.repository.getTransaction(id);
+    assert.equal(recovering.intent.status,"PENDING"); assert.equal(recovering.intent.winningAttemptId,null);
+    assert.equal(recovering.intent.reorgRecovery.rebroadcastRequired,true);
+    assert.equal(recovering.intent.nextActionAt,new Date(h.clock.now()).toISOString());
+    assert.equal(recovering.intent.retryStoppedAt,null); assert.equal(recovering.intent.retryStopReason,null);
+    for (const field of immutableAttemptFields) assert.ok(recovering.attempt[field] === original.attempt[field],`reorg must preserve ${field}`);
+    const [old] = await restarted.repository.getReceiptObservations(id);
+    for (const field of ["observationId","transactionHash","blockNumber","blockHash","status","confirmedHead","confirmedAt"]) {
+      assert.equal(old[field],history[0][field],`archived ${field} must remain unchanged`);
+    }
+    assert.equal(old.orphaned,true);
+    await assert.rejects(pool.query(`UPDATE ${tableName(config.databaseSchema,"transaction_receipt_orphans")} SET observed_head = observed_head + 1`),/append-only/);
+    assert.equal((await restarted.processTransactionRetriesOnce()).broadcasts,1);
+    await mine(id,original.attempt.attemptId,status);
+    // Re-inclusion uses a genuinely different canonical cache in the fixture.
+    const receipt = destination.receipts.get(original.attempt.transactionHash); receipt.blockHash = fixtureHash(7000);
+    destination.transactions.set(original.attempt.transactionHash,transactionBody(original.intent,original.attempt,100n,fixtureHash(7000)));
+    await restarted.checkReceiptsOnce();
+    const final = await restarted.repository.getTransaction(id); assert.equal(final.intent.status,status ? "CONFIRMED" : "REVERTED");
+    assert.equal(final.attempts.length,1); assert.equal(final.winningAttempt.receiptBlockHash,fixtureHash(7000));
+    const observed = await restarted.repository.getReceiptObservations(id);
+    assert.equal(observed.length,2); assert.deepEqual(observed[0],old); assert.equal(observed[1].orphaned,false);
+    assert.deepEqual(await restarted.repository.getAccount(),account);
+    assert.deepEqual(await sourceState(pool,config.databaseSchema),f.source);
+    assert.equal(destination.nodes.flatMap(node => node.calls).filter(call => ["eth_estimateGas","eth_maxPriorityFeePerGas"].includes(call.method)).length,activity);
+    const journal = await restarted.repository.getBroadcastEvents(id);
+    assert.deepEqual(journal.slice(0,f.journal.length),f.journal);
+    assert.equal(journal.filter(event => event.parentEventId === null && event.resultClass === "ACCEPTED").length,2);
+    const state = await restarted.repository.getTransaction(id); const preserved = await restarted.repository.getReceiptObservations(id);
+    await applyMigrations(pool,config.databaseSchema);
+    assert.deepEqual(await restarted.repository.getTransaction(id),state); assert.deepEqual(await restarted.repository.getReceiptObservations(id),preserved);
+  } finally { await fresh.end(); }
+});
+
+for (const status of [1,0]) test(`SQL proven reorg preserves a stopped ${status ? "CONFIRMED" : "REVERTED"} intent without scheduling another send`, async () => {
+  const id = jobs[0].deliveryJobId; const sent = await reader.submitDelivery(id);
+  await reader.repository.stopRetry(id,"MAX_ATTEMPTS_REACHED");
+  const stopped = await reader.repository.getTransaction(id);
+  assert.notEqual(stopped.intent.retryStoppedAt,null); assert.equal(stopped.intent.nextActionAt,null);
+  await mine(id,sent.attempt.attemptId,status); await reader.checkReceiptsOnce();
+  const original = await reader.repository.getTransaction(id);
+  assert.equal(original.intent.status,status ? "CONFIRMED" : "REVERTED");
+  const account = await reader.repository.getAccount(); const journal = await reader.repository.getBroadcastEvents(id);
+  const [historical] = await reader.repository.getReceiptObservations(id);
+  const sends = destination.nodes.flatMap(node => node.broadcasts).length;
+  orphanSqlBranch(original);
+  const result = await reader.checkReceiptsOnce();
+  assert.equal(result.terminal.results[0].action,"REORG_RECOVERY");
+  const recovering = await reader.repository.getTransaction(id);
+  assert.equal(recovering.intent.status,"PENDING"); assert.equal(recovering.intent.winningAttemptId,null);
+  assert.equal(recovering.intent.nextActionAt,null);
+  assert.equal(recovering.intent.retryStoppedAt,stopped.intent.retryStoppedAt);
+  assert.equal(recovering.intent.retryStopReason,"MAX_ATTEMPTS_REACHED");
+  assert.equal(recovering.intent.reorgRecovery.rebroadcastRequired,true);
+  for (const field of immutableAttemptFields) assert.ok(recovering.attempt[field] === original.attempt[field],`stopped reorg must preserve ${field}`);
+  const [orphaned] = await reader.repository.getReceiptObservations(id);
+  for (const field of ["observationId","transactionHash","blockNumber","blockHash","status","confirmedHead","confirmedAt"]) {
+    assert.equal(orphaned[field],historical[field],`stopped reorg must retain archived ${field}`);
+  }
+  assert.equal(orphaned.orphaned,true);
+  assert.equal((await reader.processTransactionRetriesOnce()).processed,0);
+  assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,sends);
+  assert.deepEqual((await reader.repository.getTransaction(id)).intent,recovering.intent);
+  assert.deepEqual(await reader.repository.getBroadcastEvents(id),journal);
+  assert.deepEqual(await reader.repository.getAccount(),account);
+  await assert.rejects(pool.query(`UPDATE ${tableName(config.databaseSchema,"transaction_intents")}
+    SET retry_stopped_at = NULL,retry_stop_reason = NULL,next_action_at = clock_timestamp() WHERE delivery_job_id = $1`,[id]),/cannot be reset/);
+});
+
+test("SQL concurrent canonicality passes archive one orphan and preserve bounded terminal progress across clients", async () => {
+  const { id,original,account } = await terminalSqlFixture(); orphanSqlBranch(original);
+  const fresh = createDatabasePool(config);
+  try {
+    const restarted = manager({ db: fresh });
+    await Promise.all([reader.checkReceiptsOnce({ limit: 1 }),restarted.checkReceiptsOnce({ limit: 1 })]);
+    const observations = await restarted.repository.getReceiptObservations(id);
+    assert.equal(observations.length,1); assert.equal(observations[0].orphaned,true);
+    assert.deepEqual(await restarted.repository.getTransaction(id),await reader.repository.getTransaction(id));
+    const progress = (await fresh.query(`SELECT terminal_scan_cursor_nonce::text AS terminal FROM ${accountTable}`)).rows[0];
+    assert.equal(progress.terminal,original.intent.nonce); assert.deepEqual(await restarted.repository.getAccount(),account);
+    await Promise.all([reader.processTransactionRetriesOnce(),restarted.processTransactionRetriesOnce()]);
+    assert.equal((await reader.repository.getTransaction(id)).attempts.length,1);
+    assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,2);
+  } finally { await fresh.end(); }
+});
+
+test("SQL terminal scan is independent, bounded and fair while pending receipt work continues", async () => {
+  for (const job of jobs) await reader.submitDelivery(job.deliveryJobId);
+  for (const job of jobs.slice(0,2)) {
+    const stored = await reader.repository.getTransaction(job.deliveryJobId); await mine(job.deliveryJobId,stored.attempt.attemptId);
+  }
+  await reader.checkReceiptsOnce();
+  const observed = [];
+  for (let round = 0; round < 4; round++) {
+    const fresh = createDatabasePool(config);
+    try {
+      const result = await manager({ db: fresh }).checkReceiptsOnce({ limit: 1 });
+      assert.equal(result.checked,1); assert.equal(result.results[0].intent.deliveryJobId,jobs[2].deliveryJobId);
+      assert.equal(result.terminal.checked,1); observed.push(result.terminal.results[0].deliveryJobId);
+    } finally { await fresh.end(); }
+  }
+  assert.deepEqual(observed,[jobs[0].deliveryJobId,jobs[1].deliveryJobId,jobs[0].deliveryJobId,jobs[1].deliveryJobId]);
+});
+
+test("SQL canonical re-inclusion adopts an existing sibling without re-signing or a new send", async () => {
+  const id = jobs[0].deliveryJobId; const parent = await reader.submitDelivery(id);
+  h.advance(config.replacementAfterMs); const child = await reader.prepareReplacement(id);
+  await mine(id,parent.attempt.attemptId); await reader.checkReceiptsOnce();
+  const original = await reader.repository.getTransaction(id); orphanSqlBranch(original);
+  await mine(id,child.attempt.attemptId);
+  destination.receipts.get(child.attempt.transactionHash).blockHash = fixtureHash(7000);
+  destination.transactions.set(child.attempt.transactionHash,transactionBody(original.intent,child.attempt,100n,fixtureHash(7000)));
+  const result = await reader.checkReceiptsOnce(); assert.equal(result.terminal.results[0].action,"REINCLUDED");
+  const stored = await reader.repository.getTransaction(id);
+  assert.equal(stored.winningAttempt.attemptId,child.attempt.attemptId); assert.equal(stored.attempts.length,2);
+  assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,1);
+});
 function sameSignedAttempt(before,after) {
   for (const field of immutableAttemptFields) assert.equal(after[field],before[field]);
 }

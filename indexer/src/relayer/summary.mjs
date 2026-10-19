@@ -7,6 +7,7 @@ export function formatRelayerSummary(record) {
     transactionHash: displayAttempt?.transactionHash ?? record.historicalSubmission?.transactionHash,
     ...(displayAttempt ? { nonce: displayAttempt.nonce } : {}),
     ...(record.intent ? { intentStatus: record.intent.status } : {}),
+    ...(record.intent?.reorgRecovery ? { canonicality: "REORG_RECOVERY",reorgId: record.intent.reorgRecovery.reorgId } : {}),
     ...(latestAttempt ? { latestAttempt: {
       transactionHash: latestAttempt.transactionHash,
       status: latestAttempt.status,

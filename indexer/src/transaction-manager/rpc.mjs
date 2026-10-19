@@ -1,3 +1,4 @@
+import { encodeFunctionData,parseAbi } from "viem";
 import { normalizeAddress } from "../canonical-message.mjs";
 import { rpcQuantity } from "./transaction.mjs";
 import { TransactionError } from "./config.mjs";
@@ -29,6 +30,12 @@ export function createTransactionRpc(config,{ pool = createDestinationRpcPool({ 
       }
     },
     readView: () => pool.readView(),
+    canonicalBlock: (number,view) => pool.canonicalBlock(number,view),
+    assertView: view => pool.assertView(view),
+    gatewayReplay: (address,messageId,view) => pool.gatewayReplay(address,encodeFunctionData({
+      abi: parseAbi(["function isMessageExecuted(bytes32 messageId) view returns (bool)"]),
+      functionName: "isMessageExecuted",args: [messageId],
+    }),view),
     receiptEvidence: (hash,view) => pool.receiptEvidence(hash,view),
     block: number => pool.block(number),
     transaction: hash => pool.transaction(hash),

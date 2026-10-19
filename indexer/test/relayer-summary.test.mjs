@@ -9,6 +9,15 @@ const deliveryJobId = `10011:0x0000000000000000000000000000000000001001:0x${"cc"
 const largeNonce = ((1n << 200n) + 17n).toString();
 const publicSummary = record => JSON.parse(deliveryJson(formatRelayerSummary(record)));
 
+test("reorg summary exposes recovery without presenting the orphaned receipt as current success or leaking signed data", () => {
+  const summary = publicSummary({ intent: { deliveryJobId,status: "PENDING",nonce: largeNonce,
+    reorgRecovery: { reorgId: "17",rebroadcastRequired: true } },
+  attempt: { transactionHash: parentHash,status: "BROADCAST",attemptNumber: 0,nonce: largeNonce,rawSignedTransaction: "private-signed-bytes" },winningAttempt: null });
+  assert.equal(summary.status,"PENDING"); assert.equal(summary.canonicality,"REORG_RECOVERY");
+  assert.equal(summary.reorgId,"17"); assert.equal(summary.transactionHash,parentHash);
+  assert.equal(JSON.stringify(summary).includes("private-signed-bytes"),false);
+});
+
 for (const status of ["CONFIRMED","REVERTED"]) {
   test(`relayer summary reports the historical parent ${status} winner and retains the latest REPLACED child diagnostic`, () => {
     const parent = Object.freeze({ transactionHash: parentHash,status,attemptNumber: 0,nonce: largeNonce });

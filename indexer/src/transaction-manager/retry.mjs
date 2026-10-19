@@ -39,7 +39,7 @@ export async function processTransactionRetriesOnce({ config, store, rpc, verify
         results.push({ deliveryJobId: id,action: observation.finalized ? current.intent.status : "AWAITING_CONFIRMATIONS" });
         continue;
       }
-      if (replacementDue(current.attempt,now,config)) {
+      if (!current.intent.reorgRecovery?.rebroadcastRequired && replacementDue(current.attempt,now,config)) {
         const prepared = await replace(id,current.attempt.attemptId,view,fence);
         if (!prepared.created) {
           if (prepared.intent.status === "PENDING" && prepared.intent.retryStoppedAt === null && prepared.attempt.attemptId === current.attempt.attemptId) {
@@ -51,7 +51,8 @@ export async function processTransactionRetriesOnce({ config, store, rpc, verify
         replacements++;
         current = prepared;
       }
-      const result = await send(id,{ rebroadcast: true,expectedAttemptId: current.attempt.attemptId,receiptView: view,fence });
+      const result = await send(id,{ rebroadcast: true,expectedAttemptId: current.attempt.attemptId,receiptView: view,fence,
+        ...(current.intent.reorgRecovery ? { expectedVersion: snapshot.version } : {}) });
       if (result.broadcast) broadcasts++;
       results.push({ deliveryJobId: id,action: result.errorClass ? "RETRY_SCHEDULED" : result.intent.status !== "PENDING" ? result.intent.status : result.broadcast ? "BROADCAST" : "ATTEMPT_CHANGED",
         errorClass: result.errorClass ?? null,attemptId: result.attempt.attemptId,transactionHash: result.attempt.transactionHash });

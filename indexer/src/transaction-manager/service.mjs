@@ -8,7 +8,8 @@ import { protocolInteger } from "../../../validator/src/committee.mjs";
 import { createTransactionRepository } from "./repository.mjs";
 import { createTransactionRpc } from "./rpc.mjs";
 import { signDeliveryTransaction, rpcQuantity } from "./transaction.mjs";
-import { inspectIntentReceipts, verifyRpcTransaction } from "./receipts.mjs";
+import { inspectIntentReceipts, observeIntentReceipts, verifyRpcTransaction } from "./receipts.mjs";
+import { revalidateTerminalReceipts } from "./receipt-reconciliation.mjs";
 import { operationTime, replacementDue, replacementFees } from "./retry-policy.mjs";
 import { processTransactionRetriesOnce } from "./retry.mjs";
 import { TransactionError } from "./config.mjs";
@@ -47,6 +48,7 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
   const sign = (intent,fields) => signDeliveryTransaction(intent,fields,account);
   const inspect = (stored,view,forceAll = false,fence) => inspectIntentReceipts({ stored,rpc,store,config,view,forceAll,fence,hooks });
   const recover = (id,fence,receiptView) => recoverTransactionsOnce({ store,rpc,config,send,hooks,deliveryJobId: id,fence,receiptView });
+  const resolveMessageId = async id => (await queue.getDeliveryEntries([id]))[0].package.message.messageId;
 
   async function prepare(id,fence) {
     if (fence) await store.assertFence(id,fence);
@@ -122,8 +124,42 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
   }
   async function sendLocked(id,options = {}) {
     await verifyChain();
+    async function checkReorgSend(atEndpoint = false) {
+      const stored = await store.getTransaction(id);
+      if (!stored.intent.reorgRecovery) return true;
+      if (options.fence) await store.assertFence(id,options.fence);
+      // Confirmation decisions keep the caller's conservative pass view.
+      // The endpoint guard is a fresh send check and never confirms receipts.
+      const view = atEndpoint ? await rpc.readView() : options.receiptView ?? await rpc.readView();
+      const observed = await observeIntentReceipts({ stored,rpc,config,view,forceAll: true,hooks });
+      await rpc.assertView(view);
+      if (observed.winner) {
+        if (!atEndpoint) {
+          await inspect(stored,view,true,options.fence);
+          return false;
+        }
+        throw new TransactionError("RPC_VIEW_INCOMPLETE");
+      }
+      if (await rpc.gatewayReplay(stored.intent.destinationGateway,await resolveMessageId(id),view)) {
+        await store.stopRetry(id,"GATEWAY_ALREADY_EXECUTED",{ fence: options.fence });
+        if (atEndpoint) throw new TransactionError("GATEWAY_ALREADY_EXECUTED");
+        return false;
+      }
+      const known = await ownTransactions(stored);
+      const [latest,pending] = await Promise.all([rpc.latestNonce(view),rpc.pendingNonce()]);
+      await rpc.assertView(view);
+      if (known.some(value => value.mined)) throw new TransactionError("RPC_VIEW_INCOMPLETE");
+      if (latest > BigInt(stored.intent.nonce) || (!known.length && pending > BigInt(stored.intent.nonce))) {
+        await store.stopRetry(id,"UNKNOWN_NONCE_CONSUMPTION",{ fence: options.fence });
+        throw new TransactionError("UNKNOWN_NONCE_CONSUMPTION");
+      }
+      if (options.fence) await store.assertFence(id,options.fence);
+      return true;
+    }
+    if (!await checkReorgSend()) return Object.freeze({ ...await store.getTransaction(id),broadcast: false });
     let rpcObservation;
-    const result = await store.broadcastPrepared(id,(raw,transactionHash,lifecycle) => rpc.broadcast(raw,transactionHash,value => { rpcObservation = value; },lifecycle),options);
+    const result = await store.broadcastPrepared(id,(raw,transactionHash,lifecycle) => rpc.broadcast(raw,transactionHash,value => { rpcObservation = value; },lifecycle),
+      { ...options,beforeEndpoint: () => checkReorgSend(true) });
     if (["ALREADY_KNOWN","NONCE_TOO_LOW"].includes(result.errorClass)) {
       const reconciled = await reconcile(result,options.receiptView ?? await rpc.readView(),options.fence);
       if (reconciled.mined || reconciled.known) return Object.freeze({ ...reconciled.stored,broadcast: true,reconciled: true,errorClass: null,errorMessage: null,errorCode: null,
@@ -158,7 +194,7 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     await verifyChain();
     let stored = await store.getTransaction(id);
     if (!stored) throw new TransactionError("TRANSACTION_NOT_PREPARED");
-    if (stored.intent.status !== "PENDING" || stored.intent.retryStoppedAt !== null ||
+    if (stored.intent.status !== "PENDING" || stored.intent.retryStoppedAt !== null || stored.intent.reorgRecovery?.rebroadcastRequired ||
         (parentAttemptId !== undefined && stored.attempt.attemptId !== parentAttemptId)) return Object.freeze({ ...stored,created: false });
     const expectedParent = stored.attempt.attemptId;
     const now = operationTime(clock);
@@ -261,13 +297,15 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
     },
     async checkReceiptsOnce({ limit = config.maxJobs } = {}) {
       return protect(async () => {
+        const terminalIds = await store.listTerminalIntents({ limit });
         const records = await store.listTrackingIntents({ limit });
         await verifyChain(); const view = await rpc.readView(); const head = view.head;
         const results = [];
         for (const stored of records) results.push((await inspect(stored,view)).stored);
+        const terminal = await revalidateTerminalReceipts({ ids: terminalIds,store,rpc,config,view,resolveMessageId,hooks });
         return Object.freeze({ head: head.toString(),checked: records.length,
           confirmed: results.filter(value => value.intent.status === "CONFIRMED").length,
-          reverted: results.filter(value => value.intent.status === "REVERTED").length,results: Object.freeze(results) });
+          reverted: results.filter(value => value.intent.status === "REVERTED").length,results: Object.freeze(results),terminal });
       });
     },
   };

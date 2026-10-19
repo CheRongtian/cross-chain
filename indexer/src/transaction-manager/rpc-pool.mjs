@@ -145,8 +145,17 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
     const blocks = await collect("snapshot block",endpoint => raw(endpoint,"eth_getBlockByNumber",[toHex(head),false]),samples.map(sample => sample.endpoint));
     if (blocks.some(result => result.value === null)) throw inconsistent("RPC_VIEW_INCOMPLETE");
     agree(blocks,block => blockIdentity(block,head));
-    return Object.freeze({ head,
+    return Object.freeze({ head,blockHash: blockIdentity(blocks[0].value,head),
       endpoints: Object.freeze(samples.map(sample => Object.freeze({ endpointLabel: sample.endpoint.label,head: sample.value }))) });
+  }
+  async function canonicalBlock(number,view) {
+    if (number > view.head) throw inconsistent("RPC_VIEW_INCOMPLETE");
+    const values = await collect("fixed canonical block",endpoint => raw(endpoint,"eth_getBlockByNumber",[toHex(number),false]),selectedFor(view));
+    if (values.some(value => value.value === null)) throw inconsistent("RPC_VIEW_INCOMPLETE");
+    return agree(values,block => blockIdentity(block,number))[0].value;
+  }
+  async function assertView(view) {
+    if (normalizeBytes32((await canonicalBlock(view.head,view)).hash) !== view.blockHash) throw inconsistent();
   }
   async function receiptEvidence(hash,view) {
     const transactionHash = normalizeBytes32(hash);
@@ -243,7 +252,15 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
       });
       return Object.freeze({ transactionHash: result.value,acceptedEndpointLabel: result.endpointLabel,observations: result.observations });
     },
-    readView,receiptEvidence,
+    readView,receiptEvidence,canonicalBlock,assertView,
+    async gatewayReplay(address,data,view) {
+      await assertView(view);
+      const values = await collect("Gateway replay",endpoint => raw(endpoint,"eth_call",[{ to: address,data },toHex(view.head)]),selectedFor(view));
+      if (values.some(value => !/^0x0{63}[01]$/.test(value.value))) throw new DestinationRpcError("RPC_INVALID_RESPONSE");
+      agree(values,value => value);
+      await assertView(view);
+      return BigInt(values[0].value) === 1n;
+    },
     async transaction(hash) {
       const expected = normalizeBytes32(hash);
       const values = await collect("transaction",async endpoint => {

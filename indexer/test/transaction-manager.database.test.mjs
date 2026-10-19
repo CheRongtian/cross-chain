@@ -175,7 +175,7 @@ test("migration reruns preserve historical direct submissions and production Rel
   const encoded = await encodeDestinationSubmission(await queue.getDeliveryPackage(id),{ validatorSets: config.validatorSets });
   const historical = await legacy.recordSubmission({ deliveryJobId: id,encoded,transactionHash: fixtureHash(888) });
   const migrations = await applyMigrations(pool,config.databaseSchema);
-  assert.equal(migrations.at(-1),"017_transaction_scan_progress.sql");
+  assert.equal(migrations.at(-1),"018_destination_receipt_reconciliation.sql");
   assert.deepEqual(await applyMigrations(pool,config.databaseSchema),migrations);
   const manager = managerFor();
   assert.deepEqual((await manager.prepareDeliveryTransaction(id)).historicalSubmission,historical);

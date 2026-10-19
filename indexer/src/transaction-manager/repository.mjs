@@ -19,6 +19,8 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
   const intents = tableName(config.databaseSchema,"transaction_intents");
   const attempts = tableName(config.databaseSchema,"transaction_attempts");
   const events = tableName(config.databaseSchema,"transaction_broadcast_events");
+  const observations = tableName(config.databaseSchema,"transaction_receipt_observations");
+  const orphans = tableName(config.databaseSchema,"transaction_receipt_orphans");
   const jobs = tableName(config.databaseSchema,"delivery_jobs");
   const accountKey = [config.destinationDomain.toString(),normalizeAddress(config.relayerAddress)];
 
@@ -36,6 +38,9 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         (final(status) ? row.winning_attempt_id === null || row.next_action_at !== null :
           row.winning_attempt_id !== null || ((row.retry_stopped_at === null) !== (row.next_action_at !== null)))) throw new TransactionError("CORRUPTED_TRANSACTION_INTENT");
     return Object.freeze({ ...actual,intentId: actual.deliveryJobId,nonce,status,winningAttemptId: row.winning_attempt_id,
+      ...(row.destination_reorg_id != null && status === "PENDING" ? {
+        reorgRecovery: { reorgId: row.destination_reorg_id,rebroadcastRequired: row.reorg_rebroadcast_required },
+      } : {}),
       nextActionAt: iso(row.next_action_at),retryStoppedAt: iso(row.retry_stopped_at),retryStopReason: row.retry_stop_reason,createdAt: iso(row.created_at) });
   }
 
@@ -113,7 +118,8 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
   }
   async function selectObservationIds(kind,limit) {
     deliveryLimit(limit);
-    const column = kind === "receipt" ? "receipt_scan_cursor_nonce" : "recovery_scan_cursor_nonce";
+    const column = kind === "receipt" ? "receipt_scan_cursor_nonce" : kind === "terminal" ? "terminal_scan_cursor_nonce" : "recovery_scan_cursor_nonce";
+    const population = kind === "terminal" ? "i.status IN ('CONFIRMED','REVERTED')" : "i.status = 'PENDING'";
     const tracking = kind === "receipt" ? `AND EXISTS (SELECT 1 FROM ${attempts} a
       WHERE a.delivery_job_id = i.delivery_job_id AND (a.broadcast_attempt_count > 0 OR a.broadcast_at IS NOT NULL))` : "";
     const ids = await deliveryTransaction(pool,async client => {
@@ -123,7 +129,7 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
       if (!account) return [];
       const cursor = account.cursor === null ? null : protocolInteger(account.cursor,"observation nonce cursor").toString();
       const select = (comparison,position,capacity) => client.query(`SELECT i.delivery_job_id,i.nonce::text AS nonce
-        FROM ${intents} i WHERE i.chain_id = $1 AND i.sender_address = $2 AND i.status = 'PENDING' ${tracking}
+        FROM ${intents} i WHERE i.chain_id = $1 AND i.sender_address = $2 AND ${population} ${tracking}
           AND ${comparison} ORDER BY i.nonce,i.delivery_job_id LIMIT $4`,[...accountKey,position,capacity]);
       const selected = (await select("($3::numeric IS NULL OR i.nonce > $3::numeric)",cursor,limit)).rows;
       // Complementary key ranges cannot duplicate a nonce. Both queries are
@@ -214,12 +220,53 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
     await client.query(`UPDATE ${attempts} SET status = $2,broadcast_at = COALESCE(broadcast_at,$3),broadcast_attempt_count = GREATEST(broadcast_attempt_count,1),
       last_broadcast_attempt_at = COALESCE(last_broadcast_attempt_at,$3),receipt_block_number = $4,receipt_block_hash = $5,receipt_status = $6,confirmed_head = $7,confirmed_at = $3 WHERE attempt_id = $1`,
       [winner.attemptId,status,actionDate(now),number.toString(),hash,observation.status,head.toString()]);
-    await client.query(`UPDATE ${intents} SET status = $2,winning_attempt_id = $3,next_action_at = NULL WHERE delivery_job_id = $1`,[id,status,winner.attemptId]);
+    await client.query(`UPDATE ${intents} SET status = $2,winning_attempt_id = $3,next_action_at = NULL,reorg_rebroadcast_required = false,
+      current_receipt_observation_id = (SELECT observation_id FROM ${observations} WHERE attempt_id = $3 ORDER BY observation_id DESC LIMIT 1)
+      WHERE delivery_job_id = $1`,[id,status,winner.attemptId]);
     await client.query(`UPDATE ${attempts} SET status = 'REPLACED' WHERE delivery_job_id = $1 AND attempt_id <> $2 AND status <> 'REPLACED'`,[id,winner.attemptId]);
     await hooks.beforeOutcomeCommit?.({ client,id,observation });
   }
   return {
     withRecoveryLock,
+    async listTerminalIntents({ limit = config.maxJobs } = {}) { return selectObservationIds("terminal",limit); },
+    async getReceiptObservations(id) {
+      return Object.freeze((await pool.query(`SELECT o.*,p.reorg_id,p.replacement_block_hash,p.observed_head,p.observed_head_hash,p.reconciled_at
+        FROM ${observations} o LEFT JOIN ${orphans} p USING (observation_id)
+        WHERE o.delivery_job_id = $1 ORDER BY o.observation_id`,[id])).rows.map(row => Object.freeze({
+        observationId: row.observation_id,attemptId: row.attempt_id,transactionHash: row.transaction_hash,
+        blockNumber: row.block_number,blockHash: row.block_hash,status: row.receipt_status,
+        confirmedHead: row.confirmed_head,confirmedAt: iso(row.confirmed_at),
+        orphaned: row.reorg_id !== null,
+        ...(row.reorg_id === null ? {} : { reorgId: row.reorg_id,replacementBlockHash: row.replacement_block_hash,
+          observedHead: row.observed_head,observedHeadHash: row.observed_head_hash,reconciledAt: iso(row.reconciled_at) }),
+      })));
+    },
+    async reconcileDestinationReorg(snapshotValue,{ replacementBlockHash,view,fence,receipt } = {}) {
+      const id = snapshotValue.intent.deliveryJobId; const expected = await resolveIntent(id); const now = operationTime(clock);
+      return deliveryTransaction(pool,async client => {
+        const stored = await locked(client,id,expected);
+        if (fence) await assertLeaseFence(client,config,id,fence);
+        await verifyVersion(client,id,snapshotValue.version);
+        if (!final(stored.intent.status)) throw new TransactionError("RECOVERY_STATE_CHANGED");
+        const winner = stored.winningAttempt;
+        const replacement = normalizeBytes32(replacementBlockHash);
+        if (replacement === winner.receiptBlockHash || view.head < BigInt(winner.receiptBlockNumber)) throw new TransactionError("MISSING_POSITIVE_REORG_EVIDENCE");
+        const proof = (await client.query(`INSERT INTO ${orphans} (observation_id,replacement_block_hash,observed_head,observed_head_hash,expected_version)
+          SELECT current_receipt_observation_id,$2,$3,$4,recovery_version FROM ${intents} WHERE delivery_job_id = $1 RETURNING reorg_id`,
+        [id,replacement,view.head.toString(),normalizeBytes32(view.blockHash)])).rows[0];
+        await client.query(`UPDATE ${intents} SET status = 'PENDING',winning_attempt_id = NULL,current_receipt_observation_id = NULL,
+          destination_reorg_id = $2,reorg_rebroadcast_required = true,next_action_at = CASE WHEN retry_stopped_at IS NULL THEN $3::timestamptz ELSE NULL END
+          WHERE delivery_job_id = $1`,[id,proof.reorg_id,actionDate(now)]);
+        // Only the current cache is invalidated. The archived observation and
+        // its original hash/status/head/time remain immutable and queryable.
+        await client.query(`UPDATE ${attempts} SET status = CASE WHEN attempt_number < $2 THEN 'REPLACED'
+            WHEN broadcast_at IS NULL THEN 'SIGNED' ELSE 'BROADCAST' END,
+          receipt_block_number = NULL,receipt_block_hash = NULL,receipt_status = NULL,confirmed_head = NULL,confirmed_at = NULL
+          WHERE delivery_job_id = $1 AND (attempt_id = $3 OR attempt_number = $2)`,[id,stored.attempt.attemptNumber,winner.attemptId]);
+        if (receipt) await finalize(client,await read(client,id,expected),receipt,now);
+        return read(client,id,expected);
+      });
+    },
     async getBroadcastEvents(id) {
       return Object.freeze((await pool.query(`SELECT e.* FROM ${events} e JOIN ${attempts} a USING (attempt_id)
         WHERE a.delivery_job_id = $1 ORDER BY e.event_id`,[id])).rows.map(eventRecord));
@@ -326,7 +373,7 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         const existing = await read(client,intent.deliveryJobId,intent);
         if (existing) return Object.freeze({ ...existing,created: false,nonceAdvancedFromRpc: false });
         if (fence && (await client.query(`SELECT 1 FROM ${intents} i WHERE chain_id = $1 AND sender_address = $2 AND status = 'PENDING'
-          AND (retry_stopped_at IS NOT NULL OR EXISTS (SELECT 1 FROM ${attempts} a WHERE a.delivery_job_id = i.delivery_job_id
+          AND (retry_stopped_at IS NOT NULL OR reorg_rebroadcast_required OR EXISTS (SELECT 1 FROM ${attempts} a WHERE a.delivery_job_id = i.delivery_job_id
             AND a.status = 'SIGNED' AND a.attempt_number = (SELECT MAX(attempt_number) FROM ${attempts} WHERE delivery_job_id = i.delivery_job_id))) LIMIT 1`,accountKey)).rowCount) {
           throw new TransactionError("SIGNED_TRANSACTION_REQUIRES_EXPLICIT_BROADCAST");
         }
@@ -368,7 +415,7 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         return Object.freeze({ ...await read(client,id,expected),created: true });
       });
     },
-    async broadcastPrepared(id,broadcast,{ rebroadcast = false,expectedAttemptId,expectedVersion,fence,recoveryContext } = {}) {
+    async broadcastPrepared(id,broadcast,{ rebroadcast = false,expectedAttemptId,expectedVersion,fence,recoveryContext,beforeEndpoint } = {}) {
       const expected = await resolveIntent(id); const now = operationTime(clock);
       return withRecoveryLock(id,async context => {
         context.assertHeld();
@@ -381,7 +428,7 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
           if (stored.attempt.status !== "SIGNED" && !rebroadcast) return { stored };
           const earlier = (await client.query(`SELECT i.delivery_job_id FROM ${intents} i JOIN ${attempts} a USING (delivery_job_id)
             WHERE i.chain_id = $1 AND i.sender_address = $2 AND i.status = 'PENDING' AND i.nonce < $3
-              AND (i.retry_stopped_at IS NOT NULL OR (a.status = 'SIGNED' AND a.attempt_number = (SELECT MAX(attempt_number) FROM ${attempts} WHERE delivery_job_id = i.delivery_job_id)))
+              AND (i.retry_stopped_at IS NOT NULL OR i.reorg_rebroadcast_required OR (a.status = 'SIGNED' AND a.attempt_number = (SELECT MAX(attempt_number) FROM ${attempts} WHERE delivery_job_id = i.delivery_job_id)))
             ORDER BY i.nonce LIMIT 1`,[...accountKey,stored.intent.nonce])).rows[0];
           if (earlier) throw new TransactionError("EARLIER_SIGNED_TRANSACTION_BLOCKS_BROADCAST");
           const event = await insertEvent(client,stored.attempt.attemptId);
@@ -397,6 +444,7 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         const lifecycle = {
           async beforeEndpoint(endpointLabel) {
             context.assertHeld();
+            await beforeEndpoint?.();
             return deliveryTransaction(pool,async client => {
               const current = await locked(client,id,expected);
               if (fence) await assertLeaseFence(client,config,id,fence);
@@ -434,6 +482,9 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
           if (current.intent.status === "PENDING" && current.attempt.attemptId === attempt.attemptId) {
             await client.query(`UPDATE ${attempts} SET status = $2,broadcast_at = $3,last_error_class = $4 WHERE attempt_id = $1`,
               [attempt.attemptId,errorClass ? current.attempt.status : "BROADCAST",current.attempt.broadcastAt ?? (errorClass ? null : actionDate(now)),errorClass]);
+            if (errorClass === null && current.intent.reorgRecovery?.rebroadcastRequired) {
+              await client.query(`UPDATE ${intents} SET reorg_rebroadcast_required = false WHERE delivery_job_id = $1`,[id]);
+            }
             if (errorClass === "DETERMINISTIC_REJECTION") await stop(client,current,errorCode === "RPC_TRANSACTION_HASH_MISMATCH" ? errorCode : errorClass,now);
             if (errorClass === "RPC_RESPONSE_ERROR") await stop(client,current,errorCode,now);
           }
@@ -451,6 +502,9 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         if (!attempt) throw new TransactionError("UNKNOWN_TRANSACTION_ATTEMPT");
         await client.query(`UPDATE ${attempts} SET status = $2,broadcast_at = COALESCE(broadcast_at,$3),last_error_class = 'ALREADY_KNOWN' WHERE attempt_id = $1`,
           [attemptId,attempt.status === "SIGNED" ? "BROADCAST" : attempt.status,actionDate(now)]);
+        if (stored.intent.reorgRecovery?.rebroadcastRequired && stored.attempt.attemptId === attemptId) {
+          await client.query(`UPDATE ${intents} SET reorg_rebroadcast_required = false WHERE delivery_job_id = $1`,[id]);
+        }
         return read(client,id,expected);
       });
     },

@@ -167,9 +167,20 @@ test("response-class migration preserves existing classified attempts, completed
     const legacyQueue = createDeliveryRepository({ config: cfg,pool });
     const id = (await legacyQueue.listReadyDeliveryJobs())[0].deliveryJobId;
     const legacy = createTransactionManager({ config: cfg,pool,queue: legacyQueue,rpc: destination.rpc,clock: h.clock });
-    await legacy.prepareDeliveryTransaction(id);
-    destination.nodes.forEach(node => { node.faults.set("eth_sendRawTransaction",() => { throw rpcHttpError(503); }); });
-    await assert.rejects(legacy.broadcastPreparedTransaction(id),{ code: "RPC_UNAVAILABLE" });
+    const prepared = await legacy.prepareDeliveryTransaction(id);
+    // Freeze a pre-upgrade completed 503 journal through its existing SQL
+    // guards. Live HTTP classification/fallback is covered above; the current
+    // sender intentionally requires the current schema, not a compatibility path.
+    await client.query("BEGIN"); open = true;
+    const journalTable = tableName(schema,"transaction_broadcast_events");
+    const parent = (await client.query(`INSERT INTO ${journalTable} (attempt_id,broadcast_sequence) VALUES ($1,1) RETURNING event_id`,[prepared.attempt.attemptId])).rows[0];
+    const endpoint = (await client.query(`INSERT INTO ${journalTable} (attempt_id,broadcast_sequence,parent_event_id,endpoint_label)
+      VALUES ($1,2,$2,'rpc-0') RETURNING event_id`,[prepared.attempt.attemptId,parent.event_id])).rows[0];
+    for (const event of [endpoint,parent]) await client.query(`UPDATE ${journalTable} SET completed_at = clock_timestamp(),result_class = 'ERROR',error_class = 'TRANSIENT_RPC_ERROR'
+      WHERE event_id = $1`,[event.event_id]);
+    await client.query(`UPDATE ${tableName(schema,"transaction_attempts")} SET broadcast_attempt_count = 1,last_broadcast_attempt_at = $2,
+      last_error_class = 'TRANSIENT_RPC_ERROR' WHERE attempt_id = $1`,[prepared.attempt.attemptId,new Date(h.clock.now())]);
+    await client.query("COMMIT"); open = false;
     const stored = await legacy.repository.getTransaction(id);
     const journal = await legacy.repository.getBroadcastEvents(id); const account = await legacy.repository.getAccount();
     assert.equal(stored.attempt.lastErrorClass,"TRANSIENT_RPC_ERROR");

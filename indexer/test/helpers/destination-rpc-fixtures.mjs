@@ -29,7 +29,7 @@ export function destinationRpcFixture({ config = transactionConfig({ CHAIN_B_RPC
   const nodes = config.destinationRpcUrls.map((_,index) => ({
     index,available: true,chainId: config.destinationDomain,genesisHash: config.destinationGenesisHash,head: 100n,
     pendingNonce: 9n,latestNonce: 9n,gas: 123456n,baseFee: 1000000000n,priorityFee: 1000000000n,
-    blocks: new Map(),transactions,receipts,faults: new Map(),calls: [],broadcasts: [],
+    blocks: new Map(),transactions,receipts,faults: new Map(),calls: [],broadcasts: [],replay: false,
   }));
   function createClient(url) {
     const node = nodes[config.destinationRpcUrls.indexOf(url)];
@@ -48,6 +48,7 @@ export function destinationRpcFixture({ config = transactionConfig({ CHAIN_B_RPC
         if (method === "eth_getTransactionCount") return toHex(params[1] === "pending" ? node.pendingNonce : node.latestNonce);
         if (method === "eth_estimateGas") return toHex(node.gas);
         if (method === "eth_maxPriorityFeePerGas") return toHex(node.priorityFee);
+        if (method === "eth_call") return `0x${(node.replay ? "1" : "0").padStart(64,"0")}`;
         if (method === "eth_getTransactionByHash") return node.hideTransactions ? null : node.transactions.get(params[0]) ?? null;
         if (method === "eth_getTransactionReceipt") return node.hideReceipts ? null : node.receipts.get(params[0]) ?? null;
         if (method === "eth_sendRawTransaction") {

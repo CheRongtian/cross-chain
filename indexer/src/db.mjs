@@ -1001,6 +1001,8 @@ export async function readTableColumns(pool, schema, table) {
 export async function resetIndexerTables(pool, schema) {
   await pool.query(
     `TRUNCATE TABLE
+        ${tableName(schema, "transaction_receipt_orphans")},
+        ${tableName(schema, "transaction_receipt_observations")},
         ${tableName(schema, "transaction_broadcast_events")},
         ${tableName(schema, "relayer_job_leases")},
         ${tableName(schema, "relayer_worker_ids")},

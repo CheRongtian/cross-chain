@@ -30,6 +30,7 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
     }))); } };
   const records = new Map();
   const scanCursors = { receipt: null,recovery: null };
+  const receiptHistory = []; let terminalCursor = null;
   const historical = new Map();
   const journal = []; const versions = new Map(); const recoveryLocks = new Set(); let nextEvent = 1n;
   const touch = id => versions.set(id,(versions.get(id) ?? 0n) + 1n);
@@ -56,7 +57,7 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
   }
   const state = { pendingNonce: 9n,latestNonce: 9n,head: 100n,actualChain: config.destinationDomain,
     fees: { maxFeePerGas: 3000000000n,maxPriorityFeePerGas: 1000000000n },
-    receipts: new Map(),transactions: new Map(),blocks: new Map() };
+    receipts: new Map(),transactions: new Map(),blocks: new Map(),replay: false };
   async function strict(id,expected) {
     const record = records.get(id);
     if (!record) return null;
@@ -94,6 +95,35 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
     return ids;
   }
   const repository = {
+    async listTerminalIntents({ limit }) {
+      deliveryLimit(limit);
+      const values = [...records.values()].filter(record => record.intent.status !== "PENDING")
+        .sort((a,b) => BigInt(a.intent.nonce) < BigInt(b.intent.nonce) ? -1 : 1);
+      const selected = values.filter(record => terminalCursor === null || BigInt(record.intent.nonce) > BigInt(terminalCursor)).slice(0,limit);
+      if (terminalCursor !== null && selected.length < limit) selected.push(...values.filter(record => BigInt(record.intent.nonce) <= BigInt(terminalCursor)).slice(0,limit - selected.length));
+      if (selected.length) terminalCursor = selected.at(-1).intent.nonce;
+      const ids = selected.map(record => record.intent.deliveryJobId);
+      await hooks.afterObservationSelected?.({ kind: "terminal",ids: Object.freeze([...ids]) });
+      return ids;
+    },
+    async getReceiptObservations(id) { return cloneTransactionValue(receiptHistory.filter(row => row.deliveryJobId === id)); },
+    async reconcileDestinationReorg(snapshot,{ replacementBlockHash,view,receipt }) {
+      const id = snapshot.intent.deliveryJobId;
+      await this.assertRecoverySnapshot(snapshot);
+      const record = records.get(id); const winner = record.winningAttempt;
+      if (!winner || winner.receiptBlockHash === replacementBlockHash || view.head < BigInt(winner.receiptBlockNumber)) throw new TransactionError("MISSING_POSITIVE_REORG_EVIDENCE");
+      const old = receiptHistory.findLast(row => row.deliveryJobId === id && !row.orphaned);
+      Object.assign(old,{ orphaned: true,reorgId: old.observationId,replacementBlockHash,observedHead: view.head.toString(),observedHeadHash: view.blockHash });
+      Object.assign(record.intent,{ status: "PENDING",winningAttemptId: null,nextActionAt: record.intent.retryStoppedAt ? null : timestamp(),
+        reorgRecovery: { reorgId: old.observationId,rebroadcastRequired: true } });
+      record.winningAttempt = null;
+      Object.assign(winner,{ status: winner === record.attempt ? "BROADCAST" : "REPLACED",receiptBlockNumber: null,receiptBlockHash: null,
+        receiptStatus: null,confirmedHead: null,confirmedAt: null });
+      record.attempt.status = record.attempt.broadcastAt === null ? "SIGNED" : "BROADCAST";
+      touch(id);
+      if (receipt) await this.recordOutcome(id,receipt);
+      return strict(id);
+    },
     async withRecoveryLock(id,operation,context) {
       if (context) { context.assertHeld(); return operation(context); }
       if (!records.has(id)) throw new TransactionError("TRANSACTION_NOT_PREPARED");
@@ -149,7 +179,7 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
       if (fence) await this.assertFence(intent.deliveryJobId,fence);
       const existing = await strict(intent.deliveryJobId,intent);
       if (existing) return { ...existing,created: false };
-      if (fence && [...records.values()].some(r => r.intent.status === "PENDING" && (r.intent.retryStoppedAt !== null || r.attempt.status === "SIGNED"))) throw new TransactionError("SIGNED_TRANSACTION_REQUIRES_EXPLICIT_BROADCAST");
+      if (fence && [...records.values()].some(r => r.intent.status === "PENDING" && (r.intent.retryStoppedAt !== null || r.intent.reorgRecovery?.rebroadcastRequired || r.attempt.status === "SIGNED"))) throw new TransactionError("SIGNED_TRANSACTION_REQUIRES_EXPLICIT_BROADCAST");
       const allocation = allocateNonce({ pendingNonce,nextNonce: nextNonce ?? pendingNonce });
       const canonical = { ...intent,nonce: allocation.nonce.toString() };
       delete canonical.historicalCalldata;
@@ -185,7 +215,7 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
       touch(id);
       return { ...await strict(id),created: true };
     },
-    async broadcastPrepared(id,broadcast,{ rebroadcast = false,expectedAttemptId,expectedVersion,fence,recoveryContext } = {}) {
+    async broadcastPrepared(id,broadcast,{ rebroadcast = false,expectedAttemptId,expectedVersion,fence,recoveryContext,beforeEndpoint } = {}) {
       return this.withRecoveryLock(id,async context => {
       if (fence) await this.assertFence(id,fence);
       if (expectedVersion !== undefined && expectedVersion !== versions.get(id).toString()) throw new TransactionError("RECOVERY_STATE_CHANGED");
@@ -195,14 +225,14 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
       if (stored.intent.retryStoppedAt !== null) throw new TransactionError(stored.intent.retryStopReason);
       if (stored.attempt.status !== "SIGNED" && !rebroadcast) return { ...stored,broadcast: false };
       if ([...records.values()].some(r => r.intent.status === "PENDING" && BigInt(r.intent.nonce) < BigInt(stored.intent.nonce) &&
-          (r.intent.retryStoppedAt !== null || r.attempt.status === "SIGNED"))) throw new TransactionError("EARLIER_SIGNED_TRANSACTION_BLOCKS_BROADCAST");
+          (r.intent.retryStoppedAt !== null || r.intent.reorgRecovery?.rebroadcastRequired || r.attempt.status === "SIGNED"))) throw new TransactionError("EARLIER_SIGNED_TRANSACTION_BLOCKS_BROADCAST");
       const event = appendEvent(stored.attempt);
       record.attempt.broadcastAttemptCount = (BigInt(record.attempt.broadcastAttemptCount) + 1n).toString();
       record.attempt.lastBroadcastAttemptAt = timestamp(); record.intent.nextActionAt = nextAction(); touch(id);
       await hooks.afterBroadcastStart?.({ id,event,stored: await strict(id) });
       const lifecycle = {
         beforeEndpoint: async label => {
-          context.assertHeld(); if (fence) await this.assertFence(id,fence);
+          context.assertHeld(); await beforeEndpoint?.(); if (fence) await this.assertFence(id,fence);
           return appendEvent(stored.attempt,event.eventId,label);
         },
         afterEndpoint: async (child,result) => {
@@ -223,6 +253,7 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
       completeEvent(event.eventId,errorClass ? { resultClass: "ERROR",errorClass } : { resultClass: "ACCEPTED",transactionHash: stored.attempt.transactionHash },id);
       record.attempt.lastErrorClass = errorClass;
       if (errorClass === null) { record.attempt.status = "BROADCAST"; record.attempt.broadcastAt ??= timestamp(); }
+      if (errorClass === null && record.intent.reorgRecovery) record.intent.reorgRecovery.rebroadcastRequired = false;
       if (errorClass === "DETERMINISTIC_REJECTION") stop(record,errorCode === "RPC_TRANSACTION_HASH_MISMATCH" ? errorCode : errorClass);
       else if (errorClass === "RPC_RESPONSE_ERROR") stop(record,errorCode);
       else record.intent.nextActionAt = nextAction();
@@ -236,6 +267,7 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
       if (record.intent.status !== "PENDING") return strict(id);
       if (attempt.status === "SIGNED") attempt.status = "BROADCAST";
       attempt.broadcastAt ??= timestamp(); attempt.lastErrorClass = "ALREADY_KNOWN";
+      if (record.intent.reorgRecovery && record.attempt.attemptId === attemptId) record.intent.reorgRecovery.rebroadcastRequired = false;
       touch(id);
       return strict(id);
     },
@@ -272,6 +304,10 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
         receiptStatus: observation.status,confirmedHead: observation.head.toString(),confirmedAt: timestamp() });
       for (const other of record.attempts) if (other !== winner) other.status = "REPLACED";
       Object.assign(record.intent,{ status,winningAttemptId: winner.attemptId,nextActionAt: null }); record.winningAttempt = winner;
+      delete record.intent.reorgRecovery;
+      receiptHistory.push({ observationId: String(receiptHistory.length + 1),deliveryJobId: id,attemptId: winner.attemptId,
+        transactionHash: winner.transactionHash,blockNumber: winner.receiptBlockNumber,blockHash: winner.receiptBlockHash,
+        status: winner.receiptStatus,confirmedHead: winner.confirmedHead,confirmedAt: winner.confirmedAt,orphaned: false });
       touch(id);
       await hooks.afterOutcomeCommit?.({ id,stored: await strict(id) });
       return strict(id);
@@ -301,7 +337,10 @@ export async function transactionHarness({ config = transactionConfig(),multiDes
       return attempt.transactionHash;
     },
     async head() { calls.head++; return state.head; },
-    async readView() { return { head: await rpc.head(),endpoints: [{ endpointLabel: "rpc-0",head: state.head }] }; },
+    async readView() { return { head: await rpc.head(),blockHash: (await rpc.canonicalBlock(state.head)).hash,endpoints: [{ endpointLabel: "rpc-0",head: state.head }] }; },
+    async canonicalBlock(number) { return state.blocks.get(number.toString()) ?? { number: toHex(number),hash: fixtureHash(number + 1000n) }; },
+    async assertView(view) { if ((await rpc.canonicalBlock(view.head)).hash !== view.blockHash) throw new TransactionError("INCONSISTENT_RPC_VIEW"); },
+    async gatewayReplay() { return state.replay; },
     async receiptEvidence(hash) {
       const receipt = await rpc.receipt(hash);
       if (receipt === null) return null;

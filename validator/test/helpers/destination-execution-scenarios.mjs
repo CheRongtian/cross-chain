@@ -38,6 +38,7 @@ import { canonicalDomainMessage } from "../../../indexer/test/helpers/message-do
 import { createRelayerProcesses, verifySignedTakeoverAfterExpiry, verifyDuplicateTransportRace, verifyDestinationRpcOutage } from "../../../indexer/test/helpers/multi-relayer-integration.mjs";
 import { destinationAccessPath } from "../../../indexer/test/helpers/rpc-failover-integration.mjs";
 import { rpcObserver } from "./process-cluster.mjs";
+import { withAutomineDisabled } from "../../../indexer/test/helpers/transaction-retry-integration.mjs";
 
 const artifact = name => JSON.parse(readFileSync(new URL(`../../../contracts/out/${name}.sol/${name}.json`, import.meta.url), "utf8"));
 const normalizeError = value => typeof value === "string" && /^0x[0-9a-f]{40}$/i.test(value) ? value.toLowerCase() : value;
@@ -89,9 +90,9 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   const finality = createFinalityWatcher({ config, pool, logger: quiet });
   const rowsFor = async ids => (await readMessages(pool, config.databaseSchema)).filter(row => ids.includes(row.message_id));
 
-  async function produceSourceMessage(payload, target = application) {
+  async function produceSourceMessage(payload, target = application, destinationWindow = 3600n) {
     const event = await produceMessage(payload, { destinationGateway: gateway, destinationReceiver: target,
-      deadlineFloor: (await client.getBlock()).timestamp + 3600n });
+      deadlineFloor: (await client.getBlock()).timestamp + destinationWindow });
     const sourceAbi = parseAbi(["function computeMessageId(address,uint256,address,address,uint256,bytes32,uint256) view returns (bytes32)"]);
     assert.equal(await chainA.readContract({ address: config.sourceGateway, abi: sourceAbi, functionName: "computeMessageId",
       args: [event.sourceSender, event.destinationDomain, event.destinationGateway, event.destinationReceiver,
@@ -100,8 +101,8 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
     return event;
   }
 
-  async function produceAndFinalize(payload, target = application) {
-    const event = await produceSourceMessage(payload, target);
+  async function produceAndFinalize(payload, target = application, destinationWindow = 3600n) {
+    const event = await produceSourceMessage(payload, target, destinationWindow);
     await indexer.catchUpOnce();
     let [row] = await rowsFor([event.messageId]);
     assert.equal(row.status, "OBSERVED");
@@ -441,8 +442,196 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   await verifyRelayerFailure();
   await verifyDuplicateDelivery();
   await verifyDestinationRpcRecovery();
+  await verifyDestinationTransactionReorg();
   await verifyPrimaryFailure();
   console.log("COMPLETE END-TO-END EXECUTION EVIDENCE RECORDED: fresh ZK intent → source event → real finality/batch/PBFT/READY → production Relayer/Tx Manager → atomic Gateway/ApplicationB; duplicate rejection and business rollback; historical snapshots unchanged");
+
+  async function verifyDestinationTransactionReorg() {
+    console.log("\n[Destination Transaction Reorg Recovery]");
+    const epoch = BigInt((await pool.query(`SELECT MAX(epoch)::text AS epoch FROM ${tableName(config.databaseSchema,"message_batches")}`)).rows[0].epoch);
+    const supplier = toHex(0x9000000000000000000000000000000000000000n + epoch,{ size: 20 });
+    assert.equal(await readApp("isVerifiedSupplier",[supplier]),false);
+    const pids = active.map(index => validators[index].child.pid);
+    for (const index of active) assert.equal((await request(index,"/health")).body.ready,true);
+    const event = await produceAndFinalize(encodeAbiParameters([{ type: "uint8" },{ type: "uint8" },{ type: "address" }],[1,1,supplier]),
+      application,relayConfig.destinationConfirmations * 3n + 3600n);
+    const committed = await commitFresh([event]);
+    await certificateChecks.snapshot(committed,"healthy pinned committee committed the destination-reorg message");
+    assert.equal((await projector.materializeBatch({ batchRecordId: committed.record.batchRecordId })).createdJobs,1);
+    const [pack] = await buildDeliveryPackages(committed,{ validatorSets }); const id = pack.deliveryJobId;
+    await authenticate(pack,committed);
+    const entry = await queue.getDeliveryEntries([id]);
+    const source = { rows: await readMessages(pool,config.databaseSchema),blocks: await readIndexedSourceBlocks(pool,config.databaseSchema,config),
+      cursor: await readCursor(pool,config.databaseSchema,config) };
+    const intents = tableName(config.databaseSchema,"transaction_intents");
+    const previousIntents = (await pool.query(`SELECT * FROM ${intents} WHERE status <> 'PENDING' ORDER BY delivery_job_id`)).rows;
+    console.log(`VALID: fresh exact-intent proof reached source FINALIZED, real PBFT/QC COMMITTED and canonical READY ${id}; message ${event.messageId}; supplier ${supplier}`);
+    let observed; let freshPool; let failure;
+    try {
+      const accepted = [];
+      observed = await rpcObserver(rpcUrl,{
+        async beforeForward(message) {
+          if (message.method !== "eth_sendRawTransaction" || accepted.length !== 1) return;
+          assert.equal(await readGateway("isMessageExecuted",[event.messageId]),false,
+            "exact-message replay must still be false at the actual recovery wire boundary");
+          const held = (await pool.query(`SELECT owner_id,lease_expires_at > clock_timestamp() AND released_at IS NULL AS held
+            FROM ${tableName(config.databaseSchema,"relayer_job_leases")} WHERE delivery_job_id = $1`,[id])).rows[0];
+          assert.equal(held.owner_id,cfg.workerId); assert.equal(held.held,true);
+          const stored = await initialManager.repository.getTransaction(id);
+          assert.equal(stored.intent.status,"PENDING"); assert.ok(stored.intent.reorgRecovery);
+          assert.ok(stored.attempt.rawSignedTransaction === message.params[0],"recovery must forward the exact durable candidate");
+          console.log("VALID: Gateway exact-message replay remained false and the Relayer fence remained live at the actual recovery send boundary");
+        },
+        async afterForward(message,reply) {
+          if (message.method === "eth_sendRawTransaction") {
+            assert.ok(reply && !reply.error,"reorg scenario requires actual accepted destination broadcasts"); accepted.push(reply.result);
+          }
+        },
+      });
+      const cfg = { ...relayConfig,maxJobs: 1,destinationRpcUrl: observed.url,destinationRpcUrls: Object.freeze([observed.url]) };
+      let destinationSnapshot; let reorgEvidence; let signatures = 0;
+      const initialManager = createTransactionManager({ config: cfg,pool,queue,
+        async beforeSignedCommit({ intent }) { if (intent.deliveryJobId === id) signatures++; },
+        hooks: {
+          async afterBroadcastStart(value) {
+            if (value.id !== id || destinationSnapshot !== undefined) return;
+            destinationSnapshot = await client.request({ method: "evm_snapshot",params: [] });
+            console.log("VALID: destination control snapshot was taken after durable signing and before the target transaction's external broadcast/inclusion");
+          },
+          async afterDestinationReorg(value) { if (value.id === id) reorgEvidence = value; },
+        } });
+      const initialWorker = createRelayerWorker({ config: cfg,pool,queue,transactionManager: initialManager });
+      const rounds = previousIntents.length + 8;
+      await withAutomineDisabled(client,async () => {
+        let broadcast;
+        for (let round = 0; round < rounds; round++) {
+          await initialWorker.runOnce(); broadcast = await initialManager.repository.getTransaction(id);
+          if (broadcast?.attempt.status === "BROADCAST") break;
+        }
+        assert.equal(broadcast?.attempt.status,"BROADCAST","normal bounded Relayer selection must send the fresh READY job");
+        assert.notEqual(destinationSnapshot,undefined); assert.equal(signatures,1);
+        await client.request({ method: "anvil_mine",params: [toHex(cfg.destinationConfirmations)] });
+        await initialManager.checkReceiptsOnce();
+        const original = await initialManager.repository.getTransaction(id);
+        assert.equal(original.intent.status,"CONFIRMED"); assert.equal(original.winningAttempt.attemptId,original.attempt.attemptId);
+        const oldReceipt = await client.request({ method: "eth_getTransactionReceipt",params: [original.attempt.transactionHash] });
+        assert.equal(BigInt(oldReceipt.status),1n);
+        for (const [address,abi,name] of [[gateway,gatewayAbi,"CrossChainMessageExecuted"],[application,appAbi,"VerifiedSupplierGranted"]]) {
+          const logs = oldReceipt.logs.filter(log => log.address.toLowerCase() === address).map(log => decodeEventLog({ abi,...log }));
+          assert.equal(logs.length,1); assert.equal(logs[0].eventName,name); assert.equal(logs[0].args.messageId,event.messageId);
+        }
+        const oldBlock = await client.request({ method: "eth_getBlockByNumber",params: [oldReceipt.blockNumber,false] });
+        assert.equal(oldBlock.hash,original.attempt.receiptBlockHash);
+        assert.ok(BigInt(original.attempt.confirmedHead) - BigInt(oldReceipt.blockNumber) + 1n >= cfg.destinationConfirmations);
+        assert.equal(await readGateway("isMessageExecuted",[event.messageId]),true);
+        assert.equal(await readApp("isVerifiedSupplier",[supplier]),true);
+        const history = await initialManager.repository.getReceiptObservations(id); assert.equal(history.length,1);
+        const account = await initialManager.repository.getAccount();
+        const journal = await initialManager.repository.getBroadcastEvents(id);
+        const preparation = () => observed.calls.filter(call => call.method === "eth_maxPriorityFeePerGas" ||
+          (call.method === "eth_estimateGas" && call.params[0].data === original.intent.calldata)).length;
+        const beforePreparation = preparation();
+        console.log(`VALID: transaction ${original.attempt.transactionHash} reached canonical CONFIRMED at ${oldReceipt.blockNumber}/${oldReceipt.blockHash}; Gateway and ApplicationB executed the fresh message`);
+
+        assert.equal(await client.request({ method: "evm_revert",params: [destinationSnapshot] }),true);
+        // A reverted local node may return the displaced transaction to its
+        // mempool. Remove only this scenario's known hash before mining the
+        // empty replacement branch; production recovery must provide its send.
+        const returned = await client.request({ method: "eth_getTransactionByHash",params: [original.attempt.transactionHash] });
+        if (returned !== null) {
+          assert.equal(returned.blockNumber,null);
+          await client.request({ method: "anvil_dropTransaction",params: [original.attempt.transactionHash] });
+        }
+        await client.request({ method: "evm_setNextBlockTimestamp",params: [toHex(BigInt(oldBlock.timestamp) + 7n)] });
+        await client.request({ method: "anvil_mine",params: [toHex(cfg.destinationConfirmations + 1n)] });
+        const replacement = await client.request({ method: "eth_getBlockByNumber",params: [oldReceipt.blockNumber,false] });
+        assert.notEqual(replacement.hash,oldReceipt.blockHash);
+        assert.equal(await client.request({ method: "eth_getTransactionReceipt",params: [original.attempt.transactionHash] }),null);
+        assert.equal(await readGateway("isMessageExecuted",[event.messageId]),false);
+        assert.equal(await readApp("isVerifiedSupplier",[supplier]),false);
+        assert.equal((await initialManager.repository.getTransaction(id)).intent.status,"CONFIRMED",
+          "the fault changes Chain B only; no harness SQL manufactures a recovery result");
+        console.log(`VALID: destination canonical history replaced stored receipt block ${oldReceipt.blockNumber}: former ${oldReceipt.blockHash}; current ${replacement.hash}`);
+        console.log("VALID: the orphaned branch genuinely rolled back exact-message Gateway replay and ApplicationB business state");
+        // No target ID or fault result is supplied to the production scan.
+        for (let round = 0; round < rounds && !reorgEvidence; round++) await initialManager.checkReceiptsOnce();
+        assert.ok(reorgEvidence,"bounded normal terminal receipt scanning must discover the reorg itself");
+        assert.equal(reorgEvidence.candidatesChecked,original.attempts.length); assert.equal(reorgEvidence.replay,false);
+        const recovering = await initialManager.repository.getTransaction(id);
+        assert.equal(recovering.intent.status,"PENDING"); assert.equal(recovering.winningAttempt,null);
+        assert.equal(recovering.intent.reorgRecovery.rebroadcastRequired,true);
+        const [orphan] = await initialManager.repository.getReceiptObservations(id);
+        assert.equal(orphan.orphaned,true); assert.equal(orphan.replacementBlockHash,replacement.hash);
+        for (const field of ["observationId","transactionHash","blockNumber","blockHash","status","confirmedHead","confirmedAt"]) {
+          assert.equal(orphan[field],history[0][field],`historical receipt ${field} must remain unchanged`);
+        }
+        console.log("VALID: normal Tx Manager observation stopped claiming the orphaned CONFIRMED receipt as current execution; original hash/block/status/confirmation evidence remain historical");
+        console.log("VALID: every persisted same-intent candidate was rechecked and canonical Gateway replay was false before recovery resubmission");
+
+        freshPool = createDatabasePool(cfg);
+        const freshQueue = createDeliveryRepository({ config: cfg,pool: freshPool });
+        const restarted = createTransactionManager({ config: cfg,pool: freshPool,queue: freshQueue });
+        assert.ok(isDeepStrictEqual(await restarted.repository.getTransaction(id),recovering),"fresh clients must read identical durable reorg recovery state");
+        assert.deepEqual(await restarted.repository.getReceiptObservations(id),[orphan]);
+        const resumed = createRelayerWorker({ config: cfg,pool: freshPool,queue: freshQueue,transactionManager: restarted });
+        for (let round = 0; round < rounds && accepted.length < 2; round++) await resumed.runOnce();
+        assert.deepEqual(accepted,[original.attempt.transactionHash,original.attempt.transactionHash]);
+        const pending = await restarted.repository.getTransaction(id);
+        assert.equal(pending.attempts.length,1); assert.equal(pending.attempt.broadcastAttemptCount,"2");
+        for (const field of ["intentId","packageDigest","nonce","senderAddress","destinationGateway","value","calldata","createdAt"]) {
+          assert.ok(pending.intent[field] === original.intent[field],`reorg recovery must preserve intent ${field}`);
+        }
+        for (const field of ["attemptId","attemptNumber","nonce","gasLimit","maxFeePerGas","maxPriorityFeePerGas","rawSignedTransaction","transactionHash","createdAt"]) {
+          assert.ok(pending.attempt[field] === original.attempt[field],`reorg recovery must preserve signed ${field}`);
+        }
+        assert.equal(preparation(),beforePreparation,"reorg recovery must neither re-estimate target gas nor quote new fees");
+        assert.equal(signatures,1); assert.deepEqual(await restarted.repository.getAccount(),account);
+        const sent = observed.calls.filter(call => call.method === "eth_sendRawTransaction");
+        assert.equal(sent.length,2); assert.ok(sent.every(call => call.params[0] === original.attempt.rawSignedTransaction));
+        console.log("VALID: ordinary fenced Relayer/Tx Manager recovery resubmitted the same intent, message, package, nonce and exact signed bytes/hash; no new source proof, PBFT round, gas estimate, fee quote or signature");
+
+        await client.request({ method: "anvil_mine",params: [toHex(cfg.destinationConfirmations)] });
+        await restarted.checkReceiptsOnce();
+        const final = await restarted.repository.getTransaction(id); assert.equal(final.intent.status,"CONFIRMED");
+        const receipt = await client.request({ method: "eth_getTransactionReceipt",params: [original.attempt.transactionHash] });
+        verifyRpcTransaction(final.intent,final.attempt,await client.request({ method: "eth_getTransactionByHash",params: [original.attempt.transactionHash] }),receipt);
+        assert.equal(BigInt(receipt.status),1n); assert.notEqual(receipt.blockHash,oldReceipt.blockHash);
+        assert.ok(BigInt(final.attempt.confirmedHead) - BigInt(receipt.blockNumber) + 1n >= cfg.destinationConfirmations);
+        const finalHistory = await restarted.repository.getReceiptObservations(id);
+        assert.equal(finalHistory.length,2); assert.deepEqual(finalHistory[0],orphan); assert.equal(finalHistory[1].orphaned,false);
+        assert.equal(finalHistory[1].transactionHash,original.attempt.transactionHash);
+        assert.equal(finalHistory[1].blockHash,receipt.blockHash);
+        for (const [address,abi,eventName,args] of [
+          [gateway,gatewayAbi,"CrossChainMessageExecuted",{ messageId: event.messageId }],
+          [application,appAbi,"VerifiedSupplierGranted",{ messageId: event.messageId,supplier }],
+        ]) {
+          const logs = await client.getContractEvents({ address,abi,eventName,args,fromBlock: 0n,toBlock: "latest",strict: true });
+          assert.equal(logs.length,1); assert.equal(logs[0].transactionHash,receipt.transactionHash); assert.equal(logs[0].blockHash,receipt.blockHash);
+        }
+        assert.equal(await readGateway("isMessageExecuted",[event.messageId]),true); assert.equal(await readApp("isVerifiedSupplier",[supplier]),true);
+        assert.deepEqual((await restarted.repository.getBroadcastEvents(id)).slice(0,journal.length),journal);
+        assert.deepEqual(await queue.getDeliveryEntries([id]),entry);
+        assert.deepEqual(await lifecycle.readBatch({ batchRecordId: committed.record.batchRecordId }),committed);
+        assert.deepEqual(await readMessages(pool,config.databaseSchema),source.rows);
+        assert.deepEqual(await readIndexedSourceBlocks(pool,config.databaseSchema,config),source.blocks);
+        assert.deepEqual(await readCursor(pool,config.databaseSchema,config),source.cursor);
+        assert.deepEqual((await pool.query(`SELECT * FROM ${intents} WHERE delivery_job_id = ANY($1::text[]) ORDER BY delivery_job_id`,
+          [previousIntents.map(row => row.delivery_job_id)])).rows,previousIntents);
+        assert.deepEqual(await restarted.repository.getAccount(),account); assert.equal(observed.errors.length,0);
+        console.log(`VALID: recovered transaction ${receipt.transactionHash} reached canonical confirmation depth at ${receipt.blockNumber}/${receipt.blockHash}; exactly one canonical Gateway execution and ApplicationB transition`);
+        console.log("VALID: one historical orphaned receipt and one current canonical observation of the SAME transaction are preserved; source FINALIZED rows, batch membership/root/QC, READY authority, nonce allocator and historical executions remain unchanged");
+      });
+      for (const [position,index] of active.entries()) {
+        assert.equal(validators[index].exited,false); assert.equal(validators[index].child.pid,pids[position]);
+        assert.equal((await request(index,"/health")).body.ready,true);
+      }
+    } catch (error) { failure = error; throw error; }
+    finally {
+      const cleanup = await Promise.allSettled([freshPool?.end(),observed?.close()]);
+      const failed = cleanup.filter(value => value.status === "rejected").map(value => value.reason);
+      if (failed.length) throw new AggregateError([...(failure ? [failure] : []),...failed],"destination reorg cleanup failed");
+    }
+  }
 
   async function verifyDestinationRpcRecovery() {
     console.log("\n[Destination RPC Outage Recovery]");

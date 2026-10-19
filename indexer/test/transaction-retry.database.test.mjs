@@ -281,7 +281,8 @@ test("upgrade preserves original signed artifacts, final receipts, allocator and
       const artifacts = (await pool.query(`SELECT * FROM ${oldAttempts}`)).rows[0];
       const allocation = (await pool.query(`SELECT * FROM ${oldAccounts}`)).rows;
       const sourceBefore = await sourceState(pool,schema);
-      await applyMigrations(pool,schema);
+      const migrations = await applyMigrations(pool,schema);
+      assert.equal(migrations.at(-1),"018_destination_receipt_reconciliation.sql");
       const migrated = (await pool.query(`SELECT * FROM ${oldAttempts}`)).rows[0];
       for (const key of Object.keys(artifacts)) assert.deepEqual(migrated[key],artifacts[key],`upgrade must preserve ${status} ${key}`);
       assert.equal(migrated.broadcast_attempt_count,status === "SIGNED" ? "0" : "1");
@@ -289,16 +290,34 @@ test("upgrade preserves original signed artifacts, final receipts, allocator and
       const restored = await manager.repository.getTransaction(id);
       assert.equal(restored.intent.nonce,"9"); assert.equal(restored.attempts.length,1);
       assert.equal(restored.intent.status,["SIGNED","BROADCAST"].includes(status) ? "PENDING" : status);
+      const terminal = ["CONFIRMED","REVERTED"].includes(status);
+      const history = await manager.repository.getReceiptObservations(id);
+      const current = (await pool.query(`SELECT current_receipt_observation_id FROM ${oldIntents} WHERE delivery_job_id = $1`,[id])).rows[0];
+      assert.equal(history.length,terminal ? 1 : 0,`upgrade must archive only the ${status} terminal receipt`);
+      if (terminal) {
+        assert.equal(current.current_receipt_observation_id,history[0].observationId);
+        assert.equal(history[0].attemptId,artifacts.attempt_id); assert.equal(history[0].transactionHash,artifacts.transaction_hash);
+        assert.equal(history[0].blockNumber,artifacts.receipt_block_number); assert.equal(history[0].blockHash,artifacts.receipt_block_hash);
+        assert.equal(history[0].status,artifacts.receipt_status); assert.equal(history[0].confirmedHead,artifacts.confirmed_head);
+        assert.equal(history[0].confirmedAt,artifacts.confirmed_at.toISOString()); assert.equal(history[0].orphaned,false);
+      } else {
+        assert.equal(current.current_receipt_observation_id,null);
+      }
+      const winnerConstraint = (await pool.query(`SELECT condeferrable,condeferred FROM pg_constraint
+        WHERE conrelid = $1::regclass AND conname = 'transaction_intents_winner_fk'`,[oldIntents])).rows;
+      assert.deepEqual(winnerConstraint,[{ condeferrable: true,condeferred: true }],`upgrade must preserve the ${status} deferred winner FK`);
       const migratedAllocation = (await pool.query(`SELECT * FROM ${oldAccounts}`)).rows;
-      const preservedAllocation = migratedAllocation.map(({ receipt_scan_cursor_nonce,recovery_scan_cursor_nonce,...account }) => {
+      const preservedAllocation = migratedAllocation.map(({ receipt_scan_cursor_nonce,recovery_scan_cursor_nonce,terminal_scan_cursor_nonce,...account }) => {
         assert.equal(receipt_scan_cursor_nonce,null,`upgrade must initialize ${status} receipt scan cursor`);
         assert.equal(recovery_scan_cursor_nonce,null,`upgrade must initialize ${status} recovery scan cursor`);
+        assert.equal(terminal_scan_cursor_nonce,null,`upgrade must initialize ${status} terminal scan cursor`);
         return account;
       });
       assert.deepEqual(preservedAllocation,allocation,`upgrade must preserve ${status} allocation`);
       assert.deepEqual(await legacy.getSubmission(legacyId),oldSubmission);
       assert.deepEqual(await sourceState(pool,schema),sourceBefore);
       await applyMigrations(pool,schema);
+      assert.deepEqual(await manager.repository.getReceiptObservations(id),history,`migration rerun must preserve ${status} receipt history`);
       assert.deepEqual((await pool.query(`SELECT * FROM ${oldAccounts}`)).rows,migratedAllocation,
         `migration rerun must preserve ${status} allocation and scan cursors`);
     } finally {

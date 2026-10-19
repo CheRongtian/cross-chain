@@ -246,6 +246,7 @@ test("migrations are re-runnable and install deterministic source-event uniquene
     "015_rpc_response_errors.sql",
     "016_relayer_preparation_defer.sql",
     "017_transaction_scan_progress.sql",
+    "018_destination_receipt_reconciliation.sql",
   ]);
   assert.deepEqual(secondRun, firstRun);
   assert.ok(messageColumns.some((column) => column.column_name === "message_id"));

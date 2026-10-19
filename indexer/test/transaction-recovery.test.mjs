@@ -3,7 +3,8 @@ import test from "node:test";
 import { classifyRecovery } from "../src/transaction-manager/recovery.mjs";
 import { transactionConfig,transactionHarness,transientSendError } from "./helpers/transaction-fixtures.mjs";
 import { createTransactionManager } from "../src/transaction-manager/service.mjs";
-import { transactionFailoverHarness, rpcTimeout } from "./helpers/destination-rpc-fixtures.mjs";
+import { transactionFailoverHarness, rpcTimeout,transactionBody } from "./helpers/destination-rpc-fixtures.mjs";
+import { fixtureHash } from "./helpers/delivery-fixtures.mjs";
 
 function crashOnce() {
   let active = true;
@@ -11,6 +12,187 @@ function crashOnce() {
 }
 const rawFields = ["nonce","rawSignedTransaction","transactionHash","gasLimit","maxFeePerGas","maxPriorityFeePerGas"];
 function sameAttempt(first,second) { for (const field of rawFields) assert.equal(second[field],first[field]); }
+
+async function reorgHarness() {
+  const h = await transactionFailoverHarness();
+  // These scenarios keep the primary healthy during every actual broadcast.
+  h.calls.broadcast = h.destination.nodes[0].broadcasts;
+  return h;
+}
+const reorgPreparationCalls = h => ({ sign: h.calls.sign,
+  rpc: h.destination.nodes.flatMap(node => node.calls).filter(call =>
+    ["eth_estimateGas","eth_maxPriorityFeePerGas"].includes(call.method)).map(call => call.method) });
+async function confirmedReorgFixture(status = 1) {
+  const h = await reorgHarness(); const id = h.jobs[0].deliveryJobId;
+  await h.manager.submitDelivery(id); h.mine(id,{ status });
+  await h.manager.checkReceiptsOnce();
+  const original = await h.repository.getTransaction(id);
+  assert.equal(original.intent.status,status === 1 ? "CONFIRMED" : "REVERTED");
+  return { h,id,original,account: await h.repository.getAccount(),preparation: reorgPreparationCalls(h) };
+}
+function replaceTerminalBranch({ h,original },{ replay = false } = {}) {
+  h.destination.receipts.clear(); h.destination.transactions.clear();
+  for (const node of h.destination.nodes) {
+    node.blocks.set(original.winningAttempt.receiptBlockNumber,{ number: "0x64",hash: fixtureHash(5000) });
+    node.latestNonce = BigInt(original.intent.nonce); node.pendingNonce = BigInt(original.intent.nonce); node.replay = replay;
+  }
+}
+
+test("terminal receipt revalidation is a bounded canonical no-op and preserves receipt history", async () => {
+  const { h,id,original } = await confirmedReorgFixture();
+  const history = await h.repository.getReceiptObservations(id);
+  const result = await h.restart().checkReceiptsOnce({ limit: 1 });
+  assert.equal(result.checked,0); assert.equal(result.terminal.checked,1);
+  assert.equal(result.terminal.results[0].action,"CANONICAL");
+  assert.deepEqual(await h.repository.getTransaction(id),original);
+  assert.deepEqual(await h.repository.getReceiptObservations(id),history); assert.equal(h.calls.broadcast.length,1);
+});
+
+for (const status of [1,0]) test(`positive orphan evidence reopens ${status ? "CONFIRMED" : "REVERTED"} and reuses the exact same candidate`, async () => {
+  const f = await confirmedReorgFixture(status); const { h,id,original,account,preparation } = f;
+  replaceTerminalBranch(f);
+  const result = await h.restart().checkReceiptsOnce();
+  assert.equal(result.terminal.results[0].action,"REORG_RECOVERY");
+  const recovering = await h.repository.getTransaction(id);
+  assert.equal(recovering.intent.status,"PENDING"); assert.equal(recovering.winningAttempt,null);
+  assert.equal(recovering.intent.reorgRecovery.rebroadcastRequired,true); sameAttempt(original.attempt,recovering.attempt);
+  const [old] = await h.repository.getReceiptObservations(id);
+  assert.equal(old.orphaned,true); assert.equal(old.blockHash,original.attempt.receiptBlockHash);
+  assert.equal(old.confirmedAt,original.attempt.confirmedAt); assert.equal(old.status,status);
+  assert.equal((await h.restart().processTransactionRetriesOnce()).broadcasts,1);
+  assert.ok(h.calls.broadcast.every(raw => raw === original.attempt.rawSignedTransaction));
+  assert.deepEqual(reorgPreparationCalls(h),preparation); assert.deepEqual(await h.repository.getAccount(),account);
+  assert.equal((await h.repository.getTransaction(id)).attempts.length,1);
+});
+
+test("same signed hash re-included below confirmation depth is tracked without sending, then reconfirmed", async () => {
+  const f = await confirmedReorgFixture(); const { h,id,original,preparation } = f; replaceTerminalBranch(f);
+  const hash = fixtureHash(5101);
+  for (const node of h.destination.nodes) node.blocks.set("101",{ number: "0x65",hash });
+  h.destination.receipts.set(original.attempt.transactionHash,{ transactionHash: original.attempt.transactionHash,blockNumber: "0x65",blockHash: hash,status: "0x1" });
+  h.destination.transactions.set(original.attempt.transactionHash,transactionBody(original.intent,original.attempt,101n,hash));
+  assert.equal((await h.manager.checkReceiptsOnce()).terminal.results[0].action,"AWAITING_CONFIRMATIONS");
+  assert.equal((await h.repository.getTransaction(id)).intent.status,"PENDING");
+  assert.equal((await h.manager.processTransactionRetriesOnce()).broadcasts,0);
+  h.destination.nodes.forEach(node => { node.head = 103n; });
+  await h.restart().checkReceiptsOnce();
+  const final = await h.repository.getTransaction(id); assert.equal(final.intent.status,"CONFIRMED");
+  assert.equal(final.winningAttempt.receiptBlockHash,hash); sameAttempt(original.attempt,final.attempt);
+  const history = await h.repository.getReceiptObservations(id);
+  assert.equal(history.length,2); assert.equal(history[0].orphaned,true); assert.equal(history[1].orphaned,false);
+  assert.equal(h.calls.broadcast.length,1); assert.deepEqual(reorgPreparationCalls(h),preparation);
+});
+
+test("a persisted sibling can become the canonical winner without a third candidate or another broadcast", async () => {
+  const h = await reorgHarness(); const id = h.jobs[0].deliveryJobId;
+  const parent = await h.manager.submitDelivery(id); h.advance(h.config.replacementAfterMs);
+  const child = await h.manager.prepareReplacement(id);
+  h.mine(id,{ attemptId: parent.attempt.attemptId }); await h.manager.checkReceiptsOnce();
+  const original = await h.repository.getTransaction(id); replaceTerminalBranch({ h,original });
+  const hash = fixtureHash(5101); h.destination.nodes.forEach(node => {
+    node.head = 103n; node.blocks.set("101",{ number: "0x65",hash });
+  });
+  h.destination.receipts.set(child.attempt.transactionHash,{ transactionHash: child.attempt.transactionHash,blockNumber: "0x65",blockHash: hash,status: "0x1" });
+  h.destination.transactions.set(child.attempt.transactionHash,transactionBody(original.intent,child.attempt,101n,hash));
+  const result = await h.restart().checkReceiptsOnce();
+  assert.equal(result.terminal.results[0].action,"REINCLUDED"); assert.equal(result.terminal.results[0].candidatesChecked,2);
+  const stored = await h.repository.getTransaction(id);
+  assert.equal(stored.winningAttempt.attemptId,child.attempt.attemptId); assert.equal(stored.attempts.length,2);
+  assert.equal(h.calls.broadcast.length,1); assert.equal(h.calls.sign,2);
+});
+
+test("a missing terminal receipt alone leaves the recorded outcome and history untouched", async () => {
+  const { h,id,original } = await confirmedReorgFixture(); h.destination.receipts.clear();
+  assert.equal((await h.restart().checkReceiptsOnce()).terminal.results[0].action,"UNRESOLVED");
+  assert.deepEqual(await h.repository.getTransaction(id),original);
+  assert.equal((await h.repository.getReceiptObservations(id))[0].orphaned,false); assert.equal(h.calls.broadcast.length,1);
+});
+
+test("a changed fixed-head anchor during terminal evidence collection cannot authorize orphaning", async () => {
+  const f = await confirmedReorgFixture(); const { h,id,original } = f; replaceTerminalBranch(f);
+  h.destination.nodes[0].faults.set("eth_getTransactionReceipt",({ forward }) => {
+    h.destination.nodes.forEach(node => node.blocks.set("102",{ number: "0x66",hash: fixtureHash(9000) }));
+    return forward();
+  });
+  const result = await h.manager.checkReceiptsOnce();
+  assert.equal(result.terminal.results[0].action,"UNRESOLVED");
+  assert.deepEqual(await h.repository.getTransaction(id),original);
+  assert.equal((await h.repository.getReceiptObservations(id))[0].orphaned,false); assert.equal(h.calls.broadcast.length,1);
+});
+
+for (const fault of ["unavailable","timeout","behind","conflict","identity"]) test(`terminal ${fault} evidence cannot declare a reorg or authorize a send`, async () => {
+  const f = await confirmedReorgFixture(); const { h,id,original } = f;
+  if (fault === "unavailable") h.destination.nodes.forEach(node => { node.available = false; });
+  if (fault === "identity") h.destination.nodes.forEach(node => { node.genesisHash = fixtureHash(9000); });
+  if (fault === "timeout") h.destination.nodes.forEach(node => node.faults.set("eth_getBlockByNumber",({ params,forward }) => {
+    if (params[0] === "0x0") return forward(); throw rpcTimeout();
+  }));
+  if (fault === "behind") { replaceTerminalBranch(f); h.destination.nodes[1].head = 99n; }
+  if (fault === "conflict") h.destination.nodes[0].blocks.set("100",{ number: "0x64",hash: fixtureHash(5000) });
+  if (["unavailable","timeout","identity"].includes(fault)) await assert.rejects(h.restart().checkReceiptsOnce());
+  else assert.equal((await h.restart().checkReceiptsOnce()).terminal.results[0].action,"UNRESOLVED");
+  assert.deepEqual(await h.repository.getTransaction(id),original);
+  assert.equal((await h.repository.getReceiptObservations(id))[0].orphaned,false); assert.equal(h.calls.broadcast.length,1);
+});
+
+test("Gateway replay already consumed on the replacement branch prevents resubmission without preserving stale success", async () => {
+  const f = await confirmedReorgFixture(); const { h,id } = f; replaceTerminalBranch(f,{ replay: true });
+  assert.equal((await h.manager.checkReceiptsOnce()).terminal.results[0].action,"GATEWAY_ALREADY_EXECUTED");
+  const stored = await h.repository.getTransaction(id);
+  assert.equal(stored.intent.status,"PENDING"); assert.equal(stored.intent.retryStopReason,"GATEWAY_ALREADY_EXECUTED");
+  assert.equal(stored.winningAttempt,null); assert.equal((await h.manager.processTransactionRetriesOnce()).broadcasts,0);
+  assert.equal(h.calls.broadcast.length,1);
+});
+
+test("replay is checked again at the actual endpoint send boundary", async () => {
+  const f = await confirmedReorgFixture(); const { h,id } = f; replaceTerminalBranch(f);
+  await h.manager.checkReceiptsOnce();
+  const replay = h.options.rpc.gatewayReplay; let reads = 0;
+  h.options.rpc.gatewayReplay = async (...args) => {
+    if (++reads === 2) h.destination.nodes.forEach(node => { node.replay = true; });
+    return replay(...args);
+  };
+  await assert.rejects(h.manager.processTransactionRetriesOnce(),{ code: "GATEWAY_ALREADY_EXECUTED" });
+  assert.equal(h.calls.broadcast.length,1);
+  assert.equal((await h.repository.getTransaction(id)).intent.retryStopReason,"GATEWAY_ALREADY_EXECUTED");
+});
+
+test("a replay-read timeout after positive orphan proof cannot retain stale success or authorize a send", async () => {
+  const f = await confirmedReorgFixture(); const { h,id } = f; replaceTerminalBranch(f);
+  h.destination.nodes.forEach(node => node.faults.set("eth_call",() => { throw rpcTimeout(); }));
+  assert.equal((await h.manager.checkReceiptsOnce()).terminal.results[0].action,"UNRESOLVED");
+  assert.equal((await h.repository.getTransaction(id)).intent.status,"PENDING");
+  assert.equal((await h.repository.getReceiptObservations(id))[0].orphaned,true);
+  await h.manager.processTransactionRetriesOnce(); assert.equal(h.calls.broadcast.length,1);
+  h.destination.nodes.forEach(node => node.faults.clear()); h.advance(h.config.rebroadcastIntervalMs);
+  assert.equal((await h.restart().processTransactionRetriesOnce()).broadcasts,1);
+});
+
+test("concurrent reorg observations and retries serialize without branching or another nonce", async () => {
+  const f = await confirmedReorgFixture(); const { h,id,account,preparation } = f; replaceTerminalBranch(f);
+  await Promise.all([h.manager.checkReceiptsOnce(),h.restart().checkReceiptsOnce()]);
+  assert.equal((await h.repository.getReceiptObservations(id)).filter(row => row.orphaned).length,1);
+  await Promise.all([h.manager.processTransactionRetriesOnce(),h.restart().processTransactionRetriesOnce()]);
+  assert.equal(h.calls.broadcast.length,2); assert.deepEqual(await h.repository.getAccount(),account);
+  assert.deepEqual(reorgPreparationCalls(h),preparation); assert.equal((await h.repository.getTransaction(id)).attempts.length,1);
+});
+
+test("reorg does not reset exhausted retry history and unexplained canonical nonce consumption stops a send", async () => {
+  const f = await confirmedReorgFixture(); const { h,id,original } = f;
+  replaceTerminalBranch(f); await h.manager.checkReceiptsOnce();
+  h.destination.nodes.forEach(node => { node.latestNonce = BigInt(original.intent.nonce) + 1n; });
+  await assert.rejects(h.manager.processTransactionRetriesOnce(),{ code: "UNKNOWN_NONCE_CONSUMPTION" });
+  assert.equal((await h.repository.getTransaction(id)).intent.retryStopReason,"UNKNOWN_NONCE_CONSUMPTION");
+  assert.equal(h.calls.broadcast.length,1);
+  const g = await reorgHarness(); const stoppedId = g.jobs[0].deliveryJobId;
+  await g.manager.submitDelivery(stoppedId); await g.repository.stopRetry(stoppedId,"MAX_ATTEMPTS_REACHED");
+  g.mine(stoppedId); await g.manager.checkReceiptsOnce();
+  const confirmed = await g.repository.getTransaction(stoppedId); replaceTerminalBranch({ h: g,original: confirmed });
+  await g.manager.checkReceiptsOnce();
+  const stopped = await g.repository.getTransaction(stoppedId);
+  assert.equal(stopped.intent.retryStopReason,"MAX_ATTEMPTS_REACHED"); assert.equal(stopped.intent.retryStoppedAt,confirmed.intent.retryStoppedAt);
+  assert.equal((await g.manager.processTransactionRetriesOnce()).broadcasts,0);
+});
 
 test("recovery limit=1 rotates past unproductive mined bodies to a later canonical receipt without authorizing a send", async () => {
   const h = await transactionHarness();

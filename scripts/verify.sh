@@ -882,6 +882,13 @@ printf '286. Rotate recovery independently without changing send order, allocati
 printf '287. Observe a later canonical receipt behind incomplete earlier evidence with limit 1\n'
 printf '288. Preserve progress across fresh processes, selection crashes, wrap, terminal removal and concurrent clients\n'
 printf '289. Schedule unchanged NO_REPLACEMENT work into the future without signing, sending or nonce allocation\n'
+printf '290. Revalidate terminal destination receipts with an independent bounded persistent cursor and fixed canonical view\n'
+printf '291. Preserve historical receipts through migration, proven orphaning, concurrent reconciliation and fresh database clients\n'
+printf '     Upgrade legacy terminal rows without pending-trigger DDL failures and preserve the deferred winner FK\n'
+printf '     Verify exact timestamp scheduling after proven reorgs while stopped retries retain a null schedule\n'
+printf '292. Confirm a fresh real Gateway/ApplicationB execution, then replace only its destination branch using a local snapshot\n'
+printf '293. Require positive replacement-block evidence, all-candidate reconciliation and Gateway replay checks before recovery\n'
+printf '294. Reuse the exact persisted signed transaction, reconfirm on the replacement branch and count one canonical business execution\n'
 printf '     Replace a real Chain A branch while a fresh authorized source occurrence is FINALIZING\n'
 printf '     Preserve terminal REORGED evidence and prove zero downstream batch/QC/READY/transaction/destination propagation\n'
 printf '     Resume a canonical replacement through the same schema, live validator cluster and production Gateway/ApplicationB\n'
@@ -973,7 +980,7 @@ node --test \
     "$INDEXER_DIR/test/relayer-leases.test.mjs" \
     "$INDEXER_DIR/test/transaction-recovery.test.mjs"
 
-CURRENT_STEP="Chain A Indexer database, migration sequence/upgrades, fixed-snapshot concurrency, RPC retry/restart, batch/Merkle/lifecycle, delivery leases, preparation fairness and independent receipt/recovery cursors with fresh-process/crash/concurrency tests"
+CURRENT_STEP="Chain A Indexer database, migration sequence/upgrades with terminal receipt backfill, typed reorg schedules/stopped retries, fixed-snapshot concurrency, RPC retry/restart, batch/Merkle/lifecycle, delivery leases, preparation fairness and independent receipt/recovery cursors with fresh-process/crash/concurrency tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
@@ -2036,7 +2043,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, non-primary Byzantine safety and canonical execution E2E, relayer process failure/natural-expiry signed takeover E2E, two-process duplicate-delivery race E2E, all-path destination RPC outage/automatic resumption E2E, primary failure/view-change E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
+CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, non-primary Byzantine safety and canonical execution E2E, relayer process failure/natural-expiry signed takeover E2E, two-process duplicate-delivery race E2E, all-path destination RPC outage/automatic resumption E2E, confirmed destination transaction reorg/reconfirmation E2E, primary failure/view-change E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 printf '%s\n' 'RPC recovery accounting: distinguish pre-sign nonce-blocked preparation from persisted transaction reuse; reject post-persistence gas estimation, fee repricing or signing.'
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
