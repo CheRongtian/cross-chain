@@ -1698,6 +1698,44 @@ Verification snapshots Chain B, controls automine and temporarily uses minimal r
 
 CONFIRMED records a successful canonical receipt at configured depth, a heuristic rather than permanent finality. For a new zero-value execute(bytes) transaction targeting the production DestinationGateway, EVM success means its complete verification, replay consumption and receiver call committed atomically; verification also reads both Gateway and ApplicationB storage directly. Historical EOA-targeted receipts retain their narrower transport-inclusion meaning. Later positive destination replacement evidence is reconciled through the receipt history and original intent; Byzantine RPC-provider consensus remains outside the implementation.
 
+## Read-only Message Lifecycle API
+
+`GET /api/v1/messages/:messageId` correlates one canonical cross-chain message with its source transaction and block, persisted source finality, immutable batch/Merkle commitment, PBFT observations and actual validator votes, historical quorum certificate, READY delivery job, ordered transaction attempts and current persisted destination outcome. IDs must be `0x` followed by exactly 64 hex digits; hex letters are case-insensitive and responses use lowercase canonical hex. Short values, whitespace and arbitrary strings are rejected.
+
+Responses carry `apiVersion: "1"`, `authority: "OBSERVATIONAL"` and `observedAt`, followed by these sections:
+
+- `message`, `sourceTransaction`, `sourceBlock`, `sourceOccurrences`, `finality`;
+- `batch`, `merkle`, `pbft`, `validatorVotes`, `qc`;
+- `delivery`, `deliveryAttempts`, `destinationTransaction`, `execution`.
+
+Full-width integer fields are encoded as exact decimal strings, including domains, nonces, deadlines, block heights, epochs, views, fees and fencing tokens. Bounded flags/counts can remain JSON booleans or small numbers. Later lifecycle sections remain `null` or empty lists until evidence exists. A BUILDING batch has no sealed ID/root/position yet. The API never manufactures a QC, missing vote, delivery transaction or execution for an early or terminal REORGED source occurrence.
+
+The canonical message fields are checked against the requested ID. If the same ID has historical source occurrences, the one non-REORGED occurrence is selected; when all are REORGED, the newest persisted occurrence supplies the main provenance. `sourceOccurrences` retains the other provenance. Multiple live occurrences fail closed. Historical source blocks retain their own hashes even after the indexed canonical branch changes; a missing historical parent hash stays `null`.
+
+Batch and delivery reads reuse the production snapshot/Merkle/QC validators on an unlocked read-only database snapshot. Vote readers query only the requested batch epoch and its observed or certified view in explicitly configured identity-bound validator stores. They authenticate the public evidence and deduplicate copies by phase/view/signer, with `observedBy` indicating which stores retain each vote. Local observations are separate from the source batch's COMMITTED state. Historical messages retain their pinned committee and original QC version; the latest committee does not replace earlier authority. An offline Validator process can still have readable durable state. No configured reader, an unavailable database and an observed absence of votes are distinct conditions.
+
+The API reads persisted observations and does not connect to Chain A or Chain B. `PERSISTED_CANONICAL` describes the Transaction Manager's current stored winner, not fresh independent proof of permanent chain finality. A fork that workers have not yet observed will not be discovered by GET. Archived orphan receipts remain in attempt history; once production reconciliation reopens an intent, the current transaction has no canonical winner and execution reports `REORG_RECOVERY`. GET never performs that reconciliation itself. The latest replacement is not substituted for an older actual canonical winner.
+
+For the configured production Gateway, a current successful receipt for the exact authenticated `execute(bytes)` call is reported as execution `CONFIRMED`. Set the public `PRODUCTION_DESTINATION_GATEWAY_ADDRESS` to identify that deployment. Without that match, successful historical/raw-envelope or EOA-targeted transactions are labelled `TRANSPORT_CONFIRMED`, with no Gateway/business-success claim. `businessResult` remains `null`: the generic lifecycle API does not interpret supplier actions or query ApplicationB live. Full verification separately cross-checks the queried real production execution against Gateway replay and ApplicationB state.
+
+### Configuration and startup
+
+Use the ignored root `.env` for local connection material and the committed `.env.example` only as a placeholder reference. API configuration reuses `DATABASE_URL`, `INDEXER_DB_SCHEMA`, `CHAIN_A_DOMAIN`, `SOURCE_GATEWAY_ADDRESS`, `FINALITY_BLOCK_DEPTH`, `DESTINATION_CONFIRMATIONS` and the existing public validator-set history configuration. It does not require a signer key or an RPC URL/genesis. New listener settings default to `MESSAGE_QUERY_API_HOST=127.0.0.1` and `MESSAGE_QUERY_API_PORT=8080`.
+
+`MESSAGE_QUERY_VALIDATOR_STORES` is a JSON array of existing reader locations. Each entry has `validatorAddress`, `databaseSchema`, and optionally `databaseUrl`; omitted URLs use `DATABASE_URL`. Supply readers for the historical committee members whose messages you query. Use actual public identities/schemas from your deployment; do not copy verification's temporary namespaces into a production configuration. Separate database credentials belong only in your ignored `.env`. The API creates no schemas, migrations, tables, votes or copied Explorer state.
+
+After configuring the existing deployment, start the API from `indexer/` with `npm run api:start`. It loads the root `.env`. Shutdown with `Ctrl+C` closes the listener and only its own reader pools. Injected/shared pools remain owned by their caller. Full verification creates isolated loopback listeners automatically; it does not require a manually running API.
+
+### Errors, purity and trust
+
+HTTP results are `200` for a consistent observed lifecycle, `400` for an invalid message ID, `404` for an unknown message/route, `405` for unsupported methods, `409` for inconsistent persisted evidence, `503` for unavailable observational dependencies, and `500` for unexpected internal errors. Responses contain fixed public error codes without database/RPC credentials, provider messages or stack traces. The explicit response allowlist excludes raw signed transaction bytes, private keys, private credential attributes, witnesses and connection strings. Public cross-chain payloads and signed public PBFT votes remain visible.
+
+Each source/delivery/transaction read uses a `REPEATABLE READ READ ONLY` transaction. Validator stores have their own read-only snapshots; the API does not claim atomic snapshots across independent databases. It acquires no worker/account/voting row locks, advisory locks or delivery ownership. It advances no cursor, finality, PBFT phase, retry schedule or destination recovery. It signs and broadcasts nothing, and it repairs no corrupted evidence.
+
+API responses are not protocol authorization or finality authority. Query API downtime does not affect message processing. The dependency direction is API → existing state; Indexer, Validators, Relayers, Transaction Manager and Gateway never depend on the API for decisions. DestinationGateway remains the destination authorization/replay boundary. The local read-only surface supplies no authentication service, frontend, metrics endpoint or dashboard.
+
+Complete verification retains all protocol and fault-recovery coverage, adds HTTP/unit/database query cases, and queries existing real successful messages, source orphans, replacement history, historical committees and a temporarily reopened destination intent. It also queries the fresh three-of-four execution from composed recovery while its owned stores remain available. Repeated HTTP reads are compared against source/consensus/lease/account/attempt/receipt/business snapshots, with no new chain or Validator world.
+
 ## Local Two-Chain Environment
 
 `scripts/start-chains.sh` starts two Anvil chains:
@@ -1887,6 +1925,7 @@ The script uses strict error handling and verifies the following boundaries:
 - **Durable delivery:** strict COMMITTED-to-READY projection, independently verified packages, destination-scoped leased workers, preparation-defer fairness, persistent signing/nonce allocation, exact retries and same-nonce replacement, fair receipt/recovery scans, RPC failover and fresh-process crash reconciliation.
 - **PostgreSQL service recovery:** a genuine owned-server stop after real destination acceptance, failed database-dependent progress, same-PGDATA WAL recovery, unchanged source/consensus/delivery/transaction history, valid new ownership and canonical reconciliation of the original signed transaction without a duplicate business execution.
 - **Composed recovery:** one fresh message completes same-view consensus with one non-primary offline, survives the signing Relayer's actual pre-send crash, transfers through natural lease expiry and higher fencing, remains intact during all-path destination RPC unavailability, and finishes through the same polling B process after access returns. No new authorization, batch, transaction identity or signature is introduced to recover delivery.
+- **Read-only lifecycle queries:** real loopback HTTP, exact full-width numeric encoding, explicit secret-free response/error schemas, actual historical validator votes/QCs, ordered attempt lineage, historical/current reorg distinctions and independent production-state comparisons. Read-only database snapshots and repeated-GET state checks enforce zero protocol mutations.
 - **Destination execution:** actual Chain B registries/verifiers and production `DestinationGateway`/`ApplicationB` deployment, canonical transport-v1 `execute(bytes)` parity and limits, QC → Merkle → full-message/domain checks, message-ID replay, exact receiver authority, atomic rollback/retry and supplier-state/event readback.
 - **Compatibility and negative boundaries:** unchanged legacy v1/v2 and current v3 certificates, historical signed transactions and opaque payloads, independent stateless/test-harness checks, precise invalid-evidence rejection and full real source-to-application execution through production Relayer/Transaction Manager APIs.
 
@@ -2039,6 +2078,14 @@ Cross-Chain/
 │   │   ├── verify-application-b.mjs
 │   │   └── verify-merkle-inclusion.mjs
 │   ├── src/
+│   │   ├── api/
+│   │   │   ├── config.mjs
+│   │   │   ├── errors.mjs
+│   │   │   ├── main.mjs
+│   │   │   ├── message-query.mjs
+│   │   │   ├── read-snapshot.mjs
+│   │   │   ├── server.mjs
+│   │   │   └── validator-evidence.mjs
 │   │   ├── batch-lifecycle-policy.mjs
 │   │   ├── batch-lifecycle.mjs
 │   │   ├── canonical-block.mjs
@@ -2110,6 +2157,8 @@ Cross-Chain/
 │   │   │   ├── lease-fixtures.mjs
 │   │   │   ├── merkle-inclusion-contract.mjs
 │   │   │   ├── message-domain-contract.mjs
+│   │   │   ├── message-query-fixtures.mjs
+│   │   │   ├── message-query-integration.mjs
 │   │   │   ├── multi-relayer-integration.mjs
 │   │   │   ├── read-batch-lifecycle.mjs
 │   │   │   ├── read-delivery.mjs
@@ -2127,6 +2176,8 @@ Cross-Chain/
 │   │   ├── message-batch.test.mjs
 │   │   ├── message-merkle.test.mjs
 │   │   ├── message-merkle-golden.test.mjs
+│   │   ├── message-query.test.mjs
+│   │   ├── message-query.database.test.mjs
 │   │   ├── reorg-detector.test.mjs
 │   │   ├── relayer-config.test.mjs
 │   │   ├── relayer-encoding.test.mjs

@@ -919,6 +919,11 @@ printf '308. Require B to observe structured RPC_UNAVAILABLE while both chains/d
 printf '309. Restore the same Chain B access paths; let B autonomously deliver and confirm without per-job manual recovery\n'
 printf '310. Require one original intent/nonce/hash, one external send and one canonical Gateway/ApplicationB execution\n'
 printf '311. Preserve source/batch/Merkle/QC, validator safety and prior transaction history; clean up owned workers/gates\n'
+printf '312. Validate the read-only message query API, canonical IDs, HTTP errors, decimal integers and secret-free responses\n'
+printf '313. Read real three-of-four validator evidence and unsigned/signed delivery history inside read-only database snapshots\n'
+printf '314. Query existing complete E2E messages, historical committees, source orphans and replacement attempts over HTTP\n'
+printf '315. Keep historical orphan receipts distinct from the current canonical destination winner without triggering recovery\n'
+printf '316. Compare repeated GET state snapshots; preserve every source, consensus, lease, nonce, retry and business-state boundary\n'
 printf '     Replace a real Chain A branch while a fresh authorized source occurrence is FINALIZING\n'
 printf '     Preserve terminal REORGED evidence and prove zero downstream batch/QC/READY/transaction/destination propagation\n'
 printf '     Resume a canonical replacement through the same schema, live validator cluster and production Gateway/ApplicationB\n'
@@ -1029,6 +1034,13 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
         "$INDEXER_DIR/test/rpc-failover.database.test.mjs" \
         "$INDEXER_DIR/test/relayer-leases.database.test.mjs" \
         "$INDEXER_DIR/test/transaction-recovery.database.test.mjs"
+
+CURRENT_STEP="read-only message lifecycle API HTTP, projection, read consistency, public payload provenance, secret redaction and database boundaries"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test "$INDEXER_DIR/test/message-query.test.mjs"
+DATABASE_URL="$DATABASE_URL" \
+INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
+    node --test "$INDEXER_DIR/test/message-query.database.test.mjs"
 
 CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, Solidity ABI context mapping and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -2085,7 +2097,7 @@ INDEXER_START_BLOCK="$(cast block latest --field number --rpc-url "$CHAIN_A_RPC"
 INDEXER_START_BLOCK=$((INDEXER_START_BLOCK + 1))
 printf 'Indexer integration start block: %s\n' "$INDEXER_START_BLOCK"
 
-CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, non-primary Byzantine safety and canonical execution E2E, relayer process failure/natural-expiry signed takeover E2E, two-process duplicate-delivery race E2E, all-path destination RPC outage/automatic resumption E2E, confirmed destination transaction reorg/reconfirmation E2E, primary failure/view-change E2E, owned PostgreSQL stop/same-storage restart and canonical transaction recovery E2E, continuous one-message validator/relayer/all-path RPC composed recovery E2E, historical QC/Merkle/message verification and destination replay/rollback integration"
+CURRENT_STEP="real source/consensus/transport recovery, pre-finality source reorg isolation and canonical replacement E2E, non-primary validator stop/rejoin E2E, non-primary Byzantine safety and canonical execution E2E, relayer process failure/natural-expiry signed takeover E2E, two-process duplicate-delivery race E2E, all-path destination RPC outage/automatic resumption E2E, confirmed destination transaction reorg/reconfirmation E2E, primary failure/view-change E2E, owned PostgreSQL stop/same-storage restart and canonical transaction recovery E2E, continuous one-message validator/relayer/all-path RPC composed recovery E2E, historical QC/Merkle/message verification, destination replay/rollback and read-only lifecycle HTTP integration"
 printf '\n[%s]\n' "$CURRENT_STEP"
 printf '%s\n' 'RPC recovery accounting: distinguish pre-sign nonce-blocked preparation from persisted transaction reuse; reject post-persistence gas estimation, fee repricing or signing.'
 CHAIN_A_RPC_URL="$CHAIN_A_RPC" \

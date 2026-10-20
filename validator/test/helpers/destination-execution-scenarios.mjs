@@ -41,6 +41,7 @@ import { rpcObserver } from "./process-cluster.mjs";
 import { withAutomineDisabled } from "../../../indexer/test/helpers/transaction-retry-integration.mjs";
 import { verifyPostgresRestart } from "./postgres-restart-scenarios.mjs";
 import { verifyMultiComponentRecovery } from "./multi-component-recovery-scenario.mjs";
+import { verifyMessageQueryHTTP } from "../../../indexer/test/helpers/message-query-integration.mjs";
 
 const artifact = name => JSON.parse(readFileSync(new URL(`../../../contracts/out/${name}.sol/${name}.json`, import.meta.url), "utf8"));
 const normalizeError = value => typeof value === "string" && /^0x[0-9a-f]{40}$/i.test(value) ? value.toLowerCase() : value;
@@ -446,6 +447,24 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   await verifyDestinationRpcRecovery();
   await verifyDestinationTransactionReorg();
   await verifyPrimaryFailure();
+  // Observe existing real data before the owned-database scenarios clean up.
+  // No extra message, chain, validator world or fault is created for the API.
+  const querySuccess = (await pool.query(`SELECT s.message_id FROM ${tableName(config.databaseSchema, "source_messages")} s
+    JOIN ${tableName(config.databaseSchema, "delivery_jobs")} j ON j.source_message_id = s.id
+    JOIN ${tableName(config.databaseSchema, "transaction_intents")} i USING (delivery_job_id)
+    WHERE s.status = 'FINALIZED' AND s.destination_gateway = $1 AND i.status = 'CONFIRMED' ORDER BY s.id DESC LIMIT 1`, [gateway])).rows[0];
+  const queryOrphan = (await pool.query(`SELECT message_id FROM ${tableName(config.databaseSchema, "source_messages")}
+    WHERE status = 'REORGED' ORDER BY id DESC LIMIT 1`)).rows[0];
+  const queryReplacement = (await pool.query(`SELECT j.message_id FROM ${tableName(config.databaseSchema, "delivery_jobs")} j
+    JOIN ${tableName(config.databaseSchema, "transaction_attempts")} a USING (delivery_job_id)
+    WHERE a.replacement_of_attempt_id IS NOT NULL ORDER BY a.attempt_id DESC LIMIT 1`)).rows[0];
+  assert.ok(querySuccess && queryOrphan && queryReplacement, "existing E2E must supply real successful, reorged and replacement-history API cases");
+  await verifyMessageQueryHTTP({ config: { ...config, validatorSets, destinationConfirmations: relayConfig.destinationConfirmations }, pool, states, records: validators,
+    messageIds: [...new Set([querySuccess.message_id, queryOrphan.message_id, queryReplacement.message_id,
+      ...historical.map(snapshot => snapshot.batch.messageIds[0])])], productionGateway: gateway,
+    destinationCheck: async () => ({ executed: await readGateway("isMessageExecuted", [querySuccess.message_id]),
+      nonce: await client.request({ method: "eth_getTransactionCount", params: [relayConfig.relayerAddress, "pending"] }) }),
+    label: "complete lifecycle, real orphan, replacement and historical committees" });
   await verifyPostgresRestart({ config, pool, validatorSets, produceMessage, client, chainA, gateway, application,
     gatewayAbi, appAbi, rpcUrl, registryChecks, certificateChecks, afterVerification: verifyMultiComponentRecovery });
   console.log("COMPLETE END-TO-END EXECUTION EVIDENCE RECORDED: fresh ZK intent → source event → real finality/batch/PBFT/READY → production Relayer/Tx Manager → atomic Gateway/ApplicationB; duplicate rejection and business rollback; historical snapshots unchanged");
@@ -571,6 +590,11 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
         }
         console.log("VALID: normal Tx Manager observation stopped claiming the orphaned CONFIRMED receipt as current execution; original hash/block/status/confirmation evidence remain historical");
         console.log("VALID: every persisted same-intent candidate was rechecked and canonical Gateway replay was false before recovery resubmission");
+
+        await verifyMessageQueryHTTP({ config: { ...config, validatorSets, destinationConfirmations: cfg.destinationConfirmations }, pool, states, records: validators,
+          messageIds: [event.messageId], productionGateway: gateway, expectedExecution: "REORG_RECOVERY",
+          destinationCheck: async () => ({ executed: await readGateway("isMessageExecuted", [event.messageId]),
+            supplier: await readApp("isVerifiedSupplier", [supplier]) }), label: "historical orphan receipt with no current canonical winner" });
 
         freshPool = createDatabasePool(cfg);
         const freshQueue = createDeliveryRepository({ config: cfg,pool: freshPool });

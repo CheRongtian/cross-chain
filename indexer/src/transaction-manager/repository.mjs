@@ -226,11 +226,8 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
     await client.query(`UPDATE ${attempts} SET status = 'REPLACED' WHERE delivery_job_id = $1 AND attempt_id <> $2 AND status <> 'REPLACED'`,[id,winner.attemptId]);
     await hooks.beforeOutcomeCommit?.({ client,id,observation });
   }
-  return {
-    withRecoveryLock,
-    async listTerminalIntents({ limit = config.maxJobs } = {}) { return selectObservationIds("terminal",limit); },
-    async getReceiptObservations(id) {
-      return Object.freeze((await pool.query(`SELECT o.*,p.reorg_id,p.replacement_block_hash,p.observed_head,p.observed_head_hash,p.reconciled_at
+  async function receiptObservations(client, id) {
+      return Object.freeze((await client.query(`SELECT o.*,p.reorg_id,p.replacement_block_hash,p.observed_head,p.observed_head_hash,p.reconciled_at
         FROM ${observations} o LEFT JOIN ${orphans} p USING (observation_id)
         WHERE o.delivery_job_id = $1 ORDER BY o.observation_id`,[id])).rows.map(row => Object.freeze({
         observationId: row.observation_id,attemptId: row.attempt_id,transactionHash: row.transaction_hash,
@@ -240,6 +237,36 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
         ...(row.reorg_id === null ? {} : { reorgId: row.reorg_id,replacementBlockHash: row.replacement_block_hash,
           observedHead: row.observed_head,observedHeadHash: row.observed_head_hash,reconciledAt: iso(row.reconciled_at) }),
       })));
+  }
+  return {
+    withRecoveryLock,
+    async listTerminalIntents({ limit = config.maxJobs } = {}) { return selectObservationIds("terminal",limit); },
+    async getReceiptObservations(id) { return receiptObservations(pool, id); },
+    // Exact transaction history without scan cursor writes or recovery locks.
+    async readTransactionObservation(id, expected, client) {
+      const stored = await read(client, id, expected);
+      if (!stored) return null;
+      const receipts = await receiptObservations(client, id);
+      const row = (await client.query(`SELECT current_receipt_observation_id FROM ${intents} WHERE delivery_job_id = $1`, [id])).rows[0];
+      const current = receipts.find(value => value.observationId === row.current_receipt_observation_id) ?? null;
+      for (const observation of receipts) {
+        const candidate = stored.attempts.find(value => value.attemptId === observation.attemptId);
+        if (!candidate || candidate.transactionHash !== observation.transactionHash ||
+            ![0,1].includes(observation.status) || protocolInteger(observation.confirmedHead) < protocolInteger(observation.blockNumber)) {
+          throw new TransactionError("CORRUPTED_TRANSACTION_OUTCOME");
+        }
+        normalizeBytes32(observation.blockHash);
+      }
+      if (receipts.filter(value => !value.orphaned).length !== (final(stored.intent.status) ? 1 : 0)) throw new TransactionError("CORRUPTED_TRANSACTION_OUTCOME");
+      if (final(stored.intent.status) ? !current || current.orphaned || current.attemptId !== stored.winningAttempt.attemptId ||
+          current.transactionHash !== stored.winningAttempt.transactionHash || current.blockHash !== stored.winningAttempt.receiptBlockHash ||
+          current.blockNumber !== stored.winningAttempt.receiptBlockNumber || current.status !== stored.winningAttempt.receiptStatus ||
+          current.confirmedHead !== stored.winningAttempt.confirmedHead || current.confirmedAt !== stored.winningAttempt.confirmedAt : row.current_receipt_observation_id !== null) {
+        throw new TransactionError("CORRUPTED_TRANSACTION_OUTCOME");
+      }
+      const journal = (await client.query(`SELECT e.* FROM ${events} e JOIN ${attempts} a USING (attempt_id)
+        WHERE a.delivery_job_id = $1 ORDER BY e.event_id`, [id])).rows.map(eventRecord);
+      return { ...stored, receipts, currentReceipt: current, broadcastEvents: journal };
     },
     async reconcileDestinationReorg(snapshotValue,{ replacementBlockHash,view,fence,receipt } = {}) {
       const id = snapshotValue.intent.deliveryJobId; const expected = await resolveIntent(id); const now = operationTime(clock);

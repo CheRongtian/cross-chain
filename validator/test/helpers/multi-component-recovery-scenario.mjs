@@ -22,6 +22,7 @@ import { authenticateCommit } from "../../src/commit.mjs";
 import { expectedCommitStatement, verifyQuorumCertificate } from "../../src/quorum-certificate.mjs";
 import { sourceState } from "./four-process.mjs";
 import { rpcObserver } from "./process-cluster.mjs";
+import { verifyMessageQueryHTTP } from "../../../indexer/test/helpers/message-query-integration.mjs";
 
 const quiet = { log() {}, warn() {}, error() {} };
 const same = (actual, expected, label) => assert.ok(isDeepStrictEqual(actual, expected), label);
@@ -410,6 +411,12 @@ export async function verifyMultiComponentRecovery({ config, pool, lifecycle, qu
     assert.equal(records.get(offline).exited, true);
     for (const index of live) { assert.equal(records.get(index).exited, false); assert.equal((await request(index, "/health")).body.ready, true); }
     assert.equal(observer.errors.length, 0); for (const path of paths) assert.equal(path.errors.length, 0);
+    await verifyMessageQueryHTTP({ config: { ...config, destinationConfirmations: txConfig.destinationConfirmations }, pool, states, records,
+      messageIds: [event.messageId], productionGateway: gateway, expectedExecution: "CONFIRMED", missingSigner: offlineAddress,
+      destinationCheck: async () => ({ executed: await client.readContract({ address: gateway, abi: gatewayAbi, functionName: "isMessageExecuted", args: [event.messageId] }),
+        supplier: await client.readContract({ address: application, abi: appAbi, functionName: "isVerifiedSupplier", args: [supplier] }),
+        nonce: await client.request({ method: "eth_getTransactionCount", params: [txConfig.relayerAddress, "pending"] }) }),
+      label: "fresh confirmed production execution with an actual offline non-primary" });
     console.log(`VALID: the same B PID=${b.child.pid} automatically resumed after all RPC paths recovered with unchanged Chain B identity; exact original hash=${final.attempt.transactionHash}, canonical receipt block=${final.attempt.receiptBlockNumber}, confirmations>=${txConfig.destinationConfirmations}`);
     console.log("VALID: combined non-primary validator stop -> Relayer A SIGKILL -> natural-expiry B takeover -> all-path RPC outage -> autonomous recovery completed for ONE message; exactly one READY job, intent, nonce, candidate, accepted external send, Gateway execution and ApplicationB transition; zero replacements");
     console.log("VALID: source provenance/finality, batch/Merkle, pinned committee, same-view 3-of-4 QC, earlier transaction history and fencing authority survived; PostgreSQL and both chains stayed online throughout this composed scenario");

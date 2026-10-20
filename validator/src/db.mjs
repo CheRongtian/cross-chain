@@ -358,6 +358,37 @@ export function createValidatorStore({ pool, config }) {
   }
 
   return {
+    // One exact persisted context, on the caller's read-only MVCC snapshot.
+    // No identity binding, epoch registration, voting or worker lock occurs.
+    async readConsensusObservation({ epoch, view }, client) {
+      await checkState(client);
+      const exact = protocolInteger(epoch).toString();
+      const state = (await client.query(`SELECT * FROM ${epochViews}
+        WHERE local_validator_identity = $1 AND epoch = $2`, [config.validatorAddress, exact])).rows[0] ?? null;
+      const observedView = view ?? state?.current_view ?? "0";
+      const proposal = proposalRecord((await client.query(`SELECT * FROM ${prepares}
+        WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (1,2,3)`,
+      [config.validatorAddress, exact, observedView])).rows[0]);
+      // Original v1 has view-zero PREPARE/COMMIT evidence without an active
+      // view state. Observe it without enabling legacy voting transitions.
+      if (proposal?.envelope.protocolVersion === "1") {
+        const votes = (await client.query(`SELECT * FROM ${commitVotes}
+          WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 1 ORDER BY voter_identity`,
+        [config.validatorAddress, exact, observedView])).rows.map(commitVoteRecord);
+        const preparations = (await client.query(`SELECT * FROM ${prepareVotes}
+          WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 1 ORDER BY voter_identity`,
+        [config.validatorAddress, exact, observedView])).rows.map(prepareVoteRecord);
+        const prepared = preparedRecord((await client.query(`SELECT * FROM ${preparedStates}
+          WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 1`,
+        [config.validatorAddress, exact, observedView])).rows[0]);
+        const quorum = (await client.query(`SELECT qc_digest FROM ${commitQuorums}
+          WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version = 1`,
+        [config.validatorAddress, exact, observedView])).rows[0] ?? null;
+        return { state, proposal, prepares: { votes: preparations, prepared }, commits: { votes, quorum } };
+      }
+      return { state, proposal, prepares: await prepareResult(client, exact, undefined, observedView),
+        commits: await commitResult(client, exact, observedView) };
+    },
     async registerEpoch(proposal) {
       return transaction(async (client) => { await checkState(client, "FOR UPDATE"); await ensureEpoch(client, proposal); await assertSafe(client, proposal, ViewChangeError); });
     },

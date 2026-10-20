@@ -160,13 +160,13 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
     return inserted.rows[0];
   }
 
-  async function readMembership(client, row) {
+  async function readMembership(client, row, lock = "FOR SHARE OF s") {
     const result = await client.query(
       `SELECT s.*, m.message_id AS assigned_message_id, m.canonical_position
          FROM ${members} m JOIN ${sources} s ON s.id = m.source_message_id
         WHERE m.batch_record_id = $1
         ORDER BY m.canonical_position ASC NULLS LAST, s.id ASC
-        FOR SHARE OF s`,
+        ${lock}`,
       [row.batch_record_id],
     );
     return result.rows;
@@ -182,12 +182,12 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
     });
   }
 
-  async function snapshot(client, row) {
+  async function snapshot(client, row, memberLock) {
     const record = lifecycleRecord(row);
     if (record.version !== MESSAGE_BATCH_VERSION) {
       throw new Error("persisted batch version mismatch");
     }
-    const rows = await readMembership(client, row);
+    const rows = await readMembership(client, row, memberLock);
     const messages = validateMembers(rows);
     const persistedMembers = Object.freeze(rows.map((member) => Object.freeze({
       sourceMessageId: member.id,
@@ -449,6 +449,12 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
       // A caller-owned transaction keeps strict source reads and queue writes atomic.
       if (client) return snapshot(client, await readRecord(client, batchRecordId, "FOR SHARE"));
       return transaction(async (client) => snapshot(client, await readRecord(client, batchRecordId, "FOR SHARE")), { lockScope: false });
+    },
+
+    // Observational readers own a REPEATABLE READ, READ ONLY transaction.
+    // Reuse every strict snapshot/QC check without taking worker row locks.
+    async readBatchObservation({ batchRecordId }, client) {
+      return snapshot(client, await readRecord(client, batchRecordId, ""), "");
     },
 
     async markConsensusPending({ batchRecordId }) {
