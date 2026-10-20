@@ -924,6 +924,8 @@ printf '313. Read real three-of-four validator evidence and unsigned/signed deli
 printf '314. Query existing complete E2E messages, historical committees, source orphans and replacement attempts over HTTP\n'
 printf '315. Keep historical orphan receipts distinct from the current canonical destination winner without triggering recovery\n'
 printf '316. Compare repeated GET state snapshots; preserve every source, consensus, lease, nonce, retry and business-state boundary\n'
+printf '317. Serve the same-origin Explorer and validate search URLs, static allowlists, safe text rendering and request races\n'
+printf '318. Display real message authorization, lifecycle, votes, quorum, replacement and orphan evidence through the browser view model\n'
 printf '     Replace a real Chain A branch while a fresh authorized source occurrence is FINALIZING\n'
 printf '     Preserve terminal REORGED evidence and prove zero downstream batch/QC/READY/transaction/destination propagation\n'
 printf '     Resume a canonical replacement through the same schema, live validator cluster and production Gateway/ApplicationB\n'
@@ -1041,6 +1043,10 @@ node --test "$INDEXER_DIR/test/message-query.test.mjs"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
     node --test "$INDEXER_DIR/test/message-query.database.test.mjs"
+
+CURRENT_STEP="cross-chain message explorer"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test "$INDEXER_DIR/test/explorer.test.mjs" "$INDEXER_DIR/test/explorer-http.test.mjs"
 
 CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, Solidity ABI context mapping and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"

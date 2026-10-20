@@ -1698,13 +1698,31 @@ Verification snapshots Chain B, controls automine and temporarily uses minimal r
 
 CONFIRMED records a successful canonical receipt at configured depth, a heuristic rather than permanent finality. For a new zero-value execute(bytes) transaction targeting the production DestinationGateway, EVM success means its complete verification, replay consumption and receiver call committed atomically; verification also reads both Gateway and ApplicationB storage directly. Historical EOA-targeted receipts retain their narrower transport-inclusion meaning. Later positive destination replacement evidence is reconciled through the receipt history and original intent; Byzantine RPC-provider consensus remains outside the implementation.
 
+## Cross-chain Message Explorer
+
+A built-in read-only Explorer presents one canonical message from its Chain A source occurrence through authorization, finality, batching, Merkle commitment, PBFT votes and quorum evidence, Relayer transaction history, and the current persisted Chain B execution result. It consumes the Message Query API described below. It never authorizes a proof, finalizes a source occurrence, votes, retries a delivery, reserves a nonce or submits a transaction.
+
+The Explorer is served by the existing API process: after configuring the deployment, start that process from `indexer/` with `npm run api:start`, then open `http://127.0.0.1:8080/` (or `/explorer`). Enter a complete canonical message ID. The shareable URL is `/?messageId=<canonical-message-id>`; replace the placeholder with an actual ID from your deployment. No second daemon, frontend build, package installation, wallet, external font or CDN is required. The page uses repository-local HTML, CSS and JavaScript modules. Listener configuration remains the API's existing loopback host/port settings.
+
+The lifecycle timeline and detailed sections show Source, ZK Authorization, Finality, Batch, Merkle Commitment, PBFT Consensus, Validator Votes, Quorum & Certificate, Delivery, Relayer Attempts, Destination Transaction and Execution Result. Full-width integers remain exact decimal strings. Hashes remain fully readable and wrap on narrow screens. Public payload bytes are shown as hex in technical details. Search is keyboard-accessible, reports loading and fixed safe errors, cancels superseded requests and supports browser back/forward navigation. Refresh only performs another observational GET.
+
+The page preserves original QC versions and pinned historical committees. It renders actual durable votes without adding an offline member's missing vote. Pending source/consensus states never imply delivery or execution. Attempt history retains replacement parents and older canonical winners. Orphaned receipts are visibly historical; the current destination observation is displayed separately, including recovery with no current winner. `TRANSPORT_CONFIRMED` does not imply Gateway/ApplicationB execution; `REVERTED` remains a failure. Application-specific business results remain unavailable unless supplied by the generic API, and are never decoded or inferred from supplier payloads.
+
+Authorization observations require `IDENTITY_APPLICATION_ADDRESS` to identify the deployed, non-upgradeable production `IdentityApplicationA` for the configured source domain and SourceGateway. The query layer matches the exact version-2 message's `sourceSender` and source scope to this deployment. This relies on the production contract's only outbound path, `forwardAuthorizedMessage`, verifying the exact intent proof before calling SourceGateway; it is an operator-configured deployment assumption, not independent contract-code or Groth16 verification by the API. The existing complete verification separately observes the correlated `AuthorizedMessageForwarded` event and source message after a successful real proof-bearing transaction.
+
+Matching live occurrences expose `AUTHORIZED`; a displaced occurrence exposes only `HISTORICAL_AUTHORIZED` on its former branch. Missing configuration, another application, another scope or an unsupported historical message version exposes `UNAVAILABLE`. An unavailable observation is not a failed proof. This field does not claim current credential validity, permanent source finality, credential-to-EVM ownership or a new proof check. Neither proofs nor private witnesses are sent to the browser.
+
+The Explorer has no database, Validator-store or chain-RPC access and no protocol authority. All browser requests use the same-origin read-only API; all API-controlled display values are inserted as text. The server serves an explicit static-path allowlist, never arbitrary project files, with same-origin content restrictions. Explorer/API downtime does not affect protocol processing. Observations can lag chain changes; viewing a message never triggers reconciliation or reorg recovery. There are no metrics, dashboards, authentication or analytics services.
+
+The single full verification entry remains `./scripts/verify.sh`, writing the latest complete run to root `verification.log`. It retains all protocol regressions and adds an Explorer group for pure view-model/client/renderer tests and real loopback static/API HTTP tests. Existing E2E listeners also serve the assets, feed real messages through the same browser client and view-model/renderer code, and cover source orphans, historical committees, replacement history, destination reorg recovery and the three-of-four successful production execution. This is HTTP plus production presentation-code verification without browser automation; visual browser behavior still requires manual inspection. Repeated Explorer queries remain inside the existing zero-protocol-mutation snapshot checks.
+
 ## Read-only Message Lifecycle API
 
 `GET /api/v1/messages/:messageId` correlates one canonical cross-chain message with its source transaction and block, persisted source finality, immutable batch/Merkle commitment, PBFT observations and actual validator votes, historical quorum certificate, READY delivery job, ordered transaction attempts and current persisted destination outcome. IDs must be `0x` followed by exactly 64 hex digits; hex letters are case-insensitive and responses use lowercase canonical hex. Short values, whitespace and arbitrary strings are rejected.
 
 Responses carry `apiVersion: "1"`, `authority: "OBSERVATIONAL"` and `observedAt`, followed by these sections:
 
-- `message`, `sourceTransaction`, `sourceBlock`, `sourceOccurrences`, `finality`;
+- `message`, `zkAuthorization`, `sourceTransaction`, `sourceBlock`, `sourceOccurrences`, `finality`;
 - `batch`, `merkle`, `pbft`, `validatorVotes`, `qc`;
 - `delivery`, `deliveryAttempts`, `destinationTransaction`, `execution`.
 
@@ -1720,7 +1738,7 @@ For the configured production Gateway, a current successful receipt for the exac
 
 ### Configuration and startup
 
-Use the ignored root `.env` for local connection material and the committed `.env.example` only as a placeholder reference. API configuration reuses `DATABASE_URL`, `INDEXER_DB_SCHEMA`, `CHAIN_A_DOMAIN`, `SOURCE_GATEWAY_ADDRESS`, `FINALITY_BLOCK_DEPTH`, `DESTINATION_CONFIRMATIONS` and the existing public validator-set history configuration. It does not require a signer key or an RPC URL/genesis. New listener settings default to `MESSAGE_QUERY_API_HOST=127.0.0.1` and `MESSAGE_QUERY_API_PORT=8080`.
+Use the ignored root `.env` for local connection material and the committed `.env.example` only as a placeholder reference. API configuration reuses `DATABASE_URL`, `INDEXER_DB_SCHEMA`, `CHAIN_A_DOMAIN`, `SOURCE_GATEWAY_ADDRESS`, `FINALITY_BLOCK_DEPTH`, `DESTINATION_CONFIRMATIONS` and the existing public validator-set history configuration. The optional public `IDENTITY_APPLICATION_ADDRESS` enables the deployment-scoped authorization observation described above; leaving it empty reports unavailable evidence. It does not require a signer key or an RPC URL/genesis. Listener settings default to `MESSAGE_QUERY_API_HOST=127.0.0.1` and `MESSAGE_QUERY_API_PORT=8080`.
 
 `MESSAGE_QUERY_VALIDATOR_STORES` is a JSON array of existing reader locations. Each entry has `validatorAddress`, `databaseSchema`, and optionally `databaseUrl`; omitted URLs use `DATABASE_URL`. Supply readers for the historical committee members whose messages you query. Use actual public identities/schemas from your deployment; do not copy verification's temporary namespaces into a production configuration. Separate database credentials belong only in your ignored `.env`. The API creates no schemas, migrations, tables, votes or copied Explorer state.
 
@@ -1732,7 +1750,7 @@ HTTP results are `200` for a consistent observed lifecycle, `400` for an invalid
 
 Each source/delivery/transaction read uses a `REPEATABLE READ READ ONLY` transaction. Validator stores have their own read-only snapshots; the API does not claim atomic snapshots across independent databases. It acquires no worker/account/voting row locks, advisory locks or delivery ownership. It advances no cursor, finality, PBFT phase, retry schedule or destination recovery. It signs and broadcasts nothing, and it repairs no corrupted evidence.
 
-API responses are not protocol authorization or finality authority. Query API downtime does not affect message processing. The dependency direction is API → existing state; Indexer, Validators, Relayers, Transaction Manager and Gateway never depend on the API for decisions. DestinationGateway remains the destination authorization/replay boundary. The local read-only surface supplies no authentication service, frontend, metrics endpoint or dashboard.
+API responses are not protocol authorization or finality authority. Query API downtime does not affect message processing. The dependency direction is Explorer → API → existing state; Indexer, Validators, Relayers, Transaction Manager and Gateway never depend on this observational surface for decisions. DestinationGateway remains the destination authorization/replay boundary. The local read-only surface includes the built-in Explorer but supplies no authentication service, metrics endpoint or dashboard.
 
 Complete verification retains all protocol and fault-recovery coverage, adds HTTP/unit/database query cases, and queries existing real successful messages, source orphans, replacement history, historical committees and a temporarily reopened destination intent. It also queries the fresh three-of-four execution from composed recovery while its owned stores remain available. Repeated HTTP reads are compared against source/consensus/lease/account/attempt/receipt/business snapshots, with no new chain or Validator world.
 
@@ -2070,6 +2088,13 @@ Cross-Chain/
 │   │   ├── 016_relayer_preparation_defer.sql
 │   │   ├── 017_transaction_scan_progress.sql
 │   │   └── 018_destination_receipt_reconciliation.sql
+│   ├── public/explorer/
+│   │   ├── index.html
+│   │   ├── app.js
+│   │   ├── client.js
+│   │   ├── view-model.js
+│   │   ├── render.js
+│   │   └── styles.css
 │   ├── scripts/
 │   │   ├── build-forward-authorization-vectors.mjs
 │   │   ├── generate-merkle-golden-vectors.mjs
@@ -2085,6 +2110,8 @@ Cross-Chain/
 │   │   │   ├── message-query.mjs
 │   │   │   ├── read-snapshot.mjs
 │   │   │   ├── server.mjs
+│   │   │   ├── source-authorization.mjs
+│   │   │   ├── static-assets.mjs
 │   │   │   └── validator-evidence.mjs
 │   │   ├── batch-lifecycle-policy.mjs
 │   │   ├── batch-lifecycle.mjs
@@ -2145,6 +2172,8 @@ Cross-Chain/
 │   │   ├── delivery-package.test.mjs
 │   │   ├── delivery-policy.test.mjs
 │   │   ├── delivery.database.test.mjs
+│   │   ├── explorer.test.mjs
+│   │   ├── explorer-http.test.mjs
 │   │   ├── finality-policy.test.mjs
 │   │   ├── finality-watcher.test.mjs
 │   │   ├── forward-authorization.test.mjs
@@ -2152,6 +2181,8 @@ Cross-Chain/
 │   │   │   ├── delivery-fixtures.mjs
 │   │   │   ├── delivery-integration.mjs
 │   │   │   ├── destination-rpc-fixtures.mjs
+│   │   │   ├── explorer-fixtures.mjs
+│   │   │   ├── explorer-integration.mjs
 │   │   │   ├── fail-relayer-rpc.mjs
 │   │   │   ├── legacy-relayer.mjs
 │   │   │   ├── lease-fixtures.mjs
@@ -2159,6 +2190,7 @@ Cross-Chain/
 │   │   │   ├── message-domain-contract.mjs
 │   │   │   ├── message-query-fixtures.mjs
 │   │   │   ├── message-query-integration.mjs
+│   │   │   ├── message-query-privacy.mjs
 │   │   │   ├── multi-relayer-integration.mjs
 │   │   │   ├── read-batch-lifecycle.mjs
 │   │   │   ├── read-delivery.mjs

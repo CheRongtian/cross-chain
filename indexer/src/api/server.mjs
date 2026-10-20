@@ -2,6 +2,7 @@ import { createServer } from "node:http";
 import { deliveryJson } from "../delivery/package.mjs";
 import { normalizeBytes32 } from "../canonical-message.mjs";
 import { MessageQueryError, publicQueryError } from "./errors.mjs";
+import { explorerHeaders, isExplorerPath, readExplorerAsset } from "./static-assets.mjs";
 
 export function createMessageQueryServer({ config, query }) {
   const server = createServer(async (request, response) => {
@@ -11,6 +12,13 @@ export function createMessageQueryServer({ config, query }) {
       response.end(body);
     };
     try {
+      const path = request.url.split("?", 1)[0];
+      if (isExplorerPath(path)) {
+        if (!["GET", "HEAD"].includes(request.method)) return send(405, { error: "METHOD_NOT_ALLOWED" }, { allow: "GET, HEAD" });
+        const asset = await readExplorerAsset(path);
+        response.writeHead(200, { ...explorerHeaders, "content-type": asset.contentType, "content-length": asset.body.length });
+        return response.end(request.method === "HEAD" ? undefined : asset.body);
+      }
       if (request.method !== "GET") return send(405, { error: "METHOD_NOT_ALLOWED" }, { allow: "GET" });
       const match = /^\/api\/v1\/messages\/([^/?]*)$/.exec(request.url);
       if (!match) return send(404, { error: "ENDPOINT_NOT_FOUND" });

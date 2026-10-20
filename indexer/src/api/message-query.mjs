@@ -9,6 +9,7 @@ import { createTransactionRepository } from "../transaction-manager/repository.m
 import { readSnapshot } from "./read-snapshot.mjs";
 import { readValidatorEvidence } from "./validator-evidence.mjs";
 import { evidenceRead, inconsistent, MessageQueryError } from "./errors.mjs";
+import { observeSourceAuthorization } from "./source-authorization.mjs";
 
 const iso = value => value == null ? null : new Date(value).toISOString();
 const receipt = value => value ? { transactionHash: value.transactionHash, blockNumber: value.blockNumber,
@@ -28,6 +29,7 @@ export function projectMessageLifecycle({ config, source, occurrences, block, sn
   const message = validateCanonicalMessage(databaseRowToBatchMessage(source), source.message_id);
   const origin = provenance(source);
   const response = { apiVersion: "1", authority: "OBSERVATIONAL", observedAt: new Date().toISOString(), message,
+    zkAuthorization: observeSourceAuthorization(config, message, origin),
     sourceTransaction: { transactionHash: origin.transactionHash, logIndex: origin.logIndex, sourceGateway: message.sourceGateway },
     sourceBlock: { blockNumber: origin.blockNumber, blockHash: origin.blockHash, parentHash: block?.parent_hash ?? null },
     sourceOccurrences: occurrences.map(provenance),

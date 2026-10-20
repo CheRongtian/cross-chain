@@ -30,7 +30,9 @@ export function loadMessageQueryConfig(environment = process.env) {
     return { ...database, validatorAddress };
   });
   const productionDestinationGateway = environment.PRODUCTION_DESTINATION_GATEWAY_ADDRESS ? normalizeAddress(environment.PRODUCTION_DESTINATION_GATEWAY_ADDRESS) : null;
-  return { ...base, listenHost, listenPort, finalityBlockDepth, destinationConfirmations, validatorStores, productionDestinationGateway };
+  const identityApplicationAddress = environment.IDENTITY_APPLICATION_ADDRESS ? normalizeAddress(environment.IDENTITY_APPLICATION_ADDRESS) : null;
+  if (identityApplicationAddress === `0x${"0".repeat(40)}`) throw new Error("invalid IDENTITY_APPLICATION_ADDRESS");
+  return { ...base, listenHost, listenPort, finalityBlockDepth, destinationConfirmations, validatorStores, productionDestinationGateway, identityApplicationAddress };
 }
 
 export const publicMessageQueryConfig = config => ({ host: config.listenHost, port: config.listenPort,

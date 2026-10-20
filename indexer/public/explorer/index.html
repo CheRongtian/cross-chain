@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Read-only cross-chain message lifecycle explorer.">
+  <title>Cross-chain Message Explorer</title>
+  <link rel="stylesheet" href="/assets/explorer/styles.css">
+  <script type="module" src="/assets/explorer/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#message-view">Skip to message lifecycle</a>
+  <header class="shell">
+    <div class="masthead"><a href="/" class="brand">CROSS-CHAIN <span>EXPLORER</span></a><span class="read-only">READ ONLY</span></div>
+    <p class="eyebrow">CHAIN A → CHAIN B</p>
+    <h1>Follow the message.</h1>
+    <p class="intro">Source evidence, consensus and delivery history. One canonical message ID.</p>
+    <form id="message-search" novalidate>
+      <label for="message-id">Message ID</label>
+      <div class="search-row"><input id="message-id" name="messageId" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="search-hint search-status" placeholder="0x followed by 64 hex digits"><button type="submit">View message</button><button type="button" id="refresh" class="secondary">Refresh</button></div>
+      <p id="search-hint" class="hint">Paste the complete canonical bytes32 ID. Queries never submit a transaction.</p>
+    </form>
+    <p id="search-status" role="status" aria-live="polite" aria-atomic="true">Enter a canonical cross-chain message ID to inspect its lifecycle.</p>
+  </header>
+  <main id="message-view" class="shell" tabindex="-1"></main>
+  <footer class="shell"><p>This Explorer is a read-only observational interface. Protocol validity is determined by source authorization, PBFT/QC evidence and destination Gateway checks.</p><p>Explorer/API availability is independent from cross-chain message processing. Persisted observations can lag chain changes.</p></footer>
+</body>
+</html>

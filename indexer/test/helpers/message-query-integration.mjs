@@ -9,6 +9,7 @@ import { encodeGatewaySubmission } from "../../src/relayer/encoding.mjs";
 import { createMessageQuery } from "../../src/api/message-query.mjs";
 import { createMessageQueryServer } from "../../src/api/server.mjs";
 import { assertMessageQueryPrivacy } from "./message-query-privacy.mjs";
+import { verifyExplorerAssets, verifyExplorerMessage } from "./explorer-integration.mjs";
 
 const sourceTables = ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batches", "message_batch_members",
   "batch_consensus_bindings", "batch_quorum_certificates", "batch_quorum_certificate_signatures", "delivery_batches", "delivery_jobs",
@@ -36,7 +37,9 @@ export async function verifyMessageQueryHTTP({ config, pool, states, records, me
   const queryConfig = { databaseSchema: config.databaseSchema, chainDomain: config.chainDomain, sourceGateway: config.sourceGateway,
     validatorSets: config.validatorSets, finalityBlockDepth: config.finalityBlockDepth,
     destinationConfirmations: config.destinationConfirmations ?? BigInt(process.env.DESTINATION_CONFIRMATIONS ?? "3"),
-    productionDestinationGateway: productionGateway, listenHost: "127.0.0.1", listenPort: 0 };
+    productionDestinationGateway: productionGateway,
+    identityApplicationAddress: process.env.IDENTITY_APPLICATION_ADDRESS?.toLowerCase() ?? null,
+    listenHost: "127.0.0.1", listenPort: 0 };
   const lifecycle = createBatchLifecycle({ config: queryConfig, pool });
   const queue = createDeliveryRepository({ config: queryConfig, pool });
   const expected = [];
@@ -104,6 +107,8 @@ export async function verifyMessageQueryHTTP({ config, pool, states, records, me
   console.log("VALID: read-only message query API started on an isolated loopback verification endpoint");
   const url = `http://127.0.0.1:${runtime.server.address().port}/api/v1/messages/`;
   try {
+    const origin = `http://127.0.0.1:${runtime.server.address().port}`;
+    await verifyExplorerAssets(origin);
     for (const value of expected) {
       const { source, snapshot, job, transaction, receiptHistory, actualVotes } = value;
       const response = await fetch(url + source.message_id, { signal: AbortSignal.timeout(30000) });
@@ -158,6 +163,9 @@ export async function verifyMessageQueryHTTP({ config, pool, states, records, me
         rawSignedTransactions: transaction?.attempts.map(attempt => attempt.rawSignedTransaction) ?? [] };
       assertMessageQueryPrivacy(body, privacy);
       assertMessageQueryPrivacy(again, privacy);
+      const expectedAuthorization = source.source_sender === queryConfig.identityApplicationAddress && source.version === 2 ?
+        source.status === "REORGED" ? "HISTORICAL_AUTHORIZED" : "AUTHORIZED" : "UNAVAILABLE";
+      await verifyExplorerMessage({ origin, body, source, expectedAuthorization, missingSigner });
       delete body.observedAt; delete again.observedAt;
       same(body, again, "repeated GET must return equivalent protocol fields");
       console.log(`VALID: queried real message ${source.message_id} through HTTP; source provenance/finality, batch/Merkle, persisted votes/QC, delivery history and current destination observation match independent production reads`);
@@ -168,6 +176,11 @@ export async function verifyMessageQueryHTTP({ config, pool, states, records, me
     assert.equal((await fetch(url + "0x01")).status, 400); console.log("EXPECTED FAILURE: malformed message ID returns 400 before repository access");
     assert.equal((await fetch(url + messageIds[0], { method: "POST" })).status, 405); console.log("EXPECTED FAILURE: read-only API rejects state-changing HTTP methods");
     same(await capture(), before, "HTTP GET must not mutate source, finality, batch/QC, validator votes/views, lease, account/scan cursors, retry, journals, receipts or destination state");
+    if (expectedExecution === "CONFIRMED") {
+      assert.equal(before.destination?.executed, true); assert.equal(before.destination?.supplier, true);
+      console.log("VALID: Explorer Execution section matches current production DestinationGateway/ApplicationB evidence");
+    }
+    console.log("VALID: loading, searching and refreshing Explorer views changes no source, consensus, delivery, transaction or destination state");
     console.log("VALID: repeated HTTP queries changed no source/finality/batch/QC/vote/delivery/lease/intent/nonce/retry/attempt/receipt/destination state; no broadcast or recovery was scheduled");
     console.log("VALID: API integer fields remain exact decimal strings and public allowlists exclude raw signed bytes, private keys and connection material");
   } finally { await runtime.close(); }
