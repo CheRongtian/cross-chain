@@ -4,7 +4,7 @@ import { isDeepStrictEqual } from "node:util";
 import { createPublicClient, createWalletClient, decodeAbiParameters, decodeEventLog, decodeFunctionData,
   defineChain, encodeAbiParameters, http, parseAbi, toHex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { normalizeAddress, computeCanonicalMessageId, computePayloadHash } from "../../../indexer/src/canonical-message.mjs";
+import { normalizeAddress, computeCanonicalMessageId, computePayloadHash, normalizeCanonicalMessage } from "../../../indexer/src/canonical-message.mjs";
 import { computeMessageMerkleLeaf, computeMessageMerkleNode } from "../../../indexer/src/message-merkle.mjs";
 import { createDatabasePool, createFinalityStore, readCursor, readIndexedSourceBlocks, readMessages, tableName } from "../../../indexer/src/db.mjs";
 import { createBatchLifecycle } from "../../../indexer/src/batch-lifecycle.mjs";
@@ -44,6 +44,7 @@ import { verifyMultiComponentRecovery } from "./multi-component-recovery-scenari
 import { verifyMessageQueryHTTP } from "../../../indexer/test/helpers/message-query-integration.mjs";
 import { metricValue, scrapeMetrics, scrapeValue } from "../../../indexer/test/helpers/metrics-assertions.mjs";
 import { withPendingDashboardProbe } from "../../../indexer/test/helpers/pending-dashboard-integration.mjs";
+import { persistedMessageIdentity, verifyRealMessageIntegrity, assertDestinationIdentity } from "../../../indexer/test/helpers/message-integrity-runtime.mjs";
 
 const artifact = name => JSON.parse(readFileSync(new URL(`../../../contracts/out/${name}.sol/${name}.json`, import.meta.url), "utf8"));
 const normalizeError = value => typeof value === "string" && /^0x[0-9a-f]{40}$/i.test(value) ? value.toLowerCase() : value;
@@ -94,6 +95,13 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   const indexer = createIndexer({ config, pool, logger: quiet });
   const finality = createFinalityWatcher({ config, pool, logger: quiet });
   const rowsFor = async ids => (await readMessages(pool, config.databaseSchema)).filter(row => ids.includes(row.message_id));
+  const identityHistory = new Map();
+  function recordIntegritySnapshot(snapshot) {
+    for (const message of snapshot.batch.messages) {
+      const checkpoints = identityHistory.get(message.messageId);
+      if (checkpoints) checkpoints.push({ phase: snapshot.record.status, messageId: computeCanonicalMessageId(message), canonical: normalizeCanonicalMessage(message) });
+    }
+  }
 
   async function produceSourceMessage(payload, target = application, destinationWindow = 3600n) {
     const event = await produceMessage(payload, { destinationGateway: gateway, destinationReceiver: target,
@@ -110,17 +118,22 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
     const observedBefore = await metricValue("messages_observed_total");
     const finalizedBefore = await metricValue("messages_finalized_total");
     const event = await produceSourceMessage(payload, target, destinationWindow);
+    const checkpoints = [{ phase: "SOURCE_EVENT", messageId: event.messageId, canonical: normalizeCanonicalMessage(event) }];
+    identityHistory.set(event.messageId, checkpoints);
     await indexer.catchUpOnce();
     let [row] = await rowsFor([event.messageId]);
     assert.equal(row.status, "OBSERVED");
+    checkpoints.push({ phase: row.status, ...persistedMessageIdentity(event, row) });
     await finality.runFinalityPass();
     [row] = await rowsFor([event.messageId]);
     assert.equal(row.status, "FINALIZING");
+    checkpoints.push({ phase: row.status, ...persistedMessageIdentity(event, row) });
     await chainA.request({ method: "anvil_mine", params: [toHex(config.finalityBlockDepth)] });
     await indexer.catchUpOnce();
     await finality.runFinalityPass();
     [row] = await rowsFor([event.messageId]);
     assert.equal(row.status, "FINALIZED");
+    checkpoints.push({ phase: row.status, ...persistedMessageIdentity(event, row) });
     assert.equal(await metricValue("messages_observed_total"), observedBefore + 1);
     assert.equal(await metricValue("messages_finalized_total"), finalizedBefore + 1);
     await indexer.catchUpOnce(); await finality.runFinalityPass();
@@ -142,6 +155,7 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
     assert.equal(collected.assignedCount, events.length);
     const sealed = await lifecycle.sealBatch({ batchRecordId: collected.snapshot.record.batchRecordId });
     assert.deepEqual(sealed.batch.messageIds, events.map(event => event.messageId));
+    recordIntegritySnapshot(sealed);
     await lifecycle.readBatch({ batchRecordId: sealed.record.batchRecordId });
     assert.equal(await metricValue("batches_created_total"), before + created, "seal and readback add no creation");
     if (created) console.log("VALID: one new durable batch increments batches-created once while seal/commit/re-read paths do not double count it");
@@ -150,7 +164,9 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
 
   async function prepareFreshBatch(events) {
     const sealed = await sealFreshBatch(events);
-    return lifecycle.markConsensusPending({ batchRecordId: sealed.record.batchRecordId });
+    const pending = await lifecycle.markConsensusPending({ batchRecordId: sealed.record.batchRecordId });
+    recordIntegritySnapshot(pending);
+    return pending;
   }
 
   async function commitPending(pending, participants) {
@@ -177,6 +193,7 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
       return value.record.status === "COMMITTED" ? value : null;
     }, participants);
     await registryChecks.assertQcBinding(committed.quorumCertificate);
+    recordIntegritySnapshot(committed);
     console.log(`VALID: bounded canonical batch ${committed.record.batchId}; Message Root ${committed.record.messageRoot}; validator epoch ${committed.consensusBinding.validatorEpoch}; real PBFT QC → COMMITTED`);
     return committed;
   }
@@ -218,6 +235,12 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   const queue = createDeliveryRepository({ config: deliveryConfig, pool });
   const packages = await buildDeliveryPackages(snapshot, { validatorSets });
   const [successPack, failurePack] = packages;
+  await verifyRealMessageIntegrity({ config, pool, snapshot, pack: successPack, validatorSets, event: first,
+    checkpoints: identityHistory.get(first.messageId), client, domainVerifierAddress, captureDestination: async () => ({
+      first: await readGateway("isMessageExecuted", [first.messageId]),
+      redundant: await readGateway("isMessageExecuted", [redundant.messageId]),
+      supplier: await readApp("isVerifiedSupplier", [supplier]),
+    }) });
   for (const pack of packages) {
     assert.equal((await queue.getDeliveryJob(pack.deliveryJobId)).status, "READY");
     assert.deepEqual(await queue.getDeliveryPackage(pack.deliveryJobId), pack);
@@ -263,6 +286,9 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   assert.equal(gatewayEvents[0].args.batchId, snapshot.record.batchId);
   assert.equal(appEvents[0].eventName, "VerifiedSupplierGranted");
   assert.equal(appEvents[0].args.messageId, first.messageId);
+  assertDestinationIdentity({ event: first, pack: successPack, packageBytes: decodeFunctionData({ abi: DESTINATION_GATEWAY_ABI, data: tx.input }).args[0],
+    authenticatedMessageId: gatewayEvents[0].args.messageId });
+  console.log("VALID: one canonical CrossChainMessage retains the same deterministic ID across source persistence, finality, committed membership, portable transport and actual destination-authenticated decoding");
   assert.equal(appEvents[0].args.supplier.toLowerCase(), supplier);
   console.log(`VALID: real Relayer/Tx Manager signed type-2 Gateway transaction ${receipt.transactionHash}; nonce ${prepared[0].intent.nonce}; to=${gateway}; value=0; exact execute(bytes) wrapper/inner v1 parity`);
   console.log(`VALID: PBFT → Merkle → message domain → replay false → true → ApplicationB VERIFIED_SUPPLIER false → true; both exact events in the same transaction ${receipt.transactionHash}`);

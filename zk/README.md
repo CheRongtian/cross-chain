@@ -205,6 +205,15 @@ Chain A for integration checks. It expects `circom` on `PATH` and the exact npm 
 from `zk/package.json` to already exist in `zk/node_modules`; it does not install
 or initialize the development environment.
 
+Negative witness checks accept only a generated Circom assertion with its
+template location or an explicit `false` from `snarkjs.wtns.check`. The tampered
+proof case requires `snarkjs.groth16.verify` to return `false`. File/JSON/WASM,
+input-shape and verifier execution errors fail verification and retain their
+diagnostics. `scripts/verify-rejection.mjs` runs these checks in a short-lived
+process that owns its curve workers; it never treats an arbitrary nonzero exit
+as proof of a cryptographic rejection. The root script also runs the rejection
+boundary regressions in `zk/test/rejection.test.mjs` before proving.
+
 The Powers of Tau contribution and Groth16 setup performed by the script use
 fixed local-development entropy to avoid interactive input. Those generated
 files are appropriate only for local verification and must not be treated as

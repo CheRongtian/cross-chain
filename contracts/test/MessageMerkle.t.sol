@@ -81,6 +81,10 @@ contract MessageMerkleTest is Test {
     }
 
     function _canonicalMessageId(string memory base) internal view returns (bytes32) {
+        return MessageCodec.computeMessageId(_readCanonicalMessage(base));
+    }
+
+    function _readCanonicalMessage(string memory base) internal view returns (MessageCodec.CanonicalMessage memory) {
         uint256 version = _decimal(fixture, string.concat(base, ".version"));
         assertLe(version, type(uint8).max);
         MessageCodec.CanonicalMessage memory message;
@@ -97,7 +101,99 @@ contract MessageMerkleTest is Test {
         message.payloadHash = fixture.readBytes32(string.concat(base, ".payloadHash"));
         message.deadline = _decimal(fixture, string.concat(base, ".deadline"));
         assertEq(keccak256(fixture.readBytes(string.concat(base, ".payload"))), message.payloadHash);
-        return MessageCodec.computeMessageId(message);
+        return message;
+    }
+
+    // Parse each baseline once; independent value-field copies isolate every mutation.
+    // forge-lint: disable-next-item(calls-loop)
+    function testCanonicalFieldMutationsCannotReuseFrozenMerkleCommitment() public view {
+        for (uint256 vectorIndex = 0; vectorIndex < GOLDEN_VECTOR_COUNT; vectorIndex++) {
+            string memory base = _vectorPath(vectorIndex);
+            string memory path = string.concat(base, ".batch.messages[0]");
+            MessageMerkle.Proof memory proof = _readProof(fixture, string.concat(base, ".proofs[0]"));
+            bytes32 root = fixture.readBytes32(string.concat(base, ".messageRoot"));
+            MessageCodec.CanonicalMessage memory original = _readCanonicalMessage(path);
+            assertEq(MessageCodec.computeMessageId(original), proof.messageId);
+            assertTrue(MessageMerkle.verifyProof(proof.batchId, proof.messageId, proof.leafCount, root, proof));
+            for (uint256 mutation = 0; mutation < 9; mutation++) {
+                _assertChangedIdentityCannotReuseProof(_changedCanonicalMessage(original, mutation), proof, root);
+                assertEq(MessageCodec.computeMessageId(original), proof.messageId);
+            }
+            {
+                bytes memory payload = fixture.readBytes(string.concat(path, ".payload"));
+                uint256 originalLength = payload.length;
+                assertGt(originalLength, 0);
+                payload[0] = payload[0] ^ bytes1(0x01);
+                MessageCodec.CanonicalMessage memory changedPayload = _copyCanonicalMessage(original);
+                // Exact bytes hashing intentionally follows the production payload commitment.
+                // forge-lint: disable-next-line(asm-keccak256)
+                bytes32 changedHash = keccak256(payload);
+                assertNotEq(changedHash, changedPayload.payloadHash);
+                changedPayload.payloadHash = changedHash;
+                assertEq(payload.length, originalLength);
+                _assertChangedIdentityCannotReuseProof(changedPayload, proof, root);
+            }
+            assertEq(MessageCodec.computeMessageId(original), proof.messageId);
+            assertTrue(MessageMerkle.verifyProof(proof.batchId, proof.messageId, proof.leafCount, root, proof));
+        }
+    }
+
+    function _copyCanonicalMessage(MessageCodec.CanonicalMessage memory original)
+        internal
+        pure
+        returns (MessageCodec.CanonicalMessage memory)
+    {
+        return MessageCodec.CanonicalMessage({
+            version: original.version,
+            sourceDomain: original.sourceDomain,
+            sourceGateway: original.sourceGateway,
+            sourceSender: original.sourceSender,
+            destinationDomain: original.destinationDomain,
+            destinationGateway: original.destinationGateway,
+            destinationReceiver: original.destinationReceiver,
+            nonce: original.nonce,
+            payloadHash: original.payloadHash,
+            deadline: original.deadline
+        });
+    }
+
+    function _changedCanonicalMessage(MessageCodec.CanonicalMessage memory original, uint256 mutation)
+        internal
+        pure
+        returns (MessageCodec.CanonicalMessage memory changed)
+    {
+        changed = _copyCanonicalMessage(original);
+        if (mutation == 0) changed.sourceDomain += 1;
+        else if (mutation == 1) changed.destinationDomain += 1;
+        else if (mutation == 2) changed.sourceGateway = address(0xA101);
+        else if (mutation == 3) changed.sourceSender = address(0xA102);
+        else if (mutation == 4) changed.destinationGateway = address(0xA103);
+        else if (mutation == 5) changed.destinationReceiver = address(0xA104);
+        else if (mutation == 6) changed.nonce += 1;
+        else if (mutation == 7) changed.deadline += 1;
+        else changed.version = 1;
+    }
+
+    function _assertChangedIdentityCannotReuseProof(
+        MessageCodec.CanonicalMessage memory changed,
+        MessageMerkle.Proof memory original,
+        bytes32 root
+    ) internal pure {
+        bytes32 changedId = MessageCodec.computeMessageId(changed);
+        assertNotEq(changedId, original.messageId);
+        bytes32 leaf = MessageMerkle.computeLeaf(original.batchId, original.index, changedId);
+        assertNotEq(leaf, MessageMerkle.computeLeaf(original.batchId, original.index, original.messageId));
+        uint256 position = original.index;
+        for (uint256 level = 0; level < original.siblings.length; level++) {
+            leaf = position % 2 == 0 ? MessageMerkle.hashNode(leaf, original.siblings[level])
+                : MessageMerkle.hashNode(original.siblings[level], leaf);
+            position /= 2;
+        }
+        assertNotEq(leaf, root);
+        MessageMerkle.Proof memory candidate = MessageMerkle.Proof({ batchId: original.batchId,
+            messageId: changedId, index: original.index, leafCount: original.leafCount, siblings: original.siblings });
+        assertFalse(MessageMerkle.verifyProof(original.batchId, changedId, original.leafCount, root, candidate));
+        assertTrue(MessageMerkle.verifyProof(original.batchId, original.messageId, original.leafCount, root, original));
     }
 
     function _assertLevels(string memory base, bytes32[] memory leaves, bytes32 root) internal view {

@@ -34,11 +34,8 @@ expect_witness_rejection() {
 
     printf '\n[expected witness rejection: %s]\n' "$case_name"
 
-    if node "$WITNESS_GENERATOR" "$WASM_FILE" "$input_file" "$witness_file"; then
-        if "$SNARKJS" wtns check "$R1CS_FILE" "$witness_file"; then
-            fail "$case_name unexpectedly satisfied the circuit"
-        fi
-    fi
+    node "$SCRIPT_DIR/verify-rejection.mjs" witness "$case_name" \
+        "$WASM_FILE" "$input_file" "$witness_file" "$R1CS_FILE"
 
     printf 'Verified expected circuit rejection: %s\n' "$case_name"
 }
@@ -156,9 +153,8 @@ TAMPERED_PUBLIC="$PROVING_DIR/public-tampered.json"
 printf '\n[expected proof rejection: tampered public commitment]\n'
 node "$SCRIPT_DIR/tamper-public.mjs" "$VALID_PUBLIC" "$TAMPERED_PUBLIC" "$SCALAR_FIELD_PRIME"
 
-if "$SNARKJS" groth16 verify "$VERIFICATION_KEY" "$TAMPERED_PUBLIC" "$VALID_PROOF"; then
-    fail "proof unexpectedly verified with a tampered public commitment"
-fi
+node "$SCRIPT_DIR/verify-rejection.mjs" proof "tampered public commitment" \
+    "$VERIFICATION_KEY" "$TAMPERED_PUBLIC" "$VALID_PROOF"
 
 printf 'Verified expected proof rejection: tampered public commitment\n'
 printf '\nZK CREDENTIAL STATE AND NULLIFIER VERIFICATION PASSED\n'

@@ -119,44 +119,8 @@ assert_hex_equal() {
     printf 'Verified %s: %s\n' "$label" "$actual"
 }
 
-expect_call_revert() {
-    local label="$1"
-    local error_signature="$2"
-    local error_name="${error_signature%%(*}"
-    local error_selector
-    local output
-    local line
-    local decoded_pattern
-    local selector_pattern
-    local matched="false"
-    shift 2
-
-    error_selector="$(cast sig "$error_signature")" || fail "could not derive selector for $error_signature"
-    [[ "$error_selector" =~ ^0x[[:xdigit:]]{8}$ ]] || fail "invalid selector for $error_signature"
-    error_selector="$(normalize "$error_selector")"
-    decoded_pattern="execution reverted:[[:space:]]*$(normalize "$error_name")(\(|[[:space:]]*$)"
-    selector_pattern="execution reverted(:[[:space:]]*(custom error[[:space:]]+)?${error_selector}[[:xdigit:]]*([[:space:],\"]|$)|,[[:space:]]*data:[[:space:]]*\"?${error_selector}[[:xdigit:]]*(\"|[[:space:]]|$))"
-
-    if output="$(cast call "$@" 2>&1)"; then
-        printf '%s\n' "$output"
-        fail "$label unexpectedly succeeded"
-    fi
-
-    printf '%s\n' "$output"
-    # Match the actual revert reason/data on its own line, not an error name or
-    # selector mentioned elsewhere in CLI, transport, or contextual diagnostics.
-    while IFS= read -r line; do
-        if [[ "$line" =~ $decoded_pattern ]] || [[ "$line" =~ $selector_pattern ]]; then
-            matched="true"
-            break
-        fi
-    done <<< "$(normalize "$output")"
-    if [[ "$matched" != "true" ]]; then
-        fail "$label reverted without $error_signature"
-    fi
-
-    printf 'EXPECTED FAILURE: %s (%s)\n' "$label" "$error_name"
-}
+# shellcheck source=lib/expect-revert.sh
+source "$SCRIPT_DIR/lib/expect-revert.sh"
 
 verify_call_revert_assertions() (
     # This subshell confines the command double to synthetic helper fixtures.
@@ -169,6 +133,7 @@ verify_call_revert_assertions() (
     local expected_status
     local actual_status
     local output
+    local invocation
     expected_selector="$(cast sig 'InvalidDeadline()')" || fail "could not derive fixture selector"
     [[ "$expected_selector" =~ ^0x[[:xdigit:]]{8}$ ]] || fail "invalid fixture selector"
 
@@ -183,8 +148,11 @@ verify_call_revert_assertions() (
             *) return 2 ;;
         esac
     }
+    synthetic_call() {
+        cast call "$ZERO_ADDRESS" 'fixture()'
+    }
 
-    for fixture in decoded selector rpc-data wrong-revert name-prefix transport cli success; do
+    for fixture in decoded selector rpc-data wrong-revert name-prefix transport cli empty-reason wrong-selector success; do
         call_status=1
         expected_status=1
         case "$fixture" in
@@ -207,29 +175,43 @@ Expected InvalidDeadline ($expected_selector) but received a different revert"
             name-prefix) diagnostic='Error: execution reverted: InvalidDeadlineExtended' ;;
             transport) diagnostic="Error: connection refused while requesting InvalidDeadline ($expected_selector)" ;;
             cli) diagnostic="error: unexpected argument 'InvalidDeadline' ($expected_selector)" ;;
+            empty-reason) diagnostic="Error: execution reverted
+Expected InvalidDeadline ($expected_selector) but no reason was returned" ;;
+            wrong-selector) diagnostic="Error: execution reverted: custom error 0x00000000
+Expected InvalidDeadline ($expected_selector) but received another selector" ;;
             success)
                 diagnostic='Error: execution reverted: InvalidDeadline'
                 call_status=0
                 ;;
         esac
-        if output="$(expect_call_revert "synthetic $fixture" 'InvalidDeadline()' "$ZERO_ADDRESS" 'fixture()' 2>&1)"; then
-            actual_status=0
-        else
-            actual_status=$?
-        fi
-        if [[ "$actual_status" != "$expected_status" ]] \
-            || [[ "$output" != *"synthetic cast stdout: $fixture"* ]] \
-            || [[ "$output" != *"$diagnostic"* ]]; then
-            printf '%s\n' "$output"
-            fail "revert-helper fixture $fixture returned unexpected status or lost diagnostics"
-        fi
-        if [[ "$expected_status" == "0" ]]; then
-            [[ "$output" == *"EXPECTED FAILURE: synthetic $fixture (InvalidDeadline)"* ]] || fail "fixture $fixture lost exact-revert evidence"
-        elif [[ "$output" == *"EXPECTED FAILURE:"* ]]; then
-            printf '%s\n' "$output"
-            fail "fixture $fixture incorrectly credited an expected policy rejection"
-        fi
-        printf 'VALID: synthetic revert-helper fixture / %s / exit %s, stdout/stderr preserved\n' "$fixture" "$actual_status"
+        for invocation in cast callback; do
+            if [[ "$invocation" == "cast" ]]; then
+                if output="$(expect_call_revert "synthetic $fixture" 'InvalidDeadline()' "$ZERO_ADDRESS" 'fixture()' 2>&1)"; then
+                    actual_status=0
+                else
+                    actual_status=$?
+                fi
+            else
+                if output="$(expect_command_revert "synthetic $fixture" 'InvalidDeadline()' synthetic_call 2>&1)"; then
+                    actual_status=0
+                else
+                    actual_status=$?
+                fi
+            fi
+            if [[ "$actual_status" != "$expected_status" ]] \
+                || [[ "$output" != *"synthetic cast stdout: $fixture"* ]] \
+                || [[ "$output" != *"$diagnostic"* ]]; then
+                printf '%s\n' "$output"
+                fail "revert-helper fixture $fixture / $invocation returned unexpected status or lost diagnostics"
+            fi
+            if [[ "$expected_status" == "0" ]]; then
+                [[ "$output" == *"EXPECTED FAILURE: synthetic $fixture (InvalidDeadline)"* ]] || fail "fixture $fixture lost exact-revert evidence"
+            elif [[ "$output" == *"EXPECTED FAILURE:"* ]]; then
+                printf '%s\n' "$output"
+                fail "fixture $fixture incorrectly credited an expected policy rejection"
+            fi
+            printf 'VALID: synthetic revert-helper fixture / %s / %s / exit %s, stdout/stderr preserved\n' "$fixture" "$invocation" "$actual_status"
+        done
     done
 )
 
@@ -943,6 +925,8 @@ printf '     Stop the actual primary after durable, subset-only PRE-PREPARE deli
 printf '     Recover the same batch/root through real timeout, three-signer VIEW_CHANGE, verified NEW_VIEW and higher-view destination execution\n'
 printf '     Verify Prometheus operational metric families, bounded labels, HTTP purity and durable event deltas in the existing protocol/fault scenarios\n'
 printf '     Validate Grafana provisioning, parsed PromQL and nine operational views; verify the read-only pending collector against existing real delivery outcomes\n'
+printf '     Check deterministic message identity, full-width JavaScript/Solidity parity and in-memory canonical/payload mutations against frozen vectors and existing committed E2E evidence\n'
+printf '     Distinguish explicit ZK rejection from execution faults and share strict revert-reason matching across source/deployment checks\n'
 
 CURRENT_STEP="full verification finality profile validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1010,6 +994,15 @@ node "$INDEXER_DIR/scripts/generate-merkle-golden-vectors.mjs" --check
 CURRENT_STEP="frozen PBFT certificate reference drift check"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node "$VALIDATOR_DIR/scripts/generate-pbft-certificate-vectors.mjs" --check
+
+CURRENT_STEP="message integrity invariants"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test "$INDEXER_DIR/test/message-integrity-invariants.test.mjs"
+printf 'Solidity integrity cases run with the retained Foundry suite; durable lifecycle and real committed-message identity probes run in the retained database/E2E groups.\n'
+
+CURRENT_STEP="verification rejection assertion regressions"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test "$PROJECT_ROOT/zk/test/rejection.test.mjs"
 
 CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, fair receipt/recovery observation, RPC classification, batch, Merkle, golden compatibility, lifecycle, portable delivery, destination-scoped leases and preparation defer/fairness unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1212,7 +1205,7 @@ printf '\n[%s]\n' "$CURRENT_STEP"
 # Protocol/test-specific exceptions are documented at their source sites; global rules remain enabled.
 forge lint --deny warnings
 
-CURRENT_STEP="forge test -vv including shared Merkle golden compatibility"
+CURRENT_STEP="forge test -vv including shared Merkle golden compatibility and single-parse message integrity probes"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test -vv
 

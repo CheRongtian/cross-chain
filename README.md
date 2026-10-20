@@ -293,6 +293,20 @@ messageId        = keccak256(
 
 The Gateway nonce is monotonically increasing within one `SourceGateway` deployment. It is not globally unique across chains or Gateway contracts. Global protocol message identity comes from the complete type-tagged encoding, so the same nonce can appear on different source chains, source gateways, destination chains, or destination gateways without producing the same message ID.
 
+### Message integrity
+
+Canonical identifiers bind the source and destination domains, Gateway/application identities, nonce, payload commitment and deadline. Equivalent input objects, property insertion order, operational timestamps, source provenance, database IDs and later lifecycle metadata do not redefine a message. Protocol integers remain exact `uint256` values across JavaScript BigInt/string representations and Solidity.
+
+Once a message is included in a committed Message Root, changing an authenticated field changes its canonical ID and Merkle leaf, preventing reuse of the original membership proof under the original root. A payload candidate retaining its old hash or ID fails canonical validation. Recomputing a valid replacement hash/ID still does not replace the committed member: production Merkle/package verification rejects its old proof and root. PostgreSQL provides operational durability and sealed-membership guards; canonical identity, ordered Merkle commitments and authenticated PBFT roots provide the cryptographic integrity boundary.
+
+A mutation can also equal a different existing member, such as changing nonce 1 to 2 in a batch containing both. It still cannot reuse the original position's proof. Rebuilding a batch with that ID twice must fail the duplicate-membership check; the existing member remains valid with its own original proof. The integrity regressions cover both duplicate replacements and genuinely new IDs without assuming every mutation constructs a valid replacement batch.
+
+Deterministic security regressions call the production message/hash, batch, Merkle and package helpers. Read-only `test-vectors/merkle-golden-vectors.json` and `test-vectors/destination-transport.json` supply fixed expected IDs, roots, proofs and transport bytes, with Solidity checks against the same evidence. Adjacent full-width domain mutations, same-length payload mutations (including the 4096-byte boundary), stale IDs and freshly recomputed IDs are checked explicitly. These selected regressions are not a formal proof or an exhaustive randomized campaign.
+
+The existing `./scripts/verify.sh` includes `[message integrity invariants]` and preserves all prior verification groups. Existing database regressions check immutable canonical evidence at SEALED, CONSENSUS_PENDING and COMMITTED. The retained real source-to-destination scenario records one identity through source emission, persistence/finality, sealing, PBFT commitment, portable encoding and actual Gateway-authenticated destination decoding. Negative probes mutate only in-memory candidates, compare source/batch/QC/READY/transaction and destination-state snapshots, and reverify the original message/proof/root/QC afterward. Public payload hashes and original/mutated IDs are printed as evidence in root `verification.log`; fixed expected vectors are never rewritten to make a check pass.
+
+Verification distinguishes protocol rejection from execution failure. ZK negative cases require an explicit verifier `false` or a generated circuit assertion with a template location; input, file, WASM and other execution errors fail the run. Root and credential deployment checks share the same strict revert matcher, preserving stdout/stderr and rejecting error names/selectors that appear only in unrelated diagnostics. `[verification rejection assertion regressions]` checks these ZK failure boundaries before proving; retained source-policy fixtures exercise both shared Shell entry forms.
+
 ### SourceGateway
 
 `contracts/src/SourceGateway.sol` exposes:
@@ -2338,11 +2352,14 @@ Cross-Chain/
 │   │   │   ├── lease-fixtures.mjs
 │   │   │   ├── merkle-inclusion-contract.mjs
 │   │   │   ├── message-domain-contract.mjs
+│   │   │   ├── message-integrity.mjs
+│   │   │   ├── message-integrity-runtime.mjs
 │   │   │   ├── message-query-fixtures.mjs
 │   │   │   ├── message-query-integration.mjs
 │   │   │   ├── message-query-privacy.mjs
 │   │   │   ├── multi-relayer-integration.mjs
 │   │   │   ├── read-batch-lifecycle.mjs
+│   │   │   ├── read-canonical-message.mjs
 │   │   │   ├── read-delivery.mjs
 │   │   │   ├── relayer-fixtures.mjs
 │   │   │   ├── relayer-integration.mjs
@@ -2356,6 +2373,7 @@ Cross-Chain/
 │   │   ├── indexer.test.mjs
 │   │   ├── integration.test.mjs
 │   │   ├── message-batch.test.mjs
+│   │   ├── message-integrity-invariants.test.mjs
 │   │   ├── message-merkle.test.mjs
 │   │   ├── message-merkle-golden.test.mjs
 │   │   ├── message-query.test.mjs
@@ -2404,6 +2422,8 @@ Cross-Chain/
 │   ├── deploy-replay-test-harness.sh
 │   ├── deploy-validator-set-registry.sh
 │   ├── deploy-verifier.sh
+│   ├── lib/
+│   │   └── expect-revert.sh
 │   ├── start-chains.sh
 │   ├── start.sh
 │   └── verify.sh
@@ -2506,7 +2526,10 @@ Cross-Chain/
 │   │   ├── credential-state.mjs
 │   │   ├── nullifier.mjs
 │   │   ├── tamper-public.mjs
-│   │   └── verify-circuit.sh
+│   │   ├── verify-circuit.sh
+│   │   └── verify-rejection.mjs
+│   ├── test/
+│   │   └── rejection.test.mjs
 │   ├── credential-state.json
 │   ├── encoding.json
 │   ├── nullifier.json

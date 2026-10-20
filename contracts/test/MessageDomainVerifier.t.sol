@@ -252,6 +252,51 @@ contract MessageDomainVerifierTest is Test {
         assertEq(vm.getRecordedLogs().length, 0);
     }
 
+    function testSameLengthPayloadMutationRejectsStaleHashAndOriginalMessageId() public {
+        MessageCodec.CanonicalMessage memory message = _message();
+        bytes memory payload = bytes(PAYLOAD_TEXT);
+        bytes32 originalId = MessageCodec.computeMessageId(message);
+        assertTrue(_verify(message, payload, originalId));
+        bytes memory changed = bytes.concat(payload);
+        changed[0] = changed[0] ^ bytes1(0x01);
+        assertEq(changed.length, payload.length);
+        // This fixed content probe uses the production's exact dynamic-byte commitment.
+        // forge-lint: disable-next-line(asm-keccak256)
+        bytes32 changedHash = keccak256(changed);
+        assertNotEq(changedHash, message.payloadHash);
+        _reject(message, changed, originalId,
+            abi.encodeWithSelector(MessageDomainVerifier.PayloadHashMismatch.selector, message.payloadHash, changedHash));
+        message.payloadHash = changedHash;
+        bytes32 changedId = MessageCodec.computeMessageId(message);
+        assertNotEq(changedId, originalId);
+        assertEq(verifier.computeMessageId(message, changed), changedId);
+        _reject(message, changed, originalId,
+            abi.encodeWithSelector(MessageDomainVerifier.MessageIdMismatch.selector, originalId, changedId));
+        assertTrue(_verify(_message(), payload, originalId));
+    }
+
+    function testAdjacentFullWidthDomainMutationsRetainAllOtherCanonicalFields() public view {
+        MessageCodec.CanonicalMessage memory message = _message();
+        message.sourceDomain = (uint256(1) << 200) + SOURCE_DOMAIN;
+        message.destinationDomain = (uint256(1) << 200) + DESTINATION_DOMAIN;
+        message.nonce = (uint256(1) << 240) + 7;
+        message.deadline = (uint256(1) << 255) + 3600;
+        bytes32 originalId = verifier.computeMessageId(message, bytes(PAYLOAD_TEXT));
+        assertEq(originalId, MessageCodec.computeMessageId(message));
+        message.sourceDomain += 1;
+        bytes32 sourceChangedId = verifier.computeMessageId(message, bytes(PAYLOAD_TEXT));
+        assertNotEq(sourceChangedId, originalId);
+        message.sourceDomain -= 1;
+        message.destinationDomain += 1;
+        bytes32 destinationChangedId = verifier.computeMessageId(message, bytes(PAYLOAD_TEXT));
+        assertNotEq(destinationChangedId, originalId);
+        assertNotEq(destinationChangedId, sourceChangedId);
+        message.destinationDomain -= 1;
+        assertEq(verifier.computeMessageId(message, bytes(PAYLOAD_TEXT)), originalId);
+        assertEq(message.nonce, (uint256(1) << 240) + 7);
+        assertEq(message.deadline, (uint256(1) << 255) + 3600);
+    }
+
     function testFullWidthDomainsNonceAndDeadlineRemainExact() public {
         MessageCodec.CanonicalMessage memory m = _message();
         m.destinationDomain = type(uint256).max;

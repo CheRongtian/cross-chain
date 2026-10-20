@@ -34,6 +34,9 @@ normalize() {
     printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+# shellcheck source=lib/expect-revert.sh
+source "$SCRIPT_DIR/lib/expect-revert.sh"
+
 uint_to_decimal() {
     local encoded_value="${1%%[[:space:]]*}"
     local decoded_value
@@ -228,27 +231,7 @@ assert_uint_equal() {
 }
 
 expect_application_revert() {
-    local label="$1"
-    local error_signature="$2"
-    local error_name="${error_signature%%(*}"
-    local error_selector
-    local output
-
-    error_selector="$(cast sig "$error_signature")"
-
-    if output="$(call_identity_application 2>&1)"; then
-        printf '%s\n' "$output"
-        fail "$label unexpectedly succeeded"
-    fi
-
-    printf '%s\n' "$output"
-
-    if [[ "$(normalize "$output")" != *"$(normalize "$error_selector")"* ]] \
-        && [[ "$output" != *"$error_name"* ]]; then
-        fail "$label reverted without $error_signature"
-    fi
-
-    printf 'Verified expected application rejection: %s (%s)\n' "$label" "$error_name"
+    expect_command_revert "$1" "$2" call_identity_application
 }
 
 expect_state_update_revert() {
@@ -257,64 +240,20 @@ expect_state_update_revert() {
     local caller="$3"
     local new_root="$4"
     local revoked_commitments="$5"
-    local error_name="${error_signature%%(*}"
-    local error_selector
-    local output
-
-    error_selector="$(cast sig "$error_signature")"
-
-    if output="$(
-        cast call "$IDENTITY_APPLICATION_ADDRESS" \
-            "updateCredentialStateRoot(uint256,uint256[])" \
-            "$new_root" \
-            "$revoked_commitments" \
-            --from "$caller" \
-            --rpc-url "$CHAIN_A_RPC_URL" \
-            2>&1
-    )"; then
-        printf '%s\n' "$output"
-        fail "$label unexpectedly succeeded"
-    fi
-
-    printf '%s\n' "$output"
-
-    if [[ "$(normalize "$output")" != *"$(normalize "$error_selector")"* ]] \
-        && [[ "$output" != *"$error_name"* ]]; then
-        fail "$label reverted without $error_signature"
-    fi
-
-    printf 'Verified expected state update rejection: %s (%s)\n' "$label" "$error_name"
+    expect_call_revert "$label" "$error_signature" \
+        "$IDENTITY_APPLICATION_ADDRESS" \
+        "updateCredentialStateRoot(uint256,uint256[])" \
+        "$new_root" "$revoked_commitments" \
+        --from "$caller" --rpc-url "$CHAIN_A_RPC_URL"
 }
 
 expect_policy_epoch_advance_revert() {
     local label="$1"
     local error_signature="$2"
     local caller="$3"
-    local error_name="${error_signature%%(*}"
-    local error_selector
-    local output
-
-    error_selector="$(cast sig "$error_signature")"
-
-    if output="$(
-        cast call "$IDENTITY_APPLICATION_ADDRESS" \
-            "advancePolicyEpoch()" \
-            --from "$caller" \
-            --rpc-url "$CHAIN_A_RPC_URL" \
-            2>&1
-    )"; then
-        printf '%s\n' "$output"
-        fail "$label unexpectedly succeeded"
-    fi
-
-    printf '%s\n' "$output"
-
-    if [[ "$(normalize "$output")" != *"$(normalize "$error_selector")"* ]] \
-        && [[ "$output" != *"$error_name"* ]]; then
-        fail "$label reverted without $error_signature"
-    fi
-
-    printf 'Verified expected policy epoch rejection: %s (%s)\n' "$label" "$error_name"
+    expect_call_revert "$label" "$error_signature" \
+        "$IDENTITY_APPLICATION_ADDRESS" "advancePolicyEpoch()" \
+        --from "$caller" --rpc-url "$CHAIN_A_RPC_URL"
 }
 
 set_next_block_timestamp() {

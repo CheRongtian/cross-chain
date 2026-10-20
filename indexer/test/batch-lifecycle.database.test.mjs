@@ -15,6 +15,7 @@ import { createValidatorSetResolver } from "../../validator/src/validator-sets.m
 import { commitConfigs, signedCommitFixture } from "../../validator/test/helpers/commit-fixtures.mjs";
 import { buildQuorumCertificate, expectedCommitStatement, qcDigest } from "../../validator/src/quorum-certificate.mjs";
 import { cloneCandidateFixture, sourceState } from "../../validator/test/helpers/four-process.mjs";
+import { assertCanonicalIdentity, assertMerkleIntegrity } from "./helpers/message-integrity.mjs";
 
 const config = loadDatabaseConfig({
   ...process.env,
@@ -308,6 +309,43 @@ test("a collection failure after member insertion rolls back every assignment an
     assert.equal(result.assignedCount, 2);
     assert.equal(result.snapshot.record.batchRecordId, current.record.batchRecordId);
   } finally { await fresh.end(); }
+});
+
+test("SEALED, CONSENSUS_PENDING and COMMITTED preserve canonical members and reject ordinary API rewrites", async () => {
+  const { id, rows } = await collectedPair();
+  const messagesBefore = await readMessages(pool, config.databaseSchema);
+  const sealed = await lifecycle.sealBatch({ batchRecordId: id });
+  async function check(snapshot) {
+    assert.deepEqual(snapshot.batch, sealed.batch);
+    assert.deepEqual(snapshot.tree, sealed.tree);
+    assert.deepEqual(snapshot.members, sealed.members);
+    for (let index = 0; index < snapshot.batch.messages.length; index++) {
+      assertCanonicalIdentity(snapshot.batch.messages[index], snapshot.members[index].messageId);
+      assertMerkleIntegrity({ batch: snapshot.batch, tree: snapshot.tree, index });
+    }
+    const state = await sourceState(pool, config.databaseSchema);
+    await assert.rejects(committingLifecycle.assignMessages({ batchRecordId: id, sourceMessageIds: [rows[0].id] }),
+      { message: "members can only be assigned to a BUILDING batch" });
+    await assert.rejects(committingLifecycle.sealBatch({ batchRecordId: id, expectedBatchId: hash(99) }),
+      { message: "sealed batch ID does not match caller expectation" });
+    await assert.rejects(committingLifecycle.sealBatch({ batchRecordId: id, expectedMessageRoot: hash(99) }),
+      { message: "sealed Message Root does not match caller expectation" });
+    assert.deepEqual(await sourceState(pool, config.databaseSchema), state);
+    assert.deepEqual(await committingLifecycle.readBatch({ batchRecordId: id }), snapshot);
+    assert.deepEqual(await readMessages(pool, config.databaseSchema), messagesBefore);
+  }
+  await check(sealed);
+  const pending = await committingLifecycle.markConsensusPending({ batchRecordId: id });
+  await check(pending);
+  const statement = expectedCommitStatement({ protocolVersion: "3", sourceDomain: pending.record.sourceDomain,
+    sourceGateway: pending.record.sourceGateway, epoch: pending.record.epoch, view: "0", validatorEpoch: "0",
+    batchId: pending.record.batchId, messageRoot: pending.record.messageRoot }, committee, validatorSets);
+  const votes = await Promise.all(commitConfigs.slice(0, 3).map(identity => signedCommitFixture(statement, identity)));
+  const certificate = await buildQuorumCertificate(votes, { peers: committee, validatorSets, expected: statement });
+  const committed = await committingLifecycle.commitWithCertificate({ certificate });
+  await check(committed);
+  assert.deepEqual(committed.quorumCertificate, certificate);
+  console.log("VALID: persisted canonical member IDs/leaves/roots remain unchanged through SEALED, CONSENSUS_PENDING and COMMITTED; API mutation attempts leave source and QC history untouched");
 });
 
 test("only a matching independently verified QC can commit; equivalent evidence preserves the first certificate", async () => {
