@@ -26,6 +26,12 @@
     "test:database": "node --test test/database.test.mjs test/batch-lifecycle.database.test.mjs test/delivery.database.test.mjs test/relayer.database.test.mjs test/transaction-manager.database.test.mjs test/transaction-retry.database.test.mjs test/rpc-failover.database.test.mjs test/relayer-leases.database.test.mjs test/transaction-recovery.database.test.mjs",
     "test:integration": "node --test test/integration.test.mjs"
   },
+  "devDependencies": {
+    "@lezer/highlight": "1.2.1",
+    "@lezer/lr": "1.4.2",
+    "@prometheus-io/lezer-promql": "0.305.0",
+    "yaml": "2.8.3"
+  },
   "dependencies": {
     "pg": "8.23.1",
     "prom-client": "15.1.3",

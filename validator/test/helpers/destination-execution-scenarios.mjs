@@ -43,6 +43,7 @@ import { verifyPostgresRestart } from "./postgres-restart-scenarios.mjs";
 import { verifyMultiComponentRecovery } from "./multi-component-recovery-scenario.mjs";
 import { verifyMessageQueryHTTP } from "../../../indexer/test/helpers/message-query-integration.mjs";
 import { metricValue, scrapeMetrics, scrapeValue } from "../../../indexer/test/helpers/metrics-assertions.mjs";
+import { withPendingDashboardProbe } from "../../../indexer/test/helpers/pending-dashboard-integration.mjs";
 
 const artifact = name => JSON.parse(readFileSync(new URL(`../../../contracts/out/${name}.sol/${name}.json`, import.meta.url), "utf8"));
 const normalizeError = value => typeof value === "string" && /^0x[0-9a-f]{40}$/i.test(value) ? value.toLowerCase() : value;
@@ -314,25 +315,31 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   assert.equal(await readApp("isVerifiedSupplier", [supplier]), true);
   console.log(`EXPECTED FAILURE: different authenticated message ${redundant.messageId} reached ApplicationB AlreadyVerifiedSupplier; actual Tx Manager transaction REVERTED; replay remains false`);
   await client.request({ method: "anvil_mine", params: [toHex(relayConfig.destinationConfirmations)] });
-  const executionFailures = await metricValue("destination_execution_failures_total");
-  const latencyCount = await metricValue("cross_chain_latency_seconds", { part: "_count" });
-  const latencySum = await metricValue("cross_chain_latency_seconds", { part: "_sum" });
-  await manager.checkReceiptsOnce();
-  assert.equal((await manager.repository.getTransaction(successPack.deliveryJobId)).intent.status, "CONFIRMED");
-  assert.equal((await manager.repository.getTransaction(failurePack.deliveryJobId)).intent.status, "REVERTED");
-  assert.equal(await metricValue("destination_execution_failures_total"), executionFailures + 1);
-  assert.equal(await metricValue("cross_chain_latency_seconds", { part: "_count" }), latencyCount + 1);
-  const successObservation = (await manager.repository.getTransaction(successPack.deliveryJobId)).winningAttempt;
-  const [sourceObservation] = await rowsFor([first.messageId]);
-  const durationMs = Date.parse(successObservation.confirmedAt) - sourceObservation.observed_at.getTime();
-  assert.ok(durationMs >= 0);
-  assert.equal(Math.round(((await metricValue("cross_chain_latency_seconds", { part: "_sum" })) - latencySum) * 1000), durationMs,
-    "the fresh latency sample must use the real persisted source and canonical confirmation timestamps");
-  await manager.checkReceiptsOnce();
-  assert.equal(await metricValue("destination_execution_failures_total"), executionFailures + 1);
-  assert.equal(await metricValue("cross_chain_latency_seconds", { part: "_count" }), latencyCount + 1);
-  console.log("VALID: one fresh successful production message records cross-chain latency from durable source observation to canonical destination execution confirmation");
-  console.log("VALID: a real canonical destination REVERTED outcome increments destination execution failures while preparation defer and RPC failure do not");
+  await withPendingDashboardProbe({ config, pool, resolvedCount: 2, validatorOrigins: active.map(index => peers[index].url), captureDestination: async () => ({
+    first: await readGateway("isMessageExecuted", [first.messageId]),
+    redundant: await readGateway("isMessageExecuted", [redundant.messageId]),
+    supplier: await readApp("isVerifiedSupplier", [supplier]),
+  }) }, async () => {
+    const executionFailures = await metricValue("destination_execution_failures_total");
+    const latencyCount = await metricValue("cross_chain_latency_seconds", { part: "_count" });
+    const latencySum = await metricValue("cross_chain_latency_seconds", { part: "_sum" });
+    await manager.checkReceiptsOnce();
+    assert.equal((await manager.repository.getTransaction(successPack.deliveryJobId)).intent.status, "CONFIRMED");
+    assert.equal((await manager.repository.getTransaction(failurePack.deliveryJobId)).intent.status, "REVERTED");
+    assert.equal(await metricValue("destination_execution_failures_total"), executionFailures + 1);
+    assert.equal(await metricValue("cross_chain_latency_seconds", { part: "_count" }), latencyCount + 1);
+    const successObservation = (await manager.repository.getTransaction(successPack.deliveryJobId)).winningAttempt;
+    const [sourceObservation] = await rowsFor([first.messageId]);
+    const durationMs = Date.parse(successObservation.confirmedAt) - sourceObservation.observed_at.getTime();
+    assert.ok(durationMs >= 0);
+    assert.equal(Math.round(((await metricValue("cross_chain_latency_seconds", { part: "_sum" })) - latencySum) * 1000), durationMs,
+      "the fresh latency sample must use the real persisted source and canonical confirmation timestamps");
+    await manager.checkReceiptsOnce();
+    assert.equal(await metricValue("destination_execution_failures_total"), executionFailures + 1);
+    assert.equal(await metricValue("cross_chain_latency_seconds", { part: "_count" }), latencyCount + 1);
+    console.log("VALID: one fresh successful production message records cross-chain latency from durable source observation to canonical destination execution confirmation");
+    console.log("VALID: a real canonical destination REVERTED outcome increments destination execution failures while preparation defer and RPC failure do not");
+  });
   const evidence = async () => ({
     intents: (await pool.query(`SELECT * FROM ${tableName(config.databaseSchema, "transaction_intents")} ORDER BY delivery_job_id`)).rows,
     attempts: (await pool.query(`SELECT * FROM ${tableName(config.databaseSchema, "transaction_attempts")} ORDER BY attempt_id`)).rows,

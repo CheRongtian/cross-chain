@@ -10,7 +10,9 @@ import { createMessageQuery } from "../../src/api/message-query.mjs";
 import { createMessageQueryServer } from "../../src/api/server.mjs";
 import { assertMessageQueryPrivacy } from "./message-query-privacy.mjs";
 import { verifyExplorerAssets, verifyExplorerMessage } from "./explorer-integration.mjs";
-import { assertScrapePure } from "./metrics-assertions.mjs";
+import { assertScrapePure, scrapeValue } from "./metrics-assertions.mjs";
+import { registerPendingDelivery, PENDING_DELIVERY_NAME } from "../../src/metrics/pending-delivery.mjs";
+import { assertDashboardExposition } from "./grafana-contract.mjs";
 
 const sourceTables = ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batches", "message_batch_members",
   "batch_consensus_bindings", "batch_quorum_certificates", "batch_quorum_certificate_signatures", "delivery_batches", "delivery_jobs",
@@ -103,11 +105,12 @@ export async function verifyMessageQueryHTTP({ config, pool, states, records, me
     validators: await Promise.all(entries.map(([, state]) => tables(state.pool, state.config.databaseSchema, validatorTables))),
     destination: destinationCheck ? await destinationCheck() : null });
   const before = await capture();
+  const pendingMetric = registerPendingDelivery({ config: queryConfig, pool });
   const runtime = createMessageQueryServer({ config: queryConfig, query: createMessageQuery({ config: queryConfig, pool, validatorReaders: readers }) });
-  await runtime.listen();
-  console.log("VALID: read-only message query API started on an isolated loopback verification endpoint");
-  const url = `http://127.0.0.1:${runtime.server.address().port}/api/v1/messages/`;
   try {
+    await runtime.listen();
+    console.log("VALID: read-only message query API started on an isolated loopback verification endpoint");
+    const url = `http://127.0.0.1:${runtime.server.address().port}/api/v1/messages/`;
     const origin = `http://127.0.0.1:${runtime.server.address().port}`;
     await verifyExplorerAssets(origin);
     for (const value of expected) {
@@ -171,7 +174,11 @@ export async function verifyMessageQueryHTTP({ config, pool, states, records, me
       same(body, again, "repeated GET must return equivalent protocol fields");
       console.log(`VALID: queried real message ${source.message_id} through HTTP; source provenance/finality, batch/Merkle, persisted votes/QC, delivery history and current destination observation match independent production reads`);
     }
-    await assertScrapePure(origin);
+    const exposition = await assertScrapePure(origin);
+    assertDashboardExposition(exposition);
+    if (expectedExecution === "REORG_RECOVERY") {
+      assert.ok(scrapeValue(exposition, PENDING_DELIVERY_NAME) >= 1, "the real reopened destination intent is unresolved again");
+    }
     const unknown = `0x${"00".repeat(32)}`;
     assert.equal((await pool.query(`SELECT 1 FROM ${tableName(config.databaseSchema, "source_messages")} WHERE message_id = $1`, [unknown])).rowCount, 0);
     assert.equal((await fetch(url + unknown)).status, 404); console.log("EXPECTED FAILURE: unknown canonical message ID returns 404 without mutation");
@@ -186,5 +193,5 @@ export async function verifyMessageQueryHTTP({ config, pool, states, records, me
     console.log("VALID: loading, searching and refreshing Explorer views changes no source, consensus, delivery, transaction or destination state");
     console.log("VALID: repeated HTTP queries changed no source/finality/batch/QC/vote/delivery/lease/intent/nonce/retry/attempt/receipt/destination state; no broadcast or recovery was scheduled");
     console.log("VALID: API integer fields remain exact decimal strings and public allowlists exclude raw signed bytes, private keys and connection material");
-  } finally { await runtime.close(); }
+  } finally { try { await runtime.close(); } finally { pendingMetric.close(); } }
 }

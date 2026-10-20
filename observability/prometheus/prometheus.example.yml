@@ -1,0 +1,21 @@
+# One deployment/source scope per Prometheus job set. Replace the commented
+# Validator targets with their real configured HTTP host:port values. Never
+# copy ephemeral verification ports or put credential-bearing URLs here.
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+scrape_configs:
+  - job_name: cross-chain-api
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+  - job_name: cross-chain-workers
+    static_configs:
+      # Example: an existing continuous Indexer with METRICS_PORT=9101.
+      # Add other live worker listeners, each with its own configured port.
+      # One-shot metrics cease to exist when their process exits.
+      - targets: ["127.0.0.1:9101"]
+  - job_name: cross-chain-validators
+    static_configs:
+      # Example structure only: uncomment after supplying actual host:ports.
+      # - targets: ["<validator-1-host:port>", "<validator-2-host:port>", "<validator-3-host:port>", "<validator-4-host:port>"]
+      - targets: []

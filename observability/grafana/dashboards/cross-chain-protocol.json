@@ -1,0 +1,232 @@
+{
+  "id": null,
+  "uid": "cross-chain-protocol",
+  "title": "Cross-Chain Protocol Overview",
+  "description": "Aggregate operational observations from one configured deployment/source scope. Explorer provides per-message investigation. Counters reset on process restart, short-lived workers can escape scraping, and local PBFT observations are not global round counts or proof of consensus safety. Grafana has no protocol authority.",
+  "tags": ["cross-chain", "operational", "prometheus"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "15s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": { "refresh_intervals": ["15s", "30s", "1m", "5m"] },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "links": [],
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Observed Message Rate",
+      "description": "New durable source occurrences per second. Requires live worker scrapes and enough samples for rate; missing observations are not zero throughput.",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum(rate(cross_chain_messages_observed_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none" }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Finalized Message Rate",
+      "description": "New durable source FINALIZED transitions per second, using the source confirmation-depth policy.",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum(rate(cross_chain_messages_finalized_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none" }
+    },
+    {
+      "id": 3, "type": "stat", "title": "Pending Deliveries",
+      "description": "Current persisted READY jobs in the API's configured source scope without a CONFIRMED/REVERTED intent. Includes deferred, stopped, signed, pending, reopened and historical unconfirmed work. API replicas must observe the same scope; max avoids double-counting replicas. Unavailable collection is unknown, never zero. This is not worker eligibility or fresh chain finality.",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "max((cross_chain_pending_delivery_jobs{job=\"cross-chain-api\"} >= 0) and on(job, instance) (up{job=\"cross-chain-api\"} == 1))", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0, "noValue": "Unknown" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none" }
+    },
+    {
+      "id": 4, "type": "stat", "title": "Source Occurrences Reorged — Selected Range",
+      "description": "Window increase of source occurrences transitioning to REORGED. Counts displaced occurrences, not fork incidents or destination receipt reorgs. Prometheus increase is extrapolated and can be fractional.",
+      "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum(increase(cross_chain_messages_reorged_total{job=~\"cross-chain-.*\"}[$__range]))", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "noValue": "No data" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none" }
+    },
+    {
+      "id": 5, "type": "stat", "title": "Local View-change Rate",
+      "description": "Sum of local Validator certified NEW_VIEW acceptance rates. Replicas count independent observations; this is not a global count of view-change incidents or evidence of unsafe consensus.",
+      "gridPos": { "x": 16, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum(rate(cross_chain_pbft_view_changes_total{job=\"cross-chain-validators\"}[$__rate_interval]))", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none" }
+    },
+    {
+      "id": 6, "type": "stat", "title": "RPC Failure Rate",
+      "description": "Failed endpoint requests per second, including a primary failure followed by successful fallback. An RPC failure does not imply failed delivery.",
+      "gridPos": { "x": 20, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum(rate(cross_chain_rpc_failures_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none" }
+    },
+    { "id": 10, "type": "row", "title": "Message Throughput & Latency", "collapsed": false, "panels": [], "gridPos": { "x": 0, "y": 4, "w": 24, "h": 1 } },
+    {
+      "id": 11, "type": "timeseries", "title": "Message Throughput",
+      "description": "Observed and finalized source occurrence rates. Event counters are process-local and reset on restart; short-lived worker activity can be missed between scrapes.",
+      "gridPos": { "x": 0, "y": 5, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(cross_chain_messages_observed_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "Observed", "range": true },
+        { "refId": "B", "expr": "sum(rate(cross_chain_messages_finalized_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "Finalized", "range": true }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data", "custom": { "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Cross-chain Latency",
+      "description": "Histogram estimates from durable source observation to new canonical production Gateway confirmation. No successful samples gives No data, not zero latency. Reconfirmation after a proven reorg is a new observation; this is not an exactly-once business ledger.",
+      "gridPos": { "x": 12, "y": 5, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(cross_chain_cross_chain_latency_seconds_bucket{job=~\"cross-chain-.*\"}[$__rate_interval])))", "legendFormat": "p50", "range": true },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(cross_chain_cross_chain_latency_seconds_bucket{job=~\"cross-chain-.*\"}[$__rate_interval])))", "legendFormat": "p95", "range": true },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(cross_chain_cross_chain_latency_seconds_bucket{job=~\"cross-chain-.*\"}[$__rate_interval])))", "legendFormat": "p99", "range": true }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0, "noValue": "No data", "custom": { "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    { "id": 20, "type": "row", "title": "Operational PBFT / Validator Health", "collapsed": false, "panels": [], "gridPos": { "x": 0, "y": 13, "w": 24, "h": 1 } },
+    {
+      "id": 21, "type": "timeseries", "title": "Local PBFT Round Duration",
+      "description": "Per-replica PRE-PREPARE acceptance to first durable local QC, aggregated as timing samples. Operational timing does not independently establish protocol safety. Abandoned views are excluded from this committed-round distribution.",
+      "gridPos": { "x": 0, "y": 14, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.50, sum by (le) (rate(cross_chain_pbft_round_duration_seconds_bucket{job=\"cross-chain-validators\",outcome=\"committed\"}[$__rate_interval])))", "legendFormat": "p50", "range": true },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(cross_chain_pbft_round_duration_seconds_bucket{job=\"cross-chain-validators\",outcome=\"committed\"}[$__rate_interval])))", "legendFormat": "p95", "range": true }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0, "noValue": "No data", "custom": { "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    {
+      "id": 22, "type": "timeseries", "title": "Local PBFT View Changes",
+      "description": "Certified higher-view acceptances per second per Validator target. View change is a liveness mechanism, not a safety failure. Healthy steady-state generally has low view-change and quorum-failure rates.",
+      "gridPos": { "x": 12, "y": 14, "w": 6, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum by (instance) (rate(cross_chain_pbft_view_changes_total{job=\"cross-chain-validators\"}[$__rate_interval]))", "legendFormat": "{{instance}}", "range": true }],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data", "custom": { "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    {
+      "id": 23, "type": "timeseries", "title": "Local PBFT Quorum Failures",
+      "description": "First timeout entry without a local QC per active old view. Invalid/duplicate votes and repeated timeout handling add no event. These are local observations, not a global incident count.",
+      "gridPos": { "x": 18, "y": 14, "w": 6, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum by (instance) (rate(cross_chain_pbft_quorum_failures_total{job=\"cross-chain-validators\"}[$__rate_interval]))", "legendFormat": "{{instance}}", "range": true }],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data", "custom": { "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    {
+      "id": 24, "type": "stat", "title": "Validator Readiness",
+      "description": "Latest production readiness observation for each reachable Validator: 1 ready, 0 not ready. Readiness is cached from existing production checks; /metrics does not probe dependencies. Unreachable targets are unknown here; see scrape availability. Neither signal changes the pinned committee or quorum.",
+      "gridPos": { "x": 0, "y": 22, "w": 12, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "cross_chain_validator_available{job=\"cross-chain-validators\"} and on(job, instance) (up{job=\"cross-chain-validators\"} == 1)", "legendFormat": "{{instance}}", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "noValue": "Unknown", "mappings": [{ "type": "value", "options": { "0": { "text": "Not ready", "color": "red" }, "1": { "text": "Ready", "color": "green" } } }] }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    {
+      "id": 25, "type": "stat", "title": "Validator Scrape Availability",
+      "description": "Prometheus up per configured Validator target: 1 scrape succeeded, 0 failed. A reachable process may still be unready. Keep all intended targets configured; absence does not remove a member or lower quorum.",
+      "gridPos": { "x": 12, "y": 22, "w": 12, "h": 5 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "up{job=\"cross-chain-validators\"}", "legendFormat": "{{instance}}", "instant": true, "range": false }],
+      "fieldConfig": { "defaults": { "min": 0, "max": 1, "noValue": "Unknown", "mappings": [{ "type": "value", "options": { "0": { "text": "Scrape failed", "color": "red" }, "1": { "text": "Reachable", "color": "green" } } }] }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "value_and_name" }
+    },
+    { "id": 30, "type": "row", "title": "Delivery / Relayer Health", "collapsed": false, "panels": [], "gridPos": { "x": 0, "y": 27, "w": 24, "h": 1 } },
+    {
+      "id": 31, "type": "timeseries", "title": "Pending Delivery Trend",
+      "description": "Persisted unresolved READY work, not attempts minus successes and not immediately runnable jobs. No SLA threshold is assumed. Deferred and stopped work remains unresolved; DB or scrape unavailability creates a gap.",
+      "gridPos": { "x": 0, "y": 28, "w": 12, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "max((cross_chain_pending_delivery_jobs{job=\"cross-chain-api\"} >= 0) and on(job, instance) (up{job=\"cross-chain-api\"} == 1))", "legendFormat": "Unresolved READY", "range": true }],
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "noValue": "Unknown", "custom": { "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 32, "type": "timeseries", "title": "Delivery Attempts / Transaction Replacements",
+      "description": "New durable signed candidates and same-nonce replacement candidates per second. Replacements are a subset of attempts; these series are intentionally not summed.",
+      "gridPos": { "x": 12, "y": 28, "w": 12, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(cross_chain_delivery_attempts_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "Signed candidates", "range": true },
+        { "refId": "B", "expr": "sum(rate(cross_chain_transaction_replacements_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "Replacements", "range": true }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data", "custom": { "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    {
+      "id": 33, "type": "timeseries", "title": "Delivery Retries",
+      "description": "Durable exact-candidate repeat sends versus new replacement creation. Failover endpoints of one action do not become multiple exact retries. Receipt-only reconciliation adds no retry.",
+      "gridPos": { "x": 0, "y": 35, "w": 12, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum by (kind) (rate(cross_chain_delivery_retries_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "{{kind}}", "range": true }],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data", "custom": { "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    {
+      "id": 34, "type": "timeseries", "title": "Relayer Failures",
+      "description": "Failed explicit production actions by bounded operation/class. Passive busy/defer/no-work results add zero. A successful RPC failover can contribute RPC failures without a failed Relayer action.",
+      "gridPos": { "x": 12, "y": 35, "w": 12, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum by (operation, reason_class) (rate(cross_chain_relayer_failures_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "{{operation}} / {{reason_class}}", "range": true }],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data", "custom": { "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    { "id": 40, "type": "row", "title": "RPC Health", "collapsed": false, "panels": [], "gridPos": { "x": 0, "y": 42, "w": 24, "h": 1 } },
+    {
+      "id": 41, "type": "timeseries", "title": "RPC Failures by Operation",
+      "description": "Failed destination endpoint requests per second by actual bounded wire operation. Successful failover does not erase a primary request failure; delivery may still succeed.",
+      "gridPos": { "x": 0, "y": 43, "w": 12, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum by (operation) (rate(cross_chain_rpc_failures_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "{{operation}}", "range": true }],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data", "custom": { "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    {
+      "id": 42, "type": "timeseries", "title": "RPC Failures by Class",
+      "description": "The same failed requests grouped by bounded production classification. No raw error text or credential-bearing endpoint URL is a series label.",
+      "gridPos": { "x": 12, "y": 43, "w": 12, "h": 7 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum by (reason_class) (rate(cross_chain_rpc_failures_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "{{reason_class}}", "range": true }],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data", "custom": { "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } }
+    },
+    { "id": 50, "type": "row", "title": "Source Reorg / Failure / Retry", "collapsed": false, "panels": [], "gridPos": { "x": 0, "y": 50, "w": 24, "h": 1 } },
+    {
+      "id": 51, "type": "timeseries", "title": "Source Occurrence Reorg Rate",
+      "description": "Source occurrence REORGED transitions per second. Destination receipt orphaning is a separate lifecycle and is not included in this counter.",
+      "gridPos": { "x": 0, "y": 51, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum(rate(cross_chain_messages_reorged_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "Source occurrences", "range": true }],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data", "custom": { "spanNulls": false } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "single", "sort": "none" } }
+    },
+    {
+      "id": 52, "type": "timeseries", "title": "Failure / Retry Rates",
+      "description": "Independent operational signals. One incident may contribute to several series, so they are never stacked or summed into a fabricated total failure count. REVERTED requires canonical receipt evidence; preparation defer and RPC outage alone produce no execution failure.",
+      "gridPos": { "x": 12, "y": 51, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "cross-chain-prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(cross_chain_delivery_retries_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "Delivery retries", "range": true },
+        { "refId": "B", "expr": "sum(rate(cross_chain_relayer_failures_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "Relayer failures", "range": true },
+        { "refId": "C", "expr": "sum(rate(cross_chain_rpc_failures_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "RPC failures", "range": true },
+        { "refId": "D", "expr": "sum(rate(cross_chain_destination_execution_failures_total{job=~\"cross-chain-.*\"}[$__rate_interval]))", "legendFormat": "Destination execution failures", "range": true }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0, "noValue": "No data", "custom": { "spanNulls": false, "stacking": { "mode": "none", "group": "A" } } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "none" } }
+    }
+  ]
+}

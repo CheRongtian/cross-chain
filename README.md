@@ -91,7 +91,8 @@ The current implementation can:
 - compose QC, Merkle and full-message verification in `DestinationGateway.execute(bytes)`, consume the authenticated message ID and dispatch its payload atomically;
 - execute the Application B supplier-grant example only through its configured Gateway, with business errors rolling back message consumption;
 - query one message's persisted lifecycle through a read-only API and built-in Explorer;
-- expose process-local Prometheus operational metrics without granting the observability surface any protocol authority.
+- expose process-local Prometheus operational metrics without granting the observability surface any protocol authority;
+- provide a provisionable Grafana operational dashboard for throughput, latency, component health, unresolved delivery backlog, source reorgs and failure/retry activity.
 
 ## Architecture
 
@@ -1762,9 +1763,9 @@ The protocol exposes Prometheus-compatible operational metrics for source ingest
 
 ### Endpoints and process ownership
 
-`GET /metrics` returns the standard Prometheus text exposition and content type produced by [prom-client](https://github.com/siimon/prom-client/tree/v15.1.3), pinned to `15.1.3` in the Indexer package and lockfile. `HEAD` is supported; other methods receive `405` without changing counters or protocol state. Scraping serializes in-memory instruments only: it performs no database/RPC queries, worker locks, recovery or backfill. Serialization failure returns a fixed safe `503`; no error stack or connection material is exposed, and ordinary protocol processing continues.
+`GET /metrics` returns the standard Prometheus text exposition and content type produced by [prom-client](https://github.com/siimon/prom-client/tree/v15.1.3), pinned to `15.1.3` in the Indexer package and lockfile. `HEAD` is supported; other methods receive `405` without changing counters or protocol state. The original fifteen instruments serialize in-memory state without database/RPC queries, worker locks, recovery or backfill. The API additionally owns the read-only pending-delivery collector described below, which performs one aggregate SELECT per scrape. Serialization failure returns a fixed safe `503`; no error stack or connection material is exposed, and ordinary protocol processing continues.
 
-Each OS process owns one explicit registry. It is never registered with prom-client's global registry. API/Explorer serves `/metrics` on its existing `MESSAGE_QUERY_API_HOST`/`MESSAGE_QUERY_API_PORT` (default `127.0.0.1:8080`). Each Validator serves its own registry on that Validator's existing HTTP port. API scrapes do not aggregate metrics from separate workers or reconstruct counters from their databases. An API-only process will legitimately expose zero protocol-event counters.
+Each OS process owns one explicit registry. It is never registered with prom-client's global registry. API/Explorer serves `/metrics` on its existing `MESSAGE_QUERY_API_HOST`/`MESSAGE_QUERY_API_PORT` (default `127.0.0.1:8080`). Each Validator serves its own registry on that Validator's existing HTTP port. API scrapes do not aggregate event counters from separate workers or reconstruct counters from their databases. An API-only process will legitimately expose zero protocol-event counters; its additional pending gauge observes the configured durable source scope.
 
 Indexer, Finality, Relayer and Transaction Manager CLI entries can expose their own same-process metrics-only listener using optional `METRICS_HOST` (default `127.0.0.1`) and `METRICS_PORT`. An empty/unset port disables it. Hosts are limited to loopback (`127.0.0.1`, `::1`, `localhost`); assign a different port to each simultaneous CLI process through its own environment. The listener has no scheduler or protocol commands, closes with its owning run, and a bind failure does not stop that worker. Short-lived one-shot workers can finish between scrapes; no background daemon, persistent exporter, process aggregation or new worker mode is provided.
 
@@ -1780,7 +1781,7 @@ scrape_configs:
       - targets: ["127.0.0.1:9101"]
 ```
 
-Add each running Validator's actual existing HTTP address as a separate target; the repository does not assign a second Validator port. Target/job labels belong to the scraper, not protocol message labels. Prometheus installation, Docker, Grafana and dashboard provisioning are outside this repository's verification flow.
+This minimal snippet illustrates worker ownership only. For the supplied Grafana dashboard, use `observability/prometheus/prometheus.example.yml` and its fixed job names instead. Add each running Validator's actual existing HTTP address as a separate target; the repository does not assign a second Validator port. Target/job labels belong to the scraper, not protocol message labels. External Prometheus/Grafana installation and operation remain outside the verification prerequisites; dashboard artifacts are verified without starting those services.
 
 ### Metric definitions
 
@@ -1803,6 +1804,7 @@ Every name below is exported exactly as written. All counters track new events i
 | `cross_chain_transaction_replacements_total` | Counter | Each genuinely new durable same-nonce replacement candidate after COMMIT. Concurrent duplicate preparation, reuse and reconciliation add zero. |
 | `cross_chain_cross_chain_latency_seconds` | Histogram | Persisted `source_messages.observed_at` → persisted canonical receipt `confirmed_at` for a new successful terminal observation of the exact `execute(bytes)` wrapper at configured `PRODUCTION_DESTINATION_GATEWAY_ADDRESS`. The doubled `cross_chain` is the canonical metric name. Historical raw-envelope/EOA transport receipts, signature creation and unconfirmed sends are excluded. |
 | `cross_chain_destination_execution_failures_total` | Counter | A new durably canonical REVERTED destination transaction outcome after the ordinary receipt-depth checks; repeated reads/polls add zero. Estimate rejection/defer and unavailable RPCs do not create this event. |
+| `cross_chain_pending_delivery_jobs` | Gauge | API-owned current count of READY jobs whose source remains FINALIZED in the configured source domain/Gateway, with no CONFIRMED/REVERTED intent. Read-only collection, no labels, no event-counter reconstruction. |
 
 PBFT histogram buckets (seconds): `0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120`. Latency buckets (seconds): `0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600`. Standard `_bucket`, `_sum`, `_count` and `+Inf` series are provided. Missing, invalid or negative persisted durations drop only that metric observation.
 
@@ -1815,6 +1817,59 @@ Durable transition observations are emitted only after COMMIT and discarded on r
 Canonical receipt finality remains depth-based and reversible. A later reorg does not subtract an old counter/histogram observation. Genuine canonical reconfirmation after ordinary production recovery is a **new terminal event**, and may produce a second latency or failure observation for the same intent. These metrics describe observed events; they are not an exactly-once business-execution ledger. The lifecycle API and immutable receipt history remain the place to inspect current/historical provenance.
 
 The existing `./scripts/verify.sh` adds `[prometheus operational metrics]` for library types/HELP/buckets, isolated registries, bounded labels, secret sentinels, loopback HTTP methods and fail-open serialization/sinks, rollback/duplicate persistence, and event deltas. It checks the installed pinned dependency without installing packages. Existing real source/finality/reorg, PBFT/primary-failure, retry/replacement, all-path RPC outage, Gateway success and canonical REVERTED scenarios retain their original safety assertions and add metric deltas. Existing Explorer/API zero-mutation snapshots now include repeated metrics scrapes, covering source/QC/votes/leases/nonces/retries/attempts/receipts and Gateway/ApplicationB state. Results overwrite root `verification.log`. No Prometheus server, Grafana, additional chain, Validator network or fault framework is started just for metrics.
+
+## Grafana Operational Dashboard
+
+The repository ships **Cross-Chain Protocol Overview**, a single provisionable/importable Grafana dashboard backed only by Prometheus. It provides aggregate message throughput, cross-chain latency, PBFT and Validator health, Relayer/RPC behavior, unresolved delivery backlog, source reorgs and independent failure/retry activity. The Explorer remains the place for individual-message investigation. Grafana never participates in source authorization, finality, voting, delivery ownership, signing or destination execution.
+
+```text
+Protocol workers ── /metrics ──> Prometheus ──> Grafana (aggregate operations)
+Existing durable state ──> Message Query API ──> Explorer (one message)
+```
+
+The committed artifacts are:
+
+- `observability/grafana/dashboards/cross-chain-protocol.json`: stable dashboard UID `cross-chain-protocol`, version 1, Classic JSON schema 39, built-in Stat/Time series/Row panels; no external panel plugins, scripts or remote assets.
+- `observability/grafana/provisioning/dashboards/cross-chain.yaml`: a file provider in the Cross-Chain folder, refreshed every 30 seconds. UI saves are disabled intentionally; the committed artifact controls the definition. Removing the source does not automatically delete the dashboard.
+- `observability/grafana/provisioning/datasources/prometheus.yaml`: the sole datasource, UID `cross-chain-prometheus`, server/proxy access to `http://127.0.0.1:9090`, GET queries and a 15-second minimum interval.
+- `observability/prometheus/prometheus.example.yml`: public loopback scrape examples with the job-name contract used by dashboard queries.
+
+The JSON uses the widely supported [Classic model](https://grafana.com/docs/grafana/latest/visualizations/dashboards/build-dashboards/view-dashboard-json-model/) and ordinary [file provisioning](https://grafana.com/docs/grafana/latest/administration/provisioning/), intended for Grafana installations supporting that model, including Grafana 11/12. It does not require an experimental dashboard schema or a Grafana application package dependency.
+
+### Configure existing observability services
+
+1. Start the existing protocol components and read-only API against the intended deployment. The API collector uses its existing source domain/Gateway and database schema configuration. It opens no connection to a chain node for collection.
+2. Configure your external Prometheus from the committed example. Keep job names `cross-chain-api`, `cross-chain-workers`, `cross-chain-validators`: readiness queries select only the Validator job, excluding zero-initialized gauges from other processes. Supply the actual configured Validator HTTP addresses in the intentionally empty Validator target list. The worker example at `127.0.0.1:9101` assumes an existing worker configured with that metrics port; remove/change it when that listener is absent. Never copy ephemeral test ports. Do not scrape the same process endpoint twice under different jobs.
+3. In the **Grafana process environment**, set `GF_PATHS_PROVISIONING` to `<absolute-repository-path>/observability/grafana/provisioning` and `CROSS_CHAIN_GRAFANA_DASHBOARDS_PATH` to `<absolute-repository-path>/observability/grafana/dashboards`. Replace the path placeholder with your real repository location; both directories already exist in the repository. Grafana expands the provider's environment value. These settings belong to Grafana, not the protocol workers. Start/restart your existing Grafana instance to load the datasource/provider. The default datasource URL assumes Prometheus is reachable from Grafana at the local address; adapt the deployment-local provisioning URL if its location differs. Authentication is managed by your deployment and is not included in these files.
+4. Open **Cross-Chain → Cross-Chain Protocol Overview**. Alternatively, once the matching datasource UID exists, import the committed dashboard JSON using Grafana's ordinary import UI. No protocol API, chain-node endpoint or database is a Grafana datasource.
+
+Use one deployment/source scope for this job set. Multiple API replicas in `cross-chain-api` must read the same scope/schema; the pending panels use `max`, not `sum`, to avoid duplicate backlog counts. Independently scoped deployments should use separate datasource/dashboard deployments rather than silently summing unrelated scopes.
+
+Workers retain their existing lifecycle. A one-shot Relayer or Transaction Manager exits after its action, and its listener exits with it. Prometheus can miss such activity entirely or lack enough samples for `rate`. The dashboard does not create persistent exporters or turn one-shot workers into new daemons. Missing targets/insufficient samples produce **No data**, not a promise of zero activity or complete historical coverage. Counters reset on restart and have the documented post-COMMIT crash gaps.
+
+### Reading the panels
+
+The default global range is one hour with 15-second refresh. Throughput uses observed/finalized `rate` queries with Grafana's adaptive rate interval. Latency displays p50/p95/p99 from the existing production histogram buckets in seconds. No successful observations yields No data. The unchanged canonical metric name is `cross_chain_cross_chain_latency_seconds`; destination reconfirmations remain new observations under its existing semantics.
+
+PBFT timing shows p50/p95 of local committed-round samples; local view-change and quorum-failure rates retain their per-Validator meaning. They do not prove protocol safety or count one incident globally across replicas. Validator readiness uses the production availability gauge only for targets whose latest scrape succeeded. A separate `up` panel shows reachability. Reachable/unready, unreachable and unknown are distinct; target loss changes no committee or quorum. These instant panels do not retain an old ready value from an earlier point in the selected range.
+
+Relayer panels show candidate creation, retries by kind, bounded operational failures and replacements. RPC panels group failed requests by operation/class, including failures followed by successful failover. Source reorg counts use the selected-range increase of source occurrence REORGED transitions, separate from destination receipt orphaning; Prometheus increase is an extrapolated estimate and may be fractional. Failure/retry overview series remain independent because one incident can contribute to several signals. No invented safety threshold, combined failure total or retry percentage is shown.
+
+### Pending-delivery observation
+
+`cross_chain_pending_delivery_jobs` is the one additional metric: an unlabeled Gauge owned only by the existing API process. It counts current persisted READY jobs in the configured source scope whose source is FINALIZED and whose intent has no CONFIRMED/REVERTED terminal outcome. No intent, a signed/pending intent, preparation defer, stopped retries and reopened destination recovery all remain unresolved. Immutable READY job status alone never implies pending work or successful execution.
+
+Historical transport-only submissions without a canonical terminal intent remain unresolved in this count: a submitted hash is insufficient confirmation. This can include retained historical work that current workers intentionally skip. The gauge is **unresolved backlog**, not immediately eligible work, expected future throughput or independently checked chain truth. A terminal observation discovered to be orphaned re-enters backlog when ordinary production reconciliation reopens the intent; collection never performs that reconciliation.
+
+Each API scrape issues one read-only aggregate SELECT on existing tables, with a five-second client query timeout and the database's statement-level consistent snapshot. It takes no row/advisory/lease locks, starts no protocol transaction, advances no cursor and creates no nonce, signature, retry or receipt. The other fifteen metrics retain their original in-memory event semantics and perform no database collection. No other worker imports the pending collector, and no production entry imports Grafana files.
+
+A failed or invalid count exports `NaN` (unknown) instead of retaining a stale value or inventing zero. The pending queries filter out nonnumeric values, producing the panel's Unknown/No data state. Other metric families remain available; query errors and connection details are not exposed. Pending/readiness queries also exclude unsuccessful scrape targets. Grafana, Prometheus or collector failure never pauses a worker or changes protocol authority. There is no new metrics table, migration, cache, alerting/tracing stack or container infrastructure.
+
+### Verification
+
+The only root verification entry remains `./scripts/verify.sh`, overwriting root `verification.log`. `[grafana operational dashboard]` validates JSON identity, all nine required views, datasource/provider YAML, source-resolved file paths, bounded metric/label references, histogram/rate semantics, secret-free artifacts and read-only collector behavior. PromQL syntax is parsed with the Prometheus project's fixed-version parser; YAML uses a fixed-version parser. Both are **development dependencies only** in the Indexer package, with the parser's pinned Lezer peers; prepare updated Indexer development dependencies before verification. The script checks them without installing anything.
+
+All prior tests remain. The existing real source/PBFT/fault/Relayer/Gateway scenarios already produce the event metrics. Their actual exposition is checked against dashboard references, with Prometheus-generated `up` treated separately. The existing receipt pass now also observes real unresolved READY work, confirms its backlog decrease and compares repeated-scrape protocol/business snapshots. Existing Explorer/API snapshots include the pending collector. Static checks do not execute a Prometheus query engine or prove browser rendering: Grafana import/rendering and external service connectivity remain operator checks. Full verification requires no Grafana/Prometheus binary, Docker, plugin download or browser.
 
 ## Local Two-Chain Environment
 
@@ -2198,6 +2253,7 @@ Cross-Chain/
 │   │   ├── message-merkle.mjs
 │   │   ├── metrics/
 │   │   │   ├── http.mjs
+│   │   │   ├── pending-delivery.mjs
 │   │   │   └── registry.mjs
 │   │   ├── migrate.mjs
 │   │   ├── reorg-detector.mjs
@@ -2277,6 +2333,9 @@ Cross-Chain/
 │   │   ├── message-query.database.test.mjs
 │   │   ├── metrics.test.mjs
 │   │   ├── metrics.database.test.mjs
+│   │   ├── grafana-dashboard.test.mjs
+│   │   ├── pending-delivery.test.mjs
+│   │   ├── pending-delivery.database.test.mjs
 │   │   ├── reorg-detector.test.mjs
 │   │   ├── relayer-config.test.mjs
 │   │   ├── relayer-encoding.test.mjs
@@ -2297,6 +2356,13 @@ Cross-Chain/
 │   │   └── transaction-recovery.test.mjs
 │   ├── package.json
 │   └── package-lock.json
+├── observability/
+│   ├── grafana/
+│   │   ├── dashboards/cross-chain-protocol.json
+│   │   └── provisioning/
+│   │       ├── dashboards/cross-chain.yaml
+│   │       └── datasources/prometheus.yaml
+│   └── prometheus/prometheus.example.yml
 ├── scripts/
 │   ├── build-canonical-message-vector.mjs
 │   ├── build-validator-set-vector.mjs

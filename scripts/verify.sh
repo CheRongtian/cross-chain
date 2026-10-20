@@ -942,6 +942,7 @@ printf '     Restore the same Chain B access and require ordinary polling to del
 printf '     Stop the actual primary after durable, subset-only PRE-PREPARE delivery and before old-view quorum\n'
 printf '     Recover the same batch/root through real timeout, three-signer VIEW_CHANGE, verified NEW_VIEW and higher-view destination execution\n'
 printf '     Verify Prometheus operational metric families, bounded labels, HTTP purity and durable event deltas in the existing protocol/fault scenarios\n'
+printf '     Validate Grafana provisioning, parsed PromQL and nine operational views; verify the read-only pending collector against existing real delivery outcomes\n'
 
 CURRENT_STEP="full verification finality profile validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -968,6 +969,19 @@ NODE_MAJOR_VERSION="$(node -p 'Number(process.versions.node.split(".")[0])')"
     || fail "The pinned prom-client dependency is missing. Prepare the updated Indexer dependencies before verification; this script does not install them."
 [[ "$(node -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).version' "$INDEXER_DIR/node_modules/prom-client/package.json")" == "15.1.3" ]] \
     || fail "The installed prom-client must match the pinned version 15.1.3. Prepare the updated Indexer dependencies before verification."
+for DASHBOARD_DEPENDENCY in '@prometheus-io/lezer-promql' '@lezer/highlight' '@lezer/lr' 'yaml'; do
+    [[ -f "$INDEXER_DIR/node_modules/$DASHBOARD_DEPENDENCY/package.json" ]] \
+        || fail "Dashboard verification development dependencies are missing. Prepare the updated Indexer development dependencies before verification; this script does not install them."
+done
+node --input-type=module - "$INDEXER_DIR" <<'JS'
+import { readFileSync } from 'node:fs';
+const directory = process.argv[2];
+const manifest = JSON.parse(readFileSync(`${directory}/package.json`, 'utf8'));
+for (const [name, version] of Object.entries(manifest.devDependencies)) {
+  const installed = JSON.parse(readFileSync(`${directory}/node_modules/${name}/package.json`, 'utf8'));
+  if (installed.version !== version) throw new Error(`Dashboard verification dependency version mismatch: ${name}; prepare the pinned Indexer development dependencies`);
+}
+JS
 [[ -f "$VALIDATOR_DIR/node_modules/viem/package.json" ]] && [[ -f "$VALIDATOR_DIR/node_modules/pg/package.json" ]] \
     || fail "Validator dependencies are missing. Prepare the validator package dependencies before verification; this script does not install them."
 printf 'Verified Node.js version: %s\n' "$(node --version)"
@@ -1060,6 +1074,14 @@ DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
     node --test "$INDEXER_DIR/test/metrics.database.test.mjs"
 printf 'Real PBFT, source reorg, replacement, RPC outage, execution and scrape-purity metric deltas are also checked in the retained end-to-end scenarios below.\n'
+
+CURRENT_STEP="grafana operational dashboard"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test "$INDEXER_DIR/test/grafana-dashboard.test.mjs" "$INDEXER_DIR/test/pending-delivery.test.mjs"
+DATABASE_URL="$DATABASE_URL" \
+INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
+    node --test "$INDEXER_DIR/test/pending-delivery.database.test.mjs"
+printf 'Real referenced-family exposition, unresolved READY backlog changes and scrape purity are also checked in the retained end-to-end scenarios. Grafana/Prometheus servers and browsers are not required.\n'
 
 CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, Solidity ABI context mapping and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
