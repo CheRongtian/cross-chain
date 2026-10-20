@@ -13,6 +13,7 @@ import {PBFTCertificateVerifier} from "../src/PBFTCertificateVerifier.sol";
 import {MerkleInclusionVerifier} from "../src/MerkleInclusionVerifier.sol";
 import {MessageDomainVerifier} from "../src/MessageDomainVerifier.sol";
 import {MessageReplayProtection} from "../src/MessageReplayProtection.sol";
+import {IPBFTCertificateVerifier} from "../src/interfaces/IPBFTCertificateVerifier.sol";
 import {MessageCodec} from "../src/MessageCodec.sol";
 import {MessageMerkle} from "../src/MessageMerkle.sol";
 import {DeliveryPackageCodec as Codec} from "../src/libraries/DeliveryPackageCodec.sol";
@@ -108,6 +109,152 @@ contract DestinationGatewayTest is Test {
         vm.expectRevert(abi.encodeWithSelector(MessageReplayProtection.MessageAlreadyExecuted.selector, pack.message.messageId));
         vm.prank(address(0xDEF));
         gateway.execute(_encode(pack));
+    }
+
+    function testCrossChainSafetyUnauthorizedSelfConsistentRootCannotExecute() public {
+        Codec.Package memory pack = _safetyBaseline();
+        bytes memory authorizedCertificate = pack.envelope.certificate;
+        bytes32 authorizedRoot = pack.envelope.messageRoot;
+        // Change only the other member, retaining the exact target message and its valid business intent.
+        pack.batch.messageIds[1] = bytes32(uint256(2));
+        _reauthorizeSafetyPackage(pack);
+        assertNotEq(pack.envelope.messageRoot, authorizedRoot);
+        _assertSafetyMembership(pack);
+        // The original commitment never authorized this otherwise self-consistent alternate tree.
+        pack.envelope.certificate = authorizedCertificate;
+        _rejectSafety(pack, abi.encodeWithSelector(PBFTCertificateVerifier.ContextMismatch.selector));
+        pack = _package(address(application), abi.encode(uint8(1), uint8(1), SUPPLIER), 2, Certificate.EPOCH_VERSION);
+        pack.envelope.certificate = authorizedCertificate;
+        assertEq(pack.envelope.messageRoot, authorizedRoot);
+        _assertSafetySuccess(pack);
+    }
+
+    function testCrossChainSafetyWrongSiblingCannotConsumeAndOriginalProofStillExecutes() public {
+        Codec.Package memory pack = _safetyBaseline();
+        bytes32 sibling = pack.envelope.siblings[0];
+        pack.envelope.siblings[0] = bytes32(uint256(sibling) ^ 1);
+        bytes32 alteredRoot = MessageMerkle.hashNode(
+            MessageMerkle.computeLeaf(pack.batch.batchId, 0, pack.message.messageId), pack.envelope.siblings[0]
+        );
+        _rejectSafety(pack, abi.encodeWithSelector(
+            MessageMerkle.MerkleRootMismatch.selector, pack.envelope.messageRoot, alteredRoot
+        ));
+        pack.envelope.siblings[0] = sibling;
+        _assertSafetySuccess(pack);
+    }
+
+    function testCrossChainSafetyTwoValidSignersCannotAuthorizeThreeOfFourQuorum() public {
+        Codec.Package memory pack = _safetyBaseline();
+        bytes memory authorizedCertificate = pack.envelope.certificate;
+        (uint8 version, bytes memory statement, bytes32 digest, Certificate.Evidence[] memory verifiedVotes) =
+            abi.decode(authorizedCertificate, (uint8, bytes, bytes32, Certificate.Evidence[]));
+        assertEq(verifiedVotes.length, QUORUM);
+        assertNotEq(verifiedVotes[0].voterIdentity, verifiedVotes[1].voterIdentity);
+        // Both signatures are copied byte-for-byte from the already authenticated three-signer QC.
+        Certificate.Evidence[] memory insufficient = new Certificate.Evidence[](2);
+        insufficient[0] = verifiedVotes[0];
+        insufficient[1] = verifiedVotes[1];
+        pack.envelope.certificate = abi.encode(version, statement, digest, insufficient);
+        _assertSafetyMembership(pack);
+        _rejectSafety(pack, abi.encodeWithSelector(Certificate.InvalidEvidenceCount.selector, 2));
+        pack.envelope.certificate = authorizedCertificate;
+        _assertSafetySuccess(pack);
+    }
+
+    function testCrossChainSafetyDuplicateAuthenticatedBytesRejectEverySubmitter() public {
+        Codec.Package memory pack = _safetyBaseline();
+        bytes memory originalBytes = _encode(pack);
+        _assertSafetySuccess(pack);
+        _assertSafetyCryptography(pack);
+        bytes memory reason = abi.encodeWithSelector(
+            MessageReplayProtection.MessageAlreadyExecuted.selector, pack.message.messageId
+        );
+        _rejectSafetyFrom(pack, reason, SUBMITTER);
+        _rejectSafetyFrom(pack, reason, address(0xDEF));
+        assertEq(_encode(pack), originalBytes);
+        assertTrue(gateway.isMessageExecuted(pack.message.messageId));
+        assertTrue(application.isVerifiedSupplier(SUPPLIER));
+    }
+
+    function testCrossChainSafetySelfConsistentWrongDestinationDomainCannotExecute() public {
+        Codec.Package memory valid = _safetyBaseline();
+        Codec.Package memory changed = _package(address(application), valid.message.payload, 2, Certificate.EPOCH_VERSION);
+        changed.message.destinationDomain = DESTINATION + 1;
+        _reauthorizeSafetyPackage(changed);
+        assertNotEq(changed.message.messageId, valid.message.messageId);
+        _assertSafetyCryptography(changed);
+        _rejectSafety(changed, abi.encodeWithSelector(
+            MessageDomainVerifier.InvalidDestinationDomain.selector, DESTINATION, DESTINATION + 1
+        ));
+        _assertSafetySuccess(valid);
+        assertFalse(gateway.isMessageExecuted(changed.message.messageId));
+    }
+
+    function testCrossChainSafetyFullWidthDestinationCannotAliasLocalDomain() public {
+        Codec.Package memory valid = _safetyBaseline();
+        Codec.Package memory changed = _package(address(application), valid.message.payload, 2, Certificate.EPOCH_VERSION);
+        changed.message.destinationDomain = (uint256(1) << 200) + DESTINATION;
+        _reauthorizeSafetyPackage(changed);
+        assertNotEq(changed.message.messageId, valid.message.messageId);
+        _assertSafetyCryptography(changed);
+        _rejectSafety(changed, abi.encodeWithSelector(
+            MessageDomainVerifier.InvalidDestinationDomain.selector, DESTINATION, changed.message.destinationDomain
+        ));
+        _assertSafetySuccess(valid);
+    }
+
+    function testCrossChainSafetySelfConsistentWrongDestinationGatewayCannotExecute() public {
+        Codec.Package memory valid = _safetyBaseline();
+        Codec.Package memory changed = _package(address(application), valid.message.payload, 2, Certificate.EPOCH_VERSION);
+        changed.message.destinationGateway = SUBMITTER;
+        _reauthorizeSafetyPackage(changed);
+        assertNotEq(changed.message.messageId, valid.message.messageId);
+        _assertSafetyCryptography(changed);
+        _rejectSafety(changed, abi.encodeWithSelector(
+            MessageDomainVerifier.DestinationGatewayMismatch.selector, address(gateway), SUBMITTER
+        ));
+        _assertSafetySuccess(valid);
+    }
+
+    function testCrossChainSafetySelfConsistentUntrustedSourceGatewayCannotExecute() public {
+        Codec.Package memory valid = _safetyBaseline();
+        Codec.Package memory changed = _package(address(application), valid.message.payload, 2, Certificate.EPOCH_VERSION);
+        changed.message.sourceGateway = SUBMITTER;
+        _reauthorizeSafetyPackage(changed);
+        assertNotEq(changed.message.messageId, valid.message.messageId);
+        _assertSafetyCryptography(changed);
+        _rejectSafety(changed, abi.encodeWithSelector(
+            RemoteGatewayRegistry.UntrustedRemoteGateway.selector, SOURCE, SUBMITTER, SOURCE_GATEWAY
+        ));
+        assertEq(remote.trustedRemoteGateway(SOURCE), SOURCE_GATEWAY);
+        _assertSafetySuccess(valid);
+    }
+
+    function testCrossChainSafetySelfConsistentUnknownSourceDomainCannotExecute() public {
+        Codec.Package memory valid = _safetyBaseline();
+        Codec.Package memory changed = _package(address(application), valid.message.payload, 2, Certificate.EPOCH_VERSION);
+        changed.message.sourceDomain = SOURCE + 1;
+        _reauthorizeSafetyPackage(changed);
+        assertNotEq(changed.message.messageId, valid.message.messageId);
+        _assertSafetyCryptography(changed);
+        _rejectSafety(changed, abi.encodeWithSelector(RemoteGatewayRegistry.UnknownSourceDomain.selector, SOURCE + 1));
+        assertEq(remote.trustedRemoteGateway(SOURCE + 1), address(0));
+        _assertSafetySuccess(valid);
+    }
+
+    function testCrossChainSafetyInvalidReceiverCannotRedirectBusinessExecution() public {
+        Codec.Package memory valid = _safetyBaseline();
+        Codec.Package memory changed = _package(address(0), valid.message.payload, 2, Certificate.EPOCH_VERSION);
+        _reauthorizeSafetyPackage(changed);
+        assertNotEq(changed.message.messageId, valid.message.messageId);
+        _assertSafetyCryptography(changed);
+        _rejectSafety(changed, abi.encodeWithSelector(MessageDomainVerifier.InvalidDestinationReceiver.selector));
+        changed = _package(SUBMITTER, valid.message.payload, 2, Certificate.EPOCH_VERSION);
+        _reauthorizeSafetyPackage(changed);
+        assertNotEq(changed.message.messageId, valid.message.messageId);
+        _assertSafetyCryptography(changed);
+        _rejectSafety(changed, abi.encodeWithSelector(DestinationGateway.InvalidDestinationReceiver.selector, SUBMITTER));
+        _assertSafetySuccess(valid);
     }
 
     // Each version signs its original frozen hash schema and resolves its original historical authority.
@@ -381,6 +528,93 @@ contract DestinationGatewayTest is Test {
         assertEq(vm.getRecordedLogs().length, 0);
     }
 
+    function _safetyBaseline() private returns (Codec.Package memory pack) {
+        pack = _package(address(application), abi.encode(uint8(1), uint8(1), SUPPLIER), 2, Certificate.EPOCH_VERSION);
+        pack.envelope.certificate = _certificate(pack, Certificate.EPOCH_VERSION, QUORUM);
+        // Prove the complete fixture can execute before attacking one boundary, then restore this test's own EVM state.
+        uint256 snapshot = vm.snapshotState();
+        _assertSafetySuccess(pack);
+        assertTrue(vm.revertToStateAndDelete(snapshot));
+        assertFalse(gateway.isMessageExecuted(pack.message.messageId));
+        assertFalse(application.isVerifiedSupplier(SUPPLIER));
+    }
+
+    function _assertSafetySuccess(Codec.Package memory pack) private {
+        assertFalse(gateway.isMessageExecuted(pack.message.messageId));
+        assertFalse(application.isVerifiedSupplier(SUPPLIER));
+        _assertSafetyCryptography(pack);
+        vm.recordLogs();
+        vm.prank(SUBMITTER);
+        gateway.execute(_encode(pack));
+        assertTrue(gateway.isMessageExecuted(pack.message.messageId));
+        assertTrue(application.isVerifiedSupplier(SUPPLIER));
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        assertEq(logs.length, 2);
+        assertEq(logs[0].emitter, address(application));
+        assertEq(logs[0].topics[0], ApplicationB.VerifiedSupplierGranted.selector);
+        assertEq(logs[0].topics[1], pack.message.messageId);
+        assertEq(logs[0].topics[2], bytes32(uint256(uint160(SUPPLIER))));
+        assertEq(logs[1].emitter, address(gateway));
+        assertEq(logs[1].topics[0], DestinationGateway.CrossChainMessageExecuted.selector);
+        assertEq(logs[1].topics[1], pack.message.messageId);
+        assertEq(abi.decode(logs[1].data, (bytes32)), pack.batch.batchId);
+    }
+
+    function _rejectSafety(Codec.Package memory pack, bytes memory reason) private {
+        assertFalse(gateway.isMessageExecuted(pack.message.messageId));
+        assertFalse(application.isVerifiedSupplier(SUPPLIER));
+        _rejectSafetyFrom(pack, reason, SUBMITTER);
+        _rejectSafetyFrom(pack, reason, address(0xDEF));
+        assertFalse(gateway.isMessageExecuted(pack.message.messageId));
+    }
+
+    function _rejectSafetyFrom(Codec.Package memory pack, bytes memory reason, address submitter) private {
+        bool consumedBefore = gateway.isMessageExecuted(pack.message.messageId);
+        bool supplierBefore = application.isVerifiedSupplier(SUPPLIER);
+        vm.recordLogs();
+        vm.expectRevert(reason);
+        vm.prank(submitter);
+        gateway.execute(_encode(pack));
+        assertEq(gateway.isMessageExecuted(pack.message.messageId), consumedBefore);
+        assertEq(application.isVerifiedSupplier(SUPPLIER), supplierBefore);
+        assertEq(vm.getRecordedLogs().length, 0);
+    }
+
+    function _assertSafetyCryptography(Codec.Package memory pack) private view {
+        assertEq(MessageCodec.computeMessageId(Codec.canonicalMessage(pack.message)), pack.message.messageId);
+        IPBFTCertificateVerifier.ExpectedContext memory context = Certificate.context(pack.envelope.certificate);
+        context.sourceDomain = pack.message.sourceDomain;
+        context.sourceGateway = pack.message.sourceGateway;
+        context.batchEpoch = pack.batch.epoch;
+        context.batchId = pack.batch.batchId;
+        context.messageRoot = pack.envelope.messageRoot;
+        assertTrue(certificateVerifier.verifyCertificate(pack.envelope.certificate, context));
+        _assertSafetyMembership(pack);
+    }
+
+    function _assertSafetyMembership(Codec.Package memory pack) private view {
+        MerkleInclusionVerifier.BatchContext memory context = MerkleInclusionVerifier.BatchContext({
+            version: pack.batch.version, sourceDomain: pack.message.sourceDomain, sourceGateway: pack.message.sourceGateway,
+            epoch: pack.batch.epoch, batchId: pack.batch.batchId
+        });
+        MessageMerkle.Proof memory proof = MessageMerkle.Proof({
+            batchId: pack.batch.batchId, messageId: pack.message.messageId, index: pack.envelope.messageIndex,
+            leafCount: pack.envelope.leafCount, siblings: pack.envelope.siblings
+        });
+        assertTrue(merkleVerifier.verifyInclusion(context, pack.envelope.messageRoot, pack.message.messageId,
+            pack.envelope.messageIndex, pack.batch.messageIds, proof));
+    }
+
+    function _reauthorizeSafetyPackage(Codec.Package memory pack) private view {
+        pack.message.messageId = MessageCodec.computeMessageId(Codec.canonicalMessage(pack.message));
+        pack.batch.messageIds[0] = pack.message.messageId;
+        pack.batch.batchId = merkleVerifier.computeBatchId(pack.batch.version, pack.message.sourceDomain,
+            pack.message.sourceGateway, pack.batch.epoch, pack.batch.messageIds);
+        (pack.envelope.messageRoot, pack.envelope.siblings) = _tree(pack.batch.batchId, pack.batch.messageIds);
+        // TEST-ONLY signatures exercise the real verifier; no live validator signs any altered message/root.
+        pack.envelope.certificate = _certificate(pack, Certificate.EPOCH_VERSION, QUORUM);
+    }
+
     // Fixture payload hashing stays explicit and independently readable beside the canonical identity.
     // The three-version test deliberately builds independent bounded fixtures and calls the real batch-ID verifier.
     // forge-lint: disable-next-item(asm-keccak256, calls-loop)
@@ -411,7 +645,8 @@ contract DestinationGatewayTest is Test {
         pack.envelope.leafCount = count;
         pack.envelope.messageRoot = root;
         pack.envelope.siblings = siblings;
-        pack.envelope.certificate = _certificate(pack.batch.batchId, root, qcVersion);
+        pack.envelope.certificate = _certificate(pack, qcVersion,
+            qcVersion == Certificate.EPOCH_VERSION ? COMMITTEE_SIZE : QUORUM);
     }
 
     function _encode(Codec.Package memory pack) private pure returns (bytes memory) {
@@ -468,21 +703,20 @@ contract DestinationGatewayTest is Test {
 
     // The three original PBFT schemas are intentionally explicit for independent composition coverage.
     // forge-lint: disable-next-item(calls-loop, asm-keccak256)
-    function _certificate(bytes32 batchId, bytes32 root, uint8 version) private view returns (bytes memory) {
+    function _certificate(Codec.Package memory pack, uint8 version, uint256 count) private view returns (bytes memory) {
         Certificate.Statement memory statement;
         statement.protocolVersion = version;
-        statement.sourceDomain = SOURCE;
-        statement.sourceGateway = SOURCE_GATEWAY;
-        statement.epoch = EPOCH;
+        statement.sourceDomain = pack.message.sourceDomain;
+        statement.sourceGateway = pack.message.sourceGateway;
+        statement.epoch = pack.batch.epoch;
         statement.viewNumber = version == Certificate.LEGACY_VERSION ? 0 : VIEW;
-        statement.batchId = batchId;
-        statement.messageRoot = root;
+        statement.batchId = pack.batch.batchId;
+        statement.messageRoot = pack.envelope.messageRoot;
         statement.validatorEpoch = version == Certificate.EPOCH_VERSION ? CURRENT_AUTHORITY : INITIAL_AUTHORITY;
         (address[COMMITTEE_SIZE] memory members, uint8 quorum, bytes32 committee) = validators.getValidatorSet(statement.validatorEpoch);
         assertEq(uint256(quorum), QUORUM);
         statement.committeeDigest = committee;
         statement.proposalDigest = _proposal(statement, members);
-        uint256 count = version == Certificate.EPOCH_VERSION ? COMMITTEE_SIZE : QUORUM;
         Certificate.Evidence[] memory votes = new Certificate.Evidence[](count);
         for (uint256 index = 0; index < count; index++) {
             votes[index] = _signedVote(statement, members[index]);
@@ -491,7 +725,7 @@ contract DestinationGatewayTest is Test {
     }
 
     function _wireStatement(Certificate.Statement memory statement) private pure returns (bytes memory) {
-        return bytes.concat(abi.encode(SOURCE, SOURCE_GATEWAY, EPOCH),
+        return bytes.concat(abi.encode(statement.sourceDomain, statement.sourceGateway, statement.epoch),
             statement.protocolVersion == Certificate.LEGACY_VERSION ? bytes("") : abi.encode(statement.viewNumber),
             abi.encode(statement.batchId, statement.messageRoot, statement.proposalDigest, statement.committeeDigest),
             statement.protocolVersion == Certificate.EPOCH_VERSION ? abi.encode(statement.validatorEpoch) : bytes(""));
@@ -508,7 +742,7 @@ contract DestinationGatewayTest is Test {
     }
 
     function _prefix(Certificate.Statement memory statement) private pure returns (bytes memory prefix) {
-        prefix = abi.encode(statement.protocolVersion, SOURCE, SOURCE_GATEWAY, EPOCH);
+        prefix = abi.encode(statement.protocolVersion, statement.sourceDomain, statement.sourceGateway, statement.epoch);
         if (statement.protocolVersion != Certificate.LEGACY_VERSION) prefix = bytes.concat(prefix, abi.encode(statement.viewNumber));
     }
 
@@ -519,7 +753,8 @@ contract DestinationGatewayTest is Test {
             statement.protocolVersion == Certificate.LEGACY_VERSION ? "" : ",uint256 view", ",bytes32 batchId,bytes32 messageRoot,address primaryIdentity",
             statement.protocolVersion == Certificate.EPOCH_VERSION ? ",uint256 validatorEpoch,bytes32 committeeDigest)" : ")");
         bytes memory encoded = bytes.concat(abi.encode(keccak256(bytes(schema))), _prefix(statement),
-            abi.encode(statement.batchId, statement.messageRoot, members[(EPOCH % COMMITTEE_SIZE + statement.viewNumber) % COMMITTEE_SIZE]));
+            abi.encode(statement.batchId, statement.messageRoot,
+                members[(statement.epoch % COMMITTEE_SIZE + statement.viewNumber % COMMITTEE_SIZE) % COMMITTEE_SIZE]));
         if (statement.protocolVersion == Certificate.EPOCH_VERSION) encoded = bytes.concat(encoded, abi.encode(statement.validatorEpoch, statement.committeeDigest));
         return keccak256(encoded);
     }

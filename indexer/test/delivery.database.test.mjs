@@ -6,7 +6,7 @@ import { applyMigrations, createCanonicalStore, createDatabasePool, createDataba
 import { createBatchLifecycle } from "../src/batch-lifecycle.mjs";
 import { createDeliveryProjector } from "../src/delivery/projector.mjs";
 import { createDeliveryRepository } from "../src/delivery/repository.mjs";
-import { verifyDeliveryPackage } from "../src/delivery/package.mjs";
+import { buildDeliveryPackages, deliveryJobId, verifyDeliveryPackage } from "../src/delivery/package.mjs";
 import { createValidatorSetResolver } from "../../validator/src/validator-sets.mjs";
 import { buildQuorumCertificate, expectedCommitStatement } from "../../validator/src/quorum-certificate.mjs";
 import { commitConfigs, signedCommitFixture } from "../../validator/test/helpers/commit-fixtures.mjs";
@@ -186,12 +186,43 @@ test("BUILDING, SEALED and CONSENSUS_PENDING cannot create a delivery projection
   await persist(fixture.batch.messages);
   const collected = await lifecycle.collectEligible({ initialEpoch: 23n });
   const id = collected.snapshot.record.batchRecordId;
+  const sourceBefore = await readMessages(pool,config.databaseSchema);
   for (const advance of [null,() => lifecycle.sealBatch({ batchRecordId: id }),() => lifecycle.markConsensusPending({ batchRecordId: id })]) {
     if (advance) await advance();
+    const snapshot = await lifecycle.readBatch({ batchRecordId: id });
     await assert.rejects(projector.materializeBatch({ batchRecordId: id }),{ code: "DELIVERY_REQUIRES_COMMITTED" });
+    await assert.rejects(buildDeliveryPackages(snapshot,{ validatorSets: config.validatorSets }),{ code: "DELIVERY_REQUIRES_COMMITTED" });
     assert.deepEqual(await counts(),{ batches: 0,jobs: 0 });
     assert.deepEqual(await projector.projectCommittedBatches(),{ materializedBatches: 0,createdJobs: 0 });
+    for (const member of snapshot.members) {
+      const target = (await pool.query(`SELECT
+        (SELECT COUNT(*) FROM ${jobs} WHERE source_message_id = $1 OR message_id = $2)::int AS ready,
+        (SELECT COUNT(*) FROM ${tableName(config.databaseSchema,"batch_quorum_certificates")}
+          WHERE batch_record_id = $3)::int AS qc`,[member.sourceMessageId,member.messageId,id])).rows[0];
+      assert.deepEqual(target,{ ready: 0,qc: 0 });
+      if (snapshot.batch) {
+        const jobId = deliveryJobId({ sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway,
+          batchId: snapshot.record.batchId,messageIndex: member.position });
+        await assert.rejects(repository.getDeliveryPackage(jobId),{ code: "DELIVERY_JOB_NOT_FOUND" });
+      }
+    }
+    assert.deepEqual(await lifecycle.readBatch({ batchRecordId: id }),snapshot);
+    assert.deepEqual(await readMessages(pool,config.databaseSchema),sourceBefore);
+    console.log(`VALID: cross-chain safety ${snapshot.record.status} batch ${id} has no persisted QC, READY job or retrievable portable package for any exact member`);
   }
+  // The same canonical members become deliverable only through the real QC-authorized transition.
+  const pending = await lifecycle.readBatch({ batchRecordId: id });
+  const statement = expectedCommitStatement({ sourceDomain: pending.record.sourceDomain,sourceGateway: pending.record.sourceGateway,
+    epoch: pending.record.epoch,batchId: pending.record.batchId,messageRoot: pending.record.messageRoot },commitConfigs[0].peers,config.validatorSets);
+  const commits = await Promise.all(commitConfigs.slice(0,3).map(identity => signedCommitFixture(statement,identity)));
+  const certificate = await buildQuorumCertificate(commits,{ peers: commitConfigs[0].peers,validatorSets: config.validatorSets,expected: statement });
+  const committed = await lifecycle.commitWithCertificate({ certificate });
+  const projected = await projector.materializeBatch({ batchRecordId: id });
+  const packages = await buildDeliveryPackages(committed,{ validatorSets: config.validatorSets });
+  assert.equal(projected.createdJobs,committed.members.length);
+  for (const pack of packages) assert.deepEqual(await repository.getDeliveryPackage(pack.deliveryJobId),pack);
+  assert.deepEqual(await readMessages(pool,config.databaseSchema),sourceBefore);
+  console.log("VALID: the same pre-commit members materialize READY only after a verified three-signer QC authorizes their production COMMITTED transition");
 });
 
 test("failure after a partial insert rolls back the entire projection; a fresh projector retries", async () => {

@@ -10,7 +10,7 @@ import { createDatabasePool, createFinalityStore, readCursor, readIndexedSourceB
 import { createBatchLifecycle } from "../../../indexer/src/batch-lifecycle.mjs";
 import { createIndexer } from "../../../indexer/src/indexer.mjs";
 import { createFinalityWatcher } from "../../../indexer/src/finality-watcher.mjs";
-import { buildDeliveryPackages } from "../../../indexer/src/delivery/package.mjs";
+import { buildDeliveryPackages, deliveryJobId } from "../../../indexer/src/delivery/package.mjs";
 import { createDeliveryProjector } from "../../../indexer/src/delivery/projector.mjs";
 import { createDeliveryRepository } from "../../../indexer/src/delivery/repository.mjs";
 import { DELIVERY_POLICY } from "../../../indexer/src/delivery/policy.mjs";
@@ -162,10 +162,12 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
     return sealed;
   }
 
-  async function prepareFreshBatch(events) {
+  async function prepareFreshBatch(events, assertPreCommit) {
     const sealed = await sealFreshBatch(events);
+    if (assertPreCommit) await assertPreCommit(sealed);
     const pending = await lifecycle.markConsensusPending({ batchRecordId: sealed.record.batchRecordId });
     recordIntegritySnapshot(pending);
+    if (assertPreCommit) await assertPreCommit(pending);
     return pending;
   }
 
@@ -198,10 +200,10 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
     return committed;
   }
 
-  async function commitFresh(events) {
+  async function commitFresh(events, assertPreCommit) {
     const node = active[0];
     const before = scrapeValue(await scrapeMetrics(peers[node].url), "cross_chain_pbft_round_duration_seconds_count", { outcome: "committed" });
-    const pending = await prepareFreshBatch(events);
+    const pending = await prepareFreshBatch(events, assertPreCommit);
     const batchCount = await metricValue("batches_created_total");
     const committed = await commitPending(pending, active);
     assert.equal(await metricValue("batches_created_total"), batchCount, "consensus commit is no batch creation");
@@ -227,6 +229,51 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   const first = await produceAndFinalize(payload);
   const redundant = await produceAndFinalize(payload);
   assert.notEqual(first.messageId, redundant.messageId);
+  async function assertPreCommitSafety(pending, targetSupplier) {
+    assert.ok(["SEALED", "CONSENSUS_PENDING"].includes(pending.record.status));
+    const cfg = { ...config, validatorSets };
+    const projector = createDeliveryProjector({ config: cfg, pool });
+    const repository = createDeliveryRepository({ config: cfg, pool });
+    const sourceBefore = await rowsFor(pending.batch.messageIds);
+    assert.equal(sourceBefore.length, pending.members.length);
+    assert.ok(sourceBefore.every(row => row.status === "FINALIZED"));
+    async function destinationSnapshot() {
+      return Promise.all(pending.batch.messages.map(async message => ({
+        messageId: message.messageId,
+        consumed: await readGateway("isMessageExecuted", [message.messageId]),
+        supplier: await readApp("isVerifiedSupplier", [targetSupplier]),
+        executions: (await client.getContractEvents({ address: gateway, abi: gatewayAbi,
+          eventName: "CrossChainMessageExecuted", args: { messageId: message.messageId },
+          fromBlock: 0n, toBlock: "latest", strict: true })).length,
+        grants: (await client.getContractEvents({ address: application, abi: appAbi,
+          eventName: "VerifiedSupplierGranted", args: { messageId: message.messageId, supplier: targetSupplier },
+          fromBlock: 0n, toBlock: "latest", strict: true })).length,
+      })));
+    }
+    const destinationBefore = await destinationSnapshot();
+    assert.deepEqual(destinationBefore, pending.batch.messageIds.map(messageId => ({
+      messageId, consumed: false, supplier: false, executions: 0, grants: 0,
+    })));
+    await assert.rejects(projector.materializeBatch({ batchRecordId: pending.record.batchRecordId }),
+      { code: "DELIVERY_REQUIRES_COMMITTED" });
+    await assert.rejects(buildDeliveryPackages(pending, { validatorSets }), { code: "DELIVERY_REQUIRES_COMMITTED" });
+    for (const member of pending.members) {
+      const target = (await pool.query(`SELECT
+        (SELECT COUNT(*) FROM ${tableName(config.databaseSchema, "batch_quorum_certificates")}
+          WHERE batch_record_id = $1)::int AS qc,
+        (SELECT COUNT(*) FROM ${tableName(config.databaseSchema, "delivery_jobs")}
+          WHERE source_message_id = $2 OR message_id = $3)::int AS ready`,
+      [pending.record.batchRecordId, member.sourceMessageId, member.messageId])).rows[0];
+      assert.deepEqual(target, { qc: 0, ready: 0 });
+      const jobId = deliveryJobId({ sourceDomain: config.chainDomain, sourceGateway: config.sourceGateway,
+        batchId: pending.record.batchId, messageIndex: member.position });
+      await assert.rejects(repository.getDeliveryPackage(jobId), { code: "DELIVERY_JOB_NOT_FOUND" });
+    }
+    assert.deepEqual(await lifecycle.readBatch({ batchRecordId: pending.record.batchRecordId }), pending);
+    assert.deepEqual(await rowsFor(pending.batch.messageIds), sourceBefore);
+    assert.deepEqual(await destinationSnapshot(), destinationBefore);
+    console.log(`VALID: cross-chain safety real ${pending.record.status} batch ${pending.record.batchId} has canonical membership/root/proofs but no committed QC, target READY package or Gateway/ApplicationB effect`);
+  }
   const snapshot = await commitFresh([first, redundant]);
   const deliveryConfig = { ...config, validatorSets };
   const projector = createDeliveryProjector({ config: deliveryConfig, pool });
@@ -292,6 +339,7 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   assert.equal(appEvents[0].args.supplier.toLowerCase(), supplier);
   console.log(`VALID: real Relayer/Tx Manager signed type-2 Gateway transaction ${receipt.transactionHash}; nonce ${prepared[0].intent.nonce}; to=${gateway}; value=0; exact execute(bytes) wrapper/inner v1 parity`);
   console.log(`VALID: PBFT → Merkle → message domain → replay false → true → ApplicationB VERIFIED_SUPPLIER false → true; both exact events in the same transaction ${receipt.transactionHash}`);
+  console.log(`VALID: cross-chain safety fully authorized FINALIZED baseline ${first.messageId} executed through production DestinationGateway/ApplicationB with its real COMMITTED root, QC, Merkle proof, trusted source and exact destination`);
 
   const block = await client.getBlock();
   // Controlled negative transactions use half of the actual local block budget, never a production gas override.
@@ -956,7 +1004,8 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
     }
     await assertHealthyValidators();
     const event = await produceAndFinalize(targetPayload);
-    const committed = await commitFresh([event]);
+    // The earlier complete production execution is the positive baseline for these missing-authority probes.
+    const committed = await commitFresh([event], pending => assertPreCommitSafety(pending, targetSupplier));
     assert.equal(committed.record.status, "COMMITTED"); assert.equal(committed.quorumCertificate.view, "0");
     const selected = validatorSets.resolveByValidatorEpoch(committed.consensusBinding.validatorEpoch);
     assert.equal(selected.validatorEpoch, validatorSets.resolveForBatchEpoch(committed.record.epoch).validatorEpoch);
@@ -1098,6 +1147,10 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
         const events = await client.getContractEvents({ address, abi, eventName, args, fromBlock: 0n, toBlock: "latest", strict: true });
         assert.equal(events.length, 1); assert.equal(events[0].transactionHash, winner.attempt.transactionHash);
       }
+      assert.notEqual(winner.transaction.from.toLowerCase(), loser.transaction.from.toLowerCase());
+      assert.equal(await readGateway("isMessageExecuted", [event.messageId]), true);
+      assert.equal(await readApp("isVerifiedSupplier", [targetSupplier]), true);
+      console.log(`VALID: cross-chain safety duplicate target ${event.messageId}: two independent submitters and byte-identical packages produced one canonical ApplicationB transition/event; the exact MessageAlreadyExecuted rejection preserved the first success`);
       const repeated = await projector.materializeBatch({ batchRecordId: committed.record.batchRecordId });
       assert.equal(repeated.materialized, false); assert.equal(repeated.createdJobs, 0);
       await assertOneReady();
@@ -2353,10 +2406,20 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
       const orphanNullifier = await sourceAuthorization(orphan);
       assert.equal(await sourceNonce(), nonceBefore + 1n);
       await indexer.catchUpOnce();
-      assert.equal((await readOccurrence(orphan)).status, "OBSERVED");
+      const observed = await readOccurrence(orphan);
+      assert.equal(observed.status, "OBSERVED");
+      const observedCollection = await recoveryLifecycle.collectEligible();
+      assert.ok(observedCollection.snapshot.members.every(member =>
+        member.sourceMessageId !== observed.id && member.messageId !== orphan.messageId));
+      await assertExcluded(observed);
+      console.log(`VALID: cross-chain safety real OBSERVED occurrence ${observed.id}/${orphan.messageId} has no selected batch member, PBFT/QC, READY package, transaction or destination business effect`);
       await finality.runFinalityPass();
       const beforeReorg = await readOccurrence(orphan);
       assert.equal(beforeReorg.status, "FINALIZING");
+      const finalizingCollection = await recoveryLifecycle.collectEligible();
+      assert.deepEqual(finalizingCollection.snapshot, observedCollection.snapshot);
+      assert.ok(finalizingCollection.snapshot.members.every(member =>
+        member.sourceMessageId !== beforeReorg.id && member.messageId !== orphan.messageId));
       assert.ok(beforeReorg.finalizing_at instanceof Date); assert.equal(beforeReorg.finalized_at, null);
       await chainA.request({ method: "anvil_mine", params: ["0x1"] });
       await indexer.catchUpOnce();
@@ -2382,16 +2445,16 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
           (SELECT COUNT(*) FROM orphan_attempts)::text AS signed_attempts,
           (SELECT COUNT(*) FROM ${journals} WHERE attempt_id IN (SELECT attempt_id FROM orphan_attempts))::text AS broadcasts,
           (SELECT COUNT(*) FROM orphan_attempts WHERE receipt_block_number IS NOT NULL)::text AS receipts`,
-        [beforeReorg.id, orphan.messageId])).rows[0];
+        [expectedOccurrence.id, orphan.messageId])).rows[0];
         assert.deepEqual(counts, { membership: "0", qc_membership: "0", ready: "0", intents: "0",
           signed_attempts: "0", broadcasts: "0", receipts: "0" });
         const eligible = await createFinalityStore(recoveryPool, config.databaseSchema).listBatchEligibleMessages(scope);
-        assert.ok(eligible.every(row => row.id !== beforeReorg.id && row.message_id !== orphan.messageId));
+        assert.ok(eligible.every(row => row.id !== expectedOccurrence.id && row.message_id !== orphan.messageId));
         // Authenticate every referenced batch from current durable membership/QC,
         // rather than looking for the message ID in consensus log strings.
         const batches = new Map();
         for (const current of await readBatches()) {
-          assert.ok(current.members.every(member => member.sourceMessageId !== beforeReorg.id && member.messageId !== orphan.messageId));
+          assert.ok(current.members.every(member => member.sourceMessageId !== expectedOccurrence.id && member.messageId !== orphan.messageId));
           if (current.batch) {
             assert.ok(!current.batch.messageIds.includes(orphan.messageId));
             batches.set(current.batch.batchId, current);
@@ -2419,6 +2482,7 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
 
       await assertExcluded(beforeReorg);
       console.log(`VALID: real source event ${orphan.messageId} persisted FINALIZING below depth ${config.finalityBlockDepth}; no batch/QC/READY/intent before reorg`);
+      console.log(`VALID: cross-chain safety real OBSERVED/FINALIZING target ${orphan.messageId} obtained no canonical batch, sealed root, PBFT proposal/votes/QC, READY package or Chain B execution before source finality`);
       assert.equal(await chainA.request({ method: "evm_revert", params: [branchSnapshot] }), true);
       assert.equal(BigInt(await chainA.request({ method: "eth_blockNumber" })), commonAncestor.number);
       assert.equal(await sourceNonce(), nonceBefore);

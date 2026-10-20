@@ -307,6 +307,30 @@ The existing `./scripts/verify.sh` includes `[message integrity invariants]` and
 
 Verification distinguishes protocol rejection from execution failure. ZK negative cases require an explicit verifier `false` or a generated circuit assertion with a template location; input, file, WASM and other execution errors fail the run. Root and credential deployment checks share the same strict revert matcher, preserving stdout/stderr and rejecting error names/selectors that appear only in unrelated diagnostics. `[verification rejection assertion regressions]` checks these ZK failure boundaries before proving; retained source-policy fixtures exercise both shared Shell entry forms.
 
+### Cross-chain safety
+
+Destination execution requires the complete authorization chain. Source finality makes an exact canonical occurrence eligible for batching; a validator quorum must commit its sealed batch root; the message must prove ordered membership in that root; the QC must authenticate against the historical validator set; and the complete message must bind a currently trusted source and the exact local destination. A self-consistent Merkle tree alone grants no execution authority.
+
+Chain B does not directly query Chain A finality. That responsibility belongs to the source finality pipeline and the validators' independent checks of canonical blocks, receipts, raw source logs and configured successor depth. Under the four-member, one-fault, three-signature quorum model, an OBSERVED, FINALIZING or REORGED occurrence cannot acquire canonical batch membership, a committed QC-backed READY package or an authorized destination execution. Deterministic local verification uses the configured successor depth of two and exact mined blocks, without timing-based sleeps or fabricated QCs for unfinalized occurrences.
+
+The deterministic cross-chain safety coverage establishes seven boundaries:
+
+- Unfinalized occurrences are excluded by production batch selection and cannot propagate into PBFT/QC, READY or destination business effects.
+- BUILDING, SEALED and CONSENSUS_PENDING batches cannot create portable delivery authority. Only the production QC-authorized COMMITTED transition makes the same members deliverable.
+- A message with a corrupted membership path cannot execute under an otherwise valid root/QC.
+- Two individually valid committee signatures remain below the required three-of-four quorum and cannot authorize execution.
+- An authenticated message ID can execute at most once, including byte-identical packages sent by different callers or independent Relayer processes.
+- Self-consistently rehashed messages for another destination domain or Gateway cannot execute locally; full-width destination values retain their exact identity.
+- A known source domain paired with an untrusted Gateway, or an unmapped source domain, is rejected even when test-local QC/Merkle evidence is otherwise valid.
+
+Isolated Foundry cases compose the production registries, certificate/Merkle/domain verifiers, Gateway replay storage and ApplicationB. A shared valid package first succeeds through the complete production execution path, then test-owned EVM state is restored before a single authority boundary is broken. Test-only committee signing scalars remain inside the existing Solidity fixture. Negative cases assert precise errors, unchanged replay/business state and zero emitted logs for both controlled submitters. Original valid evidence executes after rejection; rehashed policy-negative messages have their own distinct, unconsumed IDs. These fixtures do not ask the live validator cluster to authorize altered messages or roots.
+
+The receiver is authenticated message intent, without an ApplicationB-only allowlist. An authorized message may name another valid receiver; substituting the receiver in an existing commitment is rejected, while self-consistent zero-address or code-free targets fail the existing destination checks. No new receiver routing policy is introduced.
+
+Relayers are transport actors, not authorization authorities. PostgreSQL provides operational durability, not cross-chain authorization; a returned transaction hash or database CONFIRMED marker cannot replace canonical Gateway state and events. Production verification authenticates the evidence before replay consumption, and the receiver callback commits atomically with that consumption. Invalid QC, membership, source or destination evidence cannot burn the message ID, modify ApplicationB or emit a business success event. Replay rejection preserves the first successful execution.
+
+The existing `./scripts/verify.sh` includes `[cross-chain safety invariants]` alongside every retained regression group. Database cases check exact target membership, QC and READY/package absence. The existing real source-reorg scenario checks OBSERVED and FINALIZING boundaries with live validators, preserves terminal REORGED exclusion, and later executes the canonical replacement. A fresh real batch is checked at SEALED and CONSENSUS_PENDING before its genuine PBFT commitment and successful production Gateway/ApplicationB execution. The retained two-process duplicate-delivery race checks two canonical receipts from distinct senders, one exact replay rejection, and exactly one correlated business success event. All evidence goes to root `verification.log`; these deterministic checks are not a formal proof or a randomized/stateful campaign.
+
 ### SourceGateway
 
 `contracts/src/SourceGateway.sol` exposes:

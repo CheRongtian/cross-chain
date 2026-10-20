@@ -16,6 +16,8 @@ import { commitConfigs, signedCommitFixture } from "../../validator/test/helpers
 import { buildQuorumCertificate, expectedCommitStatement, qcDigest } from "../../validator/src/quorum-certificate.mjs";
 import { cloneCandidateFixture, sourceState } from "../../validator/test/helpers/four-process.mjs";
 import { assertCanonicalIdentity, assertMerkleIntegrity } from "./helpers/message-integrity.mjs";
+import { createDeliveryProjector } from "../src/delivery/projector.mjs";
+import { buildDeliveryPackages } from "../src/delivery/package.mjs";
 
 const config = loadDatabaseConfig({
   ...process.env,
@@ -543,6 +545,26 @@ test("only FINALIZED occurrences in the correct source scope can be assigned", a
   ), /source scope mismatch/);
   const collected = await lifecycle.collectEligible();
   assert.deepEqual(collected.snapshot.members.map((member) => member.sourceMessageId), [rows[0].id]);
+  const before = await readMessages(pool, config.databaseSchema);
+  const sealed = await lifecycle.sealBatch({ batchRecordId: id });
+  const projector = createDeliveryProjector({ config: { ...lifecycleConfig, validatorSets }, pool });
+  await assert.rejects(projector.materializeBatch({ batchRecordId: id }), { code: "DELIVERY_REQUIRES_COMMITTED" });
+  await assert.rejects(buildDeliveryPackages(sealed, { validatorSets }), { code: "DELIVERY_REQUIRES_COMMITTED" });
+  const canonical = await createMessageBatcher({ config: lifecycleConfig, pool }).buildBatch({ epoch: 23n });
+  for (const row of rows.slice(1)) {
+    assert.ok(!canonical.messageIds.includes(row.message_id));
+    assert.ok(!sealed.batch.messageIds.includes(row.message_id));
+    assert.ok(sealed.members.every(member => member.sourceMessageId !== row.id));
+    const absent = (await pool.query(`SELECT
+      (SELECT COUNT(*) FROM ${members} WHERE source_message_id = $1 OR message_id = $2)::int AS membership,
+      (SELECT COUNT(*) FROM ${certificateTable} q JOIN ${members} m USING (batch_record_id)
+        WHERE m.source_message_id = $1 OR m.message_id = $2)::int AS qc,
+      (SELECT COUNT(*) FROM ${tableName(config.databaseSchema, "delivery_jobs")}
+        WHERE source_message_id = $1 OR message_id = $2)::int AS ready`, [row.id, row.message_id])).rows[0];
+    assert.deepEqual(absent, { membership: 0, qc: 0, ready: 0 });
+    console.log(`VALID: cross-chain safety target ${row.message_id} in ${row.status} is excluded by production batch selection, sealed membership, QC and READY authority`);
+  }
+  assert.deepEqual(await readMessages(pool, config.databaseSchema), before);
 });
 
 test("sealing reuses canonical batch and Merkle definitions and survives client recreation", async () => {

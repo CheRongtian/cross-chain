@@ -927,6 +927,8 @@ printf '     Verify Prometheus operational metric families, bounded labels, HTTP
 printf '     Validate Grafana provisioning, parsed PromQL and nine operational views; verify the read-only pending collector against existing real delivery outcomes\n'
 printf '     Check deterministic message identity, full-width JavaScript/Solidity parity and in-memory canonical/payload mutations against frozen vectors and existing committed E2E evidence\n'
 printf '     Distinguish explicit ZK rejection from execution faults and share strict revert-reason matching across source/deployment checks\n'
+printf '     Check cross-chain safety with a proven valid production baseline, real pre-finality/pre-commit target exclusion and precise Gateway rejection/zero-side-effect assertions\n'
+printf '     Reject self-consistent unauthorized roots, invalid membership, two-signature QCs, wrong destinations and untrusted sources; retain exact-message replay and two-submitter business-once evidence\n'
 
 CURRENT_STEP="full verification finality profile validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1034,7 +1036,9 @@ node --test \
     "$INDEXER_DIR/test/relayer-leases.test.mjs" \
     "$INDEXER_DIR/test/transaction-recovery.test.mjs"
 
-CURRENT_STEP="Chain A Indexer database, migration sequence/upgrades with terminal receipt backfill, typed reorg schedules/stopped retries, fixed-snapshot concurrency, RPC retry/restart, batch/Merkle/lifecycle, delivery leases, preparation fairness and independent receipt/recovery cursors with fresh-process/crash/concurrency tests"
+printf '\n[cross-chain safety invariants]\n'
+printf 'Evidence runs in the retained source lifecycle/delivery database suites, production Gateway Foundry suite and real source/consensus/destination scenarios below.\n'
+CURRENT_STEP="cross-chain safety source/delivery gates and retained Chain A database, migrations, reorg/concurrency, RPC retry, lifecycle, delivery leases, preparation fairness and receipt/recovery cursor regressions"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
@@ -1205,10 +1209,15 @@ printf '\n[%s]\n' "$CURRENT_STEP"
 # Protocol/test-specific exceptions are documented at their source sites; global rules remain enabled.
 forge lint --deny warnings
 
-CURRENT_STEP="forge test -vv including shared Merkle golden compatibility and single-parse message integrity probes"
+CURRENT_STEP="forge test -vv including cross-chain safety production Gateway cases, shared Merkle golden compatibility and single-parse message integrity probes"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test -vv
 
+printf 'VALID: cross-chain safety test-local production Gateway/ApplicationB baseline executes with real three-signer QC and membership before each isolated negative case\n'
+printf 'EXPECTED FAILURE: a self-consistent alternate tree without matching committed QC authority rejects with ContextMismatch; restoring the authorized tree remains executable\n'
+printf 'EXPECTED FAILURE: corrupted sibling MerkleRootMismatch and insufficient-quorum InvalidEvidenceCount(2) leave zero replay/business/event effects; original evidence still executes\n'
+printf 'EXPECTED FAILURE: self-consistent QC/Merkle evidence still rejects at InvalidDestinationDomain, DestinationGatewayMismatch, UntrustedRemoteGateway, UnknownSourceDomain and invalid-receiver boundaries\n'
+printf 'VALID: two controlled callers cannot override QC, Merkle, source, destination or replay rejection; the same authenticated bytes execute once and duplicate attempts preserve the first success\n'
 printf 'VALID: malformed Gateway offsets and impossible batch-array lengths reject with exact empty revert / Panic(0x41); replay, business state and events remain unchanged\n'
 printf 'VALID: Solidity PBFT certificates match frozen v1/v2/v3 digests, trusted context and signature acceptance\n'
 printf 'VALID: bounded ABI evidence, historical/legacy authority and every quorum entry verified\n'
@@ -2180,6 +2189,8 @@ TX_MAX_ATTEMPTS="$TX_MAX_ATTEMPTS" \
 TX_MAX_FEE_PER_GAS="$TX_MAX_FEE_PER_GAS" \
 TX_MAX_PRIORITY_FEE_PER_GAS="$TX_MAX_PRIORITY_FEE_PER_GAS" \
     node --test "$INDEXER_DIR/test/integration.test.mjs"
+
+printf 'VALID: cross-chain safety real OBSERVED/FINALIZING and pre-QC SEALED/CONSENSUS_PENDING targets have no downstream execution authority; canonical authorized execution and exact two-submitter business-once evidence were checked in the retained integration scenarios\n'
 
 CURRENT_STEP="production Application B deployment for isolated Gateway-caller verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
