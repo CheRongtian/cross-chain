@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { recoverMessageAddress } from "viem";
 import { validatorAccount } from "../src/identity.mjs";
 import { after, before, beforeEach, test } from "node:test";
 import { applyValidatorMigrations, createValidatorPool, createValidatorStore } from "../src/db.mjs";
@@ -9,13 +10,15 @@ import { loadValidatorConfig } from "../src/config.mjs";
 import { committeeDigest, deterministicPrimary } from "../src/committee.mjs";
 import { prePrepareDigest, signPrePrepare } from "../src/pre-prepare.mjs";
 import { createPrePrepareService } from "../src/pre-prepare-service.mjs";
-import { signPrepare } from "../src/prepare.mjs";
+import { authenticatePrepare, prepareDigest, signPrepare } from "../src/prepare.mjs";
 import { createPrepareService } from "../src/prepare-service.mjs";
 import { createCommitService } from "../src/commit-service.mjs";
-import { signCommit } from "../src/commit.mjs";
+import { authenticateCommit, commitDigest, signCommit } from "../src/commit.mjs";
 import { buildPreparedCertificate, proposalIdentity } from "../src/prepared-certificate.mjs";
 import { signNewView, signViewChange, selectSafeProposal } from "../src/view-change.mjs";
-import { expectedCommitStatement } from "../src/quorum-certificate.mjs";
+import { expectedCommitStatement, verifyQuorumCertificate } from "../src/quorum-certificate.mjs";
+import { buildMessageBatch } from "../../indexer/src/message-batch.mjs";
+import { buildMessageMerkleTree } from "../../indexer/src/message-merkle.mjs";
 import { viewTimeoutDeadline } from "../src/view-timeout.mjs";
 import { createMetrics, bindPoolMetrics } from "../../indexer/src/metrics/registry.mjs";
 import { metricValue } from "../../indexer/test/helpers/metrics-assertions.mjs";
@@ -87,6 +90,214 @@ async function commitVote(statement, voterIndex, overrides = {}) {
   return signCommit(configs[voterIndex], { messageType: "COMMIT", ...statement,
     voterIdentity: configs[voterIndex].validatorAddress, ...overrides });
 }
+
+async function acceptSafetyProposal(epoch = snapshot.record.epoch) {
+  const batch = buildMessageBatch({ ...snapshot.batch, epoch });
+  const tree = buildMessageMerkleTree(batch);
+  const primary = configs.find(config => config.validatorAddress === deterministicPrimary(configs[0].peers, epoch));
+  const proposal = await signPrePrepare(primary, { messageType: "PRE_PREPARE", protocolVersion: "3", view: "0",
+    sourceDomain: batch.sourceDomain, sourceGateway: batch.sourceGateway, epoch: batch.epoch,
+    batchId: batch.batchId, messageRoot: tree.messageRoot, primaryIdentity: primary.validatorAddress });
+  for (let index = 0; index < stores.length; index++) {
+    await stores[index].savePrePrepare(proposal, direction(configs[index], proposal));
+  }
+  return proposal;
+}
+
+async function safetyState(store, epoch, view = "0") {
+  return { proposal: await store.readPrePrepare(epoch, view), view: await store.readViewState(epoch),
+    prepare: await store.readPrepareState(epoch, view), commit: await store.readCommitState(epoch, view) };
+}
+
+async function committedSafetyBaseline() {
+  const proposal = await acceptSafetyProposal();
+  // Each independent identity signs only through its own production durable cast path.
+  for (let voter = 0; voter < 3; voter++) {
+    const { vote } = await stores[voter].castPrepareVote(proposal.epoch);
+    for (let receiver = 0; receiver < stores.length; receiver++) {
+      if (receiver !== voter) await stores[receiver].savePrepareVote(vote);
+    }
+  }
+  for (let voter = 0; voter < 3; voter++) {
+    const own = await stores[voter].castCommitVote(proposal.epoch);
+    const vote = own.votes.find(value => value.voterIdentity === configs[voter].validatorAddress);
+    for (let receiver = 0; receiver < stores.length; receiver++) {
+      if (receiver !== voter) await stores[receiver].saveCommitVote(vote);
+    }
+  }
+  const certificate = (await stores[0].readCommitState(proposal.epoch)).certificate;
+  const expected = expectedCommitStatement(proposal, configs[0]);
+  assert.deepEqual(await verifyQuorumCertificate(certificate, {
+    peers: configs[0].peers, validatorSets: configs[0].validatorSets, expected,
+  }), certificate);
+  assert.equal(new Set(certificate.commits.map(vote => vote.voterIdentity)).size, 3);
+  for (const store of stores) {
+    assert.equal((await store.readPrepareState(proposal.epoch)).voteCount, 3);
+    assert.deepEqual((await store.readCommitState(proposal.epoch)).certificate, certificate);
+    await store.finalizeEpoch(certificate);
+  }
+  return { proposal, certificate };
+}
+
+test("PBFT safety: finalized root locks reject conflicts before and after independent store reload", async () => {
+  const { proposal, certificate } = await committedSafetyBaseline();
+  const adversary = configs.find(config => config.validatorAddress !== proposal.primaryIdentity);
+  const conflictingRoot = `0x${"fa".repeat(32)}`;
+  assert.notEqual(conflictingRoot, proposal.messageRoot);
+  const conflicting = expectedCommitStatement({ ...proposal, messageRoot: conflictingRoot, proposalDigest: undefined }, configs[0]);
+  const badPrepare = await signPrepare(adversary, { messageType: "PREPARE", ...conflicting, voterIdentity: adversary.validatorAddress });
+  const badCommit = await signCommit(adversary, { messageType: "COMMIT", ...conflicting, voterIdentity: adversary.validatorAddress });
+  assert.deepEqual(await authenticatePrepare(configs[0], badPrepare), badPrepare);
+  assert.deepEqual(await authenticateCommit(configs[0], badCommit), badCommit);
+  assert.equal(new Set(configs.map(config => config.databaseSchema)).size, 4);
+  for (let index = 0; index < stores.length; index++) {
+    const original = await safetyState(stores[index], proposal.epoch);
+    const freshPool = createValidatorPool(configs[index]);
+    try {
+      const reloaded = createValidatorStore({ config: configs[index], pool: freshPool });
+      await reloaded.bindIdentity();
+      for (const store of [stores[index], reloaded]) {
+        const prepare = createPrepareService({ config: configs[index], store, logger: { warn() {} } });
+        const commit = createCommitService({ config: configs[index], store, logger: { warn() {} } });
+        for (let retry = 0; retry < 3; retry++) {
+          await assert.rejects(store.checkSafeProposal(conflicting), { code: "UNSAFE_SELECTED_PROPOSAL" });
+          assert.equal((await prepare.receive(badPrepare)).reason, "ALREADY_COMMITTED");
+          assert.equal((await commit.receive(badCommit)).reason, "ALREADY_COMMITTED");
+        }
+        const noNewSignature = async () => assert.fail("a finalized slot must not sign another value");
+        await assert.rejects(store.castPrepareVote(proposal.epoch, noNewSignature), { code: "ALREADY_COMMITTED" });
+        if (index < 3) {
+          const originalSelf = await store.castCommitVote(proposal.epoch, noNewSignature);
+          assert.deepEqual(originalSelf.certificate, certificate);
+          assert.ok(originalSelf.votes.every(vote => vote.messageRoot === proposal.messageRoot));
+        } else {
+          await assert.rejects(store.castCommitVote(proposal.epoch, noNewSignature), { code: "ALREADY_COMMITTED" });
+        }
+        assert.deepEqual(await safetyState(store, proposal.epoch), original);
+      }
+      for (const name of ["pbft_epoch_views", "pbft_pre_prepares", "pbft_prepared_states", "pbft_commit_quorums"]) {
+        const roots = (await freshPool.query(`SELECT DISTINCT message_root FROM ${tableName(configs[index].databaseSchema, name)}
+          WHERE local_validator_identity = $1 AND epoch = $2`, [configs[index].validatorAddress, proposal.epoch])).rows;
+        assert.deepEqual(roots, [{ message_root: proposal.messageRoot }]);
+      }
+    } finally { await freshPool.end(); }
+  }
+  console.log(`VALID: PBFT safety source ${proposal.sourceDomain}/${proposal.sourceGateway}, consensus epoch ${proposal.epoch}, validator epoch ${proposal.validatorEpoch}: four independent restored stores retain R1 ${proposal.messageRoot} and QC ${certificate.qcDigest}; genuine R2 ${conflictingRoot} retries never sign or authorize a conflicting root`);
+});
+
+test("PBFT safety: duplicate PREPARE and COMMIT weight stays 1,2,2,2,3 across pool reload and fourth vote preserves first QC", async () => {
+  const baseline = await committedSafetyBaseline();
+  const baselineState = await safetyState(stores[0], baseline.proposal.epoch);
+  const target = await acceptSafetyProposal(BigInt(baseline.proposal.epoch) + 1n);
+  assert.equal((await stores[0].readPrepareState(target.epoch)).voteCount, 0);
+  assert.equal((await stores[0].readCommitState(target.epoch)).voteCount, 0);
+  const prepares = [];
+  for (const store of stores) prepares.push((await store.castPrepareVote(target.epoch)).vote);
+  assert.equal((await stores[0].readPrepareState(target.epoch)).voteCount, 1);
+  const freshPool = createValidatorPool(configs[0]);
+  try {
+    const reloaded = createValidatorStore({ config: configs[0], pool: freshPool });
+    await reloaded.bindIdentity();
+    const receivePrepare = createPrepareService({ config: configs[0], store: reloaded, logger: { warn() {} } });
+    for (const [vote, expectedCount] of [[prepares[1], 2], [prepares[1], 2], [prepares[0], 2]]) {
+      const reply = await receivePrepare.receive(vote);
+      assert.equal(reply.result, "ACCEPTED"); assert.equal(reply.voteCount, expectedCount); assert.equal(reply.prepared, false);
+    }
+    const twoPrepares = await reloaded.readPrepareState(target.epoch);
+    const secondReload = createValidatorStore({ config: configs[0], pool: freshPool });
+    await secondReload.bindIdentity();
+    await secondReload.savePrepareVote(prepares[1]);
+    assert.deepEqual(await secondReload.readPrepareState(target.epoch), twoPrepares);
+    assert.equal((await secondReload.savePrepareVote(prepares[2])).voteCount, 3);
+    assert.ok((await secondReload.readPrepareState(target.epoch)).prepared);
+    assert.equal((await secondReload.savePrepareVote(prepares[3])).voteCount, 4);
+    for (let receiver = 1; receiver < stores.length; receiver++) {
+      for (const vote of prepares) await stores[receiver].savePrepareVote(vote);
+    }
+    const commits = [];
+    for (let voter = 0; voter < stores.length; voter++) {
+      const own = await stores[voter].castCommitVote(target.epoch);
+      commits.push(own.votes.find(vote => vote.voterIdentity === configs[voter].validatorAddress));
+    }
+    assert.equal((await secondReload.readCommitState(target.epoch)).voteCount, 1);
+    const receiveCommit = createCommitService({ config: configs[0], store: secondReload, logger: { warn() {} } });
+    for (const [vote, expectedCount] of [[commits[1], 2], [commits[1], 2], [commits[0], 2]]) {
+      const reply = await receiveCommit.receive(vote);
+      assert.equal(reply.result, "ACCEPTED"); assert.equal(reply.voteCount, expectedCount); assert.equal(reply.commitQuorum, false);
+    }
+    const twoCommits = await secondReload.readCommitState(target.epoch);
+    const thirdReload = createValidatorStore({ config: configs[0], pool: freshPool });
+    await thirdReload.bindIdentity();
+    await thirdReload.saveCommitVote(commits[1]);
+    assert.deepEqual(await thirdReload.readCommitState(target.epoch), twoCommits);
+    assert.equal(twoCommits.certificate, null);
+    const three = await thirdReload.saveCommitVote(commits[2]);
+    assert.equal(three.voteCount, 3); assert.ok(three.certificate);
+    const four = await thirdReload.saveCommitVote(commits[3]);
+    assert.equal(four.voteCount, 4); assert.deepEqual(four.certificate, three.certificate);
+    assert.deepEqual(four.quorum, three.quorum);
+    assert.deepEqual(await safetyState(thirdReload, baseline.proposal.epoch), baselineState);
+    assert.deepEqual(await verifyQuorumCertificate(four.certificate, { peers: configs[0].peers,
+      validatorSets: configs[0].validatorSets, expected: expectedCommitStatement(target, configs[0]) }), three.certificate);
+  } finally { await freshPool.end(); }
+  console.log("VALID: PBFT safety production durable PREPARE/COMMIT cardinalities are 0,1,2,2,2,3,4; reload duplicates add no weight, only the third distinct signer enables quorum, and the fourth retains the first QC");
+});
+
+test("PBFT safety: valid wrong consensus/validator epochs leave target PREPARED and COMMIT collections unchanged", async () => {
+  const baseline = await committedSafetyBaseline();
+  const target = await acceptSafetyProposal(BigInt(baseline.proposal.epoch) + 1n);
+  const wrongEpoch = (BigInt(target.epoch) + 1n).toString();
+  assert.ok(BigInt(target.epoch) > 2n ** 53n);
+  const history = [...configs[0].validatorSets.history, { validatorEpoch: "1",
+    activationBatchEpoch: (BigInt(target.epoch) + 10n).toString(), validators: configs[0].validatorSets.history[0].validators }];
+  const config = configuration({ SOURCE_DATABASE_URL: process.env.DATABASE_URL, VALIDATOR_DATABASE_URL: process.env.DATABASE_URL,
+    VALIDATOR_DB_SCHEMA: configs[0].databaseSchema, VALIDATOR_SET_HISTORY: JSON.stringify(history) });
+  const store = createValidatorStore({ config, pool: pools[0] });
+  await store.bindIdentity();
+  const baselineState = await safetyState(store, baseline.proposal.epoch);
+  const statement = expectedCommitStatement(target, config);
+  const prepare = createPrepareService({ config, store, logger: { warn() {} } });
+  const commit = createCommitService({ config, store, logger: { warn() {} } });
+  const prepares = await Promise.all([0, 1, 2].map(index => signedVote(target, index)));
+  const commits = await Promise.all([0, 1, 2].map(index => commitVote(statement, index)));
+  await store.savePrepareVote(prepares[0]); await store.savePrepareVote(prepares[1]);
+  const wrongPrepare = await signedVote(target, 2, { epoch: wrongEpoch });
+  const wrongCommit = await commitVote(statement, 2, { epoch: wrongEpoch });
+  assert.deepEqual(await authenticatePrepare(config, wrongPrepare), wrongPrepare);
+  assert.deepEqual(await authenticateCommit(config, wrongCommit), wrongCommit);
+  const wrongSetVotes = [];
+  for (const [original, digestName, digest] of [[prepares[2], "prepareDigest", prepareDigest], [commits[2], "commitDigest", commitDigest]]) {
+    // TEST-ONLY adversarial V3 signs the other registered epoch with the production digest; both sets share members.
+    const vote = { ...original, validatorEpoch: "1" };
+    vote[digestName] = digest(vote);
+    vote.signature = await validatorAccount(configs[2].privateKey).signMessage({ message: { raw: vote[digestName] } });
+    assert.equal((await recoverMessageAddress({ message: { raw: vote[digestName] }, signature: vote.signature })).toLowerCase(), vote.voterIdentity);
+    wrongSetVotes.push(vote);
+  }
+  async function rejectOtherEpochs() {
+    const before = await safetyState(store, target.epoch);
+    assert.equal((await prepare.receive(wrongPrepare)).reason, "WRONG_EPOCH");
+    assert.equal((await commit.receive(wrongCommit)).reason, "NOT_PREPARED");
+    assert.equal((await prepare.receive(wrongSetVotes[0])).reason, "WRONG_VALIDATOR_EPOCH");
+    assert.equal((await commit.receive(wrongSetVotes[1])).reason, "WRONG_VALIDATOR_EPOCH");
+    assert.deepEqual(await safetyState(store, target.epoch), before);
+    assert.deepEqual(await safetyState(store, baseline.proposal.epoch), baselineState);
+    assert.equal((await store.readPrepareState(wrongEpoch)).voteCount, 0);
+    assert.equal((await store.readCommitState(wrongEpoch)).voteCount, 0);
+  }
+  await rejectOtherEpochs();
+  assert.equal((await store.readPrepareState(target.epoch)).prepared, null);
+  await store.savePrepareVote(prepares[2]);
+  await store.saveCommitVote(commits[0]); await store.saveCommitVote(commits[1]);
+  await rejectOtherEpochs();
+  assert.equal((await store.readCommitState(target.epoch)).certificate, null);
+  const genuine = await store.saveCommitVote(commits[2]);
+  assert.equal(genuine.voteCount, 3);
+  assert.deepEqual(await verifyQuorumCertificate(genuine.certificate, {
+    peers: config.peers, validatorSets: config.validatorSets, expected: statement,
+  }), genuine.certificate);
+  console.log(`EXPECTED FAILURE: PBFT safety genuinely signed batch epoch ${wrongEpoch} and registered validator epoch 1 votes add zero target weight at batch epoch ${target.epoch}/validator epoch 0, before PREPARED and at two COMMITs; third matching signer alone forms the QC`);
+});
 
 test("COMMIT cast and receive require durable PREPARED; missing or two-prepare state has no commit weight", async () => {
   const proposal = await signedProposal();
@@ -664,8 +875,20 @@ test("cross-view COMMIT lock retains the safe root; an old-view QC can finalize 
   await stores[0].finalizeEpoch(oldQC);
   assert.equal(await stores[0].currentView(original.epoch), "1");
   await assert.rejects(stores[0].castViewChange(original.epoch), /ALREADY_COMMITTED/);
-  const fresh = createValidatorStore({ config: configs[0], pool: pools[0] });
-  await assert.rejects(fresh.acceptNewView((await transition("2", prepared)).message, proposalIdentity(original)), /ALREADY_COMMITTED/);
+  const freshPool = createValidatorPool(configs[0]);
+  try {
+    const fresh = createValidatorStore({ config: configs[0], pool: freshPool });
+    await fresh.bindIdentity();
+    await assert.rejects(fresh.acceptNewView((await transition("2", prepared)).message, proposalIdentity(original)), /ALREADY_COMMITTED/);
+    await assert.rejects(fresh.checkSafeProposal({ ...proposalIdentity(original), messageRoot: wrong.messageRoot }),
+      { code: "UNSAFE_SELECTED_PROPOSAL" });
+    assert.deepEqual((await fresh.readCommitState(original.epoch, "0")).certificate, oldQC);
+    assert.equal((await fresh.readPrepareState(original.epoch, "1")).prepared.messageRoot, original.messageRoot);
+    assert.equal((await fresh.readViewState(original.epoch)).current_view, "1");
+    assert.deepEqual(await verifyQuorumCertificate(oldQC, { peers: configs[0].peers,
+      validatorSets: configs[0].validatorSets, expected: originalStatement }), oldQC);
+    console.log("VALID: PBFT safety a fresh pool retains the cross-view R1 lock, original old-view QC and certified safe value; a higher view cannot authorize R2 or rewrite the first QC");
+  } finally { await freshPool.end(); }
 });
 
 test("two VIEW_CHANGE senders cannot establish NEW_VIEW and malformed evidence cannot enter persistence", async () => {

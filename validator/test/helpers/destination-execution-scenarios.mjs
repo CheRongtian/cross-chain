@@ -1996,6 +1996,36 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
     assert.equal(verified.commits.length, 3);
     assert.deepEqual(verified.commits.map(vote => vote.voterIdentity).sort(), honestAddresses);
     await assertWeights(honest, honest); await assertDurableAuthority(true);
+    console.log(`VALID: PBFT safety baseline committed R1 ${statement.messageRoot} for source ${statement.sourceDomain}/${statement.sourceGateway}, consensus epoch ${statement.epoch}, view ${view}, validator epoch ${statement.validatorEpoch}; three distinct honest PREPARE/COMMIT signers ${honestAddresses.join(", ")}; QC ${verified.qcDigest}`);
+    // Wait on the existing durable finalization boundary before asserting its precise rejection semantics.
+    await until("all four Byzantine-scenario stores finalized the target committed root", async () => {
+      const views = await Promise.all(members.map(index => states[index].store.readViewState(statement.epoch)));
+      return views.every(state => state?.finalized === true) ? views : null;
+    }, members);
+    const protectedStates = new Map();
+    for (const index of members) protectedStates.set(index, {
+      prepare: await states[index].store.readPrepareState(statement.epoch, view),
+      commit: await states[index].store.readCommitState(statement.epoch, view),
+      state: await states[index].store.readViewState(statement.epoch),
+    });
+    for (let retry = 0; retry < 3; retry++) {
+      for (const index of honest) {
+        for (const bad of badStatements) {
+          await assert.rejects(states[index].store.checkSafeProposal(bad), { code: "UNSAFE_SELECTED_PROPOSAL" });
+        }
+        for (const bad of badPrepares) await reject(index, "/pbft/prepare", bad, "ALREADY_COMMITTED");
+        for (const bad of badCommits) await reject(index, "/pbft/commit", bad, "ALREADY_COMMITTED");
+      }
+    }
+    for (const index of members) {
+      assert.deepEqual({ prepare: await states[index].store.readPrepareState(statement.epoch, view),
+        commit: await states[index].store.readCommitState(statement.epoch, view),
+        state: await states[index].store.readViewState(statement.epoch) }, protectedStates.get(index));
+    }
+    await assertDurableAuthority(true);
+    assert.deepEqual(await lifecycle.readBatch({ batchRecordId: pending.record.batchRecordId }), committed);
+    console.log(`EXPECTED FAILURE: PBFT safety genuine non-primary ${adversaryAddress} retried conflicting roots ${roots.join(", ")} after R1 COMMITTED; production peer endpoints rejected at ALREADY_COMMITTED and independent safe-value checks rejected at UNSAFE_SELECTED_PROPOSAL`);
+    console.log("VALID: PBFT safety exactly one committed root/QC remains for the target source scope and consensus epoch; original signers, view, validator epoch, committee digest and local locks are unchanged; conflicting roots have no READY authority");
     await certificateChecks.snapshot(committed, "three honest signers committed the sole canonical root despite genuine Byzantine messages");
     const reused = { ...forged, commits: verified.commits };
     await assert.rejects(() => verifyQuorumCertificate(reused, { peers, validatorSets, expected: badStatements[0] }), { code: "MISMATCHED_COMMIT" });

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { setTimeout as pause } from "node:timers/promises";
+import { recoverMessageAddress } from "viem";
 import { validatorAccount } from "../../src/identity.mjs";
 import { deterministicPrimary } from "../../src/committee.mjs";
 import { createValidatorSetResolver } from "../../src/validator-sets.mjs";
@@ -229,6 +230,34 @@ export async function verifyValidatorRotation({ sourceConfig,sourcePool,snapshot
     await merkleChecks.members(oldAfterInclusions, "unchanged authenticated old proofs after rotation and V1 shutdown");
     await domainChecks.members(oldAfterRotation, oldAfterInclusions, "unchanged historical full messages after V1 shutdown");
     await certificateChecks.accept(newEncoded, newContext, "epoch 8 QC still verifies after V1 shutdown");
+    const oldStatement = expectedCommitStatement(oldAfterRotation.quorumCertificate, { peers, validatorSets });
+    const currentStatement = expectedCommitStatement(newAfterRotation.quorumCertificate, { peers, validatorSets });
+    const oldOptions = { peers, validatorSets, expected: oldStatement };
+    const currentOptions = { peers, validatorSets, expected: currentStatement };
+    const oldSet = validatorSets.resolveByValidatorEpoch(oldQc.validatorEpoch);
+    const currentSet = validatorSets.resolveByValidatorEpoch(qc.validatorEpoch);
+    assert.equal(oldSet.validatorEpoch, "7"); assert.equal(currentSet.validatorEpoch, "8");
+    assert.equal(oldSet.validators.length, 4); assert.equal(currentSet.validators.length, 4);
+    assert.ok(oldSet.validators.includes(peers[0].address)); assert.ok(!currentSet.validators.includes(peers[0].address));
+    assert.ok(currentSet.validators.includes(peers[4].address)); assert.ok(!oldSet.validators.includes(peers[4].address));
+    assert.ok(oldQc.commits.some(vote => vote.voterIdentity === peers[0].address));
+    assert.ok(qc.commits.some(vote => vote.voterIdentity === peers[4].address));
+    assert.equal(oldQc.committeeDigest, oldSet.committeeDigest);
+    assert.equal(qc.committeeDigest, currentSet.committeeDigest);
+    assert.deepEqual(await verifyQuorumCertificate(oldAfterRotation.quorumCertificate, oldOptions), oldCommitted.quorumCertificate);
+    assert.deepEqual(await verifyQuorumCertificate(newAfterRotation.quorumCertificate, currentOptions), newCommitted.quorumCertificate);
+    assert.equal(encodeCertificate(oldAfterRotation.quorumCertificate), oldEncoded);
+    assert.equal(encodeCertificate(newAfterRotation.quorumCertificate), newEncoded);
+    const removedAtCurrentView = await signedCommitFixture(currentStatement, states[0].config);
+    for (const vote of [futureVote, removedAtCurrentView]) {
+      assert.equal((await recoverMessageAddress({ message: { raw: vote.commitDigest }, signature: vote.signature })).toLowerCase(), vote.voterIdentity);
+    }
+    await assert.rejects(verifyQuorumCertificate({ ...oldQc, commits: [...oldQc.commits.slice(0, 2), futureVote] }, oldOptions),
+      { code: "UNKNOWN_VALIDATOR" });
+    await assert.rejects(verifyQuorumCertificate({ ...qc, commits: [...qc.commits.slice(0, 2), removedAtCurrentView] }, currentOptions),
+      { code: "UNKNOWN_VALIDATOR" });
+    console.log(`VALID: PBFT safety after V1 shutdown, the same frozen actual QC bytes verify off-chain and through production Solidity against epoch 7/${oldSet.committeeDigest} and epoch 8/${currentSet.committeeDigest}; batch epochs ${oldStatement.epoch}/${currentStatement.epoch} remain distinct from validator-set epochs`);
+    console.log("EXPECTED FAILURE: PBFT safety genuine V5 signatures cannot backdate epoch-7 authority and genuine removed-V1 signatures cannot enter the exact epoch-8 QC/view; historical and current committees each remain four members with quorum three");
     await merkleChecks.members(newAfterInclusions, "authenticated rotated Message E proof after V1 shutdown");
     await domainChecks.members(newAfterRotation, newAfterInclusions, "rotated full Message E after V1 shutdown");
     await merkleChecks.negatives(oldInclusions, "actual epoch 7 A/B/D batch");

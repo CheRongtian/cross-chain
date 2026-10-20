@@ -929,6 +929,8 @@ printf '     Check deterministic message identity, full-width JavaScript/Solidit
 printf '     Distinguish explicit ZK rejection from execution faults and share strict revert-reason matching across source/deployment checks\n'
 printf '     Check cross-chain safety with a proven valid production baseline, real pre-finality/pre-commit target exclusion and precise Gateway rejection/zero-side-effect assertions\n'
 printf '     Reject self-consistent unauthorized roots, invalid membership, two-signature QCs, wrong destinations and untrusted sources; retain exact-message replay and two-submitter business-once evidence\n'
+printf '     Verify PBFT safety over distinct signers and exact batch epoch/view/root/validator epoch; reload durable locks and duplicate-vote collections without gaining quorum weight\n'
+printf '     Retry genuine Byzantine conflicting votes after the sole canonical commitment and verify unchanged epoch-7/8 QCs against their own historical committees in JavaScript and Solidity\n'
 
 CURRENT_STEP="full verification finality profile validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1080,6 +1082,11 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
     node --test "$INDEXER_DIR/test/pending-delivery.database.test.mjs"
 printf 'Real referenced-family exposition, unresolved READY backlog changes and scrape purity are also checked in the retained end-to-end scenarios. Grafana/Prometheus servers and browsers are not required.\n'
 
+CURRENT_STEP="pbft safety invariants"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test "$VALIDATOR_DIR/test/pbft-safety-invariants.test.mjs"
+printf 'Durable counts, independent safety locks and reload/cross-view cases run in the retained validator database suite; real Byzantine post-commit and historical-committee evidence runs in the retained integration scenarios.\n'
+
 CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, Solidity ABI context mapping and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
@@ -1100,11 +1107,14 @@ CURRENT_STEP="verification-owned PostgreSQL helper ownership, same-directory lif
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test "$VALIDATOR_DIR/test/postgres-cluster.test.mjs"
 
-CURRENT_STEP="isolated validator migrations, endpoint/history separation, consistent PREPARE reads, COMMIT locks, and quorum persistence tests"
+CURRENT_STEP="PBFT safety durable locks, duplicate/epoch isolation and retained validator migrations, endpoint/history separation, PREPARE reads and QC persistence tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 DATABASE_URL="${VALIDATOR_VERIFICATION_DATABASE_URL:-$DATABASE_URL}" \
 VALIDATOR_DATABASE_TEST_SCHEMA="cross_chain_validator_database_verification" \
     node --test "$VALIDATOR_DIR/test/database.test.mjs"
+
+printf 'VALID: PBFT safety independent restored stores reject finalized-root conflicts without new signatures; repeated PREPARE/COMMIT delivery and reload retain 1,2,2,2,3 distinct counts and preserve the first QC after vote four\n'
+printf 'EXPECTED FAILURE: genuinely signed wrong consensus/validator epochs do not change target PREPARED, COMMIT quorum or QC; cross-view reload retains the certified safe root and original old-view QC\n'
 
 CURRENT_STEP="local chain availability check"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -2191,6 +2201,7 @@ TX_MAX_PRIORITY_FEE_PER_GAS="$TX_MAX_PRIORITY_FEE_PER_GAS" \
     node --test "$INDEXER_DIR/test/integration.test.mjs"
 
 printf 'VALID: cross-chain safety real OBSERVED/FINALIZING and pre-QC SEALED/CONSENSUS_PENDING targets have no downstream execution authority; canonical authorized execution and exact two-submitter business-once evidence were checked in the retained integration scenarios\n'
+printf 'VALID: PBFT safety real non-primary Byzantine retries before and after commitment preserve one target root/QC/signers and no conflicting READY or destination authority; actual historical epoch-7/8 QC bytes verify against their own committees after V1 shutdown\n'
 
 CURRENT_STEP="production Application B deployment for isolated Gateway-caller verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
