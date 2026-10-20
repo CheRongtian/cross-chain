@@ -941,6 +941,7 @@ printf '     Block every configured destination RPC path after durable SIGNED an
 printf '     Restore the same Chain B access and require ordinary polling to deliver both jobs without manual submit or database reset\n'
 printf '     Stop the actual primary after durable, subset-only PRE-PREPARE delivery and before old-view quorum\n'
 printf '     Recover the same batch/root through real timeout, three-signer VIEW_CHANGE, verified NEW_VIEW and higher-view destination execution\n'
+printf '     Verify Prometheus operational metric families, bounded labels, HTTP purity and durable event deltas in the existing protocol/fault scenarios\n'
 
 CURRENT_STEP="full verification finality profile validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -963,6 +964,10 @@ NODE_MAJOR_VERSION="$(node -p 'Number(process.versions.node.split(".")[0])')"
     || fail "Indexer dependencies are missing. Run 'cd indexer && npm ci' before verification."
 [[ -f "$INDEXER_DIR/node_modules/pg/package.json" ]] \
     || fail "Indexer dependencies are missing. Run 'cd indexer && npm ci' before verification."
+[[ -f "$INDEXER_DIR/node_modules/prom-client/package.json" ]] \
+    || fail "The pinned prom-client dependency is missing. Prepare the updated Indexer dependencies before verification; this script does not install them."
+[[ "$(node -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).version' "$INDEXER_DIR/node_modules/prom-client/package.json")" == "15.1.3" ]] \
+    || fail "The installed prom-client must match the pinned version 15.1.3. Prepare the updated Indexer dependencies before verification."
 [[ -f "$VALIDATOR_DIR/node_modules/viem/package.json" ]] && [[ -f "$VALIDATOR_DIR/node_modules/pg/package.json" ]] \
     || fail "Validator dependencies are missing. Prepare the validator package dependencies before verification; this script does not install them."
 printf 'Verified Node.js version: %s\n' "$(node --version)"
@@ -1047,6 +1052,14 @@ INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
 CURRENT_STEP="cross-chain message explorer"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test "$INDEXER_DIR/test/explorer.test.mjs" "$INDEXER_DIR/test/explorer-http.test.mjs"
+
+CURRENT_STEP="prometheus operational metrics"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test "$INDEXER_DIR/test/metrics.test.mjs"
+DATABASE_URL="$DATABASE_URL" \
+INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
+    node --test "$INDEXER_DIR/test/metrics.database.test.mjs"
+printf 'Real PBFT, source reorg, replacement, RPC outage, execution and scrape-purity metric deltas are also checked in the retained end-to-end scenarios below.\n'
 
 CURRENT_STEP="independent validator, PRE-PREPARE, PREPARE, COMMIT, QC, Solidity ABI context mapping and fault transport unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"

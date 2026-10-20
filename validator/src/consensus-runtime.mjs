@@ -2,11 +2,12 @@ import { tableName } from "../../indexer/src/db.mjs";
 import { deterministicPrimary } from "./committee.mjs";
 import { ViewChangeError } from "./prepared-certificate.mjs";
 import { viewTimeoutDeadline } from "./view-timeout.mjs";
+import { processMetrics, recordMetric } from "../../indexer/src/metrics/registry.mjs";
 
 // The clock is injectable. Production owns one bounded, serialized scheduler;
 // no HTTP route can set the view or directly fire its timeout.
 export function createConsensusRuntime({ config, sourcePool, store, validation, lifecycle, prePrepare, prepare, commit, viewChange,
-  clock = { now: () => Date.now(), schedule: setTimeout, cancel: clearTimeout }, logger = console }) {
+  clock = { now: () => Date.now(), schedule: setTimeout, cancel: clearTimeout }, logger = console, metrics = processMetrics }) {
   let stopped = false;
   let timer;
   let pendingTick = Promise.resolve();
@@ -126,6 +127,7 @@ export function createConsensusRuntime({ config, sourcePool, store, validation, 
       pendingTick = tick().catch((error) => {
         // An internal state failure halts the scheduler and makes readiness fail closed.
         stopped = true;
+        recordMetric(metrics, "available", {}, 0);
         logger.error(`PBFT scheduler halted: ${error.code ?? "CONSENSUS_STATE_FAILURE"}`);
       }).finally(schedule);
     }, interval);

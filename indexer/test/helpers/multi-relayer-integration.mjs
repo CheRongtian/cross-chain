@@ -11,6 +11,7 @@ import { verifyRpcTransaction } from "../../src/transaction-manager/receipts.mjs
 import { verifySignedTransaction } from "../../src/transaction-manager/transaction.mjs";
 import { withAutomineDisabled } from "./transaction-retry-integration.mjs";
 import { createDestinationRpcPool } from "../../src/transaction-manager/rpc-pool.mjs";
+import { metricValue } from "./metrics-assertions.mjs";
 
 const ENTRY = fileURLToPath(new URL("./relayer-process.mjs",import.meta.url));
 export function createRelayerProcesses({ environment,pidFile }) {
@@ -495,6 +496,7 @@ export async function verifyDestinationRpcOutage({ processes,pool,config,manager
     console.log("VALID: both delivery jobs were durable before the destination RPC outage; the committed broadcast-start marker still has zero external sends");
 
     for (const path of paths) path.state.available = false;
+    const rpcFailuresBefore = await metricValue("rpc_failures_total");
     let unavailable;
     await assert.rejects(() => rpc.verifyChain(),error => {
       if (error.code !== "RPC_UNAVAILABLE") return false;
@@ -502,6 +504,8 @@ export async function verifyDestinationRpcOutage({ processes,pool,config,manager
       return unavailable.length === paths.length && unavailable.every(value => value.outcome === "UNAVAILABLE" && value.errorClass === "TRANSIENT_RPC_ERROR");
     });
     assert.equal(new Set(unavailable.map(value => value.endpointLabel)).size,paths.length);
+    assert.equal(await metricValue("rpc_failures_total"), rpcFailuresBefore + paths.length, "one rejected identity request per unavailable path");
+    console.log("VALID: all-path destination RPC outage increments bounded failure series for actual failed requests");
     assert.equal(BigInt(await client.request({ method: "eth_chainId",params: [] })),config.destinationDomain);
     assert.equal((await client.request({ method: "eth_getBlockByNumber",params: ["0x0",false] })).hash,config.destinationGenesisHash);
     assert.ok((await client.request({ method: "eth_getCode",params: [gateway,"latest"] })) === gatewayCode);

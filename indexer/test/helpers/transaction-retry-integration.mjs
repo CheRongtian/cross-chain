@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { toHex } from "viem";
 import { createTransactionManager } from "../../src/transaction-manager/service.mjs";
 import { verifyRpcTransaction } from "../../src/transaction-manager/receipts.mjs";
+import { metricValue } from "./metrics-assertions.mjs";
 
 // Shared local-chain fixture: workers must be stopped inside operation's own
 // finally before mining mode is restored. This never resets destination state.
@@ -44,8 +45,14 @@ export async function verifyPendingReplacement({ config,pool,queue,legacy,destin
     assert.equal(parentTransaction.blockNumber,null);
     assert.equal(await destination.request({ method: "eth_getTransactionReceipt",params: [first.attempt.transactionHash] }),null);
     now = Math.max(now,Date.parse(first.attempt.broadcastAt)) + config.replacementAfterMs;
+    const attemptsBefore = await metricValue("delivery_attempts_total");
+    const replacementsBefore = await metricValue("transaction_replacements_total");
+    const retriesBefore = await metricValue("delivery_retries_total", { labels: { kind: "replacement" } });
     const replacement = await manager.prepareReplacement(jobId,first.attempt.attemptId);
     assert.equal(replacement.created,true);
+    assert.equal(await metricValue("delivery_attempts_total"), attemptsBefore + 1);
+    assert.equal(await metricValue("transaction_replacements_total"), replacementsBefore + 1);
+    assert.equal(await metricValue("delivery_retries_total", { labels: { kind: "replacement" } }), retriesBefore + 1);
     assert.equal(replacement.attempt.status,"SIGNED");
     assert.equal(replacement.attempt.broadcastAttemptCount,"0");
     assert.equal(replacement.attempts.length,2);
@@ -126,6 +133,10 @@ export async function verifyPendingReplacement({ config,pool,queue,legacy,destin
     assert.deepEqual(await manager.repository.getAccount(),account);
     assert.deepEqual(await run(["read",jobId]),finalized);
     assert.equal((await manager.prepareReplacement(jobId)).created,false);
+    assert.equal(await metricValue("transaction_replacements_total"), replacementsBefore + 1);
+    assert.equal(await metricValue("delivery_attempts_total"), attemptsBefore + 1);
+    console.log("VALID: one durable same-nonce replacement increments transaction replacements exactly once despite concurrent/recovery reads");
+    console.log("VALID: real exact retry/replacement paths increment bounded retry metrics while receipt-only reconciliation does not");
     console.log("VALID: real pending Chain B transaction was replaced at the same nonce with higher fees; fresh processes recovered exact history and its canonical winner");
     return finalized;
   });

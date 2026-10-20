@@ -10,6 +10,7 @@ import { createMessageQuery } from "../../src/api/message-query.mjs";
 import { createMessageQueryServer } from "../../src/api/server.mjs";
 import { assertMessageQueryPrivacy } from "./message-query-privacy.mjs";
 import { verifyExplorerAssets, verifyExplorerMessage } from "./explorer-integration.mjs";
+import { assertScrapePure } from "./metrics-assertions.mjs";
 
 const sourceTables = ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batches", "message_batch_members",
   "batch_consensus_bindings", "batch_quorum_certificates", "batch_quorum_certificate_signatures", "delivery_batches", "delivery_jobs",
@@ -170,12 +171,14 @@ export async function verifyMessageQueryHTTP({ config, pool, states, records, me
       same(body, again, "repeated GET must return equivalent protocol fields");
       console.log(`VALID: queried real message ${source.message_id} through HTTP; source provenance/finality, batch/Merkle, persisted votes/QC, delivery history and current destination observation match independent production reads`);
     }
+    await assertScrapePure(origin);
     const unknown = `0x${"00".repeat(32)}`;
     assert.equal((await pool.query(`SELECT 1 FROM ${tableName(config.databaseSchema, "source_messages")} WHERE message_id = $1`, [unknown])).rowCount, 0);
     assert.equal((await fetch(url + unknown)).status, 404); console.log("EXPECTED FAILURE: unknown canonical message ID returns 404 without mutation");
     assert.equal((await fetch(url + "0x01")).status, 400); console.log("EXPECTED FAILURE: malformed message ID returns 400 before repository access");
     assert.equal((await fetch(url + messageIds[0], { method: "POST" })).status, 405); console.log("EXPECTED FAILURE: read-only API rejects state-changing HTTP methods");
     same(await capture(), before, "HTTP GET must not mutate source, finality, batch/QC, validator votes/views, lease, account/scan cursors, retry, journals, receipts or destination state");
+    console.log("VALID: repeated Prometheus scrapes change no source lifecycle, batch/QC, validator vote, lease, nonce, retry, attempt, receipt, Gateway replay or ApplicationB state");
     if (expectedExecution === "CONFIRMED") {
       assert.equal(before.destination?.executed, true); assert.equal(before.destination?.supplier, true);
       console.log("VALID: Explorer Execution section matches current production DestinationGateway/ApplicationB evidence");

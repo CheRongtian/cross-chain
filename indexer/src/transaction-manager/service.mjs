@@ -16,9 +16,10 @@ import { TransactionError } from "./config.mjs";
 import { recoverTransactionsOnce } from "./recovery.mjs";
 import { BROADCAST_ERROR_CLASSES, ESTIMATE_EXECUTION_REVERT } from "./rpc-errors.mjs";
 import { DestinationRpcError } from "./rpc-pool.mjs";
+import { metricsFor, relayerFailure } from "../metrics/registry.mjs";
 
 export function createTransactionManager({ config,pool,queue = createDeliveryRepository({ config,pool }),
-  rpc = createTransactionRpc(config),account = privateKeyToAccount(config.privateKey),repository,
+  rpc = createTransactionRpc(config, { metrics: metricsFor(pool) }),account = privateKeyToAccount(config.privateKey),repository,
   legacy = createRelaySubmissionRepository({ config,pool,queue }),beforeSignedCommit,hooks = {},clock = { now: Date.now } }) {
   const verification = { validatorSets: config.validatorSets,sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway };
   async function protect(operation) {
@@ -27,6 +28,12 @@ export function createTransactionManager({ config,pool,queue = createDeliveryRep
       const safe = new TransactionError(error?.code ?? "TRANSACTION_MANAGER_FAILED");
       safe.message = safeRelayerMessage(error,config); safe.observations = error?.observations ?? [];
       if (BROADCAST_ERROR_CLASSES.includes(error?.errorClass)) safe.errorClass = error.errorClass;
+      // These outcomes become normal defer/busy results in the leased worker.
+      // They create no failed operational action or destination outcome.
+      if (!["PREPARATION_EXECUTION_REJECTED", "SIGNED_TRANSACTION_REQUIRES_EXPLICIT_BROADCAST",
+        "EARLIER_SIGNED_TRANSACTION_BLOCKS_BROADCAST", "TRANSACTION_RECOVERY_BUSY"].includes(safe.code)) {
+        relayerFailure(metricsFor(pool), safe, "transaction");
+      }
       throw safe;
     }
   }

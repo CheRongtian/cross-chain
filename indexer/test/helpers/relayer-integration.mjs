@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { metricValue } from "./metrics-assertions.mjs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -179,8 +180,12 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     secondary.setFault("eth_sendRawTransaction","already-known");
     const retryTime = Math.max(Date.now(),Date.parse(signed.intent.nextActionAt));
     const retryManager = createTransactionManager({ config: loadTransactionConfig(env),pool,queue,legacy: repository,clock: { now: () => retryTime } });
+    const retryBefore = await metricValue("delivery_retries_total", { labels: { kind: "exact_rebroadcast" } });
+    const attemptsBefore = await metricValue("delivery_attempts_total");
     const retryResult = await retryManager.processTransactionRetriesOnce();
     assert.equal(retryResult.replacements,0); assert.equal(retryResult.broadcasts,1);
+    assert.equal(await metricValue("delivery_retries_total", { labels: { kind: "exact_rebroadcast" } }), retryBefore + 1, "primary response loss plus secondary failover is one repeated logical send");
+    assert.equal(await metricValue("delivery_attempts_total"), attemptsBefore);
     const firstBroadcast = await manager.repository.getTransaction(firstId);
     assert.equal(firstBroadcast.attempt.status,"BROADCAST");
     assert.equal(firstBroadcast.attempt.broadcastAttemptCount,"2");
@@ -190,6 +195,8 @@ export async function verifySingleRelayer({ config,pool,snapshots,validatorSets,
     assert.equal(observer.calls.filter(call => call.method === "eth_estimateGas").length,estimatesBefore);
     assert.equal(observer.calls.filter(call => call.method === "eth_maxPriorityFeePerGas").length,feesBefore);
     assert.deepEqual(await run(MANAGER,["read",firstId]),firstBroadcast);
+    assert.equal(await metricValue("delivery_retries_total", { labels: { kind: "exact_rebroadcast" } }), retryBefore + 1);
+    console.log("VALID: actual same-candidate retry through two endpoints increments exact_rebroadcast once; independent readback adds zero");
     assert.equal(primary.calls.filter(call => call.method === "eth_sendRawTransaction")[0].params[0],signed.attempt.rawSignedTransaction);
     assert.equal(secondary.calls.filter(call => call.method === "eth_sendRawTransaction")[0].params[0],signed.attempt.rawSignedTransaction);
     console.log("VALID: persistent retry recovered one failed SIGNED submission and rebroadcast identical bytes/hash without gas, fees, signing or nonce allocation");

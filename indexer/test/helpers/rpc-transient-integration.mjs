@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { metricValue } from "./metrics-assertions.mjs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -110,10 +111,14 @@ export async function verifyTransientRpcFailures({ environment,sourceConfig,sour
       assert.equal(signed.attempt.nonce,(nonceBefore + BigInt(index)).toString());
       const firstSends = sends(primary).length; const secondSends = sends(secondary).length;
       primary.setFault("eth_sendRawTransaction",mode);
+      const rpcBefore = await metricValue("rpc_failures_total");
+      const relayerBefore = await metricValue("relayer_failures_total");
       if (mode === "http-408-after-forward") {
         secondary.state.available = false;
         await assert.rejects(manager.broadcastPreparedTransaction(id),error => error.code === "RPC_UNAVAILABLE" &&
           error.errorClass === "AMBIGUOUS_BROADCAST" && error.observations.some(event => event.httpStatus === 408 && event.errorClass === "AMBIGUOUS_BROADCAST"));
+        assert.equal(await metricValue("relayer_failures_total"), relayerBefore + 1);
+        console.log("VALID: real relayer operational failures increment only bounded classified failure series and expose no secret error material");
         const ambiguous = await manager.repository.getTransaction(id); unchanged(signed,ambiguous);
         assert.equal(ambiguous.attempt.status,"SIGNED"); assert.equal(ambiguous.attempt.lastErrorClass,"AMBIGUOUS_BROADCAST");
         assert.equal(ambiguous.attempt.broadcastAttemptCount,"1"); assert.ok(ambiguous.intent.nextActionAt);
@@ -138,6 +143,9 @@ export async function verifyTransientRpcFailures({ environment,sourceConfig,sour
         console.log("VALID: primary forwarded exact transaction then returned HTTP 408; classified AMBIGUOUS_BROADCAST; fresh process reconciled its persisted hash through secondary with no new send/attempt/nonce/signature");
       } else {
         const sent = await manager.broadcastPreparedTransaction(id); unchanged(signed,sent);
+        assert.equal(await metricValue("rpc_failures_total"), rpcBefore + 1);
+        assert.equal(await metricValue("relayer_failures_total"), relayerBefore, "successful failover is no failed manager action");
+        console.log("VALID: a real destination RPC-path failure increments structured RPC failure metrics even when failover later completes the production operation");
         assert.equal(sent.acceptedEndpointLabel,"rpc-1");
         assert.ok(sent.rpcObservations.some(event => event.endpointLabel === "rpc-0" && event.errorClass === "TRANSIENT_RPC_ERROR" &&
           (mode === "http-429" ? event.httpStatus === 429 : event.rpcCode === -32007)));

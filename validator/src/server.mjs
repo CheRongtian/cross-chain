@@ -8,6 +8,8 @@ import { PREPARE_ENVELOPE_FIELDS } from "./prepare.mjs";
 import { COMMIT_ENVELOPE_FIELDS } from "./commit.mjs";
 import { QC_FIELDS } from "./quorum-certificate.mjs";
 import { NEW_VIEW_FIELDS, VIEW_CHANGE_FIELDS } from "./view-change.mjs";
+import { processMetrics, recordMetric } from "../../indexer/src/metrics/registry.mjs";
+import { serveMetrics } from "../../indexer/src/metrics/http.mjs";
 
 // Four VIEW_CHANGE messages may each carry four signed PREPAREs and a proposal.
 export const MAX_REQUEST_BYTES = 65536;
@@ -37,19 +39,22 @@ async function readBody(request, keys, optional = []) {
 }
 
 export function createValidatorServer({ config, service, store, prePrepare, prepare, commit, viewChange,
-  authenticatePeer = connectPeer, checkReady = async () => {}, logger = console }) {
+  authenticatePeer = connectPeer, checkReady = async () => {}, logger = console, metrics = processMetrics }) {
   let ready = true;
+  recordMetric(metrics, "available", {}, 0);
   const server = createServer(async (request, response) => {
     function send(status, body) {
       response.writeHead(status, { "content-type": "application/json" });
       response.end(JSON.stringify(body));
     }
     try {
+      if (await serveMetrics(request, response, metrics)) return;
       if (request.method === "GET" && request.url === "/health") {
         let available = ready;
         if (available) {
           try { await checkReady(); } catch { available = false; }
         }
+        recordMetric(metrics, "available", {}, available ? 1 : 0);
         return send(available ? 200 : 503, { alive: true, ready: available, pid: process.pid, validatorAddress: config.validatorAddress });
       }
       if (request.method === "GET" && request.url === "/identity") return send(200, publicIdentity(config));
@@ -169,9 +174,11 @@ export function createValidatorServer({ config, service, store, prePrepare, prep
         server.once("error", reject);
         server.listen(config.listenPort, config.listenHost, () => { server.removeListener("error", reject); resolve(); });
       });
+      recordMetric(metrics, "available", {}, 1);
     },
     async close() {
       ready = false;
+      recordMetric(metrics, "available", {}, 0);
       if (!server.listening) return;
       const closed = new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       server.closeAllConnections();

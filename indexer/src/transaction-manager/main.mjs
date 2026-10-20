@@ -3,9 +3,11 @@ import { deliveryJson } from "../delivery/package.mjs";
 import { safeRelayerMessage } from "../relayer/config.mjs";
 import { loadTransactionConfig, publicTransactionConfig } from "./config.mjs";
 import { createTransactionManager } from "./service.mjs";
+import { startWorkerMetrics } from "../metrics/http.mjs";
 
 let config;
 let pool;
+const metricsListener = await startWorkerMetrics();
 try {
   config = loadTransactionConfig();
   pool = createDatabasePool(config);
@@ -27,4 +29,4 @@ try {
   console.error(`Transaction Manager failed: ${safeRelayerMessage(error, config)}`);
   if (error.observations?.length) console.error(`Destination RPC observations: ${deliveryJson(error.observations)}`);
   process.exitCode = 1;
-} finally { if (pool) await pool.end(); }
+} finally { await metricsListener.close(); if (pool) await pool.end(); }

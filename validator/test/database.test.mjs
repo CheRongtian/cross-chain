@@ -17,6 +17,8 @@ import { buildPreparedCertificate, proposalIdentity } from "../src/prepared-cert
 import { signNewView, signViewChange, selectSafeProposal } from "../src/view-change.mjs";
 import { expectedCommitStatement } from "../src/quorum-certificate.mjs";
 import { viewTimeoutDeadline } from "../src/view-timeout.mjs";
+import { createMetrics, bindPoolMetrics } from "../../indexer/src/metrics/registry.mjs";
+import { metricValue } from "../../indexer/test/helpers/metrics-assertions.mjs";
 
 assert.ok(process.env.DATABASE_URL, "DATABASE_URL is required for validator database tests");
 const prefix = process.env.VALIDATOR_DATABASE_TEST_SCHEMA ?? "cross_chain_validator_database_test";
@@ -28,6 +30,7 @@ const pools = configs.map(createValidatorPool);
 const stores = configs.map((config, index) => createValidatorStore({ config, pool: pools[index] }));
 let snapshot;
 let head;
+let metrics;
 
 before(async () => {
   snapshot = await snapshotFixture();
@@ -35,7 +38,9 @@ before(async () => {
   for (let index = 0; index < 4; index++) await applyValidatorMigrations(pools[index], configs[index].databaseSchema);
 });
 beforeEach(async () => {
+  metrics = configs.map(() => createMetrics());
   for (let index = 0; index < 4; index++) {
+    bindPoolMetrics(pools[index], metrics[index]);
     const schema = configs[index].databaseSchema;
     await pools[index].query(`TRUNCATE TABLE ${tableName(schema, "validator_set_history")}, ${tableName(schema, "pbft_new_views")}, ${tableName(schema, "pbft_view_change_votes")}, ${tableName(schema, "pbft_epoch_views")}, ${tableName(schema, "commit_rejections")},
       ${tableName(schema, "pbft_commit_quorums")}, ${tableName(schema, "pbft_commit_votes")},
@@ -116,6 +121,11 @@ test("COMMIT locks, unique counts, quorum, and reconstructed QC survive migratio
   assert.equal((await stores[0].readCommitState(statement.epoch)).quorum, null);
   const three = await stores[0].saveCommitVote(votes[2]);
   assert.equal(three.voteCount, 3); assert.equal(three.quorum.status, "COMMIT_QUORUM");
+  const round = { metrics: metrics[0], labels: { outcome: "committed" } };
+  assert.equal(await metricValue("pbft_round_duration_seconds", { ...round, part: "_count" }), 1);
+  const acceptedAt = (await stores[0].readPrePrepare(statement.epoch)).acceptedAt;
+  const expectedDuration = (Date.parse(three.quorum.reachedAt) - Date.parse(acceptedAt)) / 1000;
+  assert.equal(await metricValue("pbft_round_duration_seconds", { ...round, part: "_sum" }), expectedDuration);
   const four = await stores[0].saveCommitVote(votes[3]);
   assert.equal(four.voteCount, 4); assert.deepEqual(four.quorum, three.quorum);
   assert.deepEqual(four.certificate, three.certificate);
@@ -136,6 +146,8 @@ test("COMMIT locks, unique counts, quorum, and reconstructed QC survive migratio
     await assert.rejects(pools[0].query(`DELETE FROM ${tableName(configs[0].databaseSchema, table)}`), /immutable/);
   }
   for (let i = 1; i < 4; i++) assert.equal((await stores[i].readCommitStates()).length, 0);
+  assert.equal(await metricValue("pbft_round_duration_seconds", { ...round, part: "_count" }), 1, "duplicate votes and reads add no round sample");
+  console.log("VALID: local PBFT histogram samples one durable QC, using persisted PRE-PREPARE and quorum timestamps; duplicate/read/restart paths add zero");
 });
 
 test("concurrent COMMIT casts sign once; concurrent duplicate/third votes create one durable quorum", async () => {
@@ -577,6 +589,8 @@ test("durable VIEW_CHANGE pauses old voting; duplicate timeouts and restart reus
   await assert.rejects(stores[0].castPrepareVote(proposal.epoch), /VIEW_CHANGE_IN_PROGRESS/);
   const reopened = createValidatorStore({ config: configs[0], pool: pools[0] });
   assert.deepEqual(await reopened.castViewChange(proposal.epoch), votes[0]);
+  assert.equal(await metricValue("pbft_quorum_failures_total", { metrics: metrics[0] }), 1, "repeated timeout handling counts one local no-quorum view");
+  assert.equal(await metricValue("pbft_view_changes_total", { metrics: metrics[0] }), 0, "a timeout vote alone accepts no NEW_VIEW");
   const conflict = await signViewChange(configs[0], { epoch: proposal.epoch, targetView: "1", acceptedProposal: null, preparedCertificate: null });
   await assert.rejects(reopened.saveViewChange(conflict), /CONFLICTING_VIEW_CHANGE/);
 });
@@ -590,6 +604,8 @@ test("NEW_VIEW acceptance is atomic, monotonic, concurrent-idempotent, and survi
   assert.equal((await stores[0].readViewChanges(original.epoch, "1")).length, 3);
   const accepted = await Promise.all(Array.from({ length: 10 }, () => stores[0].acceptNewView(message, proposalIdentity(original))));
   for (const value of accepted) assert.deepEqual(value, message);
+  assert.equal(await metricValue("pbft_view_changes_total", { metrics: metrics[0] }), 1);
+  assert.equal(await metricValue("pbft_round_duration_seconds", { metrics: metrics[0], labels: { outcome: "view_change" }, part: "_count" }), 1);
   assert.equal(await stores[0].currentView(original.epoch), "1");
   await assert.rejects(stores[0].savePrePrepare(original, direction(configs[0], original)), /STALE_VIEW/);
   await assert.rejects(stores[0].savePrepareVote(await signedVote(original, 0)), /STALE_VIEW/);
@@ -600,6 +616,8 @@ test("NEW_VIEW acceptance is atomic, monotonic, concurrent-idempotent, and survi
   await assert.rejects(stores[0].savePrePrepare(future, direction(configs[0], future)), /NEW_VIEW_REQUIRED/);
   await applyValidatorMigrations(pools[0], configs[0].databaseSchema);
   const freshPool = createValidatorPool(configs[0]);
+  const restartedMetrics = createMetrics();
+  bindPoolMetrics(freshPool, restartedMetrics);
   try {
     const restored = createValidatorStore({ config: configs[0], pool: freshPool });
     assert.equal(await restored.currentView(original.epoch), "1");
@@ -608,6 +626,7 @@ test("NEW_VIEW acceptance is atomic, monotonic, concurrent-idempotent, and survi
     assert.deepEqual(freshState, (await restored.readViewStates())[0]);
     assert.deepEqual(await restored.readNewView(original.epoch, "1"), message);
     assert.deepEqual(await restored.preparedCertificate(original.epoch), prepared);
+    assert.equal(await metricValue("pbft_view_changes_total", { metrics: restartedMetrics }), 0, "a fresh registry does not backfill persisted view changes on reads");
     const next = await signedProposal(snapshot.tree.messageRoot, "1");
     await restored.savePrePrepare(next, direction(configs[0], next));
     for (let index = 0; index < 3; index++) await restored.savePrepareVote(await signedVote(next, index));
@@ -616,10 +635,13 @@ test("NEW_VIEW acceptance is atomic, monotonic, concurrent-idempotent, and survi
     assert.notEqual(next.proposalDigest, original.proposalDigest);
     const second = await transition("2", await restored.preparedCertificate(original.epoch));
     await restored.acceptNewView(second.message, proposalIdentity(original));
+    assert.equal(await metricValue("pbft_view_changes_total", { metrics: restartedMetrics }), 1);
     assert.equal(await restored.currentView(original.epoch), "2");
     await assert.rejects(restored.acceptNewView(message, proposalIdentity(original)), /STALE_VIEW/);
     assert.equal((await restored.readPrePrepares()).length, 2);
   } finally { await freshPool.end(); }
+  assert.equal(await metricValue("pbft_view_changes_total", { metrics: metrics[0] }), 1, "the explicitly isolated restart registry owns later transitions; reads do not backfill events");
+  console.log("VALID: NEW_VIEW and timeout metrics follow durable local transitions with concurrent/replayed acceptance adding zero");
 });
 
 test("cross-view COMMIT lock retains the safe root; an old-view QC can finalize after NEW_VIEW", async () => {

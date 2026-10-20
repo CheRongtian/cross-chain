@@ -3,8 +3,10 @@ import { deliveryJson } from "../delivery/package.mjs";
 import { normalizeBytes32 } from "../canonical-message.mjs";
 import { MessageQueryError, publicQueryError } from "./errors.mjs";
 import { explorerHeaders, isExplorerPath, readExplorerAsset } from "./static-assets.mjs";
+import { processMetrics } from "../metrics/registry.mjs";
+import { serveMetrics } from "../metrics/http.mjs";
 
-export function createMessageQueryServer({ config, query }) {
+export function createMessageQueryServer({ config, query, metrics = processMetrics }) {
   const server = createServer(async (request, response) => {
     const send = (status, value, headers = {}) => {
       const body = deliveryJson(value);
@@ -12,6 +14,7 @@ export function createMessageQueryServer({ config, query }) {
       response.end(body);
     };
     try {
+      if (await serveMetrics(request, response, metrics)) return;
       const path = request.url.split("?", 1)[0];
       if (isExplorerPath(path)) {
         if (!["GET", "HEAD"].includes(request.method)) return send(405, { error: "METHOD_NOT_ALLOWED" }, { allow: "GET, HEAD" });

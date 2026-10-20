@@ -1,5 +1,6 @@
 import { normalizeBytes32 } from "./canonical-message.mjs";
 import { DELIVERY_POLICY } from "./delivery/policy.mjs";
+import { beginMetricEvents, afterMetricCommit, finishMetricEvents, recordMetric } from "./metrics/registry.mjs";
 import { createFinalityStore, normalizeSourceScope, tableName } from "./db.mjs";
 import {
   buildMessageBatch,
@@ -89,6 +90,7 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
 
   async function transaction(operation, { lockScope = true } = {}) {
     const client = await pool.connect();
+    beginMetricEvents(client, pool);
     let discarded = false;
     try {
       await client.query("BEGIN");
@@ -104,6 +106,7 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
       }
       const result = await operation(client);
       await client.query("COMMIT");
+      finishMetricEvents(client, true);
       return result;
     } catch (error) {
       try {
@@ -115,6 +118,7 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
       }
       throw error;
     } finally {
+      finishMetricEvents(client, false);
       // A failed rollback already released and discarded the interrupted client.
       if (!discarded) {
         client.release();
@@ -157,6 +161,7 @@ export function createBatchLifecycle({ config, pool, committee = config.peers, v
        VALUES ($1, $2, $3, $4) RETURNING *`,
       [...scopeParameters, epoch.toString(), Number(MESSAGE_BATCH_VERSION)],
     );
+    afterMetricCommit(client, metrics => recordMetric(metrics, "batches"));
     return inserted.rows[0];
   }
 

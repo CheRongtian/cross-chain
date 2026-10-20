@@ -2,6 +2,7 @@ import { createPublicClient, http, HttpRequestError, toHex } from "viem";
 import { normalizeBytes32 } from "../canonical-message.mjs";
 import { rpcQuantity } from "./transaction.mjs";
 import { classifyBroadcastError, normalizeRpcError } from "./rpc-errors.mjs";
+import { processMetrics, recordMetric } from "../metrics/registry.mjs";
 
 const temporary = classification => ["TRANSIENT_RPC_ERROR","AMBIGUOUS_BROADCAST"].includes(classification);
 export class DestinationRpcError extends Error {
@@ -13,7 +14,7 @@ export class DestinationRpcError extends Error {
   }
 }
 
-export function createDestinationRpcPool({ config,createClient = url => createPublicClient({
+export function createDestinationRpcPool({ config, metrics = processMetrics, createClient = url => createPublicClient({
   transport: http(url,{ retryCount: 0,timeout: config.rpcRequestTimeoutMs,async onFetchResponse(response) {
     // viem otherwise promotes JSON-RPC bodies on non-2xx responses and loses
     // their HTTP status. Keep availability/timeout evidence before parsing.
@@ -44,6 +45,7 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
       return value;
     } catch (error) {
       const normalized = normalizeRpcError(error,{ operation });
+      recordMetric(metrics, "rpc", { operation: method, reason_class: normalized.errorClass });
       throw new DestinationRpcError(normalized.errorCode,normalized);
     } finally { clearTimeout(timer); }
   }
@@ -82,6 +84,7 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
       else if (normalizeBytes32(genesis.hash) !== config.destinationGenesisHash) reason = "GENESIS_HASH_MISMATCH";
     } catch { reason = "INVALID_DESTINATION_IDENTITY"; }
     endpoint.reason = reason; endpoint.lastErrorClass = reason ? "DETERMINISTIC_REJECTION" : null;
+    if (reason) recordMetric(metrics, "rpc", { operation: reason === "CHAIN_ID_MISMATCH" ? "eth_chainId" : "eth_getBlockByNumber", reason_class: "DETERMINISTIC_REJECTION" });
     endpoint.lastFailure = null;
     endpoint.status = reason ? "IDENTITY_MISMATCH" : "HEALTHY";
     return reason === null;
@@ -211,7 +214,11 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
     health() { return Object.freeze(endpoints.map(({ label,status,reason,lastErrorClass }) => Object.freeze({ endpointLabel: label,status,reason,lastErrorClass }))); },
     async verifyChain() { await priority("identity",async () => config.destinationDomain); return config.destinationDomain; },
     async request(method,params = [],validate = value => value) {
-      return (await priority(method,async endpoint => validate(await raw(endpoint,method,params)))).value;
+      return (await priority(method,async endpoint => {
+        const value = await raw(endpoint,method,params);
+        try { return validate(value); }
+        catch (error) { recordMetric(metrics, "rpc", { operation: method, reason_class: "RPC_RESPONSE_ERROR" }); throw error; }
+      })).value;
     },
     async fees() {
       return (await priority("fee data",async endpoint => {
@@ -241,8 +248,11 @@ export function createDestinationRpcPool({ config,createClient = url => createPu
           hash = await raw(endpoint,"eth_sendRawTransaction",[rawTransaction]);
           let returned;
           try { returned = normalizeBytes32(hash); }
-          catch { throw new DestinationRpcError("RPC_INVALID_RESPONSE"); }
-          if (returned !== expected) throw new DestinationRpcError("RPC_TRANSACTION_HASH_MISMATCH");
+          catch { recordMetric(metrics, "rpc", { operation: "eth_sendRawTransaction", reason_class: "RPC_RESPONSE_ERROR" }); throw new DestinationRpcError("RPC_INVALID_RESPONSE"); }
+          if (returned !== expected) {
+            recordMetric(metrics, "rpc", { operation: "eth_sendRawTransaction", reason_class: "RPC_RESPONSE_ERROR" });
+            throw new DestinationRpcError("RPC_TRANSACTION_HASH_MISMATCH");
+          }
         } catch (error) {
           await coordinated(() => lifecycle?.afterEndpoint(event,{ resultClass: "ERROR",errorClass: classifyBroadcastError(error) }));
           throw error;

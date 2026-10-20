@@ -3,8 +3,9 @@ import { normalizeAddress } from "../canonical-message.mjs";
 import { rpcQuantity } from "./transaction.mjs";
 import { TransactionError } from "./config.mjs";
 import { createDestinationRpcPool } from "./rpc-pool.mjs";
+import { processMetrics } from "../metrics/registry.mjs";
 
-export function createTransactionRpc(config,{ pool = createDestinationRpcPool({ config }) } = {}) {
+export function createTransactionRpc(config,{ metrics = processMetrics, pool = createDestinationRpcPool({ config, metrics }) } = {}) {
   return {
     verifyChain: () => pool.verifyChain(),
     health: () => pool.health(),

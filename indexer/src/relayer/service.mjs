@@ -2,14 +2,16 @@ import { normalizeAddress } from "../canonical-message.mjs";
 import { encodeGatewaySubmission } from "./encoding.mjs";
 import { RelayerError, safeRelayerMessage } from "./config.mjs";
 import { createRelayerLeaseRepository } from "./leases.mjs";
+import { metricsFor, relayerFailure } from "../metrics/registry.mjs";
 
 export function createRelayerWorker({ config,pool,queue,transactionManager,
   leases = createRelayerLeaseRepository({ config,pool,queue }),
   afterLeaseAcquired = async () => {},afterPrepared = async () => {} }) {
   const verification = { validatorSets: config.validatorSets,sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway };
-  async function protectedOperation(operation) {
+  async function protectedOperation(operation, name = "run") {
     try { return await operation(); }
     catch (error) {
+      relayerFailure(metricsFor(pool), error, name);
       const safe = new Error(safeRelayerMessage(error,config));
       safe.code = error?.code ?? "RELAYER_RUN_FAILED";
       safe.observations = error?.observations ?? [];
@@ -91,7 +93,7 @@ export function createRelayerWorker({ config,pool,queue,transactionManager,
         // A wrong-domain explicit request is an error, not a busy lease or silent no-work result.
         if (job.destinationDomain !== config.destinationDomain.toString()) throw new RelayerError("DESTINATION_CONTEXT_MISMATCH");
         return processJob(deliveryJobId,session);
-      }));
+      }), "process_job");
     },
     async runOnce() {
       return protectedOperation(() => leases.withWorker(async session => {

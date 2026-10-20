@@ -10,6 +10,9 @@ import { actionDate, operationTime, replacementDue } from "./retry-policy.mjs";
 import { BROADCAST_ERROR_CLASSES, normalizeRpcError } from "./rpc-errors.mjs";
 import { TransactionError } from "./config.mjs";
 import { assertLeaseFence } from "../relayer/leases.mjs";
+import { decodeFunctionData } from "viem";
+import { DESTINATION_GATEWAY_ABI } from "../relayer/encoding.mjs";
+import { afterMetricCommit, recordMetric, secondsBetween } from "../metrics/registry.mjs";
 
 const iso = value => value == null ? null : value.toISOString();
 const final = status => status === "CONFIRMED" || status === "REVERTED";
@@ -161,6 +164,10 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
       max_fee_per_gas,max_priority_fee_per_gas,transaction_type,raw_signed_transaction,transaction_hash,created_at)
       VALUES ($1,$2,$3,$4,$5,'SIGNED',$6,$7,$8,$9,2,$10,$11,$12)`,[intent.deliveryJobId,number,parentId,intent.chainId,intent.senderAddress,
       intent.nonce,signed.gasLimit.toString(),signed.maxFeePerGas.toString(),signed.maxPriorityFeePerGas.toString(),signed.rawSignedTransaction,signed.transactionHash,actionDate(now)]);
+    afterMetricCommit(client, metrics => {
+      recordMetric(metrics, "attempts");
+      if (parentId !== null) { recordMetric(metrics, "replacements"); recordMetric(metrics, "retries", { kind: "replacement" }); }
+    });
   }
   async function withRecoveryLock(id,operation,context) {
     if (context) {
@@ -190,9 +197,10 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
     return eventRecord((await client.query(`INSERT INTO ${events} (attempt_id,broadcast_sequence,parent_event_id,endpoint_label)
       SELECT $1,COALESCE(MAX(broadcast_sequence),0) + 1,$2,$3 FROM ${events} WHERE attempt_id = $1 RETURNING *`,[attemptId,parentId,label])).rows[0]);
   }
-  async function completeEvent(client,eventId,{ resultClass,errorClass = null,transactionHash = null }) {
+  async function completeEvent(client,eventId,{ resultClass,errorClass = null,transactionHash = null }, retry = false) {
     const result = await client.query(`UPDATE ${events} SET completed_at = clock_timestamp(),result_class = $2,error_class = $3,returned_tx_hash = $4
       WHERE event_id = $1 AND completed_at IS NULL RETURNING *`,[eventId,resultClass,errorClass,transactionHash]);
+    if (result.rowCount && retry) afterMetricCommit(client, metrics => recordMetric(metrics, "retries", { kind: "exact_rebroadcast" }));
     if (!result.rowCount) {
       const old = (await client.query(`SELECT * FROM ${events} WHERE event_id = $1`,[eventId])).rows[0];
       if (!old || old.result_class !== resultClass || old.error_class !== errorClass || old.returned_tx_hash !== transactionHash) throw new TransactionError("CONFLICTING_BROADCAST_RESULT");
@@ -225,6 +233,21 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
       WHERE delivery_job_id = $1`,[id,status,winner.attemptId]);
     await client.query(`UPDATE ${attempts} SET status = 'REPLACED' WHERE delivery_job_id = $1 AND attempt_id <> $2 AND status <> 'REPLACED'`,[id,winner.attemptId]);
     await hooks.beforeOutcomeCommit?.({ client,id,observation });
+    afterMetricCommit(client, async metrics => {
+      if (status === "REVERTED") { recordMetric(metrics, "execution"); return; }
+      const gateway = config.productionDestinationGateway ?? process.env.PRODUCTION_DESTINATION_GATEWAY_ADDRESS;
+      if (!gateway || stored.intent.destinationGateway !== gateway.toLowerCase()) return;
+      if (decodeFunctionData({ abi: DESTINATION_GATEWAY_ABI, data: stored.intent.calldata }).functionName !== "execute") return;
+      const result = await pool.query(`SELECT s.observed_at,o.confirmed_at FROM ${jobs} j
+        JOIN ${tableName(config.databaseSchema, "source_messages")} s ON s.id = j.source_message_id
+        JOIN ${intents} i USING (delivery_job_id)
+        JOIN ${observations} o ON o.observation_id = i.current_receipt_observation_id
+        WHERE j.delivery_job_id = $1 AND i.status = 'CONFIRMED' AND o.transaction_hash = $2 AND o.block_hash = $3`,
+      [id, winner.transactionHash, hash]);
+      const row = result.rows[0]; if (!row) return;
+      const duration = secondsBetween(row.observed_at, row.confirmed_at);
+      if (duration !== null) recordMetric(metrics, "latency", {}, duration);
+    });
   }
   async function receiptObservations(client, id) {
       return Object.freeze((await client.query(`SELECT o.*,p.reorg_id,p.replacement_block_hash,p.observed_head,p.observed_head_hash,p.reconciled_at
@@ -485,7 +508,8 @@ export function createTransactionRepository({ config, pool, resolveIntent, befor
             return deliveryTransaction(pool,async client => {
               await locked(client,id,expected);
               if (fence) await assertLeaseFence(client,config,id,fence);
-              return completeEvent(client,event.eventId,result);
+              return completeEvent(client,event.eventId,result, BigInt(attempt.broadcastAttemptCount) > 1n &&
+                BigInt(event.broadcastSequence) === BigInt(start.event.broadcastSequence) + 1n);
             });
           },
         };

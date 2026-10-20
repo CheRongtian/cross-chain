@@ -2,6 +2,7 @@ import { loadConfig } from "./config.mjs";
 import { applyMigrations, createDatabasePool } from "./db.mjs";
 import { createFinalityWatcher } from "./finality-watcher.mjs";
 import { createChainClient, createIndexer, validateChainSource } from "./indexer.mjs";
+import { startWorkerMetrics } from "./metrics/http.mjs";
 
 const argumentsList = process.argv.slice(2);
 const mode = ["indexer", "finality"].includes(argumentsList[0]) ? argumentsList[0] : "indexer";
@@ -19,7 +20,9 @@ const controller = new AbortController();
 process.once("SIGINT", () => controller.abort());
 process.once("SIGTERM", () => controller.abort());
 
+let metricsListener;
 try {
+  metricsListener = await startWorkerMetrics();
   await applyMigrations(pool, config.databaseSchema);
   await validateChainSource(publicClient, config);
   if (mode === "indexer") {
@@ -38,5 +41,6 @@ try {
     }
   }
 } finally {
+  await metricsListener?.close();
   await pool.end();
 }

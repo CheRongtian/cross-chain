@@ -42,6 +42,7 @@ import { withAutomineDisabled } from "../../../indexer/test/helpers/transaction-
 import { verifyPostgresRestart } from "./postgres-restart-scenarios.mjs";
 import { verifyMultiComponentRecovery } from "./multi-component-recovery-scenario.mjs";
 import { verifyMessageQueryHTTP } from "../../../indexer/test/helpers/message-query-integration.mjs";
+import { metricValue, scrapeMetrics, scrapeValue } from "../../../indexer/test/helpers/metrics-assertions.mjs";
 
 const artifact = name => JSON.parse(readFileSync(new URL(`../../../contracts/out/${name}.sol/${name}.json`, import.meta.url), "utf8"));
 const normalizeError = value => typeof value === "string" && /^0x[0-9a-f]{40}$/i.test(value) ? value.toLowerCase() : value;
@@ -105,6 +106,8 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   }
 
   async function produceAndFinalize(payload, target = application, destinationWindow = 3600n) {
+    const observedBefore = await metricValue("messages_observed_total");
+    const finalizedBefore = await metricValue("messages_finalized_total");
     const event = await produceSourceMessage(payload, target, destinationWindow);
     await indexer.catchUpOnce();
     let [row] = await rowsFor([event.messageId]);
@@ -117,15 +120,30 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
     await finality.runFinalityPass();
     [row] = await rowsFor([event.messageId]);
     assert.equal(row.status, "FINALIZED");
+    assert.equal(await metricValue("messages_observed_total"), observedBefore + 1);
+    assert.equal(await metricValue("messages_finalized_total"), finalizedBefore + 1);
+    await indexer.catchUpOnce(); await finality.runFinalityPass();
+    assert.equal(await metricValue("messages_observed_total"), observedBefore + 1);
+    assert.equal(await metricValue("messages_finalized_total"), finalizedBefore + 1);
+    console.log("VALID: one fresh source occurrence increments observed once, its durable finalization increments finalized once, and duplicate ingestion adds no duplicate event");
     console.log(`VALID: fresh exact-intent credential proof and Application A → SourceGateway ${event.messageId}; Indexer OBSERVED → FINALIZING → FINALIZED`);
     return event;
   }
 
   async function sealFreshBatch(events) {
+    const before = await metricValue("batches_created_total");
+    const batchCount = async () => Number((await pool.query(`SELECT COUNT(*) AS count FROM ${tableName(config.databaseSchema, "message_batches")}`)).rows[0].count);
+    const rowsBefore = await batchCount();
     const collected = await lifecycle.collectEligible();
+    const created = await batchCount() - rowsBefore;
+    assert.ok(created === 0 || created === 1);
+    assert.equal(await metricValue("batches_created_total"), before + created);
     assert.equal(collected.assignedCount, events.length);
     const sealed = await lifecycle.sealBatch({ batchRecordId: collected.snapshot.record.batchRecordId });
     assert.deepEqual(sealed.batch.messageIds, events.map(event => event.messageId));
+    await lifecycle.readBatch({ batchRecordId: sealed.record.batchRecordId });
+    assert.equal(await metricValue("batches_created_total"), before + created, "seal and readback add no creation");
+    if (created) console.log("VALID: one new durable batch increments batches-created once while seal/commit/re-read paths do not double count it");
     return sealed;
   }
 
@@ -163,7 +181,17 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   }
 
   async function commitFresh(events) {
-    return commitPending(await prepareFreshBatch(events), active);
+    const node = active[0];
+    const before = scrapeValue(await scrapeMetrics(peers[node].url), "cross_chain_pbft_round_duration_seconds_count", { outcome: "committed" });
+    const pending = await prepareFreshBatch(events);
+    const batchCount = await metricValue("batches_created_total");
+    const committed = await commitPending(pending, active);
+    assert.equal(await metricValue("batches_created_total"), batchCount, "consensus commit is no batch creation");
+    assert.ok((await states[node].store.readCommitState(committed.record.epoch)).quorum);
+    const after = scrapeValue(await scrapeMetrics(peers[node].url), "cross_chain_pbft_round_duration_seconds_count", { outcome: "committed" });
+    assert.equal(after, before + 1, "the real local QC records one sample, not one per replicated vote");
+    console.log("VALID: a real PBFT round records one bounded round-duration observation for the exact production consensus lifecycle");
+    return committed;
   }
 
   const vectors = JSON.parse(readFileSync(new URL("../../../test-vectors/application-b-commands.json", import.meta.url), "utf8"));
@@ -203,7 +231,12 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   // Both estimates execute while S is unverified. G is a legitimate pre-signed transaction whose
   // later business revert is observed by the ordinary manager, without overriding its gas RPC.
   const prepared = [];
+  const attemptsBefore = await metricValue("delivery_attempts_total");
   for (const pack of packages) prepared.push(await manager.prepareDeliveryTransaction(pack.deliveryJobId));
+  assert.equal(await metricValue("delivery_attempts_total"), attemptsBefore + packages.length);
+  for (const pack of packages) await manager.repository.getTransaction(pack.deliveryJobId);
+  assert.equal(await metricValue("delivery_attempts_total"), attemptsBefore + packages.length);
+  console.log("VALID: durable transaction candidate creation increments delivery attempts while receipt polling and read-only recovery do not fabricate attempts");
   assert.equal(await readGateway("isMessageExecuted", [first.messageId]), false);
   assert.equal(await readGateway("isMessageExecuted", [redundant.messageId]), false);
   assert.equal(await readApp("isVerifiedSupplier", [supplier]), false);
@@ -281,9 +314,25 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
   assert.equal(await readApp("isVerifiedSupplier", [supplier]), true);
   console.log(`EXPECTED FAILURE: different authenticated message ${redundant.messageId} reached ApplicationB AlreadyVerifiedSupplier; actual Tx Manager transaction REVERTED; replay remains false`);
   await client.request({ method: "anvil_mine", params: [toHex(relayConfig.destinationConfirmations)] });
+  const executionFailures = await metricValue("destination_execution_failures_total");
+  const latencyCount = await metricValue("cross_chain_latency_seconds", { part: "_count" });
+  const latencySum = await metricValue("cross_chain_latency_seconds", { part: "_sum" });
   await manager.checkReceiptsOnce();
   assert.equal((await manager.repository.getTransaction(successPack.deliveryJobId)).intent.status, "CONFIRMED");
   assert.equal((await manager.repository.getTransaction(failurePack.deliveryJobId)).intent.status, "REVERTED");
+  assert.equal(await metricValue("destination_execution_failures_total"), executionFailures + 1);
+  assert.equal(await metricValue("cross_chain_latency_seconds", { part: "_count" }), latencyCount + 1);
+  const successObservation = (await manager.repository.getTransaction(successPack.deliveryJobId)).winningAttempt;
+  const [sourceObservation] = await rowsFor([first.messageId]);
+  const durationMs = Date.parse(successObservation.confirmedAt) - sourceObservation.observed_at.getTime();
+  assert.ok(durationMs >= 0);
+  assert.equal(Math.round(((await metricValue("cross_chain_latency_seconds", { part: "_sum" })) - latencySum) * 1000), durationMs,
+    "the fresh latency sample must use the real persisted source and canonical confirmation timestamps");
+  await manager.checkReceiptsOnce();
+  assert.equal(await metricValue("destination_execution_failures_total"), executionFailures + 1);
+  assert.equal(await metricValue("cross_chain_latency_seconds", { part: "_count" }), latencyCount + 1);
+  console.log("VALID: one fresh successful production message records cross-chain latency from durable source observation to canonical destination execution confirmation");
+  console.log("VALID: a real canonical destination REVERTED outcome increments destination execution failures while preparation defer and RPC failure do not");
   const evidence = async () => ({
     intents: (await pool.query(`SELECT * FROM ${tableName(config.databaseSchema, "transaction_intents")} ORDER BY delivery_job_id`)).rows,
     attempts: (await pool.query(`SELECT * FROM ${tableName(config.databaseSchema, "transaction_attempts")} ORDER BY attempt_id`)).rows,
@@ -1340,6 +1389,8 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
       }
     }
     await assertReady(members);
+    const beforeMetrics = new Map(await Promise.all(members.map(async index => [index, await scrapeMetrics(peers[index].url)])));
+    for (const body of beforeMetrics.values()) assert.equal(scrapeValue(body, "cross_chain_validator_available"), 1);
     const pending = await lifecycle.markConsensusPending({ batchRecordId: sealed.record.batchRecordId });
     assert.equal(pending.record.status, "CONSENSUS_PENDING");
     assert.equal(pending.consensusBinding.protocolVersion, "3");
@@ -1456,6 +1507,9 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
     }
     await assertOffline();
     await assert.rejects(() => request(oldPrimary, "/health"), error => error.cause?.code === "ECONNREFUSED");
+    await assert.rejects(() => scrapeMetrics(peers[oldPrimary].url), error => error.cause?.code === "ECONNREFUSED");
+    for (const index of live) assert.equal(scrapeValue(await scrapeMetrics(peers[index].url), "cross_chain_validator_available"), 1);
+    console.log("VALID: ready validators expose availability=1; stopped validator availability is represented by scrape-target loss rather than committee mutation");
     await assertOldViewIncomplete();
     assert.deepEqual(await lifecycle.readBatch({ batchRecordId: pending.record.batchRecordId }), pending);
     console.log(`VALID: deterministic primary ${oldPrimaryAddress}, PID ${stopped.child.pid}, endpoint ${peers[oldPrimary].url}, store ${offlineSchema} stopped after durable PRE-PREPARE reached only backup ${peers[recipient].address}; view ${oldView} has zero PREPARE/COMMIT votes or QC; proposal locks and store preserved; gate healed and exactly three members remain ready`);
@@ -1485,6 +1539,15 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
       return views.every(state => state?.current_view === newView && state.finalized) ? views : null;
     }, live);
     const established = await states[newPrimary].store.readNewView(oldStatement.epoch, newView);
+    for (const index of live) {
+      const body = await scrapeMetrics(peers[index].url); const before = beforeMetrics.get(index);
+      for (const name of ["cross_chain_pbft_view_changes_total", "cross_chain_pbft_quorum_failures_total"]) {
+        assert.equal(scrapeValue(body, name), scrapeValue(before, name) + 1);
+      }
+      const oldRoundCount = scrapeValue(body, "cross_chain_pbft_round_duration_seconds_count", { outcome: "view_change" });
+      assert.equal(oldRoundCount, scrapeValue(before, "cross_chain_pbft_round_duration_seconds_count", { outcome: "view_change" }) + (index === recipient ? 1 : 0));
+    }
+    console.log("VALID: the deterministic primary-failure scenario records the real certified view transition and one failed old-view quorum without changing PBFT safety");
     assert.ok(established);
     assert.equal(established.primaryIdentity, newPrimaryAddress); assert.equal(established.viewChanges.length, 3);
     assert.deepEqual(established.viewChanges.map(vote => vote.voterIdentity).sort(), liveAddresses);
@@ -2347,7 +2410,9 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
       const recoveryLogger = { log: message => reconciliation.push(message), error: message => console.error(message) };
       const recoveredWatcher = createFinalityWatcher({ config, pool: recoveryPool, publicClient: chainA, logger: recoveryLogger });
       const recoveredIndexer = createIndexer({ config, pool: recoveryPool, publicClient: chainA, logger: recoveryLogger });
+      const reorgedBefore = await metricValue("messages_reorged_total");
       await recoveredWatcher.runFinalityPass();
+      assert.equal(await metricValue("messages_reorged_total"), reorgedBefore + 1);
       assert.ok(reconciliation.includes(`Common ancestor: ${commonAncestor.number}`));
       assert.ok(reconciliation.includes("Unfinalized messages marked REORGED: 1"));
       const orphaned = await readOccurrence(orphan);
@@ -2372,6 +2437,8 @@ export async function verifyDestinationExecution({ config, pool, lifecycle, vali
       assert.equal(repeated.insertedRows, 0);
       await recoveredWatcher.runFinalityPass();
       assert.deepEqual(await readMessages(recoveryPool, config.databaseSchema), beforeRepeat);
+      assert.equal(await metricValue("messages_reorged_total"), reorgedBefore + 1);
+      console.log("VALID: one real source occurrence transitioning to REORGED increments the reorg counter once while repeated reconciliation adds no duplicate event");
       // Actually drive the existing downstream workers while the replacement is
       // still unfinalized. Old unrelated READY/deferred jobs may exist.
       await recoveryWorker.runOnce();

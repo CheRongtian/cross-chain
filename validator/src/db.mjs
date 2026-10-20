@@ -1,6 +1,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
 import pg from "pg";
+import { beginMetricEvents, afterMetricCommit, finishMetricEvents, recordMetric, secondsBetween } from "../../indexer/src/metrics/registry.mjs";
 import { tableName } from "../../indexer/src/db.mjs";
 import { validateSchemaName } from "../../indexer/src/config.mjs";
 import { consensusBinding } from "./validator-sets.mjs";
@@ -62,6 +63,20 @@ export function createValidatorStore({ pool, config }) {
   const expectedCommittee = config.validatorSets.history[0].validators;
   const historyTable = tableName(config.databaseSchema, "validator_set_history");
   const protocolConfig = { ...config, allowHistorical: true };
+  function observeRound(client, startedAt, endedAt, outcome) {
+    afterMetricCommit(client, metrics => {
+      const duration = secondsBetween(startedAt, endedAt);
+      if (duration !== null) recordMetric(metrics, "round", { outcome }, duration);
+    });
+  }
+  async function metricViewState(client, epoch) {
+    return (await client.query(`SELECT v.*,
+      (SELECT p.accepted_at FROM ${prepares} p WHERE p.local_validator_identity = v.local_validator_identity
+        AND p.epoch = v.epoch AND p.view = v.current_view AND p.protocol_version = v.protocol_version) AS metrics_started_at,
+      EXISTS (SELECT 1 FROM ${commitQuorums} q WHERE q.local_validator_identity = v.local_validator_identity
+        AND q.epoch = v.epoch AND q.view = v.current_view AND q.protocol_version = v.protocol_version) AS metrics_has_quorum
+      FROM ${epochViews} v WHERE v.local_validator_identity = $1 AND v.epoch = $2`, [config.validatorAddress, epoch])).rows[0];
+  }
   const expectedIdentity = {
     validator_address: config.validatorAddress,
     source_domain: config.chainDomain.toString(),
@@ -146,7 +161,7 @@ export function createValidatorStore({ pool, config }) {
       : { vote, voteCount: votes.length, prepared };
   }
 
-  async function requirePrepared(client, epoch, view = "0") {
+  async function requirePrepared(client, epoch, view = "0", withTiming = false) {
     const accepted = proposalRecord((await client.query(`SELECT * FROM ${prepares}
       WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (2,3)`, [config.validatorAddress, epoch, view])).rows[0]);
     if (!accepted) throw new CommitError("NOT_PREPARED");
@@ -162,7 +177,7 @@ export function createValidatorStore({ pool, config }) {
         throw new CommitError("WRONG_PREPARED_PROPOSAL");
       }
     }
-    return statement;
+    return withTiming ? { statement, acceptedAt: accepted.acceptedAt } : statement;
   }
 
   function commitVoteRecord(row) {
@@ -204,7 +219,7 @@ export function createValidatorStore({ pool, config }) {
 
   async function persistCommit(client, vote) {
     await assertActive(client, vote.epoch, vote.view, CommitError);
-    const statement = await requirePrepared(client, vote.epoch, vote.view);
+    const { statement, acceptedAt } = await requirePrepared(client, vote.epoch, vote.view, true);
     const existing = (await client.query(`SELECT * FROM ${commitVotes}
       WHERE local_validator_identity = $1 AND epoch = $2 AND voter_identity = $3 AND view = $4 AND protocol_version IN (2,3)`,
     [config.validatorAddress, vote.epoch, vote.voterIdentity, vote.view])).rows[0];
@@ -227,27 +242,30 @@ export function createValidatorStore({ pool, config }) {
     const voters = (await client.query(`SELECT voter_identity FROM ${commitVotes}
       WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3 AND protocol_version IN (2,3) ORDER BY voter_identity`, [config.validatorAddress, vote.epoch, vote.view])).rows;
     if (voters.length >= 3) {
-      await client.query(`INSERT INTO ${commitQuorums}
+      const inserted = await client.query(`INSERT INTO ${commitQuorums}
         (local_validator_identity, epoch, batch_id, message_root, proposal_digest, committee_digest, qc_digest, quorum_voters, view, protocol_version,validator_epoch)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11) ON CONFLICT (local_validator_identity, epoch, view, protocol_version) DO NOTHING`,
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10,$11) ON CONFLICT (local_validator_identity, epoch, view, protocol_version) DO NOTHING RETURNING reached_at`,
       [config.validatorAddress, vote.epoch, vote.batchId, vote.messageRoot, vote.proposalDigest,
         vote.committeeDigest, qcDigest(statement), JSON.stringify(voters.slice(0, 3).map((entry) => entry.voter_identity)), vote.view, Number(vote.protocolVersion), vote.validatorEpoch ?? null]);
+      if (inserted.rowCount) observeRound(client, acceptedAt, inserted.rows[0]?.reached_at, "committed");
     }
     return commitResult(client, vote.epoch, vote.view);
   }
 
   async function transaction(operation) {
     const client = await pool.connect();
+    beginMetricEvents(client, pool);
     let discarded = false;
     try {
       await client.query("BEGIN");
       const result = await operation(client);
       await client.query("COMMIT");
+      finishMetricEvents(client, true);
       return result;
     } catch (error) {
       try { await client.query("ROLLBACK"); } catch (rollbackError) { client.release(rollbackError); discarded = true; }
       throw error;
-    } finally { if (!discarded) client.release(); }
+    } finally { finishMetricEvents(client, false); if (!discarded) client.release(); }
   }
 
   async function persistPrepare(client, vote) {
@@ -414,7 +432,7 @@ export function createValidatorStore({ pool, config }) {
       return transaction(async (client) => {
         await checkState(client, "FOR UPDATE");
         epoch = protocolInteger(epoch).toString();
-        const state = (await client.query(`SELECT * FROM ${epochViews} WHERE local_validator_identity = $1 AND epoch = $2`, [config.validatorAddress, epoch])).rows[0];
+        const state = await metricViewState(client, epoch);
         if (!state || state.finalized) throw new ViewChangeError(state ? "ALREADY_COMMITTED" : "UNKNOWN_EPOCH");
         if (expected.view !== undefined && protocolInteger(expected.view).toString() !== state.current_view) throw new ViewChangeError("STALE_VIEW");
         if ((expected.progressRevision !== undefined && String(expected.progressRevision) !== String(state.progress_revision)) ||
@@ -442,6 +460,7 @@ export function createValidatorStore({ pool, config }) {
           view_change_at = COALESCE($4::timestamptz,CURRENT_TIMESTAMP)
           WHERE local_validator_identity = $1 AND epoch = $2`, [config.validatorAddress, epoch, targetView,
             expected.now === undefined ? null : new Date(expected.now)]);
+        if (!state.changing_view && !state.metrics_has_quorum) afterMetricCommit(client, metrics => recordMetric(metrics, "quorum"));
         return vote;
       });
     },
@@ -495,7 +514,7 @@ export function createValidatorStore({ pool, config }) {
         await checkState(client, "FOR UPDATE");
         await ensureEpoch(client, { ...message.selectedProposal, protocolVersion: message.protocolVersion });
         await assertSafe(client, message.selectedProposal, ViewChangeError);
-        const state = (await client.query(`SELECT * FROM ${epochViews} WHERE local_validator_identity = $1 AND epoch = $2`, [config.validatorAddress, message.epoch])).rows[0];
+        const state = await metricViewState(client, message.epoch);
         if (state.finalized) throw new ViewChangeError("ALREADY_COMMITTED");
         const existing = (await client.query(`SELECT * FROM ${newViews} WHERE local_validator_identity = $1 AND epoch = $2 AND view = $3`,
           [config.validatorAddress, message.epoch, message.view])).rows[0];
@@ -507,10 +526,12 @@ export function createValidatorStore({ pool, config }) {
         await assertCommitLock(client, message.epoch);
         await client.query(`INSERT INTO ${newViews} (local_validator_identity,epoch,view,digest,envelope,protocol_version,validator_epoch,committee_digest) VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8)`,
           [config.validatorAddress, message.epoch, message.view, message.newViewDigest, JSON.stringify(message), Number(message.protocolVersion), message.validatorEpoch ?? null, message.committeeDigest ?? null]);
-        await client.query(`UPDATE ${epochViews} SET current_view = $3, target_view = GREATEST(target_view,$3), changing_view = target_view > $3,
+        const changed = await client.query(`UPDATE ${epochViews} SET current_view = $3, target_view = GREATEST(target_view,$3), changing_view = target_view > $3,
           progress_at = CURRENT_TIMESTAMP, progress_revision = progress_revision + 1,
           view_change_at = CASE WHEN target_view > $3 THEN view_change_at ELSE NULL END
-          WHERE local_validator_identity = $1 AND epoch = $2`, [config.validatorAddress, message.epoch, message.view]);
+          WHERE local_validator_identity = $1 AND epoch = $2 RETURNING progress_at`, [config.validatorAddress, message.epoch, message.view]);
+        afterMetricCommit(client, metrics => recordMetric(metrics, "views"));
+        if (!state.metrics_has_quorum) observeRound(client, state.metrics_started_at, changed.rows[0]?.progress_at, "view_change");
         return message;
       });
     },

@@ -89,7 +89,9 @@ The current implementation can:
 - verify ordered message-ID inclusion on Chain B against a canonical full-membership batch commitment and an independently authenticated Message Root;
 - validate full message identity, current remote-source trust, explicit destination intent, supported message version and strict destination expiry through the stateless `MessageDomainVerifier`;
 - compose QC, Merkle and full-message verification in `DestinationGateway.execute(bytes)`, consume the authenticated message ID and dispatch its payload atomically;
-- execute the Application B supplier-grant example only through its configured Gateway, with business errors rolling back message consumption.
+- execute the Application B supplier-grant example only through its configured Gateway, with business errors rolling back message consumption;
+- query one message's persisted lifecycle through a read-only API and built-in Explorer;
+- expose process-local Prometheus operational metrics without granting the observability surface any protocol authority.
 
 ## Architecture
 
@@ -1712,7 +1714,7 @@ Authorization observations require `IDENTITY_APPLICATION_ADDRESS` to identify th
 
 Matching live occurrences expose `AUTHORIZED`; a displaced occurrence exposes only `HISTORICAL_AUTHORIZED` on its former branch. Missing configuration, another application, another scope or an unsupported historical message version exposes `UNAVAILABLE`. An unavailable observation is not a failed proof. This field does not claim current credential validity, permanent source finality, credential-to-EVM ownership or a new proof check. Neither proofs nor private witnesses are sent to the browser.
 
-The Explorer has no database, Validator-store or chain-RPC access and no protocol authority. All browser requests use the same-origin read-only API; all API-controlled display values are inserted as text. The server serves an explicit static-path allowlist, never arbitrary project files, with same-origin content restrictions. Explorer/API downtime does not affect protocol processing. Observations can lag chain changes; viewing a message never triggers reconciliation or reorg recovery. There are no metrics, dashboards, authentication or analytics services.
+The Explorer has no database, Validator-store or chain-RPC access and no protocol authority. All browser requests use the same-origin read-only API; all API-controlled display values are inserted as text. The server serves an explicit static-path allowlist, never arbitrary project files, with same-origin content restrictions. Explorer/API downtime does not affect protocol processing. Observations can lag chain changes; viewing a message never triggers reconciliation or reorg recovery. The server also provides the operational `/metrics` endpoint below; the Explorer contains no metrics dashboard, authentication or analytics service.
 
 The single full verification entry remains `./scripts/verify.sh`, writing the latest complete run to root `verification.log`. It retains all protocol regressions and adds an Explorer group for pure view-model/client/renderer tests and real loopback static/API HTTP tests. Existing E2E listeners also serve the assets, feed real messages through the same browser client and view-model/renderer code, and cover source orphans, historical committees, replacement history, destination reorg recovery and the three-of-four successful production execution. This is HTTP plus production presentation-code verification without browser automation; visual browser behavior still requires manual inspection. Repeated Explorer queries remain inside the existing zero-protocol-mutation snapshot checks.
 
@@ -1750,9 +1752,69 @@ HTTP results are `200` for a consistent observed lifecycle, `400` for an invalid
 
 Each source/delivery/transaction read uses a `REPEATABLE READ READ ONLY` transaction. Validator stores have their own read-only snapshots; the API does not claim atomic snapshots across independent databases. It acquires no worker/account/voting row locks, advisory locks or delivery ownership. It advances no cursor, finality, PBFT phase, retry schedule or destination recovery. It signs and broadcasts nothing, and it repairs no corrupted evidence.
 
-API responses are not protocol authorization or finality authority. Query API downtime does not affect message processing. The dependency direction is Explorer → API → existing state; Indexer, Validators, Relayers, Transaction Manager and Gateway never depend on this observational surface for decisions. DestinationGateway remains the destination authorization/replay boundary. The local read-only surface includes the built-in Explorer but supplies no authentication service, metrics endpoint or dashboard.
+API responses are not protocol authorization or finality authority. Query API downtime does not affect message processing. The dependency direction is Explorer → API → existing state; Indexer, Validators, Relayers, Transaction Manager and Gateway never depend on this observational surface for decisions. DestinationGateway remains the destination authorization/replay boundary. The local read-only surface includes the built-in Explorer and a separate `/metrics` route, without an authentication service or dashboard.
 
 Complete verification retains all protocol and fault-recovery coverage, adds HTTP/unit/database query cases, and queries existing real successful messages, source orphans, replacement history, historical committees and a temporarily reopened destination intent. It also queries the fresh three-of-four execution from composed recovery while its owned stores remain available. Repeated HTTP reads are compared against source/consensus/lease/account/attempt/receipt/business snapshots, with no new chain or Validator world.
+
+## Prometheus Operational Metrics
+
+The protocol exposes Prometheus-compatible operational metrics for source ingestion/finality/reorgs, batch creation, local PBFT progress, Validator readiness, durable transaction attempts/retries/replacements, destination RPC failures and execution outcomes. Metrics are aggregate observations. They authorize no source transition, consensus vote, delivery, nonce allocation, retry or Gateway execution.
+
+### Endpoints and process ownership
+
+`GET /metrics` returns the standard Prometheus text exposition and content type produced by [prom-client](https://github.com/siimon/prom-client/tree/v15.1.3), pinned to `15.1.3` in the Indexer package and lockfile. `HEAD` is supported; other methods receive `405` without changing counters or protocol state. Scraping serializes in-memory instruments only: it performs no database/RPC queries, worker locks, recovery or backfill. Serialization failure returns a fixed safe `503`; no error stack or connection material is exposed, and ordinary protocol processing continues.
+
+Each OS process owns one explicit registry. It is never registered with prom-client's global registry. API/Explorer serves `/metrics` on its existing `MESSAGE_QUERY_API_HOST`/`MESSAGE_QUERY_API_PORT` (default `127.0.0.1:8080`). Each Validator serves its own registry on that Validator's existing HTTP port. API scrapes do not aggregate metrics from separate workers or reconstruct counters from their databases. An API-only process will legitimately expose zero protocol-event counters.
+
+Indexer, Finality, Relayer and Transaction Manager CLI entries can expose their own same-process metrics-only listener using optional `METRICS_HOST` (default `127.0.0.1`) and `METRICS_PORT`. An empty/unset port disables it. Hosts are limited to loopback (`127.0.0.1`, `::1`, `localhost`); assign a different port to each simultaneous CLI process through its own environment. The listener has no scheduler or protocol commands, closes with its owning run, and a bind failure does not stop that worker. Short-lived one-shot workers can finish between scrapes; no background daemon, persistent exporter, process aggregation or new worker mode is provided.
+
+For example, an external Prometheus instance can use these static targets after the existing API and a worker configured on port `9101` have been started:
+
+```yaml
+scrape_configs:
+  - job_name: cross-chain-api
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+  - job_name: cross-chain-worker
+    static_configs:
+      - targets: ["127.0.0.1:9101"]
+```
+
+Add each running Validator's actual existing HTTP address as a separate target; the repository does not assign a second Validator port. Target/job labels belong to the scraper, not protocol message labels. Prometheus installation, Docker, Grafana and dashboard provisioning are outside this repository's verification flow.
+
+### Metric definitions
+
+Every name below is exported exactly as written. All counters track new events in the owning process; they are not database-wide totals or current-state gauges.
+
+| Metric | Type | Instrumentation and meaning |
+| --- | --- | --- |
+| `cross_chain_messages_observed_total` | Counter | Actual new source occurrence inserts after `persistRange` commits; duplicates and rolled-back inserts add zero. |
+| `cross_chain_messages_finalized_total` | Counter | Actual OBSERVED/FINALIZING → FINALIZED row transitions after finality COMMIT. |
+| `cross_chain_messages_reorged_total` | Counter | Actual unfinalized occurrence → REORGED transitions after canonical recovery COMMIT; repeated reconciliation adds zero. |
+| `cross_chain_batches_created_total` | Counter | New BUILDING batch INSERT after COMMIT; collection of an existing batch, seal, consensus commit and reads add zero. |
+| `cross_chain_pbft_round_duration_seconds` | Histogram | **Local Validator** persisted PRE-PREPARE acceptance → first durable local QC (`outcome="committed"`), or acceptance → certified NEW_VIEW abandonment without an old-view QC (`outcome="view_change"`). No accepted proposal means no invented start/sample. Replicas produce independent local observations, not a single global-round count. |
+| `cross_chain_pbft_view_changes_total` | Counter | A genuinely higher, verified NEW_VIEW accepted by this local Validator after COMMIT; repeated envelopes and reads add zero. Timeout votes alone do not increment it. |
+| `cross_chain_validator_available` | Gauge | Zero during local startup/unready/closed or halted scheduler; one after production initialization/listen and successful existing readiness checks. Existing failed health checks set zero. Scraping does not actively probe readiness. Process death is represented by scrape failure / Prometheus `up=0`, never committee mutation. |
+| `cross_chain_pbft_quorum_failures_total` | Counter | First durable local timeout/view-change entry for an active old view lacking a local QC. Repeated timeout votes, escalation of that same old view, insufficient/invalid vote input and passive reads add zero. |
+| `cross_chain_delivery_attempts_total` | Counter | Each newly persisted signed transaction candidate, including a replacement, after COMMIT; no increment for preparation calls, rebroadcast, receipt polling or read-only recovery. |
+| `cross_chain_delivery_retries_total` | Counter | `kind="replacement"` on durable new replacement creation; `kind="exact_rebroadcast"` on the first durably completed endpoint-send result of a repeated logical broadcast action for the same candidate. Root start markers without external send, subsequent failover endpoints and receipt-only reconciliation add zero. A crash before durable send-result recording can leave an observation gap. |
+| `cross_chain_relayer_failures_total` | Counter | Failed explicit Relayer/Transaction Manager actions, bounded by `operation` and `reason_class`. A propagated manager failure is counted once. Normal no-work/busy/defer/front-nonce blocking results add zero. Successful RPC failover alone is not a failed action. |
+| `cross_chain_rpc_failures_total` | Counter | Failed destination endpoint requests, including primary failure followed by successful fallback, plus explicit identity, single-request validation and broadcast-hash rejection. Bounded `operation`/`reason_class`; no endpoint URL label. Counts requests, not logical deliveries. Cross-provider disagreement without an identifiable failed individual request remains existing protocol diagnostics. |
+| `cross_chain_transaction_replacements_total` | Counter | Each genuinely new durable same-nonce replacement candidate after COMMIT. Concurrent duplicate preparation, reuse and reconciliation add zero. |
+| `cross_chain_cross_chain_latency_seconds` | Histogram | Persisted `source_messages.observed_at` → persisted canonical receipt `confirmed_at` for a new successful terminal observation of the exact `execute(bytes)` wrapper at configured `PRODUCTION_DESTINATION_GATEWAY_ADDRESS`. The doubled `cross_chain` is the canonical metric name. Historical raw-envelope/EOA transport receipts, signature creation and unconfirmed sends are excluded. |
+| `cross_chain_destination_execution_failures_total` | Counter | A new durably canonical REVERTED destination transaction outcome after the ordinary receipt-depth checks; repeated reads/polls add zero. Estimate rejection/defer and unavailable RPCs do not create this event. |
+
+PBFT histogram buckets (seconds): `0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120`. Latency buckets (seconds): `0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600`. Standard `_bucket`, `_sum`, `_count` and `+Inf` series are provided. Missing, invalid or negative persisted durations drop only that metric observation.
+
+Counter labels are allowlisted finite enums. Relayer `operation` is `process_job`, `run` or `transaction`; `reason_class` is one of `TRANSIENT_RPC_ERROR`, `AMBIGUOUS_BROADCAST`, `ALREADY_KNOWN`, `REPLACEMENT_UNDERPRICED`, `NONCE_TOO_LOW`, `DETERMINISTIC_REJECTION`, `RPC_RESPONSE_ERROR`, `STALE_FENCE`, `RELAYER_RUN_FAILED`, `TRANSACTION_MANAGER_FAILED`. RPC operations are the wire methods `eth_chainId`, `eth_getBlockByNumber`, `eth_blockNumber`, `eth_getTransactionCount`, `eth_getTransactionReceipt`, `eth_getTransactionByHash`, `eth_sendRawTransaction`, `eth_estimateGas`, `eth_maxPriorityFeePerGas`, `eth_call`, with the first seven failure classes above. Message/batch/transaction IDs, roots/QC digests, signer/user addresses, nonces, URLs, worker IDs, arbitrary exception text, credentials, private keys, raw signed bytes and private witnesses never become labels or exposition data.
+
+### Event accuracy and verification
+
+Durable transition observations are emitted only after COMMIT and discarded on rollback. They are best-effort in-memory telemetry: restart resets counters/histograms, and a crash or unavailable sink between durable COMMIT and observation can undercount. No metrics database, migration, recovery authority, event bus or historical counter backfill exists. Scraping and repeated recovery reads never replay past metric events. Library/sink/serialization failures are isolated from existing protocol errors, which retain their normal fail-fast behavior.
+
+Canonical receipt finality remains depth-based and reversible. A later reorg does not subtract an old counter/histogram observation. Genuine canonical reconfirmation after ordinary production recovery is a **new terminal event**, and may produce a second latency or failure observation for the same intent. These metrics describe observed events; they are not an exactly-once business-execution ledger. The lifecycle API and immutable receipt history remain the place to inspect current/historical provenance.
+
+The existing `./scripts/verify.sh` adds `[prometheus operational metrics]` for library types/HELP/buckets, isolated registries, bounded labels, secret sentinels, loopback HTTP methods and fail-open serialization/sinks, rollback/duplicate persistence, and event deltas. It checks the installed pinned dependency without installing packages. Existing real source/finality/reorg, PBFT/primary-failure, retry/replacement, all-path RPC outage, Gateway success and canonical REVERTED scenarios retain their original safety assertions and add metric deltas. Existing Explorer/API zero-mutation snapshots now include repeated metrics scrapes, covering source/QC/votes/leases/nonces/retries/attempts/receipts and Gateway/ApplicationB state. Results overwrite root `verification.log`. No Prometheus server, Grafana, additional chain, Validator network or fault framework is started just for metrics.
 
 ## Local Two-Chain Environment
 
@@ -2134,6 +2196,9 @@ Cross-Chain/
 │   │   ├── main.mjs
 │   │   ├── message-batch.mjs
 │   │   ├── message-merkle.mjs
+│   │   ├── metrics/
+│   │   │   ├── http.mjs
+│   │   │   └── registry.mjs
 │   │   ├── migrate.mjs
 │   │   ├── reorg-detector.mjs
 │   │   ├── relayer/
@@ -2210,6 +2275,8 @@ Cross-Chain/
 │   │   ├── message-merkle-golden.test.mjs
 │   │   ├── message-query.test.mjs
 │   │   ├── message-query.database.test.mjs
+│   │   ├── metrics.test.mjs
+│   │   ├── metrics.database.test.mjs
 │   │   ├── reorg-detector.test.mjs
 │   │   ├── relayer-config.test.mjs
 │   │   ├── relayer-encoding.test.mjs

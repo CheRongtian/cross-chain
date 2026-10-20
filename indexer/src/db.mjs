@@ -2,6 +2,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 import pg from "pg";
+import { metricsFor, recordMetric } from "./metrics/registry.mjs";
 
 import {
   CanonicalDivergenceError,
@@ -482,6 +483,7 @@ export function createDatabaseStore(pool, schema) {
         }
 
         await client.query("COMMIT");
+        recordMetric(metricsFor(pool), "observed", {}, inserted);
         return { inserted, duplicates, nextBlock: BigInt(updated.rows[0].next_block) };
       } catch (error) {
         await client.query("ROLLBACK");
@@ -806,6 +808,7 @@ export function createCanonicalStore(pool, schema) {
         }
 
         await client.query("COMMIT");
+        recordMetric(metricsFor(pool), "reorged", {}, reorged.rowCount);
         return {
           reorgedMessages: reorged.rowCount,
           deletedCanonicalBlocks: deleted.rowCount,
@@ -910,6 +913,7 @@ export function createFinalityStore(pool, schema) {
         }
 
         await client.query("COMMIT");
+        recordMetric(metricsFor(pool), "finalized", {}, result.observedToFinalized + result.finalizingToFinalized);
         return result;
       } catch (error) {
         await client.query("ROLLBACK");

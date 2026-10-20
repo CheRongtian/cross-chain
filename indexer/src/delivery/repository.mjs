@@ -1,21 +1,24 @@
 import { isDeepStrictEqual } from "node:util";
+import { beginMetricEvents, finishMetricEvents } from "../metrics/registry.mjs";
 import { createBatchLifecycle } from "../batch-lifecycle.mjs";
 import { normalizeSourceScope, tableName } from "../db.mjs";
 import { buildDeliveryPackages, DeliveryError, deliveryIndex, deliveryLimit } from "./package.mjs";
 
 export async function deliveryTransaction(pool, operation) {
   const client = await pool.connect();
+  beginMetricEvents(client, pool);
   let released = false;
   try {
     await client.query("BEGIN");
     const value = await operation(client);
     await client.query("COMMIT");
+    finishMetricEvents(client, true);
     return value;
   } catch (error) {
     try { await client.query("ROLLBACK"); }
     catch (rollbackError) { client.release(rollbackError); released = true; }
     throw error;
-  } finally { if (!released) client.release(); }
+  } finally { finishMetricEvents(client, false); if (!released) client.release(); }
 }
 
 export function deliveryLifecycle(config, pool) {
