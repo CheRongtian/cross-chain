@@ -4,7 +4,7 @@ import { messageIdFromURL } from "../../public/explorer/view-model.js";
 import { renderMessageView } from "../../public/explorer/render.js";
 import { textDocument } from "./explorer-fixtures.mjs";
 
-export const explorerAssetPaths = ["/assets/explorer/app.js", "/assets/explorer/client.js", "/assets/explorer/view-model.js", "/assets/explorer/render.js", "/assets/explorer/styles.css"];
+export const explorerAssetPaths = ["/assets/explorer/app.js", "/assets/explorer/client.js", "/assets/explorer/list-view.js", "/assets/explorer/view-model.js", "/assets/explorer/render.js", "/assets/explorer/styles.css"];
 
 export async function verifyExplorerAssets(origin) {
   for (const path of ["/", "/explorer", "/?messageId=0x01", ...explorerAssetPaths]) {

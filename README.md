@@ -1703,9 +1703,11 @@ CONFIRMED records a successful canonical receipt at configured depth, a heuristi
 
 ## Cross-chain Message Explorer
 
-A built-in read-only Explorer presents one canonical message from its Chain A source occurrence through authorization, finality, batching, Merkle commitment, PBFT votes and quorum evidence, Relayer transaction history, and the current persisted Chain B execution result. It consumes the Message Query API described below. It never authorizes a proof, finalizes a source occurrence, votes, retries a delivery, reserves a nonce or submits a transaction.
+A built-in read-only Explorer opens with recent messages from the configured source scope. Choose a message to follow its Chain A source occurrence through authorization, finality, batching, Merkle commitment, PBFT votes and quorum evidence, Relayer transaction history, and the current persisted Chain B execution result. It consumes the Message Query API described below. It never authorizes a proof, finalizes a source occurrence, votes, retries a delivery, reserves a nonce or submits a transaction.
 
-The Explorer is served by the existing API process: after configuring the deployment, start that process from `indexer/` with `npm run api:start`, then open `http://127.0.0.1:8080/` (or `/explorer`). Enter a complete canonical message ID. The shareable URL is `/?messageId=<canonical-message-id>`; replace the placeholder with an actual ID from your deployment. No second daemon, frontend build, package installation, wallet, external font or CDN is required. The page uses repository-local HTML, CSS and JavaScript modules. Listener configuration remains the API's existing loopback host/port settings.
+The Explorer is served by the existing API process: after configuring the deployment, run `./scripts/start.sh` from the project root, then open the printed address (default `http://127.0.0.1:8080/`, also available at `/explorer`). The homepage automatically loads up to 20 recent messages with first-observed time, exact source/destination domains and explicitly labelled source status. Select an ID link to open its lifecycle; no ID lookup in logs is required. Complete-ID search remains optional. Copy ID/copy link actions and expandable full IDs support sharing without losing the exact identifier. If clipboard access is unavailable, the page explains how to select the full ID or copy the browser URL.
+
+Older messages uses bounded cursor pagination; Latest messages returns to the first page. The `before` query parameter preserves a list page through detail navigation and browser back/forward. Details retain the shareable `messageId` query parameter. Refresh reloads the current list or selected detail independently of unfinished search input; blank search returns to browsing without an invalid-ID error. Empty pages show a no-messages explanation and a path back to the latest messages. No second daemon, frontend build, package installation, wallet, external font or CDN is required. The page uses repository-local HTML, CSS and JavaScript modules. Listener configuration remains the API's existing loopback host/port settings.
 
 The lifecycle timeline and detailed sections show Source, ZK Authorization, Finality, Batch, Merkle Commitment, PBFT Consensus, Validator Votes, Quorum & Certificate, Delivery, Relayer Attempts, Destination Transaction and Execution Result. Full-width integers remain exact decimal strings. Hashes remain fully readable and wrap on narrow screens. Public payload bytes are shown as hex in technical details. Search is keyboard-accessible, reports loading and fixed safe errors, cancels superseded requests and supports browser back/forward navigation. Refresh only performs another observational GET.
 
@@ -1717,9 +1719,13 @@ Matching live occurrences expose `AUTHORIZED`; a displaced occurrence exposes on
 
 The Explorer has no database, Validator-store or chain-RPC access and no protocol authority. All browser requests use the same-origin read-only API; all API-controlled display values are inserted as text. The server serves an explicit static-path allowlist, never arbitrary project files, with same-origin content restrictions. Explorer/API downtime does not affect protocol processing. Observations can lag chain changes; viewing a message never triggers reconciliation or reorg recovery. The server also provides the operational `/metrics` endpoint below; the Explorer contains no metrics dashboard, authentication or analytics service.
 
-The single full verification entry remains `./scripts/verify.sh`, writing the latest complete run to root `verification.log`. It retains all protocol regressions and adds an Explorer group for pure view-model/client/renderer tests and real loopback static/API HTTP tests. Existing E2E listeners also serve the assets, feed real messages through the same browser client and view-model/renderer code, and cover source orphans, historical committees, replacement history, destination reorg recovery and the three-of-four successful production execution. This is HTTP plus production presentation-code verification without browser automation; visual browser behavior still requires manual inspection. Repeated Explorer queries remain inside the existing zero-protocol-mutation snapshot checks.
+The single full verification entry remains `./scripts/verify.sh`, writing the latest complete run to root `verification.log`. It retains all protocol regressions and includes Explorer view-model/client/renderer tests, list/deep-link/refresh/copy navigation tests with a text-only DOM fixture, and real loopback static/API HTTP tests. Database cases check bounded pagination, scope isolation, live/orphan deduplication and unchanged persisted state. Existing E2E listeners also serve the assets, discover real messages through the production list client, feed real details through the same view-model/renderer code, and cover source orphans, historical committees, replacement history, destination reorg recovery and the three-of-four successful production execution. This is HTTP plus production presentation-code verification without browser automation; visual browser behavior still requires manual inspection. Repeated Explorer list/detail queries remain inside the existing zero-protocol-mutation snapshot checks.
 
 ## Read-only Message Lifecycle API
+
+`GET /api/v1/messages` discovers messages in the configured source domain/Gateway and database schema. Optional `limit` defaults to `20` and must be an integer from `1` to `100`; optional `before` is the previous response's exact decimal `nextCursor`. Responses contain `apiVersion`, `authority: "OBSERVATIONAL"`, `observedAt`, `items` and `nextCursor` (`null` on the last page). Each item includes only `messageId`, `sourceDomain`, `destinationDomain`, `sourceStatus` and `observedAt`. Invalid, duplicated or unknown query parameters return `400 INVALID_LIST_QUERY` before database access.
+
+The list uses a `REPEATABLE READ READ ONLY` snapshot, selects at most `limit + 1` rows and never runs a worker or queries a Validator store/RPC. Ordering follows descending stored source-occurrence IDs, with exact keyset cursors rather than offsets. For a repeated canonical message ID it prefers the live occurrence; if all occurrences are REORGED it selects the newest historical one. Older displaced occurrences stay out of later pages. Pages are independent observations: newly ingested/reorged occurrences can change a later refresh; the API does not promise a frozen snapshot across requests. Source FINALIZED is not destination execution or independently reverified QC evidence. The detail endpoint remains the place to inspect authenticated persisted lifecycle evidence.
 
 `GET /api/v1/messages/:messageId` correlates one canonical cross-chain message with its source transaction and block, persisted source finality, immutable batch/Merkle commitment, PBFT observations and actual validator votes, historical quorum certificate, READY delivery job, ordered transaction attempts and current persisted destination outcome. IDs must be `0x` followed by exactly 64 hex digits; hex letters are case-insensitive and responses use lowercase canonical hex. Short values, whitespace and arbitrary strings are rejected.
 
@@ -1745,7 +1751,24 @@ Use the ignored root `.env` for local connection material and the committed `.en
 
 `MESSAGE_QUERY_VALIDATOR_STORES` is a JSON array of existing reader locations. Each entry has `validatorAddress`, `databaseSchema`, and optionally `databaseUrl`; omitted URLs use `DATABASE_URL`. Supply readers for the historical committee members whose messages you query. Use actual public identities/schemas from your deployment; do not copy verification's temporary namespaces into a production configuration. Separate database credentials belong only in your ignored `.env`. The API creates no schemas, migrations, tables, votes or copied Explorer state.
 
-After configuring the existing deployment, start the API from `indexer/` with `npm run api:start`. It loads the root `.env`. Shutdown with `Ctrl+C` closes the listener and only its own reader pools. Injected/shared pools remain owned by their caller. Full verification creates isolated loopback listeners automatically; it does not require a manually running API.
+After configuring the existing deployment, use two separate root entry points for routine work:
+
+- `./scripts/verify.sh`: runs full verification as before and overwrites root `verification.log`.
+- `./scripts/start.sh`: keeps the read-only Explorer/API running and prints startup output in the terminal without changing `verification.log`.
+
+To browse messages:
+
+```bash
+./scripts/start.sh
+```
+
+The startup script resolves the repository location and reuses the existing `api:start` npm entry, which loads the root `.env`. Keep that terminal running and open the printed Explorer address (default `http://127.0.0.1:8080/`). Shutdown with `Ctrl+C` closes the listener and its owned reader pools. It does not install dependencies, run verification, deploy contracts, start chains/workers or launch Prometheus/Grafana. It reads existing database observations, including after local chains have stopped; it does not advance their lifecycle or check live chain state. PostgreSQL and the configured existing database/schema must remain available. Full verification manages its own temporary listeners and does not require this launcher to be running.
+
+Standalone startup needs `DATABASE_URL`, the intended `INDEXER_DB_SCHEMA`, `CHAIN_A_DOMAIN`, `SOURCE_GATEWAY_ADDRESS`, `FINALITY_BLOCK_DEPTH`, and exactly one of `VALIDATOR_SET_HISTORY` or `VALIDATOR_SET_HISTORY_FILE`. Relative API history-file paths resolve against the project root where `.env` lives, independently of the shell/npm working directory. The committed history example is not an automatic fallback: supply the actual history for the selected source schema. Reader identities/schemas in `MESSAGE_QUERY_VALIDATOR_STORES` must belong to that same deployment; a separate reader connection URL remains private in `.env`.
+
+A successful `verify.sh` run does not configure standalone startup. Its source addresses, history and reader locations are passed to its temporary processes, and its listeners are closed on completion. When inspecting persisted verification data, use the public deployment addresses recorded by that run and the actual history/read stores established for the selected source schema. Isolated fault/rotation namespaces have their own histories; do not combine their committee configuration with another namespace.
+
+Missing/invalid standalone configuration now fails before pools or listeners are created with `INVALID_CONFIGURATION` and the affected field names together. Listener conflicts report `LISTEN_ADDRESS_IN_USE` with the host/port settings to check. Diagnostics do not echo configuration values, connection strings, file contents or arbitrary exceptions, and HTTP error bodies retain their fixed public codes.
 
 ### Errors, purity and trust
 
@@ -2209,6 +2232,7 @@ Cross-Chain/
 │   │   ├── index.html
 │   │   ├── app.js
 │   │   ├── client.js
+│   │   ├── list-view.js
 │   │   ├── view-model.js
 │   │   ├── render.js
 │   │   └── styles.css
@@ -2224,6 +2248,7 @@ Cross-Chain/
 │   │   │   ├── config.mjs
 │   │   │   ├── errors.mjs
 │   │   │   ├── main.mjs
+│   │   │   ├── message-list.mjs
 │   │   │   ├── message-query.mjs
 │   │   │   ├── read-snapshot.mjs
 │   │   │   ├── server.mjs
@@ -2295,6 +2320,10 @@ Cross-Chain/
 │   │   ├── delivery.database.test.mjs
 │   │   ├── explorer.test.mjs
 │   │   ├── explorer-http.test.mjs
+│   │   ├── explorer-list.test.mjs
+│   │   ├── message-list.test.mjs
+│   │   ├── message-list.database.test.mjs
+│   │   ├── message-query-config.test.mjs
 │   │   ├── finality-policy.test.mjs
 │   │   ├── finality-watcher.test.mjs
 │   │   ├── forward-authorization.test.mjs
@@ -2376,6 +2405,7 @@ Cross-Chain/
 │   ├── deploy-validator-set-registry.sh
 │   ├── deploy-verifier.sh
 │   ├── start-chains.sh
+│   ├── start.sh
 │   └── verify.sh
 ├── test-vectors/
 │   ├── application-b-commands.json

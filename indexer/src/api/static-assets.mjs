@@ -6,6 +6,7 @@ const assets = new Map([
   ["/explorer", ["index.html", "text/html; charset=utf-8"]],
   ["/assets/explorer/app.js", ["app.js", "text/javascript; charset=utf-8"]],
   ["/assets/explorer/client.js", ["client.js", "text/javascript; charset=utf-8"]],
+  ["/assets/explorer/list-view.js", ["list-view.js", "text/javascript; charset=utf-8"]],
   ["/assets/explorer/view-model.js", ["view-model.js", "text/javascript; charset=utf-8"]],
   ["/assets/explorer/render.js", ["render.js", "text/javascript; charset=utf-8"]],
   ["/assets/explorer/styles.css", ["styles.css", "text/css; charset=utf-8"]],

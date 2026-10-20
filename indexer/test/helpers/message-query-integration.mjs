@@ -13,6 +13,9 @@ import { verifyExplorerAssets, verifyExplorerMessage } from "./explorer-integrat
 import { assertScrapePure, scrapeValue } from "./metrics-assertions.mjs";
 import { registerPendingDelivery, PENDING_DELIVERY_NAME } from "../../src/metrics/pending-delivery.mjs";
 import { assertDashboardExposition } from "./grafana-contract.mjs";
+import { fetchMessageList } from "../../public/explorer/client.js";
+import { renderMessageList } from "../../public/explorer/list-view.js";
+import { textDocument } from "./explorer-fixtures.mjs";
 
 const sourceTables = ["source_messages", "indexer_cursors", "indexed_source_blocks", "message_batches", "message_batch_members",
   "batch_consensus_bindings", "batch_quorum_certificates", "batch_quorum_certificate_signatures", "delivery_batches", "delivery_jobs",
@@ -113,6 +116,15 @@ export async function verifyMessageQueryHTTP({ config, pool, states, records, me
     const url = `http://127.0.0.1:${runtime.server.address().port}/api/v1/messages/`;
     const origin = `http://127.0.0.1:${runtime.server.address().port}`;
     await verifyExplorerAssets(origin);
+    for (let repeat = 0; repeat < 2; repeat++) {
+      const recent = await fetchMessageList(null, { fetchImpl(path, options) { return fetch(new URL(path, origin), options); } });
+      assert.equal(recent.state, "ready", "the production browser list client must consume real persisted messages");
+      assert.ok(recent.page.items.length > 0 && recent.page.items.length <= 20);
+      assert.ok(recent.page.items.every(item => item.sourceDomain === config.chainDomain.toString()));
+      const document = textDocument(); const target = document.createElement("div"); renderMessageList(document, target, recent.page);
+      for (const item of recent.page.items) assert.ok(target.textContent.includes(item.messageId));
+    }
+    console.log("VALID: Explorer discovers real persisted messages through the bounded read-only list endpoint without entering an ID");
     for (const value of expected) {
       const { source, snapshot, job, transaction, receiptHistory, actualVotes } = value;
       const response = await fetch(url + source.message_id, { signal: AbortSignal.timeout(30000) });

@@ -2,7 +2,7 @@ import { createDatabasePool } from "../db.mjs";
 import { loadMessageQueryConfig, publicMessageQueryConfig } from "./config.mjs";
 import { createMessageQuery } from "./message-query.mjs";
 import { createMessageQueryServer } from "./server.mjs";
-import { publicQueryError } from "./errors.mjs";
+import { messageQueryStartupError } from "./errors.mjs";
 import { registerPendingDelivery } from "../metrics/pending-delivery.mjs";
 
 const pools = []; let runtime; let pendingMetric;
@@ -20,9 +20,11 @@ try {
   const stopped = new Promise(resolve => { process.once("SIGINT", resolve); process.once("SIGTERM", resolve); });
   await runtime.listen();
   console.log("Read-only message query API ready:", publicMessageQueryConfig(config));
+  const host = config.listenHost.includes(":") ? `[${config.listenHost}]` : config.listenHost;
+  console.log(`Explorer: http://${host}:${config.listenPort}/`);
   await stopped;
 } catch (error) {
-  console.error(`Message query API stopped: ${publicQueryError(error).body.error}`);
+  console.error(`Message query API stopped: ${messageQueryStartupError(error)}`);
   process.exitCode = 1;
 } finally {
   const results = await Promise.allSettled([runtime?.close()]);

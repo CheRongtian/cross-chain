@@ -10,6 +10,7 @@ import { readSnapshot } from "./read-snapshot.mjs";
 import { readValidatorEvidence } from "./validator-evidence.mjs";
 import { evidenceRead, inconsistent, MessageQueryError } from "./errors.mjs";
 import { observeSourceAuthorization } from "./source-authorization.mjs";
+import { listRecentMessages } from "./message-list.mjs";
 
 const iso = value => value == null ? null : new Date(value).toISOString();
 const receipt = value => value ? { transactionHash: value.transactionHash, blockNumber: value.blockNumber,
@@ -102,6 +103,7 @@ export function createMessageQuery({ config, pool, validatorReaders = [] }) {
   const t = name => tableName(config.databaseSchema, name);
   const lifecycle = createBatchLifecycle({ config, pool });
   return {
+    listMessages(options) { return listRecentMessages({ config, pool }, options); },
     async getMessageLifecycle(input) {
       let id;
       try { id = normalizeBytes32(input, "message ID"); }

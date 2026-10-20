@@ -9,20 +9,33 @@
   <script type="module" src="/assets/explorer/app.js"></script>
 </head>
 <body>
-  <a class="skip-link" href="#message-view">Skip to message lifecycle</a>
+  <a class="skip-link" href="#explorer-content">Skip to messages</a>
   <header class="shell">
     <div class="masthead"><a href="/" class="brand">CROSS-CHAIN <span>EXPLORER</span></a><span class="read-only">READ ONLY</span></div>
     <p class="eyebrow">CHAIN A → CHAIN B</p>
     <h1>Follow the message.</h1>
-    <p class="intro">Source evidence, consensus and delivery history. One canonical message ID.</p>
+    <p class="intro">Browse recent cross-chain messages, then follow their source evidence, consensus and delivery history.</p>
     <form id="message-search" novalidate>
-      <label for="message-id">Message ID</label>
-      <div class="search-row"><input id="message-id" name="messageId" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="search-hint search-status" placeholder="0x followed by 64 hex digits"><button type="submit">View message</button><button type="button" id="refresh" class="secondary">Refresh</button></div>
-      <p id="search-hint" class="hint">Paste the complete canonical bytes32 ID. Queries never submit a transaction.</p>
+      <label for="message-id">Find a message by ID <span class="hint">(optional)</span></label>
+      <div class="search-row"><input id="message-id" name="messageId" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-describedby="search-hint search-status" placeholder="Paste a message ID, or browse below"><button id="search-submit" type="submit">View message</button><button type="button" id="refresh" class="secondary">Refresh</button></div>
+      <p id="search-hint" class="hint">Choose a recent message below or paste its complete ID. Queries never submit a transaction.</p>
     </form>
-    <p id="search-status" role="status" aria-live="polite" aria-atomic="true">Enter a canonical cross-chain message ID to inspect its lifecycle.</p>
+    <p id="search-status" role="status" aria-live="polite" aria-atomic="true"></p>
   </header>
-  <main id="message-view" class="shell" tabindex="-1"></main>
+  <main id="explorer-content" class="shell" tabindex="-1">
+    <section id="message-list-panel" class="panel" aria-labelledby="recent-heading">
+      <div class="section-head">
+        <div><h2 id="recent-heading">Recent messages</h2><p class="hint">Newest source observations first · 20 messages per page</p></div>
+        <nav class="list-pagination" aria-label="Message list pages"><a id="latest-messages" class="button-link secondary" href="/" hidden>Latest messages</a><button id="older-messages" type="button" class="secondary" disabled>Older messages</button></nav>
+      </div>
+      <p class="hint">Source status is separate from destination execution. Open a message to inspect the complete lifecycle.</p>
+      <p id="list-status" role="status" aria-live="polite" aria-atomic="true">Loading recent messages…</p>
+      <div id="message-list" tabindex="-1" aria-busy="true"></div>
+    </section>
+    <nav id="detail-navigation" class="detail-navigation" aria-label="Message navigation" hidden><a id="back-to-messages" class="button-link secondary" href="/">Back to messages</a><button id="copy-message-link" type="button" class="secondary">Copy message link</button></nav>
+    <div id="message-view" tabindex="-1" hidden></div>
+    <p id="copy-status" class="hint" role="status" aria-live="polite" aria-atomic="true"></p>
+  </main>
   <footer class="shell"><p>This Explorer is a read-only observational interface. Protocol validity is determined by source authorization, PBFT/QC evidence and destination Gateway checks.</p><p>Explorer/API availability is independent from cross-chain message processing. Persisted observations can lag chain changes.</p></footer>
 </body>
 </html>

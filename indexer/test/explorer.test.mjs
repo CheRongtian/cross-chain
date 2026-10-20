@@ -196,7 +196,7 @@ test("a stale request cannot overwrite a newer message even when fetch ignores A
 });
 
 test("browser modules are repository-local and protocol worker entry points have no Explorer dependency", async () => {
-  for (const file of ["app.js", "client.js", "view-model.js", "render.js", "styles.css", "index.html"]) {
+  for (const file of ["app.js", "client.js", "list-view.js", "view-model.js", "render.js", "styles.css", "index.html"]) {
     const source = await readFile(new URL(`../public/explorer/${file}`, import.meta.url), "utf8");
     assert.ok(!/DATABASE_URL|PRIVATE_KEY|postgres(?:ql)?:\/\/|node:|localStorage|sessionStorage|indexedDB|WalletConnect|MetaMask|eth_sendRawTransaction/.test(source));
     assert.ok(!/\.innerHTML\s*=|insertAdjacentHTML|document\.write|\beval\s*\(/.test(source));

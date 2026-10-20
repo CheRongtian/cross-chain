@@ -5,6 +5,7 @@ import { MessageQueryError, publicQueryError } from "./errors.mjs";
 import { explorerHeaders, isExplorerPath, readExplorerAsset } from "./static-assets.mjs";
 import { processMetrics } from "../metrics/registry.mjs";
 import { serveMetrics } from "../metrics/http.mjs";
+import { parseMessageListQuery } from "./message-list.mjs";
 
 export function createMessageQueryServer({ config, query, metrics = processMetrics }) {
   const server = createServer(async (request, response) => {
@@ -23,6 +24,10 @@ export function createMessageQueryServer({ config, query, metrics = processMetri
         return response.end(request.method === "HEAD" ? undefined : asset.body);
       }
       if (request.method !== "GET") return send(405, { error: "METHOD_NOT_ALLOWED" }, { allow: "GET" });
+      if (path === "/api/v1/messages") {
+        const parameters = new URL(request.url, "http://localhost").searchParams;
+        return send(200, await query.listMessages(parseMessageListQuery(parameters)));
+      }
       const match = /^\/api\/v1\/messages\/([^/?]*)$/.exec(request.url);
       if (!match) return send(404, { error: "ENDPOINT_NOT_FOUND" });
       let id;

@@ -24,13 +24,22 @@ export async function explorerFixture(version = "3") {
 // Markup APIs deliberately throw, so an unsafe renderer cannot pass silently.
 export function textDocument() {
   class Element {
-    constructor(tag) { this.tagName = tag; this.children = []; this.attributes = {}; this.value = ""; }
+    constructor(tag) { this.tagName = tag; this.children = []; this.attributes = {}; this.value = ""; this.listeners = new Map(); }
     set textContent(value) { this.value = String(value); this.children = []; }
     get textContent() { return this.value + this.children.map(child => child.textContent).join("\n"); }
     set innerHTML(value) { throw new Error("Markup assignment is forbidden"); }
     append(...children) { this.children.push(...children); }
     replaceChildren(...children) { this.value = ""; this.children = children; }
     setAttribute(name, value) { this.attributes[name] = value; }
+    getAttribute(name) { return this.attributes[name] ?? null; }
+    addEventListener(type, listener) { const values = this.listeners.get(type) ?? new Set(); values.add(listener); this.listeners.set(type, values); }
+    removeEventListener(type, listener) { this.listeners.get(type)?.delete(listener); }
+    dispatch(type, options = {}) {
+      const event = { button: 0, currentTarget: this, preventDefault() { this.defaultPrevented = true; }, ...options };
+      for (const listener of this.listeners.get(type) ?? []) listener(event);
+      return event;
+    }
+    focus() { this.focused = true; }
   }
   return { createElement(tag) { return new Element(tag); } };
 }
