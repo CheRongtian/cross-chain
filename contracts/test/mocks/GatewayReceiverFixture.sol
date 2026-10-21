@@ -10,6 +10,8 @@ contract GatewayReceiverFixture is ICrossChainReceiver {
     bool public fail;
     bool public observedConsumed;
     uint256 public calls;
+    mapping(bytes32 messageId => uint256 count) public callsByMessage;
+    mapping(bytes32 messageId => bytes32 payloadHash) public payloadHashByMessage;
     bytes public nestedCall;
     bytes public nestedResult;
     bool public nestedSuccess;
@@ -22,9 +24,13 @@ contract GatewayReceiverFixture is ICrossChainReceiver {
         nestedCall = nestedCall_;
     }
 
-    function handleCrossChainMessage(bytes32 messageId, bytes calldata) external override {
+    // Payload observation belongs to the test receiver, without introducing a second execution authority.
+    // forge-lint: disable-next-item(asm-keccak256)
+    function handleCrossChainMessage(bytes32 messageId, bytes calldata payload) external override {
         observedConsumed = gateway.isMessageExecuted(messageId);
         calls++;
+        callsByMessage[messageId]++;
+        payloadHashByMessage[messageId] = keccak256(payload);
         if (nestedCall.length != 0) {
             bytes memory data = nestedCall;
             delete nestedCall;

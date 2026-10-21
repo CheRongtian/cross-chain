@@ -4,4 +4,14 @@ out = "out"
 libs = ["lib"]
 fs_permissions = [{ access = "read", path = "../test-vectors" }]
 
+[profile.default.fuzz]
+runs = 256
+seed = "0x5eed"
+
+[profile.default.invariant]
+runs = 256
+depth = 500
+fail_on_revert = true
+show_metrics = true
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

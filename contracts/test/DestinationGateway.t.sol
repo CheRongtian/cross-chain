@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
+import {ProtocolTestFixtures} from "./helpers/ProtocolTestFixtures.sol";
 import {Vm} from "forge-std/Vm.sol";
 import {stdError} from "forge-std/StdError.sol";
 import {DestinationGateway} from "../src/DestinationGateway.sol";
@@ -21,7 +21,7 @@ import {PBFTCertificateCodec as Certificate} from "../src/libraries/PBFTCertific
 import {GatewayReceiverFixture} from "./mocks/GatewayReceiverFixture.sol";
 import {MockSourceApplication} from "./mocks/MockSourceApplication.sol";
 
-contract DestinationGatewayTest is Test {
+contract DestinationGatewayTest is ProtocolTestFixtures {
     uint256 private constant SOURCE = 10011;
     uint256 private constant DESTINATION = 2001;
     uint256 private constant NOW = 2_000_000_000;
@@ -649,134 +649,12 @@ contract DestinationGatewayTest is Test {
             qcVersion == Certificate.EPOCH_VERSION ? COMMITTEE_SIZE : QUORUM);
     }
 
-    function _encode(Codec.Package memory pack) private pure returns (bytes memory) {
-        pack.envelope.messageBytes = _messageBytes(pack.message);
-        pack.envelope.batchBytes = abi.encode(pack.batch.version, pack.batch.epoch, pack.batch.batchId, pack.batch.messageIds);
-        return _envelopeBytes(pack.envelope);
-    }
-
-    function _messageBytes(Codec.WireMessage memory m) private pure returns (bytes memory) {
-        // Strip only the dynamic tuple's outer offset, preserving the frozen flat argument list.
-        return _flat(abi.encode(m));
-    }
-
-    function _envelopeBytes(Codec.Envelope memory envelope) private pure returns (bytes memory) {
-        return _flat(abi.encode(envelope));
-    }
-
-    // Copying each version's ABI fixture requires its own bounded memory buffer inside the version test loop.
-    // forge-lint: disable-next-item(calls-loop)
-    function _flat(bytes memory tuple) private pure returns (bytes memory flat) {
-        flat = new bytes(tuple.length - WORD);
-        for (uint256 index = 0; index < flat.length; index++) flat[index] = tuple[index + WORD];
-    }
-
-    // A bounded fixture tree reuses the unchanged pure leaf/node primitives at each level.
-    // forge-lint: disable-next-item(calls-loop)
     function _tree(bytes32 batchId, bytes32[] memory ids) private pure returns (bytes32, bytes32[] memory siblings) {
-        uint256 depth = 0;
-        for (uint256 width = ids.length; width > 1; width = (width + 1) / 2) depth++;
-        siblings = new bytes32[](depth);
-        bytes32[] memory nodes = new bytes32[](ids.length);
-        for (uint256 index = 0; index < ids.length; index++) nodes[index] = MessageMerkle.computeLeaf(batchId, index, ids[index]);
-        uint256 length = nodes.length;
-        for (uint256 level = 0; length > 1; level++) {
-            siblings[level] = nodes[1];
-            for (uint256 index = 0; index < length; index += 2) {
-                nodes[index / 2] = MessageMerkle.hashNode(nodes[index], nodes[index + 1 < length ? index + 1 : index]);
-            }
-            length = (length + 1) / 2;
-        }
-        return (nodes[0], siblings);
+        return _merklePath(batchId, ids, 0);
     }
 
-    // VM signing is unit evidence only. The root positive path uses the existing real validator processes.
-    // forge-lint: disable-next-item(calls-loop)
-    function _committee(uint256 authority) private pure returns (address[COMMITTEE_SIZE] memory members) {
-        for (uint256 index = 0; index < COMMITTEE_SIZE; index++) members[index] = vm.addr(index + (authority == INITIAL_AUTHORITY ? 1 : 2));
-        for (uint256 index = 1; index < COMMITTEE_SIZE; index++) {
-            for (uint256 prior = index; prior > 0 && uint160(members[prior - 1]) > uint160(members[prior]); prior--) {
-                (members[prior - 1], members[prior]) = (members[prior], members[prior - 1]);
-            }
-        }
-    }
-
-    // The three original PBFT schemas are intentionally explicit for independent composition coverage.
-    // forge-lint: disable-next-item(calls-loop, asm-keccak256)
     function _certificate(Codec.Package memory pack, uint8 version, uint256 count) private view returns (bytes memory) {
-        Certificate.Statement memory statement;
-        statement.protocolVersion = version;
-        statement.sourceDomain = pack.message.sourceDomain;
-        statement.sourceGateway = pack.message.sourceGateway;
-        statement.epoch = pack.batch.epoch;
-        statement.viewNumber = version == Certificate.LEGACY_VERSION ? 0 : VIEW;
-        statement.batchId = pack.batch.batchId;
-        statement.messageRoot = pack.envelope.messageRoot;
-        statement.validatorEpoch = version == Certificate.EPOCH_VERSION ? CURRENT_AUTHORITY : INITIAL_AUTHORITY;
-        (address[COMMITTEE_SIZE] memory members, uint8 quorum, bytes32 committee) = validators.getValidatorSet(statement.validatorEpoch);
-        assertEq(uint256(quorum), QUORUM);
-        statement.committeeDigest = committee;
-        statement.proposalDigest = _proposal(statement, members);
-        Certificate.Evidence[] memory votes = new Certificate.Evidence[](count);
-        for (uint256 index = 0; index < count; index++) {
-            votes[index] = _signedVote(statement, members[index]);
-        }
-        return abi.encode(version, _wireStatement(statement), _voteDigest(statement, address(0), false), votes);
-    }
-
-    function _wireStatement(Certificate.Statement memory statement) private pure returns (bytes memory) {
-        return bytes.concat(abi.encode(statement.sourceDomain, statement.sourceGateway, statement.epoch),
-            statement.protocolVersion == Certificate.LEGACY_VERSION ? bytes("") : abi.encode(statement.viewNumber),
-            abi.encode(statement.batchId, statement.messageRoot, statement.proposalDigest, statement.committeeDigest),
-            statement.protocolVersion == Certificate.EPOCH_VERSION ? abi.encode(statement.validatorEpoch) : bytes(""));
-    }
-
-    // At most five known public local fixture scalars are checked; no runtime validator is synthesized here.
-    // forge-lint: disable-next-item(calls-loop, asm-keccak256)
-    function _signedVote(Certificate.Statement memory statement, address voter) private pure returns (Certificate.Evidence memory) {
-        bytes32 digest = _voteDigest(statement, voter, true);
-        uint256 key = 1;
-        while (vm.addr(key) != voter) key++;
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(key, keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", digest)));
-        return Certificate.Evidence(voter, digest, abi.encodePacked(r, s, v));
-    }
-
-    function _prefix(Certificate.Statement memory statement) private pure returns (bytes memory prefix) {
-        prefix = abi.encode(statement.protocolVersion, statement.sourceDomain, statement.sourceGateway, statement.epoch);
-        if (statement.protocolVersion != Certificate.LEGACY_VERSION) prefix = bytes.concat(prefix, abi.encode(statement.viewNumber));
-    }
-
-    // Independent test preimages intentionally retain their complete readable ABI/typed-string encoding.
-    // forge-lint: disable-next-item(asm-keccak256)
-    function _proposal(Certificate.Statement memory statement, address[COMMITTEE_SIZE] memory members) private pure returns (bytes32) {
-        string memory schema = string.concat("PBFTPrePrepare(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch",
-            statement.protocolVersion == Certificate.LEGACY_VERSION ? "" : ",uint256 view", ",bytes32 batchId,bytes32 messageRoot,address primaryIdentity",
-            statement.protocolVersion == Certificate.EPOCH_VERSION ? ",uint256 validatorEpoch,bytes32 committeeDigest)" : ")");
-        bytes memory encoded = bytes.concat(abi.encode(keccak256(bytes(schema))), _prefix(statement),
-            abi.encode(statement.batchId, statement.messageRoot,
-                members[(statement.epoch % COMMITTEE_SIZE + statement.viewNumber % COMMITTEE_SIZE) % COMMITTEE_SIZE]));
-        if (statement.protocolVersion == Certificate.EPOCH_VERSION) encoded = bytes.concat(encoded, abi.encode(statement.validatorEpoch, statement.committeeDigest));
-        return keccak256(encoded);
-    }
-
-    // Keep original version-specific test preimages visible, without optimizing their reference hashing.
-    // forge-lint: disable-next-item(asm-keccak256)
-    function _voteDigest(Certificate.Statement memory statement, address voter, bool commit) private pure returns (bytes32) {
-        string memory schema = string.concat(commit ? "PBFTCommit" : "PBFTQuorumCertificate",
-            "(uint8 protocolVersion,uint256 sourceDomain,address sourceGateway,uint256 epoch",
-            statement.protocolVersion == Certificate.LEGACY_VERSION ? "" : ",uint256 view",
-            ",bytes32 batchId,bytes32 messageRoot,bytes32 proposalDigest,bytes32 committeeDigest",
-            commit ? ",address voterIdentity" : "", statement.protocolVersion == Certificate.EPOCH_VERSION ? ",uint256 validatorEpoch)" : ")");
-        bytes memory encoded = bytes.concat(abi.encode(keccak256(bytes(schema))), _prefix(statement),
-            abi.encode(statement.batchId, statement.messageRoot, statement.proposalDigest, statement.committeeDigest));
-        if (commit) encoded = bytes.concat(encoded, abi.encode(voter));
-        if (statement.protocolVersion == Certificate.EPOCH_VERSION) encoded = bytes.concat(encoded, abi.encode(statement.validatorEpoch));
-        return keccak256(encoded);
-    }
-
-    function _putWord(bytes memory value, uint256 offset, uint256 word) private pure {
-        // Test-only exact byte corruption within an already allocated ABI frame.
-        // forge-lint: disable-next-line(inline-assembly)
-        assembly ("memory-safe") { mstore(add(add(value, WORD), offset), word) }
+        uint256 authority = version == Certificate.EPOCH_VERSION ? CURRENT_AUTHORITY : INITIAL_AUTHORITY;
+        return _makeCertificate(validators, _statement(validators, pack, version, authority, VIEW), count);
     }
 }

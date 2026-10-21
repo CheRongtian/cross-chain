@@ -29,6 +29,10 @@ SNARK_SCALAR_FIELD="218882428718392752222464057452572750885483644004160343436982
 APPLICATION_DOMAIN_NAMESPACE="cross-chain:identity-application-domain:v1"
 PUBLIC_INPUTS_SIGNATURE="(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256)"
 FORWARD_SIGNATURE="forwardAuthorizedMessage(uint256[2],uint256[2][2],uint256[2],${PUBLIC_INPUTS_SIGNATURE},(uint256,address,address,bytes,uint256))"
+readonly SOLIDITY_FUZZ_SEED="0x5eed"
+readonly SOLIDITY_FUZZ_RUNS="256"
+readonly SOLIDITY_INVARIANT_RUNS="256"
+readonly SOLIDITY_INVARIANT_DEPTH="500"
 
 ANVIL_DEV_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 SOURCE_SENDER="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
@@ -934,6 +938,8 @@ printf '     Retry genuine Byzantine conflicting votes after the sole canonical 
 printf '     Regenerate the authorizationValidUntil statement, keys and verifier; check all twelve proof-bound public inputs with real Groth16 verification\n'
 printf '     Verify exact and regenerated-proof replay, unused-context revocation, application/action/intent isolation and failed-authorization state integrity\n'
 printf '     Run exact execution-time authorization deadline equality/after rejection and before-deadline acceptance last, preserving the former expiry-window regression\n'
+printf '     Run bounded Solidity encoding/domain/nonce, Merkle and historical certificate fuzzing with a fixed recorded seed\n'
+printf '     Explore production Gateway action ordering through a selector-restricted stateful handler, preserving exactly-once callbacks and atomic replay rollback\n'
 
 CURRENT_STEP="full verification finality profile validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1221,11 +1227,34 @@ CURRENT_STEP="Solidity lint warning verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
 # Run lint once with warning failures enabled; compilation above keeps its own warning guard.
 # Protocol/test-specific exceptions are documented at their source sites; global rules remain enabled.
+printf 'Checking production contracts and fuzz/stateful test helpers; all lint warnings remain fatal.\n'
 forge lint --deny warnings
 
-CURRENT_STEP="forge test -vv including cross-chain safety production Gateway cases, shared Merkle golden compatibility and single-parse message integrity probes"
+CURRENT_STEP="stateful and fuzz security testing"
 printf '\n[%s]\n' "$CURRENT_STEP"
-forge test -vv
+printf 'Foundry profile: default\nFuzz seed: %s\nFuzz runs per property: %s\nInvariant runs: %s\nInvariant depth: %s\nInvariant fail_on_revert: true\n' \
+    "$SOLIDITY_FUZZ_SEED" "$SOLIDITY_FUZZ_RUNS" "$SOLIDITY_INVARIANT_RUNS" "$SOLIDITY_INVARIANT_DEPTH"
+printf 'The retained full Solidity regression suite and new fuzz/stateful cases run together once.\n'
+# Pin campaign counts, seed and failure policy even if the caller overrides those Foundry settings.
+# Expected Gateway reverts are classified inside the handler; unexpected handler reverts fail the campaign.
+FOUNDRY_PROFILE=default \
+FOUNDRY_FUZZ_SEED="$SOLIDITY_FUZZ_SEED" \
+FOUNDRY_FUZZ_RUNS="$SOLIDITY_FUZZ_RUNS" \
+FOUNDRY_INVARIANT_RUNS="$SOLIDITY_INVARIANT_RUNS" \
+FOUNDRY_INVARIANT_DEPTH="$SOLIDITY_INVARIANT_DEPTH" \
+FOUNDRY_INVARIANT_FAIL_ON_REVERT=true \
+FOUNDRY_INVARIANT_SHOW_METRICS=true \
+    forge test -vv
+
+printf 'VALID: bounded message/transport fuzzing round-trips the production decoder byte-identically and rejects truncation, tails, dirty padding and malformed offsets/lengths\n'
+printf 'VALID: generated source/destination substitutions and swaps preserve exact uint256 values and cannot reuse the original authenticated domain context\n'
+printf 'VALID: distinct full-width nonces change canonical identity and preserve independent production replay state\n'
+printf 'VALID: generated Merkle membership verifies; nonzero siblings, position changes, truncated/extended paths and invalid odd duplication reject\n'
+printf 'VALID: duplicate recovered signers cannot reach three-of-four quorum; authority remains pinned to epoch-7 V1-V4 or epoch-8 V2-V5 without mixed/unknown authority\n'
+printf 'VALID: selector-restricted stateful Gateway campaigns exercise valid execution, replay, invalid Merkle/QC, source/destination mutations, malformed packages, expiry, reentrancy and downstream rollback\n'
+printf 'VALID: rejected calls leave replay/business state unchanged; each authenticated messageId has at most one successful callback across generated callers/orderings\n'
+printf 'VALID: a different valid canonical wrapper or QC cannot bypass message-ID replay; same-message reentrancy cannot duplicate business effects\n'
+printf 'FUZZ / STATEFUL INVARIANT TESTS PASSED\n'
 
 printf 'VALID: cross-chain safety test-local production Gateway/ApplicationB baseline executes with real three-signer QC and membership before each isolated negative case\n'
 printf 'EXPECTED FAILURE: a self-consistent alternate tree without matching committed QC authority rejects with ContextMismatch; restoring the authorized tree remains executable\n'

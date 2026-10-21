@@ -2075,6 +2075,24 @@ Check Solidity formatting:
 forge fmt --check
 ```
 
+### Solidity security testing
+
+The Solidity security suite combines deterministic regressions with bounded Foundry fuzzing and stateful invariant testing. It uses production message encoding, transport decoding, Merkle inclusion, historical PBFT certificate verification, registries and `DestinationGateway.execute(bytes)`. No external fuzz framework, verifier mock or production test bypass is involved.
+
+Generated inputs cover all message identity fields, full-width `uint256` domains/nonces/epochs, domain swaps, payload substitutions, canonical round-trips, truncation, trailing bytes, dirty ABI padding, malformed offsets/lengths and unsupported versions. Message round-trips use the production transport decoder and its canonical-message projection; `MessageCodec` itself exposes hashing, without introducing a second decoder. Encoding acceptance alone does not establish QC authority or destination eligibility.
+
+Merkle fuzzing constructs valid trees of 1–16 members before mutating siblings, positions and path lengths; odd last-leaf duplication remains mandatory. Existing maximum-size regressions remain intact. Certificate fuzzing uses real local-EVM signatures with the fixed three-of-four quorum, distinct recovered identities and exact historical authority: epoch 7 contains V1–V4 and epoch 8 contains V2–V5. Duplicate/reordered signers, wrong signed context, removed/future members and unknown epochs cannot acquire authority. Different signature bytes recovering the same signer add no quorum weight; existing high-s and equivalent recovery-ID compatibility remain intact. Existing v1/v2/v3 fixed-vector regressions remain unchanged.
+
+The stateful handler targets six independently authenticated messages, including both historical committees, plus a separately expiring message. Foundry chooses the action order, arguments and callers. Only the handler's eleven action selectors are targeted; registry administration, receiver configuration and fixture helpers are excluded. Actions cover valid execution, replay, invalid Merkle/QC, wrong source/destination, malformed evidence, expiry, same-message reentrancy, downstream rejection and alternate canonical wrappers. Time moves forward in bounded steps while the main positive pool remains fresh.
+
+After each action, the model compares actual Gateway replay storage and per-message receiver observations: every consumed message must have exactly one successful authenticated callback, failed-only messages remain unused, and attacks cannot affect unrelated messages. Callback failure must roll replay state back so a later valid attempt can succeed. Same-message nested execution must fail without adding a second callback; the protocol continues to allow independently authenticated different-message nesting. Different valid QC subsets or job IDs can produce different canonical package bytes for the same message; replay remains keyed by the authenticated message ID.
+
+The default configuration fixes seed `0x5eed`, **256 cases per fuzz property**, and **256 invariant runs at depth 500**, with `fail_on_revert = true` and selector metrics enabled. Expected production reverts are explicitly classified by the handler; unexpected rejection of valid evidence, acceptance of invalid evidence or a helper failure fails verification. Related invariants share one campaign to avoid repeating the same expensive sequences. Existing Foundry failure persistence is retained, and failure output includes the generated input or minimized call sequence where available. Counterexamples must be preserved and investigated, without skipping their seeds or deleting the failure corpus.
+
+The complete verification script pins and logs these settings, runs the retained full Solidity suite and the new campaigns together once, and emits `FUZZ / STATEFUL INVARIANT TESTS PASSED` only after that command succeeds. The existing real two-chain, database, validator, relayer and ZK execution-time expiry checks remain mandatory. The fuzz tests themselves use only Foundry's local EVM, without RPC, database or proof generation per iteration.
+
+Fuzzing exercises implementation-level domain separation, canonical encoding and verifier invariants over generated samples. It is not a formal proof of cryptographic collision resistance or protocol correctness. The twelve-signal credential statement, public `authorizationValidUntil`, private credential expiry and rejection of old eleven-signal proofs are unchanged.
+
 ### Credential model
 
 Run from the repository root:
@@ -2263,16 +2281,27 @@ Cross-Chain/
 │       ├── ApplicationB.t.sol
 │       ├── CredentialVerifier.t.sol
 │       ├── DestinationGateway.t.sol
+│       ├── DestinationGatewayFuzz.t.sol
+│       ├── DestinationGatewayInvariant.t.sol
 │       ├── ForwardAuthorizationCodec.t.sol
 │       ├── IdentityApplicationA.t.sol
 │       ├── MerkleInclusionVerifier.t.sol
+│       ├── MerkleInclusionVerifierFuzz.t.sol
+│       ├── MessageEncodingFuzz.t.sol
 │       ├── MessageDomainVerifier.t.sol
 │       ├── MessageMerkle.t.sol
 │       ├── MessageReplayProtection.t.sol
 │       ├── PBFTCertificateVerifier.t.sol
+│       ├── PBFTCertificateVerifierFuzz.t.sol
 │       ├── RemoteGatewayRegistry.t.sol
+│       ├── helpers/
+│       │   ├── DeliveryCodecHarness.sol
+│       │   ├── GatewayHandler.sol
+│       │   ├── GatewaySecurityFixture.sol
+│       │   └── ProtocolTestFixtures.sol
 │       ├── mocks/
 │       │   ├── AuthenticatedMessageReplayHarness.sol
+│       │   ├── GatewayReceiverFixture.sol
 │       │   ├── IReplayTestReceiver.sol
 │       │   ├── MessageReplayProtectionHarness.sol
 │       │   ├── MockCredentialVerifier.sol
