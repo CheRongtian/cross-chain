@@ -18,8 +18,8 @@ if [[ -f "$ENV_FILE" ]]; then
     set +a
 fi
 
-CHAIN_A_RPC="http://127.0.0.1:4545"
-CHAIN_B_RPC="http://127.0.0.1:9545"
+CHAIN_A_RPC=""
+CHAIN_B_RPC=""
 CHAIN_A_ID="10011"
 CHAIN_B_ID="2001"
 ALTERNATE_DESTINATION_DOMAIN="3001"
@@ -81,6 +81,7 @@ RELAYER_PID_FILE=""
 POSTGRES_REGISTRY_FILE=""
 POSTGRES_VALIDATOR_PID_FILE=""
 POSTGRES_RELAYER_PID_FILE=""
+CLEAN_STACK_OWNER_FILE=""
 CURRENT_STEP="initialization"
 LAST_TX_HASH=""
 
@@ -466,6 +467,15 @@ cleanup() {
     trap - EXIT INT TERM
     set +e
 
+    if [[ -n "$CLEAN_STACK_OWNER_FILE" ]] && [[ -f "$CLEAN_STACK_OWNER_FILE" ]]; then
+        if ! node "$INDEXER_DIR/scripts/local/main.mjs" dispose "$CLEAN_STACK_OWNER_FILE"; then
+            printf 'ERROR: clean local stack cleanup failed; its ownership records are retained.\n' >&2
+            exit_code=1
+        else
+            rm -f -- "$CLEAN_STACK_OWNER_FILE"
+        fi
+    fi
+
     for worker_pid_file in "$VALIDATOR_PID_FILE" "$RELAYER_PID_FILE" "$POSTGRES_VALIDATOR_PID_FILE" "$POSTGRES_RELAYER_PID_FILE"; do
       if [[ -n "$worker_pid_file" ]] && [[ -f "$worker_pid_file" ]]; then
         while IFS= read -r validator_pid; do
@@ -505,6 +515,15 @@ cleanup() {
         wait "$CHAINS_PID" 2>/dev/null || true
     fi
 
+    if [[ "$exit_code" -ne 0 ]] && [[ -n "$TEMP_DIR" ]]; then
+        for chain_log in "$TEMP_DIR/chain-a.log" "$TEMP_DIR/chain-b.log"; do
+            if [[ -f "$chain_log" ]]; then
+                printf '\n[verification chain diagnostics: %s]\n' "$chain_log"
+                cat "$chain_log"
+            fi
+        done
+    fi
+
     if [[ -n "$TEMP_DIR" ]] && [[ -d "$TEMP_DIR" ]]; then
         rm -f -- \
             "$TEMP_DIR/deploy-output.log" \
@@ -523,7 +542,9 @@ cleanup() {
             "$TEMP_DIR/relayer-pids" \
             "$TEMP_DIR/postgres-validator-pids" \
             "$TEMP_DIR/postgres-relayer-pids" \
-            "$TEMP_DIR/forwarding-calldata.txt"
+            "$TEMP_DIR/forwarding-calldata.txt" \
+            "$TEMP_DIR/chain-a.log" \
+            "$TEMP_DIR/chain-b.log"
         rmdir "$TEMP_DIR" 2>/dev/null || true
     fi
 
@@ -940,6 +961,7 @@ printf '     Verify exact and regenerated-proof replay, unused-context revocatio
 printf '     Run exact execution-time authorization deadline equality/after rejection and before-deadline acceptance last, preserving the former expiry-window regression\n'
 printf '     Run bounded Solidity encoding/domain/nonce, Merkle and historical certificate fuzzing with a fixed recorded seed\n'
 printf '     Explore production Gateway action ordering through a selector-restricted stateful handler, preserving exactly-once callbacks and atomic replay rollback\n'
+printf '     Start a clean owned stack with real workers, native Prometheus/Grafana; demonstrate two independent happy paths and inspect actual privacy surfaces\n'
 
 CURRENT_STEP="full verification finality profile validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -987,6 +1009,10 @@ printf 'Verified Indexer dependency directories.\n'
 CURRENT_STEP="verification-owned PostgreSQL server tooling"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node "$VALIDATOR_DIR/test/helpers/postgres-cluster.mjs" --check-tools
+
+CURRENT_STEP="existing native observation tooling for the clean local stack"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node "$INDEXER_DIR/scripts/local/main.mjs" prerequisites
 
 CURRENT_STEP="PostgreSQL connectivity verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1125,27 +1151,21 @@ VALIDATOR_DATABASE_TEST_SCHEMA="cross_chain_validator_database_verification" \
 printf 'VALID: PBFT safety independent restored stores reject finalized-root conflicts without new signatures; repeated PREPARE/COMMIT delivery and reload retain 1,2,2,2,3 distinct counts and preserve the first QC after vote four\n'
 printf 'EXPECTED FAILURE: genuinely signed wrong consensus/validator epochs do not change target PREPARED, COMMIT quorum or QC; cross-view reload retains the certified safe root and original old-view QC\n'
 
-CURRENT_STEP="local chain availability check"
+CURRENT_STEP="isolated verification-owned local chains"
 printf '\n[%s]\n' "$CURRENT_STEP"
-
-CHAIN_A_CURRENT_ID="$(probe_chain_id "$CHAIN_A_RPC")"
-CHAIN_B_CURRENT_ID="$(probe_chain_id "$CHAIN_B_RPC")"
-
-if [[ -z "$CHAIN_A_CURRENT_ID" ]] && [[ -z "$CHAIN_B_CURRENT_ID" ]]; then
-    printf 'No local chains detected; starting them with scripts/start-chains.sh.\n'
+TEMP_PARENT="${TMPDIR:-/tmp}"
+TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-verification.XXXXXX")"
+VERIFICATION_PORTS="$(node "$INDEXER_DIR/scripts/local/main.mjs" ports)"
+read -r CHAIN_A_PORT CHAIN_B_PORT <<< "$VERIFICATION_PORTS"
+CHAIN_A_RPC="http://127.0.0.1:$CHAIN_A_PORT"
+CHAIN_B_RPC="http://127.0.0.1:$CHAIN_B_PORT"
+printf 'Starting independent verification chains; manually running local chains are untouched.\n'
+CHAIN_A_PORT="$CHAIN_A_PORT" CHAIN_B_PORT="$CHAIN_B_PORT" CHAIN_LOG_DIR="$TEMP_DIR" \
     "$PROJECT_ROOT/scripts/start-chains.sh" &
-    CHAINS_PID=$!
-    STARTED_CHAINS="true"
-
-    wait_for_chain "Chain A" "$CHAIN_A_RPC" "$CHAIN_A_ID"
-    wait_for_chain "Chain B" "$CHAIN_B_RPC" "$CHAIN_B_ID"
-elif [[ -n "$CHAIN_A_CURRENT_ID" ]] && [[ -n "$CHAIN_B_CURRENT_ID" ]]; then
-    assert_equal "$CHAIN_A_CURRENT_ID" "$CHAIN_A_ID" "Chain A ID"
-    assert_equal "$CHAIN_B_CURRENT_ID" "$CHAIN_B_ID" "Chain B ID"
-    printf 'Using the existing local chains; they will remain running after verification.\n'
-else
-    fail "only one expected local chain is reachable; start or stop both chains before retrying"
-fi
+CHAINS_PID=$!
+STARTED_CHAINS="true"
+wait_for_chain "Chain A" "$CHAIN_A_RPC" "$CHAIN_A_ID"
+wait_for_chain "Chain B" "$CHAIN_B_RPC" "$CHAIN_B_ID"
 
 CURRENT_STEP="chain ID and proof timestamp verification"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1287,8 +1307,6 @@ forge test --match-contract IdentityApplicationATest -vvv
 
 CURRENT_STEP="ZK security invariants and retained on-chain nullifier/revocation lifecycle"
 printf '\n[%s]\n' "$CURRENT_STEP"
-TEMP_PARENT="${TMPDIR:-/tmp}"
-TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-verification.XXXXXX")"
 POSTGRES_REGISTRY_FILE="$TEMP_DIR/postgres-cluster.json"
 POSTGRES_VALIDATOR_PID_FILE="$TEMP_DIR/postgres-validator-pids"
 POSTGRES_RELAYER_PID_FILE="$TEMP_DIR/postgres-relayer-pids"
@@ -2258,6 +2276,12 @@ APPLICATION_B_GATEWAY_TEST_ADDRESS="$APPLICATION_B_GATEWAY_TEST" \
 APPLICATION_B_OTHER_GATEWAY_TEST_ADDRESS="$APPLICATION_B_OTHER_GATEWAY_TEST" \
 APPLICATION_B_OPERATOR_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
     node "$INDEXER_DIR/scripts/verify-application-b.mjs"
+
+CURRENT_STEP="clean bootstrap happy-path and privacy demonstration"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test "$INDEXER_DIR/test/local-runtime.test.mjs"
+CLEAN_STACK_OWNER_FILE="$TEMP_DIR/clean-stack-owner.json"
+LOCAL_VERIFICATION_OWNER_FILE="$CLEAN_STACK_OWNER_FILE" node "$INDEXER_DIR/scripts/verify-clean-stack.mjs"
 
 CURRENT_STEP="ZK security invariants: execution-time credential expiry"
 printf '\n[ZK security invariants]\n'

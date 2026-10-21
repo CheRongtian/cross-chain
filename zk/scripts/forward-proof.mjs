@@ -1,4 +1,4 @@
-import { mkdtemp,readFile,rm,writeFile } from "node:fs/promises";
+import { mkdir,mkdtemp,readFile,rm,writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
@@ -17,10 +17,10 @@ const cli = fileURLToPath(new URL("../node_modules/snarkjs/build/cli.cjs",import
 // Reuse the compiled circuit and one existing development zkey. This prepares
 // one proof per real, distinct intent and never starts another setup ceremony.
 export async function generateCredentialProof({ intent,applicationDomain,policyEpoch,currentTimestamp,authorizationValidUntil,credentialStateRoot,trustedIssuer,requiredRole,
-  fixtureName = "active-secondary.json",stateName = "root-n-plus-1" }) {
+  fixtureName = "active-secondary.json",stateName = "root-n-plus-1",credential,state: suppliedState,artifacts,temporaryParent,privateInput = false,signal }) {
   const [encoding,config,fixture,state] = await Promise.all([
-    json("../encoding.json"),json("../nullifier.json"),json("../credential-model/fixtures/" + fixtureName),
-    json("../build/credential-state/" + stateName + ".json"),
+    json("../encoding.json"),json("../nullifier.json"),credential ?? json("../credential-model/fixtures/" + fixtureName),
+    suppliedState ?? json("../build/credential-state/" + stateName + ".json"),
   ]);
   const field = BigInt(encoding.scalarField.prime);
   const poseidon = await buildPoseidon();
@@ -44,23 +44,33 @@ export async function generateCredentialProof({ intent,applicationDomain,policyE
     pathIndices: membership.statePathIndices.map(BigInt) },context);
   // The existing CLI owns and exits its proving worker pool. Keeping fullProve
   // and verify inside the integration process would leave cached curve workers.
-  const temporary = await mkdtemp(fileURLToPath(new URL("../build/proving/forwarding-",import.meta.url)));
+  if (temporaryParent) await mkdir(temporaryParent,{ recursive: true,mode: 0o700 });
+  const temporary = await mkdtemp(temporaryParent ? temporaryParent + "/forwarding-" : fileURLToPath(new URL("../build/proving/forwarding-",import.meta.url)));
   let proof; let publicSignals; let failure;
   try {
     const inputPath = temporary + "/input.json"; const proofPath = temporary + "/proof.json"; const publicPath = temporary + "/public.json";
-    await writeFile(inputPath,JSON.stringify(input),"utf8");
+    await writeFile(inputPath,JSON.stringify(input),{ encoding: "utf8",mode: 0o600 });
     const run = async args => {
       try {
-        const result = await execFileAsync(process.execPath,[cli,...args],{ timeout: 120000,maxBuffer: 8 * 1024 * 1024 });
-        process.stdout.write(result.stdout); process.stderr.write(result.stderr);
+        const result = await execFileAsync(process.execPath,[cli,...args],{ timeout: 120000,maxBuffer: 8 * 1024 * 1024,signal });
+        if (!privateInput) { process.stdout.write(result.stdout); process.stderr.write(result.stderr); }
         return result;
       }
-      catch (error) { process.stdout.write(error.stdout ?? ""); process.stderr.write(error.stderr ?? ""); throw error; }
+      catch (error) {
+        if (privateInput) {
+          // Preserve complete diagnostics privately; circuit failure output may
+          // contain witness values and must never enter public verification logs.
+          const diagnostics = (temporaryParent ?? temporary) + "/prover-failure.log";
+          await writeFile(diagnostics,(error.stdout ?? "") + (error.stderr ?? "") + "\nProver process status: " + String(error.code ?? error.name),{ mode: 0o600 });
+          throw new Error("Credential proving/verification failed; private diagnostics retained at " + diagnostics);
+        }
+        process.stdout.write(error.stdout ?? ""); process.stderr.write(error.stderr ?? ""); throw error;
+      }
     };
     await run(["groth16","fullprove",inputPath,
-      fileURLToPath(new URL("../build/circuit/CredentialAuthorization_js/CredentialAuthorization.wasm",import.meta.url)),
-      fileURLToPath(new URL("../build/proving/CredentialAuthorization_final.zkey",import.meta.url)),proofPath,publicPath]);
-    await run(["groth16","verify",fileURLToPath(new URL("../build/proving/verification_key.json",import.meta.url)),publicPath,proofPath]);
+      artifacts?.wasm ?? fileURLToPath(new URL("../build/circuit/CredentialAuthorization_js/CredentialAuthorization.wasm",import.meta.url)),
+      artifacts?.zkey ?? fileURLToPath(new URL("../build/proving/CredentialAuthorization_final.zkey",import.meta.url)),proofPath,publicPath]);
+    await run(["groth16","verify",artifacts?.verificationKey ?? fileURLToPath(new URL("../build/proving/verification_key.json",import.meta.url)),publicPath,proofPath]);
     proof = JSON.parse(await readFile(proofPath,"utf8")); publicSignals = JSON.parse(await readFile(publicPath,"utf8"));
   } catch (error) { failure = error; throw error; }
   finally {

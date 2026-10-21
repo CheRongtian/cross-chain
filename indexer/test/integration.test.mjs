@@ -885,7 +885,7 @@ test("recovers source workers and seals durable batches from real finalized mess
     console.log("VALID: real Message E finalized after sealing and entered the next BUILDING epoch");
     console.log("VALID: old membership, batch ID, root, and proofs remained unchanged after rollover");
     const consensus = await verifyFourIndependentValidators({ sourceConfig: config, sourcePool: activePool,
-      snapshot: oldAfterRollover, pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE") });
+      snapshot: oldAfterRollover, pidFile: requireEnvironment("VALIDATOR_VERIFICATION_PID_FILE"),destinationRpcUrl: requireEnvironment("CHAIN_B_RPC_URL") });
     const committedProcessRead = await execFileAsync(process.execPath, [LIFECYCLE_READER_PATH, lifecycleId], {
       env: { ...process.env, EXPECTED_VALIDATOR_COMMITTEE: JSON.stringify(consensus.committee), EXPECTED_VALIDATOR_SET_HISTORY: JSON.stringify(consensus.history) },
     });

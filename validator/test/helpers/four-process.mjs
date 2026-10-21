@@ -53,7 +53,7 @@ export async function cloneCandidateFixture(pool, sourceSchema, fixtureSchema) {
   finally { client.release(); }
 }
 
-export async function verifyFourIndependentValidators({ sourceConfig, sourcePool, snapshot, pidFile }) {
+export async function verifyFourIndependentValidators({ sourceConfig, sourcePool, snapshot, pidFile, destinationRpcUrl }) {
   assert.ok(pidFile, "verification must supply its owned validator PID registry");
   assert.equal(snapshot.record.status, "CONSENSUS_PENDING");
   const prefix = "cross_chain_validator_verification";
@@ -201,7 +201,8 @@ export async function verifyFourIndependentValidators({ sourceConfig, sourcePool
     const depthResult = await request(peers[3].url, "/validate-batch", { batchId: snapshot.record.batchId });
     assert.equal(depthResult.status, 422); assert.equal(depthResult.body.reason, "INSUFFICIENT_DEPTH");
     await stop(shallow);
-    const wrongChain = await start({ ...environments[3], CHAIN_A_RPC_URL: "http://127.0.0.1:9545" }, { expectFailure: true });
+    assert.ok(destinationRpcUrl,"wrong-chain verification requires the actual isolated Chain B RPC");
+    const wrongChain = await start({ ...environments[3], CHAIN_A_RPC_URL: destinationRpcUrl }, { expectFailure: true });
     assert.match(wrongChain.stderr, /Chain A domain mismatch/);
     const wrongGateway = { ...environments[3], VALIDATOR_DB_SCHEMA: `${prefix}_negative_gateway`,
       SOURCE_GATEWAY_ADDRESS: "0x0000000000000000000000000000000000009999" };

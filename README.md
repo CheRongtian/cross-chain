@@ -4,6 +4,36 @@ This repository implements a Solidity-based cross-chain messaging prototype from
 
 On Chain B, DestinationGateway binds the existing PBFTCertificateVerifier, MerkleInclusionVerifier and MessageDomainVerifier immutably and inherits MessageReplayProtection. Anyone may submit evidence; Relayer identity and PostgreSQL grant no execution authority. The Gateway authenticates the QC, ordered membership and complete message, consumes its canonical ID, and calls the exact executable destinationReceiver through ICrossChainReceiver. ApplicationB accepts only its immutable Gateway and interprets a canonical supplier-grant payload. Receiver failure rolls back replay and business effects together. The independent components and test-only boundary harnesses remain available for regression coverage.
 
+## Local quick start
+
+Prepare the existing development dependencies/build artifacts first. Native Prometheus and Grafana must also already be installed; optional `PROMETHEUS_BIN`, `GRAFANA_BIN` and `GRAFANA_HOME` in ignored `.env` select their installed locations. `GRAFANA_BIN` identifies the unified `grafana` executable supporting `grafana server`; `GRAFANA_HOME` contains `conf/defaults.ini`. No launcher installs tools or performs a new trusted setup. Grafana plugin preinstallation and public-key downloads are disabled using the [official configuration options](https://grafana.com/docs/grafana/latest/setup-grafana/configure-grafana/). Missing reusable WASM, zkey or compiled verifier artifacts are reported with the existing `./scripts/verify.sh` preparation entry.
+
+```bash
+./scripts/start.sh
+./scripts/demo.sh
+./scripts/stop.sh
+```
+
+`start.sh` starts a complete persistent local stack, waits for readiness, prints its URLs, and returns. It owns fresh Anvil chains (`10011`/`2001`), new PostgreSQL schemas, four independent validators, continuous Indexer/Finality workers, production batch/PBFT scheduling, delivery projection, two leased Relayers with the persistent Transaction Manager, the read-only API/Explorer, Prometheus and the existing Grafana dashboard. Default browser endpoints are Explorer `http://127.0.0.1:8080/`, Prometheus `http://127.0.0.1:9090/` and Grafana `http://127.0.0.1:3000/d/cross-chain-protocol`. Grafana is loopback-only with anonymous Viewer access. A second start reuses the same healthy owned stack. An unrelated occupied port causes a clear failure; it is never attached to or terminated.
+
+Local startup, deployment, demo and observation orchestration live in `indexer/scripts/local/`. They call existing protocol components in `indexer/src/` and `validator/src/`; protocol components never import this script layer. Grafana provisioning is read only by the deployment scripts, with the existing protocol/Grafana isolation checks retained.
+
+`DATABASE_URL` in `.env` selects an existing PostgreSQL database in which the launcher creates unique namespaces. Leave it empty to use an owned temporary cluster with the already installed PostgreSQL tools. No personal password is copied into runtime configuration, manifests or results. The local stack supplies its own actual deployed addresses, source scope and validator history to children; no verification-log address copying is needed. The local signer accounts are public Anvil development accounts and must never be funded or used outside local development.
+
+`demo.sh` creates a fresh synthetic credential and legitimate authority-published active root, proves the current twelve-signal statement for one exact forwarding intent, and submits it through Application A. Existing workers carry that same message through OBSERVED, FINALIZING, FINALIZED, sealing, real PBFT PRE-PREPARE/PREPARE/COMMIT/QC, READY projection, durable signed/broadcast transport and canonical Chain B confirmation. Controlled local successor mining follows actual persisted source/transaction evidence. Success requires matching Gateway execution, exactly one `VerifiedSupplierGranted` event, replay consumption, and `isVerifiedSupplier(supplier) == true`. Repeating the demo selects an independent supplier and intent; the supplier is public business input, with no claim of private-subject EVM address ownership.
+
+The demo inspects actual destination calldata/events/state, API list/detail, the real Explorer client/view-model/text renderer, served assets and live metrics. High-entropy private identifiers and complete circuit field encodings must remain absent. Exact credential expiry and membership witnesses stay prover-local; the public `authorizationValidUntil` is an earlier authorization bound. Public issuer/role policy, commitments, roots, nullifier and forwarding intent remain public protocol evidence. This checks the implemented data path without claiming browser screenshot or visual-render verification.
+
+Owned process identities, public deployment/endpoint manifests, component logs, `demo-result.json` and private prover material live under ignored `.run/local/<run-id>/`. Private files use owner-only permissions. A startup failure cleans up only its own processes; `stop.sh` also checks stale ownership records and leaves unrelated processes and external PostgreSQL running. Stopping removes an owned temporary PostgreSQL cluster; external-database namespaces and other runtime evidence are retained. Restarting after stop creates a fresh stack. Proving artifacts are copied into each run so a later full verification rebuild does not replace the active stack's keys.
+
+Full verification remains one command:
+
+```bash
+./scripts/verify.sh
+```
+
+It overwrites root `verification.log`, retains the existing regressions/fuzz campaigns and final authorization-expiry gate, and adds `[clean bootstrap happy-path and privacy demonstration]` with `[clean-stack privacy demonstration]`. That group starts an independently owned PostgreSQL cluster and whole stack on fresh ports, runs two distinct happy paths, checks actual privacy surfaces and stops its own resources. Verification never reuses a manually running product stack. Required native Prometheus/Grafana binaries cannot be silently skipped. Runtime evidence for this isolated group is retained under `.run/verification/<run-id>/`; it never rewrites `.run/local/active.json`.
+
 The current implementation can:
 
 - produce deterministic message identifiers that can be reproduced across implementations;
@@ -1777,7 +1807,7 @@ CONFIRMED records a successful canonical receipt at configured depth, a heuristi
 
 A built-in read-only Explorer opens with recent messages from the configured source scope. Choose a message to follow its Chain A source occurrence through authorization, finality, batching, Merkle commitment, PBFT votes and quorum evidence, Relayer transaction history, and the current persisted Chain B execution result. It consumes the Message Query API described below. It never authorizes a proof, finalizes a source occurrence, votes, retries a delivery, reserves a nonce or submits a transaction.
 
-The Explorer is served by the existing API process: after configuring the deployment, run `./scripts/start.sh` from the project root, then open the printed address (default `http://127.0.0.1:8080/`, also available at `/explorer`). The homepage automatically loads up to 20 recent messages with first-observed time, exact source/destination domains and explicitly labelled source status. Select an ID link to open its lifecycle; no ID lookup in logs is required. Complete-ID search remains optional. Copy ID/copy link actions and expandable full IDs support sharing without losing the exact identifier. If clipboard access is unavailable, the page explains how to select the full ID or copy the browser URL.
+The Explorer is served by the existing API process. The complete local launcher `./scripts/start.sh` configures and starts it alongside the protocol; open the printed address (default `http://127.0.0.1:8080/`, also available at `/explorer`). The homepage automatically loads up to 20 recent messages with first-observed time, exact source/destination domains and explicitly labelled source status. Select an ID link to open its lifecycle; no ID lookup in logs is required. Complete-ID search remains optional. Copy ID/copy link actions and expandable full IDs support sharing without losing the exact identifier. If clipboard access is unavailable, the page explains how to select the full ID or copy the browser URL.
 
 Older messages uses bounded cursor pagination; Latest messages returns to the first page. The `before` query parameter preserves a list page through detail navigation and browser back/forward. Details retain the shareable `messageId` query parameter. Refresh reloads the current list or selected detail independently of unfinished search input; blank search returns to browsing without an invalid-ID error. Empty pages show a no-messages explanation and a path back to the latest messages. No second daemon, frontend build, package installation, wallet, external font or CDN is required. The page uses repository-local HTML, CSS and JavaScript modules. Listener configuration remains the API's existing loopback host/port settings.
 
@@ -1823,10 +1853,12 @@ Use the ignored root `.env` for local connection material and the committed `.en
 
 `MESSAGE_QUERY_VALIDATOR_STORES` is a JSON array of existing reader locations. Each entry has `validatorAddress`, `databaseSchema`, and optionally `databaseUrl`; omitted URLs use `DATABASE_URL`. Supply readers for the historical committee members whose messages you query. Use actual public identities/schemas from your deployment; do not copy verification's temporary namespaces into a production configuration. Separate database credentials belong only in your ignored `.env`. The API creates no schemas, migrations, tables, votes or copied Explorer state.
 
-After configuring the existing deployment, use two separate root entry points for routine work:
+Use separate root entries for verification and an interactive local deployment:
 
 - `./scripts/verify.sh`: runs full verification as before and overwrites root `verification.log`.
-- `./scripts/start.sh`: keeps the read-only Explorer/API running and prints startup output in the terminal without changing `verification.log`.
+- `./scripts/start.sh`: starts the complete owned local stack and returns after readiness without changing `verification.log`.
+- `./scripts/demo.sh`: submits and follows a real authorized supplier-grant message on that running stack.
+- `./scripts/stop.sh`: stops only that stack's owned processes.
 
 To browse messages:
 
@@ -1834,11 +1866,11 @@ To browse messages:
 ./scripts/start.sh
 ```
 
-The startup script resolves the repository location and reuses the existing `api:start` npm entry, which loads the root `.env`. Keep that terminal running and open the printed Explorer address (default `http://127.0.0.1:8080/`). Shutdown with `Ctrl+C` closes the listener and its owned reader pools. It does not install dependencies, run verification, deploy contracts, start chains/workers or launch Prometheus/Grafana. It reads existing database observations, including after local chains have stopped; it does not advance their lifecycle or check live chain state. PostgreSQL and the configured existing database/schema must remain available. Full verification manages its own temporary listeners and does not require this launcher to be running.
+The startup script resolves the repository and loads ignored root `.env`. Its detached supervisor owns the complete local deployment described in Local quick start, supplies actual deployment configuration directly to child processes, and returns after readiness. Use `stop.sh` for shutdown. `verification.log` remains exclusively owned by `verify.sh`.
 
 Standalone startup needs `DATABASE_URL`, the intended `INDEXER_DB_SCHEMA`, `CHAIN_A_DOMAIN`, `SOURCE_GATEWAY_ADDRESS`, `FINALITY_BLOCK_DEPTH`, and exactly one of `VALIDATOR_SET_HISTORY` or `VALIDATOR_SET_HISTORY_FILE`. Relative API history-file paths resolve against the project root where `.env` lives, independently of the shell/npm working directory. The committed history example is not an automatic fallback: supply the actual history for the selected source schema. Reader identities/schemas in `MESSAGE_QUERY_VALIDATOR_STORES` must belong to that same deployment; a separate reader connection URL remains private in `.env`.
 
-A successful `verify.sh` run does not configure standalone startup. Its source addresses, history and reader locations are passed to its temporary processes, and its listeners are closed on completion. When inspecting persisted verification data, use the public deployment addresses recorded by that run and the actual history/read stores established for the selected source schema. Isolated fault/rotation namespaces have their own histories; do not combine their committee configuration with another namespace.
+A successful `verify.sh` run does not configure the low-level standalone `npm --prefix indexer run api:start` command. Its source addresses, history and reader locations belong to its temporary processes. The full `start.sh` launcher needs no copied verification addresses. When using the low-level API command to inspect persisted verification data, supply the public deployment addresses and actual history/read stores established for that selected source schema. Isolated fault/rotation namespaces have their own histories; do not combine their committee configuration with another namespace.
 
 Missing/invalid standalone configuration now fails before pools or listeners are created with `INVALID_CONFIGURATION` and the affected field names together. Listener conflicts report `LISTEN_ADDRESS_IN_USE` with the host/port settings to check. Diagnostics do not echo configuration values, connection strings, file contents or arbitrary exceptions, and HTTP error bodies retain their fixed public codes.
 
@@ -1962,9 +1994,9 @@ A failed or invalid count exports `NaN` (unknown) instead of retaining a stale v
 
 ### Verification
 
-The only root verification entry remains `./scripts/verify.sh`, overwriting root `verification.log`. `[grafana operational dashboard]` validates JSON identity, all nine required views, datasource/provider YAML, source-resolved file paths, bounded metric/label references, histogram/rate semantics, secret-free artifacts and read-only collector behavior. PromQL syntax is parsed with the Prometheus project's fixed-version parser; YAML uses a fixed-version parser. Both are **development dependencies only** in the Indexer package, with the parser's pinned Lezer peers; prepare updated Indexer development dependencies before verification. The script checks them without installing anything.
+The only root verification entry remains `./scripts/verify.sh`, overwriting root `verification.log`. `[grafana operational dashboard]` validates JSON identity, all nine required views, datasource/provider YAML, source-resolved file paths, bounded metric/label references, histogram/rate semantics, secret-free artifacts and read-only collector behavior. PromQL syntax is parsed with the Prometheus project's fixed-version parser and pinned Lezer peers. The pinned YAML parser also prepares deployment-local observation configuration for the complete launcher. These tools use the existing Indexer development dependencies; prepare them before verification or local startup. No script installs them.
 
-All prior tests remain. The existing real source/PBFT/fault/Relayer/Gateway scenarios already produce the event metrics. Their actual exposition is checked against dashboard references, with Prometheus-generated `up` treated separately. The existing receipt pass now also observes real unresolved READY work, confirms its backlog decrease and compares repeated-scrape protocol/business snapshots. Existing Explorer/API snapshots include the pending collector. Static checks do not execute a Prometheus query engine or prove browser rendering: Grafana import/rendering and external service connectivity remain operator checks. Full verification requires no Grafana/Prometheus binary, Docker, plugin download or browser.
+All prior tests remain. The existing real source/PBFT/fault/Relayer/Gateway scenarios produce the event metrics. Their actual exposition is checked against dashboard references, with Prometheus-generated `up` treated separately. The receipt pass observes real unresolved READY work, confirms its backlog decrease and compares repeated-scrape protocol/business snapshots. Explorer/API snapshots include the pending collector. The added clean-stack group also starts installed native Prometheus/Grafana, checks all ten scrape targets, the provisioned datasource/dashboard and real demo privacy surfaces. Static checks alone do not prove service readiness or visual browser rendering; screenshot/browser verification remains an operator check. Docker, plugin downloads and a browser automation dependency are not required.
 
 ## Local Two-Chain Environment
 
@@ -2181,7 +2213,7 @@ The script uses strict error handling and verifies the following boundaries:
 
 `DATABASE_URL` is required and should point to a database intended for local verification. The ordinary flow uses project-owned schemas and tables; it does not drop a database or reset the `public` schema. It does not install PostgreSQL, create a database on the configured user server, install npm packages, or generate an Indexer lockfile. The restart scenario separately creates one disposable verification-owned cluster and removes only that cluster after its processes have stopped. Its isolated connection URL is derived at runtime; no additional password or setup commands are required.
 
-If neither configured RPC endpoint is running, the script starts both chains through `scripts/start-chains.sh` and stops the processes it created when verification ends. If both chains already exist with the expected chain IDs, the script reuses them and leaves them running.
+Full verification selects fresh loopback ports, starts its own chains through `scripts/start-chains.sh`, and stops only those processes on completion. It never reuses the interactive stack's chains, so verification-time snapshots, mining and time changes cannot affect a manually running demo.
 
 The validator integration applies existing migrations explicitly, chooses temporary local ports, injects runtime development keys, and cleans up its own processes and proxies. It preserves the complete normal consensus flow, then runs four isolated fault instances with fresh source/validator namespaces and real Chain A reconstruction. Test-owned namespaces are reset only during scenario preparation. The eight mutable negative-fixture tables are transactionally recreated from current source definitions and copied with explicit column lists; leftover older schemas cannot retain obsolete QC columns or checks. Fixture rebuild failures roll back, and production source data and triggers are unchanged. Healing and restart recovery retain their durable state. No production validator store is reset.
 

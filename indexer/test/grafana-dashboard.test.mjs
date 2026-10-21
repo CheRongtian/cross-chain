@@ -14,6 +14,31 @@ const yaml = relative => {
   assert.deepEqual(document.errors, []); return document.toJS();
 };
 
+const grafanaConfigurationRead = /(?:import|from|readFile)[^\n]*(?:observability\/grafana|grafana-dashboard|grafana\/provisioning)/i;
+const orchestrationDirectories = ["indexer/scripts/", "validator/scripts/", "scripts/"].map(path => new URL(path, root).href);
+
+// Follow repository-local static imports, re-exports and literal dynamic
+// imports without evaluating modules or starting any worker. Bare package
+// dependencies remain owned by their installed packages.
+function assertProtocolDependencies(entries, readSource) {
+  const visited = new Set();
+  function inspect(file, importedBy) {
+    assert.ok(!orchestrationDirectories.some(directory => file.href.startsWith(directory)),
+      `Protocol code must not depend on script-layer orchestration: ${importedBy ?? file.href} -> ${file.href}`);
+    if (visited.has(file.href)) return;
+    visited.add(file.href);
+    const source = readSource(file);
+    assert.doesNotMatch(source, grafanaConfigurationRead, `Protocol dependency reads Grafana configuration: ${fileURLToPath(file)}`);
+    for (const [, , specifier] of source.matchAll(/\b(?:from\s+|import\s*(?:\(\s*)?)(["'])([^"'\r\n]+)\1/g)) {
+      if (!specifier.startsWith(".") && !specifier.startsWith("/") && !specifier.startsWith("file:")) continue;
+      const dependency = new URL(specifier, file);
+      if (/\.(?:mjs|js)$/.test(dependency.pathname)) inspect(dependency, file.href);
+    }
+  }
+  for (const entry of entries) inspect(entry);
+  return visited;
+}
+
 test("dashboard JSON has stable identity, layout, only built-in panels and one Prometheus datasource", () => {
   assertDashboardContract(dashboard);
   console.log("VALID: provisioned Cross-Chain Protocol Overview Grafana dashboard has a stable UID and uses only the Prometheus datasource");
@@ -118,14 +143,48 @@ test("observability artifacts and README examples contain no sensitive material 
     assert.ok(!/PRIVATE_KEY|DATABASE_URL|postgres(?:ql)?:\/\/|bearer\s+\S+|secureJsonData|0x[0-9a-f]{64}|0x02[0-9a-f]{100,}/i.test(text));
     assert.ok(!/"(?:method|httpMethod)"\s*:\s*"(?:POST|PUT|PATCH|DELETE)"|"actions"\s*:|"type"\s*:\s*"(?:postgres|mysql|infinity)"/.test(text));
   }
+  const protocolSources = new Map();
   function inspect(directory) {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const file = new URL(entry.name + (entry.isDirectory() ? "/" : ""), directory);
       if (entry.isDirectory()) inspect(file);
-      else if (entry.name.endsWith(".mjs")) assert.ok(!/(?:import|from|readFile)[^\n]*(?:observability\/grafana|grafana-dashboard|grafana\/provisioning)/i.test(readFileSync(file, "utf8")));
+      else if (entry.name.endsWith(".mjs")) {
+        const source = readFileSync(file, "utf8");
+        assert.doesNotMatch(source, grafanaConfigurationRead, `Protocol code reads Grafana configuration: ${fileURLToPath(file)}`);
+        protocolSources.set(file.href, source);
+      }
     }
   }
   inspect(new URL("indexer/src/", root)); inspect(new URL("validator/src/", root));
+  assertProtocolDependencies([...protocolSources.keys()].map(path => new URL(path)), file => {
+    if (!protocolSources.has(file.href)) protocolSources.set(file.href, readFileSync(file, "utf8"));
+    return protocolSources.get(file.href);
+  });
   console.log("VALID: Grafana dashboard, variables, legends, provisioning and README contain no private keys, database credentials, RPC credentials, raw signed transactions or ZK witness material");
   console.log("VALID: no Indexer, Finality Watcher, validator, Relayer or Tx Manager production entry point depends on Grafana configuration");
+  console.log("VALID: protocol dependencies cannot import local startup, deployment or observation orchestration from the script layer");
+});
+
+test("dependency boundary rejects static, re-exported, dynamic and indirect script imports without executing modules", () => {
+  const entry = new URL("indexer/src/boundary-fixture.mjs", root);
+  const helper = new URL("indexer/src/boundary-helper.mjs", root);
+  function check(entrySource, helperSource = "export const value = 1;") {
+    const sources = new Map([[entry.href, entrySource], [helper.href, helperSource]]);
+    return assertProtocolDependencies([entry], file => {
+      assert.ok(sources.has(file.href), `Unexpected fixture dependency: ${file.href}`);
+      return sources.get(file.href);
+    });
+  }
+  for (const source of [
+    'import "../scripts/local/main.mjs";',
+    'import { startLocalStack } from "../scripts/local/main.mjs";',
+    'export { startLocalStack } from "../scripts/local/main.mjs";',
+    'const runtime = await import("../scripts/local/main.mjs");',
+    'import "../../scripts/lib/owned-postgres.mjs";',
+    'import "../../validator/scripts/local.mjs";',
+  ]) assert.throws(() => check(source), /must not depend on script-layer orchestration/);
+  assert.throws(() => check('import "./boundary-helper.mjs";', 'export * from "../scripts/local/observability.mjs";'), /must not depend on script-layer orchestration/);
+  assert.throws(() => check('import "./boundary-helper.mjs";', 'await readFile("observability/grafana/provisioning/dashboards/cross-chain.yaml");'), /reads Grafana configuration/);
+  const visited = check('import { value } from "./boundary-helper.mjs"; import "node:fs"; import "pg";', 'export { value } from "./boundary-fixture.mjs";');
+  assert.equal(visited.size, 2, "ordinary protocol dependencies and cycles remain allowed");
 });

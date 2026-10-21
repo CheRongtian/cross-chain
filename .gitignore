@@ -21,3 +21,4 @@ zk/generated/
 proof.json
 public.json
 verification_key.json
+.run/

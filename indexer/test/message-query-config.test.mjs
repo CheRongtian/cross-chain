@@ -22,17 +22,25 @@ function configurationFailure(settings) {
   return messageQueryStartupError(failure);
 }
 
-test("root Explorer launcher is executable and reuses API startup without running verification or installation", () => {
-  const path = new URL("../../scripts/start.sh", import.meta.url);
-  const source = readFileSync(path, "utf8");
-  assert.ok(source.startsWith("#!/usr/bin/env bash\n"));
-  assert.match(source, /^set -euo pipefail$/m);
-  assert.match(source, /^cd "\$PROJECT_ROOT"$/m);
-  assert.match(source, /^exec npm --prefix "\$PROJECT_ROOT\/indexer" run api:start$/m);
-  const commands = source.split("\n").filter(line => !line.trimStart().startsWith("#")).join("\n");
-  assert.doesNotMatch(commands, /verify\.sh|verification\.log|\btee\b|\bforge\b|\banvil\b|npm (?:ci|install)|--test|deploy-/);
-  assert.ok((statSync(path).mode & 0o111) !== 0, "the launcher must support direct ./scripts/start.sh execution");
-});
+// Root shell entries dispatch to the shared local-stack runtime. Keep these
+// checks separate from the low-level standalone API configuration contract.
+for (const command of ["start", "demo", "stop"]) {
+  test(`root local ${command} launcher is executable and dispatches without running verification or installation`, () => {
+    const path = new URL(`../../scripts/${command}.sh`, import.meta.url);
+    const source = readFileSync(path, "utf8");
+    assert.ok(source.startsWith("#!/usr/bin/env bash\n"));
+    assert.match(source, /^set -euo pipefail$/m);
+    assert.match(source, /^cd "\$PROJECT_ROOT"$/m);
+    const commands = source.split("\n").filter(line => !line.trimStart().startsWith("#")).join("\n");
+    const dispatch = commands.match(/^exec node "\$PROJECT_ROOT\/indexer\/scripts\/local\/main\.mjs" (start|demo|stop)$/m);
+    assert.ok(dispatch, "the launcher must dispatch to the shared local-stack runtime");
+    assert.equal(dispatch[1], command, "each launcher must select its own operation");
+    assert.equal(commands.split("\n").filter(line => /^\s*exec\b/.test(line)).length, 1, "the launcher must have one exec entry");
+    assert.doesNotMatch(commands, /verify\.sh|verification\.log|\btee\b|\bforge\b|\banvil\b|npm (?:ci|install)|--test|deploy-/);
+    assert.doesNotMatch(commands, /\bbrew\s+(?:install|upgrade|services)\b/);
+    assert.ok((statSync(path).mode & 0o111) !== 0, `the launcher must support direct ./scripts/${command}.sh execution`);
+  });
+}
 
 test("standalone API configuration reports all missing deployment fields together before any startup work", () => {
   // Reproduces the original root .env: database/indexing settings only, without
