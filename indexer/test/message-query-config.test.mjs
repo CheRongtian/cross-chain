@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,7 +24,7 @@ function configurationFailure(settings) {
 
 // Root shell entries dispatch to the shared local-stack runtime. Keep these
 // checks separate from the low-level standalone API configuration contract.
-for (const command of ["start", "demo", "stop"]) {
+for (const command of ["start", "stop"]) {
   test(`root local ${command} launcher is executable and dispatches without running verification or installation`, () => {
     const path = new URL(`../../scripts/${command}.sh`, import.meta.url);
     const source = readFileSync(path, "utf8");
@@ -32,7 +32,7 @@ for (const command of ["start", "demo", "stop"]) {
     assert.match(source, /^set -euo pipefail$/m);
     assert.match(source, /^cd "\$PROJECT_ROOT"$/m);
     const commands = source.split("\n").filter(line => !line.trimStart().startsWith("#")).join("\n");
-    const dispatch = commands.match(/^exec node "\$PROJECT_ROOT\/indexer\/scripts\/local\/main\.mjs" (start|demo|stop)$/m);
+    const dispatch = commands.match(/^exec node "\$PROJECT_ROOT\/indexer\/scripts\/local\/main\.mjs" (start|stop)$/m);
     assert.ok(dispatch, "the launcher must dispatch to the shared local-stack runtime");
     assert.equal(dispatch[1], command, "each launcher must select its own operation");
     assert.equal(commands.split("\n").filter(line => /^\s*exec\b/.test(line)).length, 1, "the launcher must have one exec entry");
@@ -41,6 +41,12 @@ for (const command of ["start", "demo", "stop"]) {
     assert.ok((statSync(path).mode & 0o111) !== 0, `the launcher must support direct ./scripts/${command}.sh execution`);
   });
 }
+
+test("demonstrations have no separate public shell or CLI entry",() => {
+  assert.equal(existsSync(new URL("../../scripts/demo.sh",import.meta.url)),false);
+  const runtime = readFileSync(new URL("../scripts/local/main.mjs",import.meta.url),"utf8");
+  assert.doesNotMatch(runtime,/command\s*===\s*["']demo["']|scripts\/demo\.sh/);
+});
 
 test("standalone API configuration reports all missing deployment fields together before any startup work", () => {
   // Reproduces the original root .env: database/indexing settings only, without

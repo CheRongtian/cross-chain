@@ -7,8 +7,9 @@ import { createTransactionManager } from "../../src/transaction-manager/service.
 import { createRelaySubmissionRepository } from "../../src/relayer/repository.mjs";
 import { createRelayerWorker } from "../../src/relayer/service.mjs";
 import { startWorkerMetrics } from "../../src/metrics/http.mjs";
-import { createLocalPipeline } from "./pipeline.mjs";
+import { createLocalPipeline,createPipelineDriver } from "./pipeline.mjs";
 import { pause,safeError,writeJson } from "./tools.mjs";
+import { serveLocalRpc } from "./ipc.mjs";
 
 const role = process.argv[2];
 const config = role === "pipeline" ? loadDeliveryConfig() : loadTransactionConfig();
@@ -21,7 +22,9 @@ try {
   let pass;
   if (role === "pipeline") {
     const pipeline = createLocalPipeline({ config: { ...loadConfig(),...config },pool,peers: JSON.parse(process.env.VALIDATOR_PEERS) });
-    pass = () => pipeline.runOnce();
+    const driver = createPipelineDriver(pipeline);
+    serveLocalRpc(driver.handlers);
+    pass = () => driver.runOnce();
   } else {
     const queue = createDeliveryRepository({ config,pool });
     const legacy = createRelaySubmissionRepository({ config,pool,queue });
@@ -37,4 +40,4 @@ try {
   await writeJson(process.env.LOCAL_READY_FILE,{ pid: process.pid,role,ready: true });
   while (!stopping) { await pass(); await pause(250); }
 } catch (error) { console.error(`${role} stopped: ${safeError(error)}`); process.exitCode = 1; }
-finally { await metrics.close(); await pool.end(); }
+finally { await metrics.close(); await pool.end(); if (process.connected) process.disconnect(); }

@@ -11,8 +11,10 @@ import { createLocalIssuer } from "../../../zk/scripts/local-credential.mjs";
 import { validatorKey,LOCAL_DEVELOPMENT_KEY } from "./config.mjs";
 import { clients,deployLocalProtocol,snapshotArtifacts } from "./deployment.mjs";
 import { observabilityConfiguration } from "./observability.mjs";
-import { ROOT,assertPortFree,binary,httpJson,pause,readJson,safeError,spawnLogged,stopRecordedProcess,waitFor,writeJson } from "./tools.mjs";
+import { ROOT,assertPortFree,binary,httpJson,pause,processIdentity,readJson,safeError,spawnLogged,stopRecordedProcess,waitFor,writeJson } from "./tools.mjs";
 import { runLocalDemo } from "./demo.mjs";
+import { localRpc } from "./ipc.mjs";
+import { assertOwnedValidator,runFaultDemo } from "./pbft-faults.mjs";
 
 export async function supervise(config) {
   const registry = join(config.directory,"processes.json");
@@ -21,6 +23,10 @@ export async function supervise(config) {
   const children = [];
   const controller = new AbortController();
   const degraded = new Set();
+  const expectedCrashes = new Set();
+  const validatorChildren = [];
+  const validatorEnvironments = [];
+  let pipeline;
   let stopping = false; let stopped = false; let failure; let busy = false; let pool; let server;
   let phase = "prerequisites"; let ready = false;
   const manifest = { ...config,createdAt: new Date().toISOString(),ready: false };
@@ -37,12 +43,14 @@ export async function supervise(config) {
     await writeJson(manifestPath,{ ...manifest,ready: false,stoppedAt: new Date().toISOString(),failure: failure ? safeError(failure) : undefined });
     if (server?.listening) { server.closeAllConnections(); await new Promise(accept => server.close(accept)); }
   }
-  process.once("SIGTERM",() => { stopping = true; }); process.once("SIGINT",() => { stopping = true; });
-  async function spawn(name,file,args,env = {}) {
+  const requestStop = () => { stopping = true; controller.abort(); };
+  process.once("SIGTERM",requestStop); process.once("SIGINT",requestStop);
+  async function spawn(name,file,args,env = {},ipc = false) {
     alive();
-    const child = await spawnLogged(name,file,args,{ directory: config.directory,env: { ...process.env,...env },
-      onExit: (name,code,signal) => {
+    const child = await spawnLogged(name,file,args,{ directory: config.directory,env: { ...process.env,...env,LOCAL_RUN_ID: config.runId },ipc,
+      onExit: (name,code,signal,pid) => {
         if (stopping) return;
+        if (signal === "SIGKILL" && expectedCrashes.delete(pid)) return;
         if (phase === "ready" && ["prometheus","grafana","api"].includes(name)) {
           degraded.add(name); ready = false;
           manifest.ready = false; manifest.degraded = [...degraded];
@@ -50,10 +58,64 @@ export async function supervise(config) {
           console.error(`Observation surface ${name} stopped; core protocol workers remain running. Use stop.sh/start.sh to restore the complete stack.`);
         } else failure = new Error(`${name} exited (${signal ?? code}); see ${join(config.directory,"logs",name + ".log")}`);
       } });
+    if (ipc) child.rpc = localRpc(child.child,config.runId);
     children.push(child); await writeJson(registry,children.map(value => value.record)); return child;
   }
-  const node = (name,path,args,env) => spawn(name,process.execPath,[join(ROOT,path),...args],env);
+  const node = (name,path,args,env,ipc = false) => spawn(name,process.execPath,[join(ROOT,path),...args],env,ipc);
   const wait = (label,fn,timeout) => waitFor(label,fn,{ alive,timeout });
+  async function publishComponents() {
+    manifest.components = [...new Map(children.map(({ record }) => [record.name,{ name: record.name,pid: record.pid,log: record.log }])).values()];
+    await writeJson(manifestPath,manifest);
+  }
+  async function startValidator(index) {
+    const owned = await node("validator-" + (index + 1),"validator/scripts/local-validator.mjs",[],validatorEnvironments[index],true);
+    validatorChildren[index] = owned;
+    const peer = manifest.peers[index];
+    await wait("validator " + peer.address,async () => {
+      const health = await httpJson(peer.url + "/health");
+      return health.ready && health.pid === owned.record.pid && health.validatorAddress === peer.address;
+    });
+    const identity = await owned.rpc("status");
+    assert.equal(identity.pid,owned.record.pid); assert.equal(identity.address,peer.address);
+    assert.equal(identity.schema,manifest.validatorSchemas[index]);
+    await publishComponents();
+    return owned;
+  }
+  const faultProcesses = {
+    at: index => validatorChildren[index],
+    fail(error) { ready = false; manifest.ready = false; failure = new Error("Fault control restoration failed: " + safeError(error)); },
+    async crash(index) {
+      const owned = validatorChildren[index];
+      assert.ok(children.includes(owned));
+      assert.equal(owned.child.exitCode,null); assert.equal(owned.child.signalCode,null);
+      const observedIdentity = await processIdentity(owned.record.pid);
+      const recorded = (await readJson(registry)).find(record => record.pid === owned.record.pid);
+      const health = await httpJson(manifest.peers[index].url + "/health");
+      const published = (await readJson(manifestPath)).components.find(value => value.name === owned.record.name);
+      assertOwnedValidator({ record: owned.record,observedIdentity,registered: recorded,published,health,address: manifest.peers[index].address });
+      ready = false; manifest.ready = false; await publishComponents();
+      expectedCrashes.add(owned.record.pid);
+      owned.child.kill("SIGKILL");
+      await wait("designated validator abrupt exit",async () => owned.child.signalCode === "SIGKILL",10000);
+      assert.equal(await processIdentity(owned.record.pid),null);
+      return owned.record.pid;
+    },
+    async restore(index) {
+      const old = validatorChildren[index];
+      if (old.child.exitCode !== null || old.child.signalCode !== null) await startValidator(index);
+      for (const [position,peer] of manifest.peers.entries()) {
+        const health = await httpJson(peer.url + "/health");
+        assert.equal(health.ready,true); assert.equal(health.validatorAddress,peer.address);
+        assert.equal(health.pid,validatorChildren[position].record.pid);
+      }
+      await wait("all observation targets after validator recovery",async () => {
+        const targets = (await httpJson(config.prometheus + "/api/v1/targets")).data.activeTargets;
+        return targets.length === 10 && targets.every(target => target.health === "up");
+      });
+      ready = degraded.size === 0; manifest.ready = ready; await publishComponents();
+      assert.equal(ready,true); return validatorChildren[index].record.pid;
+    },
+  };
   try {
     await mkdir(config.directory,{ recursive: true,mode: 0o700 });
     await mkdir(join(config.directory,"private"),{ mode: 0o700 });
@@ -68,16 +130,25 @@ export async function supervise(config) {
       const send = (status,value) => { response.writeHead(status,{ "content-type": "application/json" }); response.end(JSON.stringify(value)); };
       if (request.method === "GET" && request.url === "/status") return send(200,{ runId: config.runId,ready,phase,degraded: [...degraded],failure: failure ? safeError(failure) : null });
       if (request.headers["x-local-run"] !== config.runId) return send(403,{ error: "Run ownership mismatch" });
-      if (request.method === "POST" && request.url === "/stop") { send(200,{ stopping: true }); stopping = true; return; }
-      if (request.method !== "POST" || request.url !== "/demo") return send(404,{ error: "Unknown local control operation" });
+      if (request.method === "POST" && request.url === "/stop") { send(200,{ stopping: true }); requestStop(); return; }
+      const scenario = ({ "/demo": "happy-path","/demo/byzantine-validator": "byzantine-validator","/demo/validator-crash": "validator-crash" })[request.url];
+      if (request.method !== "POST" || !scenario) return send(404,{ error: "Unknown local control operation" });
+      if (scenario !== "happy-path" && !config.isolated) return send(404,{ error: "Validator faults are restricted to full verification" });
       if (!ready || busy) return send(409,{ error: busy ? "A demonstration is already running" : "Stack is not ready" });
       busy = true;
       response.writeHead(200,{ "content-type": "application/x-ndjson" });
       const progress = message => { if (!response.destroyed) response.write(JSON.stringify({ progress: message }) + "\n"); };
       try {
-        const result = await runLocalDemo({ config: manifest,pool,issuer,artifacts,alive,progress,signal: controller.signal });
+        const options = { config: manifest,pool,issuer,artifacts,alive,progress,signal: controller.signal };
+        const result = scenario === "happy-path" ? await runLocalDemo(options) :
+          await runFaultDemo({ ...options,scenario,pipeline: pipeline.rpc,processes: faultProcesses });
+        await writeJson(join(config.directory,"demo-result.json"),result);
+        await writeJson(join(config.directory,`demo-${result.messageId}.json`),result);
         if (!response.destroyed) response.write(JSON.stringify({ result }) + "\n");
-      } catch (error) { if (!response.destroyed) response.write(JSON.stringify({ error: safeError(error) }) + "\n"); }
+      } catch (error) {
+        if (!ready) failure = new Error("Fault demonstration could not restore complete readiness: " + safeError(error));
+        if (!response.destroyed) response.write(JSON.stringify({ error: safeError(error) }) + "\n");
+      }
       finally { busy = false; response.end(); }
     });
     await new Promise((accept,reject) => { server.once("error",reject); server.listen(config.ports.control,"127.0.0.1",accept); });
@@ -120,19 +191,20 @@ export async function supervise(config) {
       MESSAGE_QUERY_VALIDATOR_STORES: JSON.stringify(peers.map((peer,index) => ({ validatorAddress: peer.address,databaseSchema: manifest.validatorSchemas[index] }))),
     };
     phase = "validators";
-    for (const [index,peer] of peers.entries()) {
-      await node("validator-" + (index + 1),"validator/src/main.mjs",[],{ ...environment,
+    for (const index of peers.keys()) {
+      validatorEnvironments[index] = { ...environment,
         SOURCE_DATABASE_URL: databaseUrl,SOURCE_DB_SCHEMA: config.schema,VALIDATOR_DATABASE_URL: databaseUrl,VALIDATOR_DB_SCHEMA: manifest.validatorSchemas[index],
         VALIDATOR_PRIVATE_KEY: validatorKey(index),VALIDATOR_LISTEN_HOST: "127.0.0.1",VALIDATOR_LISTEN_PORT: String(config.ports.validators[index]),
-        PBFT_VIEW_TIMEOUT_MS: "30000",METRICS_PORT: "" });
-      await wait("validator " + peer.address,async () => (await httpJson(peer.url + "/health")).ready);
+        PBFT_VIEW_TIMEOUT_MS: "30000",METRICS_PORT: "" };
+      await startValidator(index);
     }
     phase = "workers";
     await node("indexer","indexer/src/main.mjs",[],{ ...environment,METRICS_PORT: String(config.ports.metrics[0]) });
     await node("finality","indexer/src/main.mjs",["finality"],{ ...environment,METRICS_PORT: String(config.ports.metrics[1]) });
     for (const [index,role] of ["pipeline","relayer-a","relayer-b"].entries()) {
       const readyFile = join(config.directory,role + "-ready.json");
-      await node(role,"indexer/scripts/local/worker.mjs",[role],{ ...environment,RELAYER_WORKER_ID: role,LOCAL_READY_FILE: readyFile,METRICS_PORT: String(config.ports.metrics[index + 2]) });
+      const owned = await node(role,"indexer/scripts/local/worker.mjs",[role],{ ...environment,RELAYER_WORKER_ID: role,LOCAL_READY_FILE: readyFile,METRICS_PORT: String(config.ports.metrics[index + 2]) },role === "pipeline");
+      if (role === "pipeline") pipeline = owned;
       await wait(role,async () => { await access(readyFile); return (await readJson(readyFile)).ready; });
     }
     await node("api","indexer/src/api/main.mjs",[],{ ...environment,METRICS_PORT: "" });
@@ -156,8 +228,7 @@ export async function supervise(config) {
       return targets.length === 10 && targets.every(target => target.health === "up");
     });
     phase = "ready"; ready = true; manifest.ready = true;
-    manifest.components = children.map(({ record }) => ({ name: record.name,pid: record.pid,log: record.log }));
-    await writeJson(manifestPath,manifest);
+    await publishComponents();
     console.log("Local stack ready; owned runtime: " + config.directory);
     while (!stopping) { alive(); await pause(250); }
   } catch (error) { failure = error; console.error(`Local stack failed during ${phase}: ${safeError(error)}`); process.exitCode = 1; }

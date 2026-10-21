@@ -50,7 +50,10 @@ export async function startLocalStack(config = undefined) {
           if (value.failure || value.degraded?.length) throw Object.assign(new Error(value.failure ?? `Observation surfaces unavailable: ${value.degraded.join(", ")}; use stop.sh/start.sh`),{ fatal: true });
           return value.ready ? value : false;
         },{ timeout: 180000 });
-        if (status.ready) return { record: existing,manifest: await readJson(join(existing.directory,"manifest.json")) };
+        if (status.ready) {
+          const stack = { record: existing,manifest: await readJson(join(existing.directory,"manifest.json")) };
+          return { ...stack,message: await ensureLocalExplorerMessage(stack) };
+        }
       }
       await stopLocalStack(existing);
     }
@@ -68,15 +71,16 @@ export async function startLocalStack(config = undefined) {
   }
   let record;
   let interrupted = false;
-  const interrupt = () => { interrupted = true; };
+  const startup = new AbortController();
+  const interrupt = () => { interrupted = true; startup.abort(); };
   process.once("SIGINT",interrupt); process.once("SIGTERM",interrupt);
   try {
     await lock.writeFile(jsonText({ pid: process.pid,identity: await processIdentity(process.pid) }));
     await mkdir(config.directory,{ mode: 0o700 });
     await writeJson(join(config.directory,"config.json"),config);
     const output = await open(join(config.directory,"supervisor.log"),"a",0o600);
-    // Spawn detached so start.sh returns after readiness. Child processes are
-    // separately registered by the supervisor and outlive this short CLI.
+    // The supervisor persists after this CLI finishes both readiness and its
+    // initial confirmed message. Verification controls its own messages.
     const { spawn } = await import("node:child_process");
     const child = spawn(process.execPath,[fileURLToPath(import.meta.url),"supervise",join(config.directory,"config.json")],{
       cwd: ROOT,env: process.env,detached: true,stdio: ["ignore",output.fd,output.fd],
@@ -99,7 +103,10 @@ export async function startLocalStack(config = undefined) {
       if (interrupted) throw new Error("Local startup interrupted; cleaning up this owned run");
       if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Local supervisor exited; see ${join(config.directory,"supervisor.log")}`);
     } });
-    return { record,manifest: await readJson(join(config.directory,"manifest.json")) };
+    const stack = { record,manifest: await readJson(join(config.directory,"manifest.json")) };
+    if (interactive) stack.message = await ensureLocalExplorerMessage(stack,console.log,{ signal: startup.signal });
+    if (interrupted) throw new Error("Local startup interrupted; cleaning up this owned run");
+    return stack;
   } catch (error) {
     try { console.error(safeError({ message: await readFile(join(config.directory,"supervisor.log"),"utf8") })); } catch { /* startup may have failed before log creation */ }
     if (record) await stopLocalStack(record);
@@ -110,9 +117,13 @@ export async function startLocalStack(config = undefined) {
   }
 }
 
-export async function demonstrateLocalStack(record,onMessage = console.log) {
+export async function demonstrateLocalStack(record,onMessage = console.log,scenario = "happy-path",signal) {
   assertLocalOwnership(record);
-  const response = await fetch(record.control + "/demo",{ method: "POST",headers: { "x-local-run": record.runId },signal: AbortSignal.timeout(360000) });
+  if (!["happy-path","byzantine-validator","validator-crash"].includes(scenario)) throw new Error("Unknown local demonstration scenario");
+  const path = scenario === "happy-path" ? "/demo" : "/demo/" + scenario;
+  const deadline = AbortSignal.timeout(360000);
+  const response = await fetch(record.control + path,{ method: "POST",headers: { "x-local-run": record.runId },
+    signal: signal ? AbortSignal.any([deadline,signal]) : deadline });
   if (!response.ok) throw new Error((await response.json()).error ?? "Local demonstration request failed");
   const decoder = new TextDecoder(); let buffer = ""; let result;
   for await (const chunk of response.body) {
@@ -126,6 +137,33 @@ export async function demonstrateLocalStack(record,onMessage = console.log) {
     }
   }
   if (!result || buffer.trim()) throw new Error("Local demo ended without a complete result");
+  return result;
+}
+
+// Both the product launcher and clean-stack verification use this exact path.
+// The persisted result locates a message; the live API must still confirm its
+// canonical execution before startup can report an Explorer-ready message.
+export async function ensureLocalExplorerMessage({ record,manifest },onMessage = console.log,{
+  signal,readResult = optionalJson,readMessage = httpJson,demonstrate = demonstrateLocalStack,
+} = {}) {
+  assertLocalOwnership(record);
+  signal?.throwIfAborted();
+  const existing = await readResult(join(record.directory,"demo-result.json"));
+  let result = existing;
+  if (!result) {
+    onMessage("Preparing the initial confirmed message for the Explorer; no separate demonstration command is required");
+    result = await demonstrate(record,onMessage,"happy-path",signal);
+  }
+  assert.match(result.messageId,/^0x[0-9a-f]{64}$/);
+  assert.equal(result.privacy,"PASSED","initial message privacy verification must pass");
+  assert.equal(result.messageExecuted,true); assert.equal(result.supplierVerified,true);
+  signal?.throwIfAborted();
+  const observed = await readMessage(manifest.api + "/api/v1/messages/" + result.messageId);
+  assert.equal(observed.execution?.status,"CONFIRMED","initial Explorer message must remain confirmed");
+  assert.equal(observed.destinationTransaction?.transactionHash,result.destinationTransaction);
+  assert.equal(observed.batch?.batchId,result.batchId); assert.equal(observed.qc?.qcDigest,result.qcDigest);
+  signal?.throwIfAborted();
+  onMessage(`${existing ? "Reusing" : "Prepared"} confirmed Explorer message ${result.messageId}`);
   return result;
 }
 
@@ -145,19 +183,13 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     } else {
       try { process.loadEnvFile(join(ROOT,".env")); } catch (error) { if (error.code !== "ENOENT") throw error; }
       if (command === "start") {
-        const { manifest } = await startLocalStack();
-        console.log(`\nExplorer: ${manifest.api}/\nPrometheus: ${manifest.prometheus}/\nGrafana: ${manifest.grafana}/d/cross-chain-protocol\nRuntime/logs: ${manifest.directory}\nSubmit a real message: ./scripts/demo.sh\nStop this owned stack: ./scripts/stop.sh`);
+        const { manifest,message } = await startLocalStack();
+        console.log(`\nExplorer: ${manifest.api}/\nConfirmed message: ${manifest.api}/?messageId=${message.messageId}\nPrometheus: ${manifest.prometheus}/\nGrafana: ${manifest.grafana}/d/cross-chain-protocol\nRuntime/logs: ${manifest.directory}\nFull verification: ./scripts/verify.sh\nStop this owned stack: ./scripts/stop.sh`);
       } else if (command === "stop") {
         const record = await optionalJson(activePath);
         if (record) { await stopLocalStack(record); await rm(activePath,{ force: true }); }
         console.log("Owned local stack stopped; runtime logs retained. Existing external PostgreSQL was left running.");
-      } else if (command === "demo") {
-        const record = await optionalJson(activePath);
-        if (!record) throw new Error("Start the local stack with ./scripts/start.sh first");
-        const result = await demonstrateLocalStack(record);
-        console.log(jsonText(result));
-        console.log("CLEAN BOOTSTRAP / HAPPY-PATH / PRIVACY DEMONSTRATION PASSED");
-      } else throw new Error("usage: local/main.mjs start | demo | stop");
+      } else throw new Error("usage: local/main.mjs start | stop");
     }
   } catch (error) { console.error(safeError(error)); process.exitCode = 1; }
 }

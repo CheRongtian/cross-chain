@@ -7,6 +7,6 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$PROJECT_ROOT"
 
-# Ready means the complete owned local protocol and observation surfaces are
-# available. The supervisor persists after this short command returns.
+# Return after the complete owned stack and one confirmed Explorer message are
+# ready. The supervisor and normal background workers keep running.
 exec node "$PROJECT_ROOT/indexer/scripts/local/main.mjs" start

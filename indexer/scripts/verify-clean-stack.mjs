@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFile,readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { localConfiguration } from "./local/config.mjs";
-import { demonstrateLocalStack,startLocalStack,stopLocalStack } from "./local/main.mjs";
+import { demonstrateLocalStack,ensureLocalExplorerMessage,startLocalStack,stopLocalStack } from "./local/main.mjs";
 import { jsonText,safeError } from "./local/tools.mjs";
 
 console.log("[clean-stack privacy demonstration]");
@@ -17,13 +17,17 @@ try {
   console.log("Independent validator processes: " + jsonText(validators.map((value,index) => ({ ...value,
     address: stack.manifest.peers[index].address,schema: stack.manifest.validatorSchemas[index],endpoint: stack.manifest.peers[index].url }))));
   console.log("VALID: fresh chains, empty migrated source state, independent validator stores, both leased Relayers and ten healthy observation targets are ready");
-  const first = await demonstrateLocalStack(stack.record);
+  const first = await ensureLocalExplorerMessage(stack);
   console.log(jsonText(first));
+  const reused = await ensureLocalExplorerMessage(stack);
+  assert.deepEqual(reused,first);
+  console.log("VALID: startup message preparation follows the real happy path and reuses its live API-confirmed result without another source message");
   // Prove a second run needs no previous message ID, proof, supplier or QC.
   const second = await demonstrateLocalStack(stack.record);
   assert.notEqual(second.messageId,first.messageId); assert.notEqual(second.supplier,first.supplier);
   assert.notEqual(second.batchId,first.batchId); assert.notEqual(second.destinationTransaction,first.destinationTransaction);
   console.log(jsonText(second));
+  if (process.env.LOCAL_VERIFICATION_OWNER_FILE) console.log("Owned clean stack retained for the immediately following fault demonstrations; root cleanup retains ownership");
 } catch (error) {
   console.error(safeError(error)); process.exitCode = 1;
   // Component stderr belongs in the root tee log as well as the run directory.
@@ -40,7 +44,7 @@ try {
   }
 }
 finally {
-  if (stack) {
+  if (stack && (process.exitCode || !process.env.LOCAL_VERIFICATION_OWNER_FILE)) {
     try { await stopLocalStack(stack.record); }
     catch (error) { console.error("Clean-stack cleanup failed: " + safeError(error)); process.exitCode = 1; }
   }

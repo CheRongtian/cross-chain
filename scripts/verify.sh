@@ -933,6 +933,9 @@ printf '315. Keep historical orphan receipts distinct from the current canonical
 printf '316. Compare repeated GET state snapshots; preserve every source, consensus, lease, nonce, retry and business-state boundary\n'
 printf '317. Serve the same-origin Explorer with bounded recent-message browsing, clickable details, cursor pages, empty-input refresh, copy actions and safe request cancellation\n'
 printf '318. Display real message authorization, lifecycle, votes, quorum, replacement and orphan evidence through the browser view model\n'
+printf '319. Preserve security/invariant/fuzz, observability and clean-stack happy-path/privacy verification\n'
+printf '320. Reuse that owned stack for fresh Byzantine-validator and non-primary crash demonstrations; require exact honest 3-of-4 QCs and one destination execution per message\n'
+printf '321. Restore all four validators without offline historical votes, preserve earlier evidence, clean up owned resources, then retain the final execution-time authorization-expiry gate\n'
 printf '     Replace a real Chain A branch while a fresh authorized source occurrence is FINALIZING\n'
 printf '     Preserve terminal REORGED evidence and prove zero downstream batch/QC/READY/transaction/destination propagation\n'
 printf '     Resume a canonical replacement through the same schema, live validator cluster and production Gateway/ApplicationB\n'
@@ -962,6 +965,7 @@ printf '     Run exact execution-time authorization deadline equality/after reje
 printf '     Run bounded Solidity encoding/domain/nonce, Merkle and historical certificate fuzzing with a fixed recorded seed\n'
 printf '     Explore production Gateway action ordering through a selector-restricted stateful handler, preserving exactly-once callbacks and atomic replay rollback\n'
 printf '     Start a clean owned stack with real workers, native Prometheus/Grafana; demonstrate two independent happy paths and inspect actual privacy surfaces\n'
+printf '     Exercise automatic Explorer message preparation and reuse; keep validator faults confined to this verification stack\n'
 
 CURRENT_STEP="full verification finality profile validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -2282,6 +2286,11 @@ printf '\n[%s]\n' "$CURRENT_STEP"
 node --test "$INDEXER_DIR/test/local-runtime.test.mjs"
 CLEAN_STACK_OWNER_FILE="$TEMP_DIR/clean-stack-owner.json"
 LOCAL_VERIFICATION_OWNER_FILE="$CLEAN_STACK_OWNER_FILE" node "$INDEXER_DIR/scripts/verify-clean-stack.mjs"
+
+CURRENT_STEP="byzantine and validator crash demonstrations"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test "$INDEXER_DIR/test/local-pbft-faults.test.mjs"
+LOCAL_VERIFICATION_OWNER_FILE="$CLEAN_STACK_OWNER_FILE" node "$INDEXER_DIR/scripts/verify-pbft-faults.mjs"
 
 CURRENT_STEP="ZK security invariants: execution-time credential expiry"
 printf '\n[ZK security invariants]\n'

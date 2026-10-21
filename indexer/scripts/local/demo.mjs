@@ -12,7 +12,7 @@ import { artifact,clients,successfulReceipt,writeContract } from "./deployment.m
 import { inspectLocalPrivacy } from "./privacy.mjs";
 import { httpJson,jsonText,waitFor,writeJson } from "./tools.mjs";
 
-export async function runLocalDemo({ config,pool,issuer,artifacts,alive,progress,signal }) {
+export async function runLocalDemo({ config,pool,issuer,artifacts,alive,progress,signal,afterFinalized = async () => {},afterConfirmed = async () => {} }) {
   const a = clients(config.chainA,10011); const b = clients(config.chainB,2001);
   const d = config.deployments;
   const sourceAbi = (await artifact("SourceGateway")).abi;
@@ -97,6 +97,7 @@ export async function runLocalDemo({ config,pool,issuer,artifacts,alive,progress
   const finalized = await wait("FINALIZED",async () => { const row = await readSource(); return row?.status === "FINALIZED" ? row : false; });
   assert.ok(finalized.finalized_at); assert.ok(BigInt(finalized.finalized_at_head) >= sourceReceipt.blockNumber + 2n);
   progress("FINALIZED: depth policy satisfied on the canonical source chain");
+  await afterFinalized({ messageId: message.messageId });
   const jobs = tableName(config.schema,"delivery_jobs");
   const batches = tableName(config.schema,"message_batches");
   const job = await wait("COMMITTED batch and READY delivery",async () => (await pool.query(`SELECT j.*,b.status AS batch_status,b.sealed_at,b.consensus_pending_at,b.committed_at
@@ -154,6 +155,7 @@ export async function runLocalDemo({ config,pool,issuer,artifacts,alive,progress
   });
   assert.equal(body.destinationTransaction.transactionHash,receipt.transactionHash); assert.equal(body.batch.batchId,pack.batchId);
   assert.equal(body.qc.qcDigest,qc.qcDigest);
+  await afterConfirmed({ messageId: message.messageId,qc });
   await inspectLocalPrivacy({ config,messageId: message.messageId,privateCredential,
     destination: { calldata: transaction.input,logs: receipt.logs,state: { messageExecuted,supplierVerified } },progress });
   const result = { messageId: message.messageId,sourceTransaction: hash,sourceBlock: sourceReceipt.blockNumber.toString(),sourceBlockHash: sourceReceipt.blockHash,

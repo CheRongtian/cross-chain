@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { recoverMessageAddress } from "viem";
+import { signAdversarialEvidence } from "../../scripts/lib/adversarial-evidence.mjs";
 import { committeeDigest } from "../../src/committee.mjs";
 import { createValidatorSetResolver } from "../../src/validator-sets.mjs";
 import { validatorAccount } from "../../src/identity.mjs";
@@ -231,12 +231,7 @@ async function nonPrimaryCrash(ctx) {
 }
 
 export async function signAdversarial(ctx, index, fields, digestFunction) {
-  const digest = digestFunction(fields);
-  const signature = await validatorAccount(ctx.keys[index]).signMessage({ message: { raw: digest } });
-  const signer = (await recoverMessageAddress({ message: { raw: digest }, signature })).toLowerCase();
-  assert.equal(signer, ctx.peers[index].address);
-  return { ...fields, signature,
-    [fields.messageType === "PRE_PREPARE" ? "proposalDigest" : fields.messageType === "PREPARE" ? "prepareDigest" : "commitDigest"]: digest };
+  return signAdversarialEvidence(ctx.keys[index],ctx.peers[index].address,fields,digestFunction);
 }
 
 async function byzantineBackup(ctx) {

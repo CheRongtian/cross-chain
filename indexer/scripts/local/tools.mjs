@@ -87,15 +87,15 @@ export async function stopRecordedProcess(record,{ graceMs = 10000 } = {}) {
   while (Date.now() < deadline && await processIdentity(record.pid) === record.identity) await pause(100);
   if (await processIdentity(record.pid) === record.identity) process.kill(record.pid,"SIGKILL");
 }
-export async function spawnLogged(name,file,args,{ directory,env,onExit }) {
+export async function spawnLogged(name,file,args,{ directory,env,onExit,ipc = false }) {
   await mkdir(join(directory,"logs"),{ recursive: true,mode: 0o700 });
   const log = join(directory,"logs",name + ".log");
   const output = await open(log,"a",0o600);
-  const child = spawn(file,args,{ cwd: ROOT,env,stdio: ["ignore",output.fd,output.fd] });
+  const child = spawn(file,args,{ cwd: ROOT,env,stdio: ipc ? ["ignore",output.fd,output.fd,"ipc"] : ["ignore",output.fd,output.fd] });
   // Register before the first await: spawn/error may fire on the next tick,
   // before an asynchronous file close or ps operation completes.
   const spawned = new Promise((accept,reject) => { child.once("spawn",accept); child.once("error",reject); });
-  child.once("exit",(code,signal) => onExit?.(name,code,signal));
+  child.once("exit",(code,signal) => onExit?.(name,code,signal,child.pid));
   try {
     await spawned;
     const record = { name,pid: child.pid,identity: await processIdentity(child.pid),log };
