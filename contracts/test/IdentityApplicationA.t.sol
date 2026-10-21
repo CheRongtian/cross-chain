@@ -29,6 +29,7 @@ contract IdentityApplicationATest is Test {
         POLICY_EPOCH,
         INTENT_HIGH_LIMB,
         INTENT_LOW_LIMB,
+        AUTHORIZATION_DEADLINE,
         VERIFIER_REJECTION
     }
 
@@ -312,6 +313,62 @@ contract IdentityApplicationATest is Test {
             uint256(application.authorizationStatus(CREDENTIAL_COMMITMENT)),
             uint256(IdentityApplicationA.AuthorizationStatus.VERIFIED_SUPPLIER)
         );
+    }
+
+    function testProofFreshnessPolicyCanExceedOneHour() public {
+        IdentityApplicationA longerFreshness = new IdentityApplicationA(address(verifier), address(sourceGateway),
+            TRUSTED_ISSUER, REQUIRED_ROLE, 2 * ONE_HOUR, STATE_AUTHORITY, ROOT_N);
+        assertEq(longerFreshness.maxProofAge(), 2 * ONE_HOUR);
+    }
+
+    function testStandaloneAuthorizationBeforeDeadlineSucceeds() public {
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _standaloneDeadlineInputs(CURRENT_TIME + 1);
+        application.verifySupplier(_mockProofA(), _mockProofB(), _mockProofC(), inputs);
+        assertTrue(application.usedNullifiers(inputs.nullifier));
+        assertTrue(application.isVerifiedSupplier(inputs.credentialCommitment));
+    }
+
+    function testStandaloneAuthorizationAtDeadlineIsRejected() public {
+        _assertStandaloneDeadlineRejected(CURRENT_TIME);
+    }
+
+    function testStandaloneAuthorizationAfterDeadlineIsRejected() public {
+        _assertStandaloneDeadlineRejected(CURRENT_TIME - 1);
+    }
+
+    function _standaloneDeadlineInputs(uint256 deadline)
+        internal view returns (ICredentialVerifier.CredentialPublicInputs memory inputs)
+    {
+        IdentityApplicationA.ForwardRequest memory request = _forwardRequest("deadline policy", CURRENT_TIME + ONE_HOUR);
+        inputs = _forwardInputs(application, request, SUBMITTER, NULLIFIER_A_EPOCH_ONE);
+        inputs.actionContext = ACTION_VERIFY_SUPPLIER;
+        inputs.forwardIntentDigestHi = 0;
+        inputs.forwardIntentDigestLo = 0;
+        inputs.authorizationValidUntil = deadline;
+    }
+
+    function _assertStandaloneDeadlineRejected(uint256 deadline) internal {
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _standaloneDeadlineInputs(deadline);
+        _expectNoForwardCalls();
+        vm.recordLogs();
+        vm.expectRevert(IdentityApplicationA.AuthorizationExpired.selector);
+        application.verifySupplier(_mockProofA(), _mockProofB(), _mockProofC(), inputs);
+        assertEq(vm.getRecordedLogs().length, 0);
+        assertFalse(application.usedNullifiers(inputs.nullifier));
+        assertFalse(application.isVerifiedSupplier(inputs.credentialCommitment));
+        assertEq(application.credentialStateRoot(), ROOT_N);
+        assertEq(application.currentPolicyEpoch(), INITIAL_POLICY_EPOCH);
+    }
+
+    function testForwardAuthorizationDeadlineGuardPrecedesVerifierAndGateway() public {
+        IdentityApplicationA.ForwardRequest memory request = _forwardRequest("deadline policy", CURRENT_TIME + ONE_HOUR);
+        ICredentialVerifier.CredentialPublicInputs memory inputs = _forwardInputs(application, request, SUBMITTER, FORWARD_NULLIFIER);
+        inputs.authorizationValidUntil = CURRENT_TIME;
+        _expectNoForwardCalls();
+        _assertForwardRequestGuard(request, inputs, IdentityApplicationA.AuthorizationExpired.selector);
+        assertEq(sourceGateway.caller(), address(0));
+        assertEq(application.credentialStateRoot(), ROOT_N);
+        assertEq(application.currentPolicyEpoch(), INITIAL_POLICY_EPOCH);
     }
 
     function testDuplicateValidProofIsRejectedByNullifier() public {
@@ -700,6 +757,7 @@ contract IdentityApplicationATest is Test {
         inputs.trustedIssuer = TRUSTED_ISSUER;
         inputs.requiredRole = REQUIRED_ROLE;
         inputs.currentTimestamp = CURRENT_TIME;
+        inputs.authorizationValidUntil = CURRENT_TIME + 2 * ONE_HOUR;
         // Local fixture getters are intentionally read for each bounded mutation.
         // forge-lint: disable-next-line(calls-loop)
         inputs.credentialStateRoot = target.credentialStateRoot();
@@ -945,6 +1003,10 @@ contract IdentityApplicationATest is Test {
             inputs.forwardIntentDigestLo += 1;
             return IdentityApplicationA.InvalidForwardIntent.selector;
         }
+        if (variant == ForwardPolicyMutation.AUTHORIZATION_DEADLINE) {
+            inputs.authorizationValidUntil = CURRENT_TIME;
+            return IdentityApplicationA.AuthorizationExpired.selector;
+        }
         // VERIFIER_REJECTION is the final enum member and is visited last by this fixture.
         // forge-lint: disable-next-line(calls-loop)
         verifier.setVerificationResult(false);
@@ -1074,19 +1136,19 @@ contract IdentityApplicationATest is Test {
         uint256 proofActionContext,
         uint256 proofNullifier
     ) internal {
-        ICredentialVerifier.CredentialPublicInputs memory publicInputs = ICredentialVerifier.CredentialPublicInputs({
-            credentialCommitment: credentialCommitment,
-            trustedIssuer: proofTrustedIssuer,
-            requiredRole: proofRequiredRole,
-            currentTimestamp: proofTimestamp,
-            credentialStateRoot: proofCredentialStateRoot,
-            applicationDomain: proofApplicationDomainValue,
-            policyEpoch: proofPolicyEpochValue,
-            actionContext: proofActionContext,
-            nullifier: proofNullifier,
-            forwardIntentDigestHi: 0,
-            forwardIntentDigestLo: 0
-        });
+        ICredentialVerifier.CredentialPublicInputs memory publicInputs;
+        publicInputs.credentialCommitment = credentialCommitment;
+        publicInputs.trustedIssuer = proofTrustedIssuer;
+        publicInputs.requiredRole = proofRequiredRole;
+        publicInputs.currentTimestamp = proofTimestamp;
+        publicInputs.credentialStateRoot = proofCredentialStateRoot;
+        publicInputs.applicationDomain = proofApplicationDomainValue;
+        publicInputs.policyEpoch = proofPolicyEpochValue;
+        publicInputs.actionContext = proofActionContext;
+        publicInputs.nullifier = proofNullifier;
+        publicInputs.forwardIntentDigestHi = 0;
+        publicInputs.forwardIntentDigestLo = 0;
+        publicInputs.authorizationValidUntil = CURRENT_TIME + 2 * ONE_HOUR;
 
         application.verifySupplier(
             _mockProofA(),

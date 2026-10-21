@@ -129,6 +129,11 @@ verify_policy_proof "application-alternate-domain"
 verify_policy_proof "application-other-action"
 verify_policy_proof "active-secondary-current"
 verify_policy_proof "authorized-forward-valid"
+verify_policy_proof "active-secondary-initial"
+verify_policy_proof "expiry-last-second"
+verify_policy_proof "authorization-narrow"
+verify_policy_proof "authorization-short"
+verify_policy_proof "authorization-renewed"
 
 GENERATED_VERIFIER="$GENERATED_CONTRACTS_DIR/Groth16Verifier.sol"
 
@@ -139,7 +144,23 @@ printf '\n[prepare Solidity proof fixtures and calldata]\n'
 node "$SCRIPT_DIR/build-solidity-fixtures.mjs"
 
 expect_witness_rejection "invalid-witness"
+expect_witness_rejection "invalid-credential-id"
+expect_witness_rejection "invalid-private-expiry"
+expect_witness_rejection "wrong-membership-owner"
 expect_witness_rejection "expired"
+expect_witness_rejection "expiry-equal"
+expect_witness_rejection "expiry-after"
+expect_witness_rejection "authorization-equal-timestamp"
+expect_witness_rejection "authorization-before-timestamp"
+expect_witness_rejection "authorization-beyond-expiry"
+expect_witness_rejection "authorization-deadline-out-of-range"
+expect_witness_rejection "authorization-timestamp-out-of-range"
+expect_witness_rejection "authorization-field-wrap"
+expect_witness_rejection "authorization-max-uint64"
+printf 'EXPECTED FAILURE: authorizationValidUntil equal to or before proof timestamp is rejected by circuit constraints\n'
+printf 'EXPECTED FAILURE: authorizationValidUntil later than private credential expiry is rejected by circuit constraints\n'
+printf 'EXPECTED FAILURE: uint64 overflow and BN254 field-wrap timestamp candidates are rejected without Number conversion\n'
+printf 'EXPECTED FAILURE: expired credential, including equality and after-expiry boundaries (INVALID_WITNESS)\n'
 expect_witness_rejection "wrong-role"
 expect_witness_rejection "untrusted-issuer"
 expect_witness_rejection "wrong-merkle-path"
@@ -157,4 +178,6 @@ node "$SCRIPT_DIR/verify-rejection.mjs" proof "tampered public commitment" \
     "$VERIFICATION_KEY" "$TAMPERED_PUBLIC" "$VALID_PROOF"
 
 printf 'Verified expected proof rejection: tampered public commitment\n'
+printf '\n[ZK security invariants: circuit and cryptographic boundaries]\n'
+node "$SCRIPT_DIR/verify-security-invariants.mjs"
 printf '\nZK CREDENTIAL STATE AND NULLIFIER VERIFICATION PASSED\n'

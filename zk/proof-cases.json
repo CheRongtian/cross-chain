@@ -105,6 +105,175 @@
       "expected": "proof-verifies"
     },
     {
+      "name": "active-secondary-initial",
+      "fixture": "active-secondary.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "active-secondary.json",
+      "privateOverrides": {},
+      "expected": "proof-verifies"
+    },
+    {
+      "name": "expiry-last-second",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "timestampFromExpiryOffset": -1,
+      "authorizationOffsetFromExpiry": "0",
+      "expected": "proof-verifies"
+    },
+    {
+      "name": "authorization-narrow",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "authorizationOffsetFromTimestamp": "1",
+      "expected": "proof-verifies"
+    },
+    {
+      "name": "authorization-short",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "authorizationOffsetFromTimestamp": "300",
+      "expected": "proof-verifies"
+    },
+    {
+      "name": "authorization-renewed",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "authorizationOffsetFromTimestamp": "7201",
+      "expected": "proof-verifies"
+    },
+    {
+      "name": "authorization-equal-timestamp",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "authorizationOffsetFromTimestamp": "0",
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "authorization-before-timestamp",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "authorizationOffsetFromTimestamp": "-1",
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "authorization-beyond-expiry",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "authorizationOffsetFromExpiry": "1",
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "authorization-deadline-out-of-range",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "policyOverrides": { "authorizationValidUntil": "18446744073709551616" },
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "authorization-timestamp-out-of-range",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "policyOverrides": { "currentTimestamp": "18446744073709551616", "authorizationValidUntil": "18446744073709551617" },
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "authorization-field-wrap",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "policyOverrides": { "authorizationValidUntil": "21888242871839275222246405745257275088548364400416034343698204186575808495616" },
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "authorization-max-uint64",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "policyOverrides": { "authorizationValidUntil": "18446744073709551615" },
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "expiry-equal",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "timestampFromExpiryOffset": 0,
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "expiry-after",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {},
+      "timestampFromExpiryOffset": 1,
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "invalid-credential-id",
+      "fixture": "valid.json",
+      "commitmentSource": "valid.json",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": {
+        "credentialId": "urn:cross-chain:credential:test:substituted-id"
+      },
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "invalid-private-expiry",
+      "fixture": "valid.json",
+      "commitmentSource": "valid.json",
+      "credentialState": "root-n",
+      "membershipSource": "valid.json",
+      "privateOverrides": { "expiry": 2208988801 },
+      "expected": "witness-rejected"
+    },
+    {
+      "name": "wrong-membership-owner",
+      "fixture": "valid.json",
+      "commitmentSource": "self",
+      "credentialState": "root-n",
+      "membershipSource": "active-secondary.json",
+      "privateOverrides": {},
+      "expected": "witness-rejected"
+    },
+    {
       "name": "invalid-witness",
       "fixture": "valid.json",
       "commitmentSource": "valid.json",

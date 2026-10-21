@@ -27,7 +27,7 @@ PROOF_TIMESTAMP_OFFSET="3600"
 APPLICATION_MAX_PROOF_AGE="3600"
 SNARK_SCALAR_FIELD="21888242871839275222246405745257275088548364400416034343698204186575808495617"
 APPLICATION_DOMAIN_NAMESPACE="cross-chain:identity-application-domain:v1"
-PUBLIC_INPUTS_SIGNATURE="(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256)"
+PUBLIC_INPUTS_SIGNATURE="(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256)"
 FORWARD_SIGNATURE="forwardAuthorizedMessage(uint256[2],uint256[2][2],uint256[2],${PUBLIC_INPUTS_SIGNATURE},(uint256,address,address,bytes,uint256))"
 
 ANVIL_DEV_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
@@ -355,12 +355,12 @@ prepare_application_forwarding() {
         "$CHAIN_A_RPC" "$IDENTITY_APPLICATION_ADDRESS" "$CHAIN_B_ID" \
         "$DESTINATION_GATEWAY" "$DESTINATION_RECEIVER" "$PAYLOAD" "$MESSAGE_DEADLINE" "$SOURCE_SENDER" \
         "$TEMP_DIR/forwarding-calldata.txt"
-    [[ "$(wc -l < "$TEMP_DIR/forwarding-calldata.txt" | tr -d '[:space:]')" == "14" ]] \
-        || fail "forwarding calldata must contain fourteen lines"
+    [[ "$(wc -l < "$TEMP_DIR/forwarding-calldata.txt" | tr -d '[:space:]')" == "15" ]] \
+        || fail "forwarding calldata must contain fifteen lines"
     FORWARD_PROOF_A="$(sed -n '1p' "$TEMP_DIR/forwarding-calldata.txt")"
     FORWARD_PROOF_B="$(sed -n '2p' "$TEMP_DIR/forwarding-calldata.txt")"
     FORWARD_PROOF_C="$(sed -n '3p' "$TEMP_DIR/forwarding-calldata.txt")"
-    FORWARD_PUBLIC_INPUTS="($(sed -n '4,14p' "$TEMP_DIR/forwarding-calldata.txt" | paste -sd ',' -))"
+    FORWARD_PUBLIC_INPUTS="($(sed -n '4,15p' "$TEMP_DIR/forwarding-calldata.txt" | paste -sd ',' -))"
 }
 
 send_application_message() {
@@ -785,7 +785,7 @@ printf '194. Retain all-path transient retry schedules across PostgreSQL clients
 printf '195. Preserve already-known, underpriced, nonce-too-low and deterministic rejection policy without blind fan-out\n'
 printf '196. Stop unknown/malformed responses separately; verify migration sequence/reruns and preserve historical upgrade state\n'
 printf '197. Keep identity, wrong-hash, fixed-head receipt, pending-parent replacement and secret-redaction regressions intact\n'
-printf '198. Match independently frozen forwarding ABI words, full-width digest limbs and eleven-signal mapping across JavaScript/Solidity\n'
+printf '198. Match independently frozen forwarding ABI words and full-width digest limbs; preserve original signal indices and append authorizationValidUntil\n'
 printf '199. Require an exact-intent credential proof and executor before atomic Application A forwarding\n'
 printf '200. Reject altered routing/payload/deadline, actions, limbs, executor, application/Gateway reuse and proof replay\n'
 printf '201. Preserve Gateway nonce/message IDs and failed-call nullifier rollback without a no-proof production path\n'
@@ -931,6 +931,9 @@ printf '     Check cross-chain safety with a proven valid production baseline, r
 printf '     Reject self-consistent unauthorized roots, invalid membership, two-signature QCs, wrong destinations and untrusted sources; retain exact-message replay and two-submitter business-once evidence\n'
 printf '     Verify PBFT safety over distinct signers and exact batch epoch/view/root/validator epoch; reload durable locks and duplicate-vote collections without gaining quorum weight\n'
 printf '     Retry genuine Byzantine conflicting votes after the sole canonical commitment and verify unchanged epoch-7/8 QCs against their own historical committees in JavaScript and Solidity\n'
+printf '     Regenerate the authorizationValidUntil statement, keys and verifier; check all twelve proof-bound public inputs with real Groth16 verification\n'
+printf '     Verify exact and regenerated-proof replay, unused-context revocation, application/action/intent isolation and failed-authorization state integrity\n'
+printf '     Run exact execution-time authorization deadline equality/after rejection and before-deadline acceptance last, preserving the former expiry-window regression\n'
 
 CURRENT_STEP="full verification finality profile validation"
 printf '\n[%s]\n' "$CURRENT_STEP"
@@ -1206,6 +1209,7 @@ forge fmt \
     generated/Groth16Verifier.sol \
     generated/CredentialProofFixture.sol \
     generated/ForwardCredentialProofFixture.sol \
+    generated/LegacyCredentialProofFixture.sol \
     generated/ForwardAuthorizationVector.sol \
     generated/CanonicalMessageVector.sol
 
@@ -1252,7 +1256,7 @@ CURRENT_STEP="identity application tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 forge test --match-contract IdentityApplicationATest -vvv
 
-CURRENT_STEP="on-chain ZK nullifier and revocation lifecycle"
+CURRENT_STEP="ZK security invariants and retained on-chain nullifier/revocation lifecycle"
 printf '\n[%s]\n' "$CURRENT_STEP"
 TEMP_PARENT="${TMPDIR:-/tmp}"
 TEMP_DIR="$(mktemp -d "$TEMP_PARENT/cross-chain-verification.XXXXXX")"
@@ -2226,4 +2230,13 @@ APPLICATION_B_OTHER_GATEWAY_TEST_ADDRESS="$APPLICATION_B_OTHER_GATEWAY_TEST" \
 APPLICATION_B_OPERATOR_KEY="$CHAIN_B_REGISTRY_ADMIN_KEY" \
     node "$INDEXER_DIR/scripts/verify-application-b.mjs"
 
+CURRENT_STEP="ZK security invariants: execution-time credential expiry"
+printf '\n[ZK security invariants]\n'
+printf 'Final required gate: a near-expiry proof remains valid but must not execute at or after authorizationValidUntil.\n'
+CHAIN_A_RPC_URL="$CHAIN_A_RPC" \
+IDENTITY_APPLICATION_ADDRESS="$IDENTITY_APPLICATION_ADDRESS" \
+VERIFIER_DEPLOYER_KEY="$ANVIL_DEV_KEY" \
+    node "$INDEXER_DIR/test/helpers/zk-security-invariants.mjs" expiry
+
+printf 'ZK SECURITY INVARIANTS PASSED\n'
 CURRENT_STEP="complete"

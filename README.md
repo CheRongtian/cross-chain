@@ -13,9 +13,10 @@ The current implementation can:
 - build deterministic Poseidon Merkle roots for active credentials;
 - commit to credential fields and prove issuer, role, expiry, and active-state membership in one circuit;
 - derive a deterministic Poseidon nullifier from the private credential identifier and a public application, epoch, and action context;
-- verify a valid proof and reject an invalid witness, expired credential, wrong role, untrusted issuer, or tampered public input;
+- verify a valid proof and reject an invalid witness, a credential expired at the proven timestamp, wrong role, untrusted issuer, or tampered public input;
 - generate a Solidity verifier from the active Groth16 proving key and verify the same proof on Chain A;
 - enforce a fixed issuer, the `VERIFIED_SUPPLIER` role, proof freshness, and the current credential-state root in `IdentityApplicationA`;
+- keep credential expiry private while binding a per-proof public `authorizationValidUntil` and requiring execution strictly before it;
 - rotate the accepted root through an explicit authority and remove effective authorization for revoked commitments;
 - preserve authorization for an unaffected active credential across a root rotation;
 - reject both exact proof replay and a newly generated proof for the same credential and authorization context;
@@ -644,8 +645,8 @@ keccak256(
 - the prover knows private credential fields matching the public `credentialCommitment`;
 - the private `issuer` equals the public policy value `trustedIssuer`;
 - the private `role` equals the public policy value `requiredRole`;
-- `currentTimestamp < expiry`;
-- `currentTimestamp` and `expiry` both fit in uint64;
+- `currentTimestamp < authorizationValidUntil <= expiry`;
+- `currentTimestamp`, `authorizationValidUntil` and private `expiry` all fit in uint64;
 - the active leaf derived from `credentialCommitment` belongs to the public `credentialStateRoot`.
 - the public `nullifier` binds the private `credentialId`, application, epoch, action and both forwarding digest limbs;
 - each forwarding limb fits in uint128; standalone verification constrains both to zero.
@@ -676,6 +677,7 @@ actionContext
 nullifier
 forwardIntentDigestHi
 forwardIntentDigestLo
+authorizationValidUntil
 ```
 
 Issuer trust remains an external policy decision. The circuit proves that the committed issuer matches the supplied public policy value. It does not verify an issuer signature or query an issuer registry.
@@ -691,7 +693,7 @@ verifyProof(
     uint256[2] proofA,
     uint256[2][2] proofB,
     uint256[2] proofC,
-    uint256[11] publicSignals
+    uint256[12] publicSignals
 ) returns (bool)
 ```
 
@@ -709,6 +711,7 @@ verifyProof(
 [8] nullifier
 [9] forwardIntentDigestHi
 [10] forwardIntentDigestLo
+[11] authorizationValidUntil
 ```
 
 Proof coordinates are converted with snarkjs `groth16.exportSolidityCallData`, including the required G2 coordinate ordering. The same generated calldata is used by Forge tests and Chain A integration verification.
@@ -716,6 +719,27 @@ Proof coordinates are converted with snarkjs `groth16.exportSolidityCallData`, i
 The Solidity verifier establishes that a Groth16 proof is valid for the supplied public signals. It does not decide which issuer is trusted, which role an application should require, or whether a caller may send a cross-chain message.
 
 `currentTimestamp` is a public input bound by the proof. The credential adapter passes it to the generated verifier without applying wall-clock policy. `IdentityApplicationA` performs the corresponding comparison against `block.timestamp`.
+
+Credential expiry, authorization execution deadline and proof freshness are distinct. The circuit proves `currentTimestamp < authorizationValidUntil <= expiry`; Application A requires `block.timestamp < authorizationValidUntil`, independently of `currentTimestamp <= block.timestamp` and `block.timestamp - currentTimestamp <= maxProofAge`. Consequently, a successful authorization executes strictly before private credential expiry. Equality with the authorization deadline is rejected as `AuthorizationExpired`. Future and stale proofs retain their separate errors and policy checks.
+
+`authorizationValidUntil` is a prover-selected, per-proof public deadline. It is not a public credential-expiry field: observers learn the bound `expiry >= authorizationValidUntil`. Exact expiry remains a private witness, although a prover's deadline selection can disclose information about it. Equality with private expiry is allowed, so a credential with only one second remaining can still produce a valid proof and execute before that deadline. There is no fixed one-hour circuit buffer. The development proof helper defaults to a two-hour authorization window chosen independently of `maxProofAge`; callers can explicitly select another deadline, including a shorter near-expiry window. The helper does not silently publish or clamp the deadline to private expiry.
+
+The authorization statement contains twelve public signals; the original eleven meanings and positions are unchanged and the new deadline is appended at index 11. Previous eleven-signal proofs are incompatible. The existing root workflow rebuilds the circuit, R1CS/WASM, development proving/verification keys, generated Solidity verifier and proof fixtures together, then deploys the new verifier, adapter and Application A and authorizes that exact application in SourceGateway. Verifier references are immutable, so old deployments do not automatically acquire the new statement. No legacy-verifier authorization fallback or fictitious nullifier migration is provided. Historical source messages, message IDs, batches, Merkle roots, QCs, transport and destination execution remain unchanged and require no re-proving or rewrite.
+
+### ZK security regression boundaries
+
+The single `./scripts/verify.sh` workflow includes `[ZK security invariants]` checks across the actual circuit, off-chain Groth16, generated Solidity verifier/adapter, and deployed Application A/SourceGateway. Deterministic credential inputs and the existing development proving flow supply real positive baselines; no mock verifier substitutes for cryptographic acceptance.
+
+- Credential binding checks cover substituted private subject/credential ID/expiry, another credential's membership path, A's proof claiming B's commitment, and legitimate independent A/B credentials.
+- Issuer and role checks distinguish an invalid witness from a cryptographically valid alternate-issuer or `AUDITOR` proof rejected by the application's current policy, including exact-intent forwarding.
+- Circuit time cases cover the shortest valid window, deadline equality with private expiry, deadline equality/before proof time, deadlines beyond private expiry, uint64 overflow/field-wrap candidates and credentials expired at proof time. Genuine valid proofs separately exercise future/stale timestamp policy and authorization-deadline rejection.
+- Revocation rotates the real active-state root through its authority. A previously admissible, unused forwarding context with the correct current epoch/action remains cryptographically valid but is rejected under the new root. B remains usable; consumed nullifiers, original proofs and previously emitted source evidence are retained.
+- All twelve public signals are mutated independently while retaining the original valid proof. Off-chain and Solidity checks require explicit `false`; unexpected exceptions fail verification. Shared snarkjs calldata preserves G2 coordinate order. A genuine historical eleven-signal proof is first checked against its captured historical key and then rejected by the upgraded verifier under a complete, well-formed twelve-signal statement. Destination domain/Gateway/receiver, payload, message deadline and executor mutations also exercise exact-intent rejection.
+- Exact and independently regenerated proofs cannot consume the same standalone or forwarding nullifier twice. Changing only `authorizationValidUntil` creates no new replay identity. Separate legal application domains, policy epochs, actions and forwarding intents retain their own valid contexts.
+
+Application-level negative cases compare consumed nullifiers, credential status, current root, policy epoch, Gateway nonce and authorization/source events. Ordinary rejection cases submit real reverting transactions after matching the precise simulated custom error; the deliberately unowned executor is checked through a read-only simulation. Owned EVM snapshots isolate these checks and restore their state before the retained lifecycle/E2E verification continues. Witness calculation errors, RPC failures, malformed artifacts and unexpected EVM errors cannot credit a security rejection.
+
+The execution-time regression runs after the retained full E2E checks and restores its own snapshot even when an assertion fails. It preserves the former boundary exactly: `proofTimestamp = expiry - 1`, `authorizationValidUntil = expiry`, execution at expiry. The proof must remain cryptographically valid; the actual transaction must fail precisely as `AuthorizationExpired`, with nullifier unused, unchanged authorization/root/epoch/nonce and zero new source or authorization events. Both standalone and forwarding paths include exact mined-time controls for success one second before the deadline and rejection at/one second after it. Results await the user's regenerated artifacts and complete verification run; these deterministic regressions are not a formal proof or a randomized/stateful campaign.
 
 ### Identity application on Chain A
 
@@ -729,7 +753,7 @@ The Solidity verifier establishes that a Groth16 proof is valid for the supplied
 - a non-zero credential-state authority;
 - a non-zero initial credential-state root.
 
-`verifySupplier` accepts proof coordinates and the eleven-field public-input struct, with the standalone action and zero intent limbs. It checks issuer, role, freshness, current root, revocation, application domain, policy epoch and nullifier replay before verification. A successful verification atomically sets:
+`verifySupplier` accepts proof coordinates and the twelve-field public-input struct, with the standalone action and zero intent limbs. It checks issuer, role, freshness, authorization deadline, current root, revocation, application domain, policy epoch and nullifier replay before verification. A successful verification atomically sets:
 
 ```text
 usedNullifiers[nullifier] = true
@@ -756,7 +780,7 @@ Its independent type separator is:
 ForwardAuthorizationIntent(uint8 protocolVersion,uint256 action,uint256 sourceDomain,address application,address sourceGateway,uint256 destinationDomain,address destinationGateway,address destinationReceiver,bytes32 payloadHash,uint256 deadline,address authorizedExecutor)
 ```
 
-The digest is Keccak-256 of the Ethereum ABI encoding of the type hash followed by those fields. Its full 256 bits become `hi = uint256(digest) >> 128` and `lo = uint256(digest) & (2**128 - 1)`. Each limb is range-constrained and participates in the circuit's Poseidon nullifier derivation. No field reduction is applied to this digest. Fixed ABI words, signal order and limb cases in `test-vectors/forward-authorizations.json` are shared across JavaScript and Solidity.
+The digest is Keccak-256 of the Ethereum ABI encoding of the type hash followed by those fields. Its full 256 bits become `hi = uint256(digest) >> 128` and `lo = uint256(digest) & (2**128 - 1)`. Each limb is range-constrained and participates in the circuit's Poseidon nullifier derivation. No field reduction is applied to this digest. Fixed ABI words, original eleven signal positions and limb cases in `test-vectors/forward-authorizations.json` are preserved; current JavaScript/Solidity mapping checks append the authorization deadline without rewriting those frozen words. `authorizationValidUntil` is bound by the proof and is absent from both the forwarding digest and nullifier preimage.
 
 The application requires matching public limbs, applies all credential checks, verifies Groth16, consumes the nullifier, then forwards the exact request. A failed Gateway call rolls the consumption back. `AuthorizedMessageForwarded` links intent digest, nullifier and message ID without private fields. Another executor or altered intent cannot use that proof to authorize its call.
 
@@ -2110,6 +2134,8 @@ The real Chain A integration runs through the unified repository verification fl
 
 ## Complete Verification
 
+The `[ZK security invariants]` gate includes the twelve-signal authorization statement, all public-input mutations and the exact execution-time expiry regression. Regeneration and fresh verifier/Application A deployment are part of the existing workflow; previous unused eleven-signal proofs cannot be reused. No security acceptance claim is made until this complete workflow succeeds with the regenerated artifacts.
+
 Run the unified verification script from the repository root:
 
 ```bash
@@ -2182,6 +2208,7 @@ NullifierAlreadyUsed
 UnauthorizedPolicyEpochAuthority
 UnauthorizedCredentialStateAuthority
 StaleProofTimestamp
+AuthorizationExpired
 EXPECTED FAILURE: closed PostgreSQL client rejected a new operation
 ```
 
@@ -2469,6 +2496,7 @@ Cross-Chain/
 │   ├── forward-authorizations.json
 │   ├── merkle-golden-vectors.json
 │   ├── nullifiers.json
+│   ├── legacy-credential-proof.json
 │   ├── pbft-certificates.json
 │   └── validator-sets.json
 ├── validator/
@@ -2561,7 +2589,8 @@ Cross-Chain/
 │   │   ├── nullifier.mjs
 │   │   ├── tamper-public.mjs
 │   │   ├── verify-circuit.sh
-│   │   └── verify-rejection.mjs
+│   │   ├── verify-rejection.mjs
+│   │   └── verify-security-invariants.mjs
 │   ├── test/
 │   │   └── rejection.test.mjs
 │   ├── credential-state.json
@@ -2583,6 +2612,7 @@ Cross-Chain/
 - The credential adapter does not compare the public timestamp with chain time; `IdentityApplicationA` enforces this check for its authorization entry point.
 - Authorization belongs to a credential commitment because the circuit does not bind its private subject to `msg.sender`.
 - Stored authorization does not automatically expire when the proof freshness window passes.
+- The circuit proves `currentTimestamp < authorizationValidUntil <= private expiry`, and Application A separately enforces execution strictly before the public authorization deadline plus its independent proof-freshness policy. `authorizationValidUntil` reveals a bound on expiry, not a separate exact-expiry field. Stored supplier status still does not automatically expire; standalone status provides no later forwarding permission.
 - Revocation uses membership in a deterministic active-credential root and an explicit Chain A root authority. The authority is responsible for publishing a root and revoked-commitment list that describe the same transition.
 - Nullifiers prevent repeated authorization for the same credential, application, epoch, and action. They do not hide the public credential commitment, prevent correlation through other public signals, or provide global replay protection across distinct contexts.
 - `SourceGateway` admits only explicitly authorized application contracts and records the direct application caller as `sourceSender`.

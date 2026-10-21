@@ -13,8 +13,8 @@ The prover demonstrates all of the following in one circuit:
   `credentialCommitment`;
 - the private issuer equals the public `trustedIssuer` selected by policy;
 - the private role equals the public `requiredRole` selected by policy;
-- the credential is unexpired under the strict rule
-  `currentTimestamp < expiry`;
+- the authorization has a valid time window under
+  `currentTimestamp < authorizationValidUntil <= expiry`;
 - the active leaf derived from `credentialCommitment` belongs to the public
   `credentialStateRoot` through the private Merkle path;
 - the public `nullifier` is derived from the private credential identifier and
@@ -49,9 +49,12 @@ Public inputs, in circuit order:
 - `nullifier`
 - `forwardIntentDigestHi`
 - `forwardIntentDigestLo`
+- `authorizationValidUntil`
 
-The circuit range-constrains `expiry` and `currentTimestamp` to unsigned
+The circuit range-constrains `expiry`, `currentTimestamp` and `authorizationValidUntil` to unsigned
 64-bit values before applying the strict comparison.
+
+The first eleven public-signal indices are unchanged; the public authorization deadline is appended at index 11. It is a per-proof execution deadline selected by the prover, independently of `maxProofAge`. Private expiry is not added to public signals. The deadline reveals the bound `expiry >= authorizationValidUntil`; equality is allowed without being required. The helper defaults to a two-hour authorization lifetime without reading expiry into that default; callers can choose another deadline, including the last valid second. No fixed freshness buffer is added to the circuit.
 
 ## Encoding and commitment
 
@@ -122,7 +125,13 @@ Reversing fixture input order is checked to produce the same root.
 - changing the application domain, policy epoch, or action context changes the
   nullifier while preserving cryptographic proof validity for that new context;
 - a modified private subject paired with the original commitment is rejected;
-- an expired credential is rejected;
+- substituted credential IDs or private expiry values retain the original commitment and fail circuit constraints;
+- another active credential's membership path cannot prove the original credential;
+- a credential expired at the proven timestamp is rejected;
+- `currentTimestamp == expiry` and `currentTimestamp == expiry + 1` fail constraints, while a genuine `expiry - 1` proof verifies;
+- the one-second authorization window is valid; authorization deadlines equal to/before proof time or beyond private expiry fail constraints;
+- authorization deadline equality with private expiry is valid;
+- uint64 timestamp overflow and BN254 field-wrap candidates fail constraints without JavaScript Number conversion;
 - a credential with the wrong role is rejected;
 - a credential from a different issuer is rejected;
 - an invalid Merkle path is rejected;
@@ -132,6 +141,8 @@ Reversing fixture input order is checked to produce the same root.
 - the unaffected credential produces a valid proof under Root N+1;
 - changing the public commitment after proof generation makes verification
   fail.
+
+`scripts/verify-security-invariants.mjs` additionally checks actual Groth16 verification for every valid case and independently mutates all twelve public signals with the original proof unchanged. It reuses the strict rejection helper: only explicit `false` counts as an invalid proof. Input, file, WASM, proving and runtime errors fail the workflow. The existing Solidity fixture builder emits fifteen-line cast text and a JSON companion from the same snarkjs-exported calldata, preserving G2 ordering without a second encoder. The fixed historical eleven-signal proof/key are regression-only evidence: their positive historical verification precedes explicit cryptographic rejection by the new verifier under a complete twelve-signal statement.
 
 The fixtures come from [`credential-model/fixtures`](credential-model/fixtures).
 Generated inputs, witnesses, proving keys, proofs, and public signals are kept
@@ -157,6 +168,7 @@ The Solidity public-signal order is:
 [8] nullifier
 [9] forwardIntentDigestHi
 [10] forwardIntentDigestLo
+[11] authorizationValidUntil
 ```
 
 `contracts/src/CredentialVerifier.sol` converts its named public-input struct
@@ -174,6 +186,10 @@ Consumed nullifiers are retained across both operations. The circuit does not
 bind its private subject to an EVM account, so application authorization is not
 keyed by the transaction submitter.
 
+The application requires `block.timestamp < authorizationValidUntil` on both authorization entry points and rejects equality/after with `AuthorizationExpired`. Future/stale timestamp checks remain independent. The final root regression preserves `currentTimestamp = expiry - 1` and `authorizationValidUntil = expiry`: the genuine proof remains valid, execution one second before the deadline succeeds, and exact/after-deadline execution must reject without nullifier, business or source effects. Owned snapshots isolate the deterministic mined-time tests. Changing only the authorization deadline does not change the canonical nullifier and cannot enable replay.
+
+This twelve-public-signal statement is intentionally incompatible with previous eleven-signal proofs and keys. The existing root workflow regenerates R1CS, WASM, witnesses, development zkey/verification key, Solidity verifier and proof fixtures together, then redeploys the immutable verifier/adapter/Application A wiring and authorizes the new application in SourceGateway. There is no old-verifier fallback. The historical proof/key JSON is loaded only by verification tooling, never by production authorization. Credential commitments, nullifier derivation, credential-state trees, forwarding digests, cross-chain message IDs, batch/Merkle/QC/transport formats and destination protocol are unchanged. Historical source events need no rewrite, and no database or nullifier migration is introduced. Regeneration and full verification remain user-run steps.
+
 ## Exact authorized forwarding
 
 The application recomputes the intent from its chain, own address and immutable
@@ -183,7 +199,7 @@ Proof verification, nullifier consumption and the Gateway call share one
 transaction; a revert restores the nullifier. Standalone verification grants no
 subsequent forwarding capability.
 
-The generated `authorized-forward-valid` fixture checks the eleven-signal
+The generated `authorized-forward-valid` fixture checks the twelve-signal
 mapping. Fixed ABI words and full-width limb cases are shared with Solidity.
 Runtime preparation reads the current deployed policy/root/epoch and block
 time, uses the active secondary synthetic credential and reuses the existing

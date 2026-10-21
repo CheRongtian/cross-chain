@@ -66,6 +66,7 @@ contract IdentityApplicationA {
     error InvalidRolePolicy();
     error FutureProofTimestamp();
     error StaleProofTimestamp();
+    error AuthorizationExpired();
     error InvalidApplicationDomain();
     error InvalidPolicyEpoch();
     error InvalidActionContext();
@@ -272,6 +273,12 @@ contract IdentityApplicationA {
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp - publicInputs.currentTimestamp > maxProofAge) {
             revert StaleProofTimestamp();
+        }
+        // This per-proof execution deadline is independently bound by Groth16
+        // and constrained not to exceed the private credential expiry.
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp >= publicInputs.authorizationValidUntil) {
+            revert AuthorizationExpired();
         }
     }
 

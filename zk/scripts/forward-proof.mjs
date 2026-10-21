@@ -6,7 +6,7 @@ import { buildPoseidon } from "circomlibjs";
 import { groth16 } from "snarkjs";
 import { computeCredentialCommitment,encodeCredential,requireCondition } from "./credential-state.mjs";
 import { computeNullifier } from "./nullifier.mjs";
-import { decimalInput } from "./build-inputs.mjs";
+import { decimalInput,DEFAULT_AUTHORIZATION_LIFETIME_SECONDS } from "./build-inputs.mjs";
 import { CREDENTIAL_PUBLIC_SIGNAL_ORDER,computeForwardIntentDigest,normalizeForwardIntent,splitForwardIntentDigest } from "../../indexer/src/forward-authorization.mjs";
 
 const json = async relative => JSON.parse(await readFile(new URL(relative,import.meta.url),"utf8"));
@@ -16,18 +16,20 @@ const cli = fileURLToPath(new URL("../node_modules/snarkjs/build/cli.cjs",import
 
 // Reuse the compiled circuit and one existing development zkey. This prepares
 // one proof per real, distinct intent and never starts another setup ceremony.
-export async function generateCredentialProof({ intent,applicationDomain,policyEpoch,currentTimestamp,credentialStateRoot,trustedIssuer,requiredRole }) {
+export async function generateCredentialProof({ intent,applicationDomain,policyEpoch,currentTimestamp,authorizationValidUntil,credentialStateRoot,trustedIssuer,requiredRole,
+  fixtureName = "active-secondary.json",stateName = "root-n-plus-1" }) {
   const [encoding,config,fixture,state] = await Promise.all([
-    json("../encoding.json"),json("../nullifier.json"),json("../credential-model/fixtures/active-secondary.json"),
-    json("../build/credential-state/root-n-plus-1.json"),
+    json("../encoding.json"),json("../nullifier.json"),json("../credential-model/fixtures/" + fixtureName),
+    json("../build/credential-state/" + stateName + ".json"),
   ]);
   const field = BigInt(encoding.scalarField.prime);
   const poseidon = await buildPoseidon();
   const encoded = encodeCredential(fixture,encoding,field);
   const commitment = computeCredentialCommitment(poseidon,encoded,encoding.commitment.preimageVersion);
-  const membership = state.memberships["active-secondary.json"];
-  requireCondition(BigInt(state.root) === BigInt(credentialStateRoot),"forwarding fixture must match the application's current credential root");
-  requireCondition(BigInt(membership.credentialCommitment) === commitment,"forwarding requires the credential's actual membership witness");
+  const membership = state.memberships[fixtureName];
+  requireCondition(membership !== undefined,"credential must have an actual active membership witness");
+  requireCondition(BigInt(state.root) === BigInt(credentialStateRoot),"credential fixture must match the application's current credential root");
+  requireCondition(BigInt(membership.credentialCommitment) === commitment,"proof requires the credential's actual membership witness");
   const normalized = intent === undefined ? undefined : normalizeForwardIntent(intent);
   if (normalized) requireCondition(normalized.action === BigInt(config.actionContexts.FORWARD_MESSAGE),"forwarding requires its dedicated action");
   const digest = normalized ? computeForwardIntentDigest(normalized) : null;
@@ -36,7 +38,9 @@ export async function generateCredentialProof({ intent,applicationDomain,policyE
     ...(digest ? splitForwardIntentDigest(digest) : { forwardIntentDigestHi: 0n,forwardIntentDigestLo: 0n }) };
   context.nullifier = computeNullifier(poseidon,encoded.credentialId,context,config,field);
   const input = decimalInput(encoded,commitment,{ trustedIssuer: BigInt(trustedIssuer),requiredRole: BigInt(requiredRole),
-    currentTimestamp: BigInt(currentTimestamp) },{ root: BigInt(state.root),pathElements: membership.statePathElements.map(BigInt),
+    currentTimestamp: BigInt(currentTimestamp),
+    authorizationValidUntil: BigInt(authorizationValidUntil ?? BigInt(currentTimestamp) + DEFAULT_AUTHORIZATION_LIFETIME_SECONDS),
+  },{ root: BigInt(state.root),pathElements: membership.statePathElements.map(BigInt),
     pathIndices: membership.statePathIndices.map(BigInt) },context);
   // The existing CLI owns and exits its proving worker pool. Keeping fullProve
   // and verify inside the integration process would leave cached curve workers.

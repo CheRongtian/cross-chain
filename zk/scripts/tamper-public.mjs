@@ -11,7 +11,7 @@ const publicSignals = JSON.parse(await readFile(inputPath, "utf8"));
 
 if (!Array.isArray(publicSignals) || publicSignals.length !== CREDENTIAL_PUBLIC_SIGNAL_ORDER.length) {
   throw new Error(
-    "expected eleven public signals with forwarding intent hi/lo appended after nullifier",
+    "expected twelve public signals with authorizationValidUntil appended after the existing eleven signals",
   );
 }
 

@@ -22,11 +22,12 @@ valid with respect to time only while `evaluationTime < expiry`.
 All credential fields are private by default and remain with the user. The
 authorization proof publishes `credentialCommitment`, `trustedIssuer`,
 `requiredRole`, `currentTimestamp`, `credentialStateRoot`,
-`applicationDomain`, `policyEpoch`, `actionContext`, `nullifier`, and two public uint128 forwarding intent limbs.
+`applicationDomain`, `policyEpoch`, `actionContext`, `nullifier`, two public uint128 forwarding intent limbs, and the appended per-proof deadline `authorizationValidUntil`.
 Credential fields and Merkle paths are not placed in public chain state. The
 identity application stores authorization under the public credential
 commitment and does not expose the private subject or credential identifier.
 The public commitment and the remaining public signals can still be correlated.
+The circuit proves `currentTimestamp < authorizationValidUntil <= private expiry` and Application A requires execution strictly before the public deadline. The deadline reveals a bound on private expiry; it is not an additional public credential-expiry field. Proof freshness remains an independent application policy.
 
 ## Trusted issuers
 

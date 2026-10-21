@@ -9,7 +9,8 @@ export async function loadIdentityApplicationAbi() {
   return JSON.parse(await readFile(new URL("../../../contracts/out/IdentityApplicationA.sol/IdentityApplicationA.json",import.meta.url),"utf8")).abi;
 }
 
-export async function prepareAuthorizedSourceMessage({ publicClient,application,destinationDomain,destinationGateway,destinationReceiver,payload,deadline,executor }) {
+export async function prepareAuthorizedSourceMessage({ publicClient,application,destinationDomain,destinationGateway,destinationReceiver,payload,deadline,executor,
+  fixtureName,stateName,proofTimestamp,authorizationValidUntil }) {
   const abi = await loadIdentityApplicationAbi();
   const block = await publicClient.getBlock();
   const read = functionName => publicClient.readContract({ address: application,abi,functionName,blockNumber: block.number });
@@ -24,7 +25,8 @@ export async function prepareAuthorizedSourceMessage({ publicClient,application,
     application: normalizeAddress(application),sourceGateway: normalizeAddress(sourceGateway),...request,authorizedExecutor: normalizeAddress(executor) };
   const digest = computeForwardIntentDigest(intent);
   assert.equal(await publicClient.readContract({ address: application,abi,functionName: "forwardIntentDigest",args: [request,executor],blockNumber: block.number }),digest);
-  const prepared = await generateCredentialProof({ intent,applicationDomain,policyEpoch,credentialStateRoot,trustedIssuer,requiredRole,currentTimestamp: block.timestamp });
+  const prepared = await generateCredentialProof({ intent,applicationDomain,policyEpoch,credentialStateRoot,trustedIssuer,requiredRole,
+    currentTimestamp: proofTimestamp ?? block.timestamp,authorizationValidUntil,fixtureName,stateName });
   return { ...prepared,intent,abi,request,args: [prepared.proofA.map(BigInt),prepared.proofB.map(row => row.map(BigInt)),prepared.proofC.map(BigInt),
     Object.fromEntries(Object.entries(prepared.publicInputs).map(([name,value]) => [name,BigInt(value)])),request] };
 }
@@ -66,6 +68,8 @@ export async function verifyForwardAuthorizationNegatives({ publicClient,walletC
     ["epoch",args => { args[3].policyEpoch += 1n; },"InvalidPolicyEpoch"],
     ["future timestamp",args => { args[3].currentTimestamp = now + 3600n; },"FutureProofTimestamp"],
     ["stale timestamp",args => { args[3].currentTimestamp = now - maxAge - 1n; },"StaleProofTimestamp"],
+    ["authorization deadline reached",args => { args[3].authorizationValidUntil = now; },"AuthorizationExpired"],
+    ["authorization deadline binding",args => { args[3].authorizationValidUntil += 1n; },"InvalidCredentialProof"],
   ];
   assert.notEqual(inputs.forwardIntentDigestHi,inputs.forwardIntentDigestLo,"swap fixture must have distinct limbs");
   for (const [label,mutate,reason] of variants) {

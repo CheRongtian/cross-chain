@@ -25,6 +25,7 @@ template CredentialAuthorization() {
     signal input nullifier;
     signal input forwardIntentDigestHi;
     signal input forwardIntentDigestLo;
+    signal input authorizationValidUntil;
 
     signal input statePathElements[CREDENTIAL_STATE_TREE_DEPTH];
     signal input statePathIndices[CREDENTIAL_STATE_TREE_DEPTH];
@@ -94,10 +95,20 @@ template CredentialAuthorization() {
     component currentTimestampRange = Num2Bits(64);
     currentTimestampRange.in <== currentTimestamp;
 
-    component unexpired = LessThan(64);
-    unexpired.in[0] <== currentTimestamp;
-    unexpired.in[1] <== expiry;
-    unexpired.out === 1;
+    component authorizationDeadlineRange = Num2Bits(64);
+    authorizationDeadlineRange.in <== authorizationValidUntil;
+
+    component authorizationWindow = LessThan(64);
+    authorizationWindow.in[0] <== currentTimestamp;
+    authorizationWindow.in[1] <== authorizationValidUntil;
+    authorizationWindow.out === 1;
+
+    // The public per-proof deadline may equal the private expiry. Execution
+    // must be strictly earlier than this deadline in IdentityApplicationA.
+    component deadlineWithinCredential = LessEqThan(64);
+    deadlineWithinCredential.in[0] <== authorizationValidUntil;
+    deadlineWithinCredential.in[1] <== expiry;
+    deadlineWithinCredential.out === 1;
 }
 
-component main {public [credentialCommitment, trustedIssuer, requiredRole, currentTimestamp, credentialStateRoot, applicationDomain, policyEpoch, actionContext, nullifier, forwardIntentDigestHi, forwardIntentDigestLo]} = CredentialAuthorization();
+component main {public [credentialCommitment, trustedIssuer, requiredRole, currentTimestamp, credentialStateRoot, applicationDomain, policyEpoch, actionContext, nullifier, forwardIntentDigestHi, forwardIntentDigestLo, authorizationValidUntil]} = CredentialAuthorization();

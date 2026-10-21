@@ -18,6 +18,9 @@ const MODEL_ROOT = path.join(ZK_ROOT, "credential-model");
 const FIXTURES_ROOT = path.join(MODEL_ROOT, "fixtures");
 const OUTPUT_ROOT = path.join(ZK_ROOT, "build", "inputs");
 const STATE_OUTPUT_ROOT = path.join(ZK_ROOT, "build", "credential-state");
+// A prover-selected default execution deadline, independent of maxProofAge.
+// Callers can choose any uint64 deadline that satisfies the actual circuit.
+export const DEFAULT_AUTHORIZATION_LIFETIME_SECONDS = 7200n;
 
 async function loadJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
@@ -41,6 +44,7 @@ export function decimalInput(encoded, commitment, policy, credentialState, nulli
     nullifier: nullifierContext.nullifier.toString(),
     forwardIntentDigestHi: (nullifierContext.forwardIntentDigestHi ?? 0n).toString(),
     forwardIntentDigestLo: (nullifierContext.forwardIntentDigestLo ?? 0n).toString(),
+    authorizationValidUntil: policy.authorizationValidUntil.toString(),
     statePathElements: credentialState.pathElements.map(String),
     statePathIndices: credentialState.pathIndices.map(String),
   };
@@ -174,6 +178,28 @@ async function main() {
       requiredRole: BigInt(requiredRole),
       currentTimestamp: BigInt(currentTimestamp),
     };
+    if (proofCase.timestampFromExpiryOffset !== undefined) {
+      requireCondition(
+        [-1, 0, 1].includes(proofCase.timestampFromExpiryOffset),
+        `${proofCase.name} has an unsupported expiry boundary`,
+      );
+      policy.currentTimestamp = BigInt(witnessCredential.expiry) + BigInt(proofCase.timestampFromExpiryOffset);
+      requireCondition(policy.currentTimestamp >= 0n && policy.currentTimestamp < (1n << 64n),
+        `${proofCase.name} timestamp must fit uint64`);
+    }
+    if (policyOverrides.currentTimestamp !== undefined) {
+      policy.currentTimestamp = parseFieldElement(policyOverrides.currentTimestamp, fieldPrime, `${proofCase.name} currentTimestamp`);
+    }
+    policy.authorizationValidUntil = policy.currentTimestamp + DEFAULT_AUTHORIZATION_LIFETIME_SECONDS;
+    if (proofCase.authorizationOffsetFromTimestamp !== undefined) {
+      policy.authorizationValidUntil = policy.currentTimestamp + BigInt(proofCase.authorizationOffsetFromTimestamp);
+    }
+    if (proofCase.authorizationOffsetFromExpiry !== undefined) {
+      policy.authorizationValidUntil = BigInt(witnessCredential.expiry) + BigInt(proofCase.authorizationOffsetFromExpiry);
+    }
+    if (policyOverrides.authorizationValidUntil !== undefined) {
+      policy.authorizationValidUntil = parseFieldElement(policyOverrides.authorizationValidUntil, fieldPrime, `${proofCase.name} authorizationValidUntil`);
+    }
     const commitmentFixture =
       proofCase.commitmentSource === "self"
         ? fixture

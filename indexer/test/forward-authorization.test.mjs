@@ -7,7 +7,9 @@ import { FORWARD_AUTHORIZATION_TYPE,CREDENTIAL_PUBLIC_SIGNAL_ORDER,computeForwar
 const vectors = JSON.parse(await readFile(new URL("../../test-vectors/forward-authorizations.json",import.meta.url),"utf8"));
 test("forward authorization matches independently frozen ABI words and public-signal order", () => {
   assert.equal(FORWARD_AUTHORIZATION_TYPE,vectors.type);
-  assert.deepEqual(CREDENTIAL_PUBLIC_SIGNAL_ORDER,vectors.publicSignalOrder);
+  assert.deepEqual(CREDENTIAL_PUBLIC_SIGNAL_ORDER,[...vectors.publicSignalOrder,"authorizationValidUntil"]);
+  assert.equal(CREDENTIAL_PUBLIC_SIGNAL_ORDER.length,12);
+  assert.equal(CREDENTIAL_PUBLIC_SIGNAL_ORDER.indexOf("authorizationValidUntil"),11);
   assert.equal(vectors.abiWords.length,11);
   assert.ok(vectors.abiWords.every(word => /^[0-9a-f]{64}$/.test(word)));
   const expected = keccak256(stringToHex(vectors.type)) + vectors.abiWords.join("");

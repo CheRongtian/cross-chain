@@ -15,6 +15,7 @@ interface ICredentialVerifier {
         uint256 nullifier;
         uint256 forwardIntentDigestHi;
         uint256 forwardIntentDigestLo;
+        uint256 authorizationValidUntil;
     }
 
     function verifyCredentialProof(

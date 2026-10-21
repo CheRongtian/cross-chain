@@ -5,7 +5,8 @@ import { FORWARD_AUTHORIZATION_TYPE,CREDENTIAL_PUBLIC_SIGNAL_ORDER,encodeForward
 
 const source = JSON.parse(await readFile(new URL("../../test-vectors/forward-authorizations.json",import.meta.url),"utf8"));
 assert.equal(FORWARD_AUTHORIZATION_TYPE,source.type);
-assert.deepEqual(CREDENTIAL_PUBLIC_SIGNAL_ORDER,source.publicSignalOrder);
+// The immutable vector freezes the original eleven positions and intent ABI.
+assert.deepEqual(CREDENTIAL_PUBLIC_SIGNAL_ORDER,[...source.publicSignalOrder,"authorizationValidUntil"]);
 assert.equal(source.abiWords.length,11);
 assert.ok(source.abiWords.every(word => /^[0-9a-f]{64}$/.test(word)));
 const encoded = keccak256(stringToHex(source.type)) + source.abiWords.join("");

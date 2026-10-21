@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-# Canonical ABI fragments for all eleven credential public signals.
-PUBLIC_INPUTS_SIGNATURE="(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256)"
+# Append-only authorizationValidUntil statement: twelve public signals.
+PUBLIC_INPUTS_SIGNATURE="(uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256,uint256)"
 VERIFY_CREDENTIAL_SIGNATURE="verifyCredentialProof(uint256[2],uint256[2][2],uint256[2],${PUBLIC_INPUTS_SIGNATURE})(bool)"
 VERIFY_SUPPLIER_SIGNATURE="verifySupplier(uint256[2],uint256[2][2],uint256[2],${PUBLIC_INPUTS_SIGNATURE})"
 EXPECTED_IDENTITY_APPLICATION_ADDRESS="${EXPECTED_IDENTITY_APPLICATION_ADDRESS:-}"
@@ -100,8 +100,8 @@ load_calldata() {
     local input_file="$CALLDATA_DIR/$case_name.txt"
 
     [[ -f "$input_file" ]] || fail "missing Solidity calldata: $input_file"
-    [[ "$(wc -l < "$input_file" | tr -d '[:space:]')" == "14" ]] \
-        || fail "Solidity calldata must contain fourteen lines: $input_file"
+    [[ "$(wc -l < "$input_file" | tr -d '[:space:]')" == "15" ]] \
+        || fail "Solidity calldata must contain fifteen lines: $input_file"
 
     PROOF_A="$(sed -n '1p' "$input_file")"
     PROOF_B="$(sed -n '2p' "$input_file")"
@@ -117,7 +117,8 @@ load_calldata() {
     NULLIFIER="$(sed -n '12p' "$input_file")"
     INTENT_HI="$(sed -n '13p' "$input_file")"
     INTENT_LO="$(sed -n '14p' "$input_file")"
-    PUBLIC_INPUTS="($CREDENTIAL_COMMITMENT,$TRUSTED_ISSUER,$REQUIRED_ROLE,$CURRENT_TIMESTAMP,$CREDENTIAL_STATE_ROOT,$APPLICATION_DOMAIN,$POLICY_EPOCH,$ACTION_CONTEXT,$NULLIFIER,$INTENT_HI,$INTENT_LO)"
+    AUTHORIZATION_VALID_UNTIL="$(sed -n '15p' "$input_file")"
+    PUBLIC_INPUTS="($CREDENTIAL_COMMITMENT,$TRUSTED_ISSUER,$REQUIRED_ROLE,$CURRENT_TIMESTAMP,$CREDENTIAL_STATE_ROOT,$APPLICATION_DOMAIN,$POLICY_EPOCH,$ACTION_CONTEXT,$NULLIFIER,$INTENT_HI,$INTENT_LO,$AUTHORIZATION_VALID_UNTIL)"
 }
 
 call_credential_verifier() {
@@ -595,6 +596,13 @@ assert_uint_equal \
     "$SUPPLIER_ACTION_CONTEXT" \
     "supplier action context"
 
+printf '\n[ZK security invariants: application, replay, revocation and exact forwarding]\n'
+CHAIN_A_RPC_URL="$CHAIN_A_RPC_URL" \
+IDENTITY_APPLICATION_ADDRESS="$IDENTITY_APPLICATION_ADDRESS" \
+VERIFIER_DEPLOYER_KEY="$VERIFIER_DEPLOYER_KEY" \
+    node "$PROJECT_ROOT/indexer/test/helpers/zk-security-invariants.mjs" application
+
+printf '\n[retained on-chain credential lifecycle]\n'
 printf '\n[valid on-chain credential proof]\n'
 load_calldata "valid"
 VALID_RESULT="$(call_credential_verifier)"
@@ -613,7 +621,8 @@ for case_spec in \
     "tampered-action-context:wrong action context" \
     "tampered-nullifier:wrong nullifier" \
     "tampered-intent-hi:wrong forwarding intent high limb" \
-    "tampered-intent-lo:wrong forwarding intent low limb"; do
+    "tampered-intent-lo:wrong forwarding intent low limb" \
+    "tampered-authorization-valid-until:wrong authorization execution deadline"; do
     CASE_NAME="${case_spec%%:*}"
     CASE_LABEL="${case_spec#*:}"
 

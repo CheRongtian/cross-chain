@@ -9,7 +9,9 @@ export const ACTION_FORWARD_MESSAGE = 3n;
 export const CREDENTIAL_PUBLIC_SIGNAL_ORDER = Object.freeze([
   "credentialCommitment","trustedIssuer","requiredRole","currentTimestamp","credentialStateRoot",
   "applicationDomain","policyEpoch","actionContext","nullifier","forwardIntentDigestHi","forwardIntentDigestLo",
+  "authorizationValidUntil",
 ]);
+export const AUTHORIZATION_VALID_UNTIL_INDEX = CREDENTIAL_PUBLIC_SIGNAL_ORDER.indexOf("authorizationValidUntil");
 const PARAMETERS = parseAbiParameters("bytes32,uint8,uint256,uint256,address,address,uint256,address,address,bytes32,uint256,address");
 
 function exactUint(value,label) {

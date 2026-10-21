@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { groth16 } from "snarkjs";
-import { CREDENTIAL_PUBLIC_SIGNAL_ORDER } from "../../indexer/src/forward-authorization.mjs";
+import { AUTHORIZATION_VALID_UNTIL_INDEX, CREDENTIAL_PUBLIC_SIGNAL_ORDER } from "../../indexer/src/forward-authorization.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ZK_ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -45,7 +45,7 @@ function solidityFixture(proofA, proofB, proofC, publicSignals, libraryName = "C
   return `// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-/// @notice Generated from snarkjs Solidity calldata for local verification.
+/// @notice Generated authorizationValidUntil statement calldata; twelve public signals.
 library ${libraryName} {
     function proofA() internal pure returns (uint256[2] memory value) {
         value[0] = uint256(${proofA[0]});
@@ -64,7 +64,7 @@ library ${libraryName} {
         value[1] = uint256(${proofC[1]});
     }
 
-    function publicSignals() internal pure returns (uint256[11] memory value) {
+    function publicSignals() internal pure returns (uint256[12] memory value) {
         value[0] = uint256(${publicSignals[0]});
         value[1] = uint256(${publicSignals[1]});
         value[2] = uint256(${publicSignals[2]});
@@ -76,6 +76,7 @@ library ${libraryName} {
         value[8] = uint256(${publicSignals[8]});
         value[9] = uint256(${publicSignals[9]});
         value[10] = uint256(${publicSignals[10]});
+        value[11] = uint256(${publicSignals[AUTHORIZATION_VALID_UNTIL_INDEX]});
     }
 }
 `;
@@ -90,6 +91,11 @@ async function writeCalldata(name, proofA, proofB, proofC, publicSignals) {
   ];
   const outputPath = path.join(CALLDATA_DIR, `${name}.txt`);
   await writeFile(outputPath, `${lines.join("\n")}\n`, "utf8");
+  // The runtime assertions consume this same snarkjs-exported ordering without
+  // parsing cast's unquoted hexadecimal-array syntax or reordering G2 by hand.
+  await writeFile(path.join(CALLDATA_DIR, `${name}.json`), `${JSON.stringify({ proofA, proofB, proofC,
+    publicInputs: Object.fromEntries(CREDENTIAL_PUBLIC_SIGNAL_ORDER.map((signal, index) => [signal, publicSignals[index]])),
+  }, null, 2)}\n`, "utf8");
   console.log(`Prepared Solidity calldata: ${path.relative(PROJECT_ROOT, outputPath)}`);
 }
 
@@ -105,7 +111,7 @@ async function loadSolidityCalldata(proofPath, publicPath) {
     "invalid Solidity proof B",
   );
   requireCondition(Array.isArray(proofC) && proofC.length === 2, "invalid Solidity proof C");
-  requireCondition(Array.isArray(publicSignals) && publicSignals.length === CREDENTIAL_PUBLIC_SIGNAL_ORDER.length, "expected eleven public signals");
+  requireCondition(Array.isArray(publicSignals) && publicSignals.length === CREDENTIAL_PUBLIC_SIGNAL_ORDER.length, "expected twelve public signals");
 
   return { proofA, proofB, proofC, publicSignals };
 }
@@ -137,6 +143,7 @@ async function main() {
     ["tampered-nullifier", 8],
     ["tampered-intent-hi", 9],
     ["tampered-intent-lo", 10],
+    ["tampered-authorization-valid-until", AUTHORIZATION_VALID_UNTIL_INDEX],
   ];
 
   for (const [name, index] of publicCases) {
@@ -154,6 +161,11 @@ async function main() {
     "application-other-action",
     "active-secondary-current",
     "authorized-forward-valid",
+    "active-secondary-initial",
+    "expiry-last-second",
+    "authorization-narrow",
+    "authorization-short",
+    "authorization-renewed",
   ]) {
     const proofPath = path.join(PROVING_DIR, `${name}-proof.json`);
     const publicPath = path.join(PROVING_DIR, `${name}-public.json`);
@@ -175,6 +187,16 @@ async function main() {
       calldata.publicSignals,
     );
   }
+
+  // Historical proof coordinates are copied unchanged. Supplying a full,
+  // well-formed twelve-field statement tests cryptographic incompatibility,
+  // without crediting a malformed old-ABI call as verifier rejection.
+  const legacy = await loadJson(path.join(PROJECT_ROOT, "test-vectors", "legacy-credential-proof.json"));
+  const legacySignals = [...legacy.publicSignals, (BigInt(legacy.publicSignals[3]) + 7200n).toString()];
+  const [legacyA, legacyB, legacyC, legacyPublic] = JSON.parse(`[${await groth16.exportSolidityCallData(legacy.proof, legacySignals)}]`);
+  await writeCalldata("legacy-proof", legacyA, legacyB, legacyC, legacyPublic);
+  await writeFile(path.join(GENERATED_CONTRACTS_DIR, "LegacyCredentialProofFixture.sol"),
+    solidityFixture(legacyA, legacyB, legacyC, legacyPublic, "LegacyCredentialProofFixture"), "utf8");
 }
 
 await main();
