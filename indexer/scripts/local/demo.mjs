@@ -12,7 +12,8 @@ import { artifact,clients,successfulReceipt,writeContract } from "./deployment.m
 import { inspectLocalPrivacy } from "./privacy.mjs";
 import { httpJson,jsonText,waitFor,writeJson } from "./tools.mjs";
 
-export async function runLocalDemo({ config,pool,issuer,artifacts,alive,progress,signal,afterFinalized = async () => {},afterConfirmed = async () => {} }) {
+export async function produceLocalSourceMessage({ config,pool,issuer,artifacts,alive,progress,signal,
+  supplier: selectedSupplier,beforeSourceBroadcast = async () => {} }) {
   const a = clients(config.chainA,10011); const b = clients(config.chainB,2001);
   const d = config.deployments;
   const sourceAbi = (await artifact("SourceGateway")).abi;
@@ -42,7 +43,7 @@ export async function runLocalDemo({ config,pool,issuer,artifacts,alive,progress
   const now = (await a.publicClient.getBlock()).timestamp;
   const nonce = await a.publicClient.readContract({ address: d.sourceGateway,abi: sourceAbi,functionName: "nextNonce" });
   // An explicit fresh business address, never a private subject/address claim.
-  const supplier = "0x" + (0x100000n + nonce).toString(16).padStart(40,"0");
+  const supplier = selectedSupplier ?? "0x" + (0x100000n + nonce).toString(16).padStart(40,"0");
   assert.equal(await readB(d.applicationB,applicationBAbi,"isVerifiedSupplier",[supplier]),false,"new demo intent must target a fresh supplier");
   progress("Preparing a fresh synthetic credential and independent supplier intent");
   const privateCredential = issuer.issue(now);
@@ -59,6 +60,7 @@ export async function runLocalDemo({ config,pool,issuer,artifacts,alive,progress
     artifacts,temporaryParent: join(config.directory,"private"),privateInput: true,signal });
   assert.equal(prepared.publicSignals.length,CREDENTIAL_PUBLIC_SIGNAL_ORDER.length);
   assert.equal(BigInt(prepared.publicInputs.actionContext),3n);
+  await beforeSourceBroadcast({ chain: a.publicClient });
   const hash = await a.wallet.writeContract({ address: d.identityApplication,abi: prepared.abi,functionName: "forwardAuthorizedMessage",args: prepared.args });
   const sourceReceipt = await successfulReceipt(a.publicClient,hash);
   const logs = sourceReceipt.logs.filter(log => log.address.toLowerCase() === d.sourceGateway);
@@ -78,7 +80,9 @@ export async function runLocalDemo({ config,pool,issuer,artifacts,alive,progress
   assert.equal(await a.publicClient.readContract({ address: d.identityApplication,abi: prepared.abi,functionName: "usedNullifiers",args: [BigInt(prepared.publicInputs.nullifier)] }),true);
   progress(`Source transaction ${hash}; canonical message ${message.messageId}`);
   const sources = tableName(config.schema,"source_messages");
-  const readSource = async () => (await pool.query(`SELECT * FROM ${sources} WHERE message_id = $1`,[message.messageId])).rows[0];
+  const readSource = async () => (await pool.query(`SELECT * FROM ${sources} WHERE message_id = $1
+    AND source_gateway = $2 AND source_tx_hash = $3 AND source_block_hash = $4 AND source_log_index = $5`,
+  [message.messageId,d.sourceGateway,hash,sourceReceipt.blockHash,String(logs[0].logIndex)])).rows[0];
   await wait("persisted OBSERVED source occurrence",async () => {
     const row = await readSource();
     if (!row) return false;
@@ -87,6 +91,11 @@ export async function runLocalDemo({ config,pool,issuer,artifacts,alive,progress
     return row;
   });
   progress("OBSERVED: canonical source event persisted by the live Indexer");
+  return { a,b,d,sourceAbi,destinationAbi,applicationBAbi,readB,privateCredential,prepared,payload,supplier,
+    message,sourceReceipt,hash,readSource,wait,progress };
+}
+
+export async function finalizeLocalSource({ a,sourceReceipt,readSource,wait,progress }) {
   await wait("FINALIZING before successor mining",async () => {
     const row = await readSource();
     if (row?.status === "FINALIZED") throw new Error("Source finalized before controlled successor mining");
@@ -97,6 +106,13 @@ export async function runLocalDemo({ config,pool,issuer,artifacts,alive,progress
   const finalized = await wait("FINALIZED",async () => { const row = await readSource(); return row?.status === "FINALIZED" ? row : false; });
   assert.ok(finalized.finalized_at); assert.ok(BigInt(finalized.finalized_at_head) >= sourceReceipt.blockNumber + 2n);
   progress("FINALIZED: depth policy satisfied on the canonical source chain");
+}
+
+export async function runLocalDemo(options) {
+  const { config,pool,progress,afterFinalized = async () => {},afterReady = async () => {},afterConfirmed = async () => {} } = options;
+  const context = await produceLocalSourceMessage(options);
+  const { a,b,d,destinationAbi,applicationBAbi,readB,privateCredential,payload,supplier,message,sourceReceipt,hash,wait } = context;
+  await finalizeLocalSource(context);
   await afterFinalized({ messageId: message.messageId });
   const jobs = tableName(config.schema,"delivery_jobs");
   const batches = tableName(config.schema,"message_batches");
@@ -114,6 +130,7 @@ export async function runLocalDemo({ config,pool,issuer,artifacts,alive,progress
   assert.ok(qc.commits.every(vote => config.peers.some(peer => peer.address === vote.voterIdentity)));
   progress(`SEALED → CONSENSUS_PENDING → COMMITTED: batch ${pack.batchId}; Merkle root ${pack.messageRoot}; QC ${qc.qcDigest}; epoch ${qc.validatorEpoch}/view ${qc.view}`);
   progress(`READY: delivery ${job.delivery_job_id}`);
+  await afterReady({ messageId: message.messageId,supplier,pack,job,deliveryConfig });
   const attempts = tableName(config.schema,"transaction_attempts");
   const intents = tableName(config.schema,"transaction_intents");
   const broadcast = await wait("durably signed and broadcast destination transaction",async () => (await pool.query(`SELECT * FROM ${attempts}

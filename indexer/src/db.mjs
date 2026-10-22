@@ -210,32 +210,35 @@ export function createDatabaseStore(pool, schema) {
 
       try {
         await client.query("BEGIN");
-        const existing = await client.query(
-          `SELECT chain_domain, source_gateway, next_block
-             FROM ${cursors}
-            WHERE chain_domain = $1 AND source_gateway = $2
-            FOR UPDATE`,
-          [normalizedScope.chainDomain, normalizedScope.sourceGateway],
-        );
+        const cursorQuery = `SELECT chain_domain, source_gateway, next_block
+          FROM ${cursors}
+          WHERE chain_domain = $1 AND source_gateway = $2
+          FOR UPDATE`;
+        const cursorKey = [normalizedScope.chainDomain, normalizedScope.sourceGateway];
+        let existing = await client.query(cursorQuery, cursorKey);
 
-        let nextBlock;
         if (existing.rowCount === 0) {
+          // An absent row cannot be locked. Another cold-start worker may
+          // create it first; read its committed cursor instead of resetting it.
           await client.query(
             `INSERT INTO ${cursors} (chain_domain, source_gateway, next_block)
-             VALUES ($1, $2, $3)`,
-            [normalizedScope.chainDomain, normalizedScope.sourceGateway, startBlock.toString()],
+             VALUES ($1, $2, $3)
+             ON CONFLICT (chain_domain, source_gateway) DO NOTHING`,
+            [...cursorKey, startBlock.toString()],
           );
-          nextBlock = startBlock;
-        } else {
-          const row = existing.rows[0];
-          if (
-            BigInt(row.chain_domain) !== BigInt(normalizedScope.chainDomain) ||
-            normalizeAddress(row.source_gateway, "stored cursor source gateway") !== normalizedScope.sourceGateway
-          ) {
-            throw new Error("stored cursor identity does not match configured chain and SourceGateway");
-          }
-          nextBlock = BigInt(row.next_block);
+          existing = await client.query(cursorQuery, cursorKey);
         }
+        if (existing.rowCount !== 1) {
+          throw new Error("indexer cursor is missing after initialization");
+        }
+        const row = existing.rows[0];
+        if (
+          BigInt(row.chain_domain) !== BigInt(normalizedScope.chainDomain) ||
+          normalizeAddress(row.source_gateway, "stored cursor source gateway") !== normalizedScope.sourceGateway
+        ) {
+          throw new Error("stored cursor identity does not match configured chain and SourceGateway");
+        }
+        const nextBlock = BigInt(row.next_block);
 
         await client.query("COMMIT");
         return nextBlock;
@@ -590,7 +593,7 @@ export function createCanonicalStore(pool, schema) {
           );
         }
         if (BigInt(cursor.rows[0].next_block) !== normalizedNextBlock) {
-          throw new CanonicalHistoryBootstrapError(
+          throw new CanonicalHistoryChangedError(
             "indexer cursor changed during canonical history bootstrap",
           );
         }
@@ -602,7 +605,9 @@ export function createCanonicalStore(pool, schema) {
           [normalizedScope.chainDomain, normalizedScope.sourceGateway],
         );
         if (Number(existingHistory.rows[0].block_count) !== 0) {
-          throw new CanonicalHistoryBootstrapError(
+          // The other worker may have initialized or advanced this scope
+          // after our empty-history read. Reconcile its committed state.
+          throw new CanonicalHistoryChangedError(
             "canonical history appeared while bootstrap was in progress",
           );
         }

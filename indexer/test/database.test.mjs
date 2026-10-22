@@ -743,6 +743,133 @@ test("accepts the same tracked block and rejects a different hash without overwr
   assert.equal((await readCursor(pool, config.databaseSchema, scope)).next_block, "10");
 });
 
+test("independent cold-start clients create one shared cursor after both observe an absent row", { timeout: 30_000 }, async () => {
+  const firstPool = createDatabasePool(config);
+  const secondPool = createDatabasePool(config);
+  const proceed = Promise.withResolvers();
+  let absentReads = 0;
+  let pending = [];
+  function synchronizedPool(realPool) {
+    return {
+      async connect() {
+        const client = await realPool.connect();
+        let firstRead = true;
+        return {
+          async query(sql, parameters) {
+            const result = await client.query(sql, parameters);
+            if (firstRead && sql.includes(cursorsTable) && sql.includes("FOR UPDATE")) {
+              firstRead = false;
+              assert.equal(result.rowCount, 0);
+              absentReads++;
+              if (absentReads === 2) proceed.resolve();
+              await proceed.promise;
+            }
+            return result;
+          },
+          release() { client.release(); },
+        };
+      },
+    };
+  }
+  try {
+    const [first, second] = await Promise.all([
+      firstPool.query("SELECT pg_backend_pid() AS pid"),
+      secondPool.query("SELECT pg_backend_pid() AS pid"),
+    ]);
+    assert.notEqual(first.rows[0].pid, second.rows[0].pid);
+    pending = [firstPool, secondPool].map(realPool =>
+      createDatabaseStore(synchronizedPool(realPool), config.databaseSchema).loadOrInitializeCursor(scope, 0n));
+    assert.deepEqual(await Promise.all(pending), [0n, 0n]);
+    assert.equal(absentReads, 2);
+    const rows = (await pool.query(`SELECT * FROM ${cursorsTable}`)).rows;
+    assert.equal(rows.length, 1); assert.equal(rows[0].next_block, "0");
+    assert.equal(rows[0].chain_domain, scope.chainDomain.toString()); assert.equal(rows[0].source_gateway, scope.sourceGateway);
+  } finally {
+    proceed.resolve();
+    await Promise.allSettled(pending);
+    await Promise.all([firstPool.end(), secondPool.end()]);
+  }
+});
+
+for (const startBlock of [0n, 10n]) {
+  for (const advanceCursor of [false, true]) {
+    test(`independent initializers reconcile concurrent ${advanceCursor ? "cursor advancement" : "history bootstrap"} from start block ${startBlock}`, { timeout: 30_000 }, async () => {
+      const stalePool = createDatabasePool(config);
+      const winnerPool = createDatabasePool(config);
+      const reached = Promise.withResolvers();
+      const resume = Promise.withResolvers();
+      const snapshotHead = 10n;
+      const liveHead = advanceCursor ? 13n : snapshotHead;
+      const anchor = startBlock === 0n ? 0n : startBlock - 1n;
+      const sharedConfig = { ...config, ...scope, sourceGatewayStartBlock: startBlock };
+      const client = {
+        async request({ method }) { assert.equal(method, "eth_blockNumber"); return `0x${liveHead.toString(16)}`; },
+        async getBlock({ blockNumber }) { assert.ok(blockNumber <= snapshotHead); return canonicalBlock(blockNumber); },
+      };
+      const staleCanonicalStore = createCanonicalStore(stalePool, config.databaseSchema);
+      const bootstrap = staleCanonicalStore.bootstrapCanonicalHistory.bind(staleCanonicalStore);
+      let bootstrapCalls = 0;
+      let bootstrapError;
+      let retries = 0;
+      let pending;
+      // Both processes have read empty history and captured a cursor before
+      // the winner commits. No timing sleeps or protocol-state repair is used.
+      staleCanonicalStore.bootstrapCanonicalHistory = async (...args) => {
+        bootstrapCalls++;
+        assert.equal(args[1].expectedNextBlock, startBlock);
+        assert.deepEqual(args[1].blocks, [canonicalBlock(anchor)]);
+        reached.resolve();
+        await resume.promise;
+        try { return await bootstrap(...args); }
+        catch (error) { bootstrapError = error; throw error; }
+      };
+      staleCanonicalStore.recoverCanonicalReorg = async () => assert.fail("forward canonical progress must not recover a fork");
+      try {
+        const [staleBackend, winnerBackend] = await Promise.all([
+          stalePool.query("SELECT pg_backend_pid() AS pid"), winnerPool.query("SELECT pg_backend_pid() AS pid"),
+        ]);
+        assert.notEqual(staleBackend.rows[0].pid, winnerBackend.rows[0].pid);
+        pending = createCanonicalReconciler({ config: sharedConfig, pool: stalePool, publicClient: client,
+          canonicalStore: staleCanonicalStore,
+          logger: { log(message) { if (message.includes("same fixed snapshot again")) retries++; }, error() {} },
+        }).reconcile({ headBlock: snapshotHead });
+        await Promise.race([reached.promise, pending.then(() => assert.fail("stale initializer missed the controlled barrier"))]);
+        const winner = await createCanonicalReconciler({ config: sharedConfig, pool: winnerPool, publicClient: client,
+          logger: { log() {}, error() {} },
+        }).reconcile({ headBlock: snapshotHead });
+        assert.equal(winner.bootstrapped, true); assert.equal(winner.blocksPersisted, 1);
+        if (advanceCursor) {
+          await createDatabaseStore(winnerPool, config.databaseSchema).persistRange(scope, {
+            fromBlock: startBlock, toBlock: liveHead, blocks: canonicalBlockRange(startBlock, liveHead),
+            rows: [messageRow({ sourceBlockNumber: "11" })],
+          });
+        }
+        const blocksBefore = await readIndexedSourceBlocks(pool, config.databaseSchema, scope);
+        const cursorBefore = await readCursor(pool, config.databaseSchema, scope);
+        const messagesBefore = await readMessages(pool, config.databaseSchema);
+        resume.resolve();
+        const result = await pending;
+        assert.ok(bootstrapError instanceof CanonicalHistoryChangedError);
+        assert.ok(!(bootstrapError instanceof CanonicalHistoryBootstrapError));
+        assert.match(bootstrapError.message, advanceCursor ? /cursor changed/ : /history appeared/);
+        assert.equal(bootstrapCalls, 1); assert.equal(retries, 1);
+        assert.equal(result.detected, false); assert.equal(result.bootstrapped, false);
+        assert.equal(result.headBlock, snapshotHead);
+        assert.equal(result.oldIndexedHead, advanceCursor ? liveHead : anchor);
+        assert.equal(result.rewoundNextBlock, advanceCursor ? liveHead + 1n : startBlock);
+        assert.deepEqual(await readIndexedSourceBlocks(pool, config.databaseSchema, scope), blocksBefore);
+        assert.deepEqual(await readCursor(pool, config.databaseSchema, scope), cursorBefore);
+        assert.deepEqual(await readMessages(pool, config.databaseSchema), messagesBefore);
+        console.log(`VALID: concurrent cold bootstrap at start ${startBlock}, cursor advanced=${advanceCursor}; fixed snapshot ${snapshotHead}, committed history/messages/cursor preserved after reconciliation`);
+      } finally {
+        resume.resolve();
+        if (pending) await pending.catch(() => {});
+        await Promise.all([stalePool.end(), winnerPool.end()]);
+      }
+    });
+  }
+}
+
 test("fails closed when pre-existing messages disagree during canonical bootstrap", async () => {
   assert.equal(await store.loadOrInitializeCursor(scope, 10n), 10n);
   await rewindCursor(11n);

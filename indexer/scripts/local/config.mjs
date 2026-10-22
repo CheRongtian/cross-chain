@@ -21,7 +21,7 @@ function rpcPort(value,fallback) {
 export async function localConfiguration({ isolated = false } = {}) {
   const runId = randomUUID();
   const parent = resolve(ROOT,".run",isolated ? "verification" : "local");
-  const ports = isolated ? await freePorts(15) : [
+  const ports = isolated ? await freePorts(17) : [
     rpcPort(process.env.CHAIN_A_RPC_URL,4545),rpcPort(process.env.CHAIN_B_RPC_URL,9545),
     port(process.env.MESSAGE_QUERY_API_PORT,8080),port(process.env.PROMETHEUS_PORT,9090),port(process.env.GRAFANA_PORT,3000),
     ...Array.from({ length: 4 },(_,i) => port(Number(process.env.LOCAL_VALIDATOR_BASE_PORT || 31001) + i,31001 + i)),
@@ -30,7 +30,7 @@ export async function localConfiguration({ isolated = false } = {}) {
   if (new Set(ports).size !== ports.length) throw new Error("Local listener ports overlap; choose distinct ports");
   const [chainA,chainB,api,prometheus,grafana,...remaining] = ports;
   return { runId,parent,directory: join(parent,runId),isolated,
-    ports: { chainA,chainB,api,prometheus,grafana,validators: remaining.slice(0,4),metrics: remaining.slice(4,9),control: remaining[9] },
+    ports: { chainA,chainB,api,prometheus,grafana,validators: remaining.slice(0,4),metrics: remaining.slice(4,9),control: remaining[9],rpcGates: remaining.slice(10) },
     schema: "local_" + runId.replaceAll("-","").slice(0,16),
     chainA: `http://127.0.0.1:${chainA}`,chainB: `http://127.0.0.1:${chainB}`,
     api: `http://127.0.0.1:${api}`,prometheus: `http://127.0.0.1:${prometheus}`,grafana: `http://127.0.0.1:${grafana}`,

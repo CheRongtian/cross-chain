@@ -935,7 +935,12 @@ printf '317. Serve the same-origin Explorer with bounded recent-message browsing
 printf '318. Display real message authorization, lifecycle, votes, quorum, replacement and orphan evidence through the browser view model\n'
 printf '319. Preserve security/invariant/fuzz, observability and clean-stack happy-path/privacy verification\n'
 printf '320. Reuse that owned stack for fresh Byzantine-validator and non-primary crash demonstrations; require exact honest 3-of-4 QCs and one destination execution per message\n'
-printf '321. Restore all four validators without offline historical votes, preserve earlier evidence, clean up owned resources, then retain the final execution-time authorization-expiry gate\n'
+printf '321. Restore all four validators without offline historical votes and preserve earlier evidence before handing off the same owned stack\n'
+printf '322. Demonstrate real durable-SIGNED owner failure, natural lease expiry, higher fencing and exact signed-transaction reuse\n'
+printf '323. Reconcile a fresh pre-finality source fork; retain its orphan with zero downstream authority and execute its fresh canonical replacement\n'
+printf '324. Send an authentic identical package from a second address after confirmation; require the exact on-chain replay rejection\n'
+printf '325. Recover one continuous message through validator crash, signed Relayer crash and all-path RPC outage using unchanged durable identities\n'
+printf '326. Restore real service readiness, verify owned cleanup, then run the execution-time authorization-expiry gate last\n'
 printf '     Replace a real Chain A branch while a fresh authorized source occurrence is FINALIZING\n'
 printf '     Preserve terminal REORGED evidence and prove zero downstream batch/QC/READY/transaction/destination propagation\n'
 printf '     Resume a canonical replacement through the same schema, live validator cluster and production Gateway/ApplicationB\n'
@@ -1047,7 +1052,7 @@ CURRENT_STEP="verification rejection assertion regressions"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test "$PROJECT_ROOT/zk/test/rejection.test.mjs"
 
-CURRENT_STEP="Chain A Indexer, fixed-snapshot reconciliation, fair receipt/recovery observation, RPC classification, batch, Merkle, golden compatibility, lifecycle, portable delivery, destination-scoped leases and preparation defer/fairness unit tests"
+CURRENT_STEP="Chain A Indexer, concurrent bootstrap and fixed-snapshot reconciliation, fair receipt/recovery observation, RPC classification, batch, Merkle, golden compatibility, lifecycle, portable delivery, destination-scoped leases and preparation defer/fairness unit tests"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test \
     "$INDEXER_DIR/test/forward-authorization.test.mjs" \
@@ -1081,6 +1086,8 @@ printf '\n[cross-chain safety invariants]\n'
 printf 'Evidence runs in the retained source lifecycle/delivery database suites, production Gateway Foundry suite and real source/consensus/destination scenarios below.\n'
 CURRENT_STEP="cross-chain safety source/delivery gates and retained Chain A database, migrations, reorg/concurrency, RPC retry, lifecycle, delivery leases, preparation fairness and receipt/recovery cursor regressions"
 printf '\n[%s]\n' "$CURRENT_STEP"
+printf 'Includes deterministic independent-client cold-start cursor creation, concurrent history bootstrap and cursor-advance regressions; unsafe legacy history and finalized-fork protections remain required.\n'
+printf 'Includes the exact local recovery evidence SQL against PostgreSQL: per-job broadcast journals, unresolved markers, unrelated-message isolation and zero propagation for a real source orphan.\n'
 DATABASE_URL="$DATABASE_URL" \
 INDEXER_DB_SCHEMA="$INDEXER_DATABASE_TEST_SCHEMA" \
     node --test \
@@ -2291,6 +2298,11 @@ CURRENT_STEP="byzantine and validator crash demonstrations"
 printf '\n[%s]\n' "$CURRENT_STEP"
 node --test "$INDEXER_DIR/test/local-pbft-faults.test.mjs"
 LOCAL_VERIFICATION_OWNER_FILE="$CLEAN_STACK_OWNER_FILE" node "$INDEXER_DIR/scripts/verify-pbft-faults.mjs"
+
+CURRENT_STEP="relayer, source reorg, replay and composed recovery demonstrations"
+printf '\n[%s]\n' "$CURRENT_STEP"
+node --test "$INDEXER_DIR/test/local-recovery.test.mjs"
+LOCAL_VERIFICATION_OWNER_FILE="$CLEAN_STACK_OWNER_FILE" node "$INDEXER_DIR/scripts/verify-recovery-demos.mjs"
 
 CURRENT_STEP="ZK security invariants: execution-time credential expiry"
 printf '\n[ZK security invariants]\n'

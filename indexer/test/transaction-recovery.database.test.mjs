@@ -3,7 +3,7 @@ import { after,before,beforeEach,test } from "node:test";
 import { privateKeyToAccount } from "viem/accounts";
 import { randomUUID } from "node:crypto";
 import { readdir,readFile } from "node:fs/promises";
-import { applyMigrations,createDatabasePool,resetIndexerTables,tableName } from "../src/db.mjs";
+import { applyMigrations,createCanonicalStore,createDatabasePool,createDatabaseStore,resetIndexerTables,tableName } from "../src/db.mjs";
 import { createDeliveryRepository } from "../src/delivery/repository.mjs";
 import { deliveryJson } from "../src/delivery/package.mjs";
 import { formatRelayerSummary } from "../src/relayer/summary.mjs";
@@ -12,7 +12,8 @@ import { verifySignedTransaction,signDeliveryTransaction } from "../src/transact
 import { transactionConfig,transactionHarness } from "./helpers/transaction-fixtures.mjs";
 import { persistReadyTransactionFixture } from "./helpers/transaction-database-fixtures.mjs";
 import { destinationRpcFixture,transactionBody,rpcTimeout } from "./helpers/destination-rpc-fixtures.mjs";
-import { fixtureHash } from "./helpers/delivery-fixtures.mjs";
+import { deliveryMessage,fixtureHash } from "./helpers/delivery-fixtures.mjs";
+import { countDeliveryBroadcastEvents,readSourceTransactionCounts } from "../scripts/local/recovery-evidence.mjs";
 import { sourceState } from "../../validator/test/helpers/four-process.mjs";
 import { developmentKeys } from "../../validator/test/helpers/fixtures.mjs";
 
@@ -65,6 +66,100 @@ async function incompleteEarlierReceipts() {
     if (job !== jobs.at(-1)) destination.receipts.delete(stored.attempt.transactionHash);
   }
 }
+
+async function sourceForJob(job) {
+  const row = (await pool.query(`SELECT source_message_id,message_id FROM ${tableName(config.databaseSchema,"delivery_jobs")}
+    WHERE delivery_job_id = $1`,[job.deliveryJobId])).rows[0];
+  return { sourceMessageId: row.source_message_id,messageId: row.message_id };
+}
+
+test("local recovery SQL counts the exact target journal through attempts without including another job", async () => {
+  const [target,other] = jobs;
+  const source = await sourceForJob(target);
+  const zero = { intents: 0,attempts: 0,broadcasts: 0 };
+  assert.equal(await countDeliveryBroadcastEvents(pool,config.databaseSchema,target.deliveryJobId),0);
+  assert.deepEqual(await readSourceTransactionCounts(pool,config.databaseSchema,source),zero);
+  await reader.submitDelivery(other.deliveryJobId);
+  const otherJournal = await reader.repository.getBroadcastEvents(other.deliveryJobId);
+  assert.ok(otherJournal.length > 0);
+  assert.equal(await countDeliveryBroadcastEvents(pool,config.databaseSchema,other.deliveryJobId),otherJournal.length);
+  assert.equal(await countDeliveryBroadcastEvents(pool,config.databaseSchema,target.deliveryJobId),0);
+  assert.deepEqual(await readSourceTransactionCounts(pool,config.databaseSchema,source),zero);
+  const signed = await reader.prepareDeliveryTransaction(target.deliveryJobId);
+  assert.equal(signed.created,true); assert.equal(signed.attempt.status,"SIGNED");
+  assert.equal(await countDeliveryBroadcastEvents(pool,config.databaseSchema,target.deliveryJobId),0);
+  assert.deepEqual(await readSourceTransactionCounts(pool,config.databaseSchema,source),{ intents: 1,attempts: 1,broadcasts: 0 });
+  await reader.broadcastPreparedTransaction(target.deliveryJobId);
+  const journal = await reader.repository.getBroadcastEvents(target.deliveryJobId);
+  assert.ok(journal.some(event => event.endpointLabel === null));
+  assert.ok(journal.some(event => event.endpointLabel !== null));
+  const expected = { intents: 1,attempts: 1,broadcasts: journal.length };
+  const before = deliveryJson(await Promise.all([target,other].map(job => reader.repository.getRecoverySnapshot(job.deliveryJobId))));
+  const account = await reader.repository.getAccount();
+  const calls = destination.nodes.map(node => node.calls.length);
+  for (let repeat = 0; repeat < 2; repeat++) {
+    assert.equal(await countDeliveryBroadcastEvents(pool,config.databaseSchema,target.deliveryJobId),journal.length);
+    assert.equal(await countDeliveryBroadcastEvents(pool,config.databaseSchema,other.deliveryJobId),otherJournal.length);
+    assert.deepEqual(await readSourceTransactionCounts(pool,config.databaseSchema,source),expected);
+    // The source exclusion rule must work for either exact occurrence ID or
+    // canonical message ID, independently of the other supplied identifier.
+    assert.deepEqual(await readSourceTransactionCounts(pool,config.databaseSchema,{ ...source,messageId: fixtureHash(0) }),expected);
+    assert.deepEqual(await readSourceTransactionCounts(pool,config.databaseSchema,{ ...source,sourceMessageId: "0" }),expected);
+  }
+  assert.deepEqual(destination.nodes.map(node => node.calls.length),calls,"evidence reads must not invoke RPC");
+  assert.equal(deliveryJson(await reader.repository.getAccount()),deliveryJson(account));
+  assert.ok(deliveryJson(await Promise.all([target,other].map(job => reader.repository.getRecoverySnapshot(job.deliveryJobId)))) === before,
+    "evidence reads changed durable intent/attempt/receipt/broadcast state");
+});
+
+for (const checkpoint of ["afterBroadcastStart","afterEndpointResult"]) {
+  test(`local recovery SQL counts unresolved journal markers at ${checkpoint} and retains them after recovery`, async () => {
+    const target = jobs[0]; const source = await sourceForJob(target);
+    const stopped = manager({ hooks: { [checkpoint]: crashOnce() } });
+    await stopped.prepareDeliveryTransaction(target.deliveryJobId);
+    await assert.rejects(stopped.broadcastPreparedTransaction(target.deliveryJobId),{ code: "TEST_CHECKPOINT" });
+    const unresolved = await reader.repository.getBroadcastEvents(target.deliveryJobId);
+    assert.ok(unresolved.length > 0); assert.ok(unresolved.every(event => event.completedAt === null));
+    assert.equal(unresolved.some(event => event.endpointLabel !== null),checkpoint === "afterEndpointResult");
+    assert.equal(destination.nodes.flatMap(node => node.broadcasts).length,checkpoint === "afterBroadcastStart" ? 0 : 1);
+    assert.equal(await countDeliveryBroadcastEvents(pool,config.databaseSchema,target.deliveryJobId),unresolved.length);
+    assert.deepEqual(await readSourceTransactionCounts(pool,config.databaseSchema,source),{ intents: 1,attempts: 1,broadcasts: unresolved.length });
+    await reader.recoverTransactionsOnce({ deliveryJobId: target.deliveryJobId });
+    const complete = await reader.repository.getBroadcastEvents(target.deliveryJobId);
+    assert.ok(complete.length >= unresolved.length); assert.ok(complete.every(event => event.completedAt !== null));
+    assert.ok(complete.some(event => event.endpointLabel !== null));
+    for (const marker of unresolved) assert.ok(complete.some(event => event.eventId === marker.eventId),"recovery must retain every journal marker");
+    assert.equal(await countDeliveryBroadcastEvents(pool,config.databaseSchema,target.deliveryJobId),complete.length);
+    assert.deepEqual(await readSourceTransactionCounts(pool,config.databaseSchema,source),{ intents: 1,attempts: 1,broadcasts: complete.length });
+  });
+}
+
+test("local source-reorg SQL returns zero for a real orphan without a delivery job while prior messages have broadcasts", async () => {
+  await reader.submitDelivery(jobs[0].deliveryJobId);
+  const previous = await reader.repository.getRecoverySnapshot(jobs[0].deliveryJobId);
+  assert.ok(previous.broadcastEvents.length > 0);
+  const message = deliveryMessage(100,{ sourceBlockNumber: 11n,sourceBlockHash: fixtureHash(12),status: "OBSERVED" });
+  await createDatabaseStore(pool,config.databaseSchema).persistRange(config,{
+    fromBlock: 11n,toBlock: 11n,blocks: [{ number: 11n,hash: fixtureHash(12),parentHash: fixtureHash(11) }],
+    rows: [{ ...message,payload: Buffer.from(message.payload.slice(2),"hex") }],
+  });
+  const recovered = await createCanonicalStore(pool,config.databaseSchema).recoverCanonicalReorg(config,{
+    commonAncestor: { number: 10n,hash: fixtureHash(11),parentHash: fixtureHash(10) },forkBlock: 11n,
+  });
+  assert.equal(recovered.reorgedMessages,1);
+  const orphan = (await pool.query(`SELECT id,message_id,status FROM ${tableName(config.databaseSchema,"source_messages")}
+    WHERE message_id = $1`,[message.messageId])).rows[0];
+  assert.equal(orphan.status,"REORGED");
+  const related = (await pool.query(`SELECT COUNT(*)::int AS count FROM ${tableName(config.databaseSchema,"delivery_jobs")}
+    WHERE source_message_id = $1 OR message_id = $2`,[orphan.id,orphan.message_id])).rows[0].count;
+  assert.equal(related,0);
+  assert.deepEqual(await readSourceTransactionCounts(pool,config.databaseSchema,{
+    sourceMessageId: orphan.id,messageId: orphan.message_id,
+  }),{ intents: 0,attempts: 0,broadcasts: 0 });
+  assert.equal(await countDeliveryBroadcastEvents(pool,config.databaseSchema,jobs[0].deliveryJobId),previous.broadcastEvents.length);
+  assert.ok(deliveryJson(await reader.repository.getRecoverySnapshot(jobs[0].deliveryJobId)) === deliveryJson(previous),
+    "orphan evidence inspection changed a previous transaction's durable state");
+});
 
 test("SQL observation selectors wrap with exact large nonces and leave allocation, recovery versions and signed evidence unchanged", async () => {
   assert.deepEqual(await reader.repository.listRecoveryIntents({ limit: 1 }),[]);

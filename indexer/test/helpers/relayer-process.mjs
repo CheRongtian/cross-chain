@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { setTimeout as pause } from "node:timers/promises";
-import { privateKeyToAccount } from "viem/accounts";
 import { createDatabasePool } from "../../src/db.mjs";
 import { createDeliveryRepository } from "../../src/delivery/repository.mjs";
 import { createRelayerWorker } from "../../src/relayer/service.mjs";
@@ -8,11 +7,10 @@ import { createTransactionManager } from "../../src/transaction-manager/service.
 import { loadTransactionConfig } from "../../src/transaction-manager/config.mjs";
 import { safeRelayerMessage } from "../../src/relayer/config.mjs";
 import { deliveryJson } from "../../src/delivery/package.mjs";
-import { encodeGatewaySubmission } from "../../src/relayer/encoding.mjs";
 import { createTransactionRpc } from "../../src/transaction-manager/rpc.mjs";
-import { signDeliveryTransaction } from "../../src/transaction-manager/transaction.mjs";
 import { formatRelayerSummary } from "../../src/relayer/summary.mjs";
 import { createRelayerCheckpoint, isRelayerPolling, relayerPollingPasses } from "./relayer-polling.mjs";
+import { prepareDuplicateTransport } from "../../scripts/lib/duplicate-transport.mjs";
 
 // IPC barriers exist only in this integration helper. Production has no pause,
 // force-expiry, stale-fence or test-mode environment switches.
@@ -88,20 +86,10 @@ try {
     // Intentional duplicate network delivery is isolated to this test entry.
     // Strict reads/encoding and signing reuse production primitives, but this
     // contender never claims a lease or writes a canonical intent/account.
-    const pack = await queue.getDeliveryPackage(request.id);
-    const encoded = await encodeGatewaySubmission(pack,{ validatorSets: config.validatorSets,
-      sourceDomain: config.chainDomain,sourceGateway: config.sourceGateway });
-    const canonical = await manager.resolveIntent(request.id);
-    assert.equal(canonical.calldata,encoded.calldata); assert.equal(canonical.packageDigest,encoded.packageDigest);
     const rpc = createTransactionRpc(config);
-    assert.equal(await rpc.verifyChain(),config.destinationDomain);
-    const gasLimit = await rpc.estimateGas(canonical);
-    const fees = await rpc.fees();
-    assert.ok(fees.maxFeePerGas <= config.maxFeePerGasCap && fees.maxPriorityFeePerGas <= config.maxPriorityFeePerGasCap);
-    const nonce = await rpc.pendingNonce();
-    const intent = { ...canonical,nonce: nonce.toString() };
-    const attempt = await signDeliveryTransaction(intent,{ nonce,gasLimit,...fees },privateKeyToAccount(config.privateKey));
-    const evidence = JSON.parse(deliveryJson({ intent,attempt,package: encoded.package }));
+    const duplicate = await prepareDuplicateTransport({ config,queue,manager,rpc,id: request.id });
+    const { attempt } = duplicate;
+    const evidence = JSON.parse(deliveryJson(duplicate));
     await notify({ type: "transport-ready",pid: process.pid,workerId: config.workerId,...evidence });
     if ((await receive()).type !== "continue") throw new Error("invalid duplicate pre-send barrier command");
     const hash = await rpc.broadcast(attempt.rawSignedTransaction,attempt.transactionHash);

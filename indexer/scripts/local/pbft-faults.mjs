@@ -8,7 +8,7 @@ import { expectedCommitStatement,qcDigest,verifyQuorumCertificate } from "../../
 import { artifact,clients } from "./deployment.mjs";
 import { runLocalDemo } from "./demo.mjs";
 import { faultSelection } from "./pipeline.mjs";
-import { httpJson,safeError } from "./tools.mjs";
+import { httpJson,jsonText,safeError } from "./tools.mjs";
 
 export function assertConflictResponse(result,target,phase,pid) {
   assert.equal(result.pid,pid); assert.equal(result.address,target.target);
@@ -41,7 +41,7 @@ async function reject(peer,path,body,reason) {
 
 // Capture only immutable authority/journal fields; leases and scrape state are
 // intentionally not protocol history. Every query below is read-only.
-async function historyReader(config,pool) {
+export async function historyReader(config,pool) {
   const t = name => tableName(config.schema,name);
   const ids = (await pool.query(`SELECT batch_record_id FROM ${t("message_batches")} WHERE status = 'COMMITTED' ORDER BY epoch`)).rows.map(row => row.batch_record_id);
   return async () => {
@@ -71,7 +71,7 @@ async function historyReader(config,pool) {
   };
 }
 
-export async function runFaultDemo({ config,pool,scenario,pipeline,processes,progress,alive,...options }) {
+export async function runFaultDemo({ config,pool,scenario,pipeline,processes,progress,alive,afterConsensus = async () => {},...options }) {
   assert.ok(["byzantine-validator","validator-crash"].includes(scenario));
   const protocol = { peers: config.peers,validatorSets: createValidatorSetResolver(config.history),chainDomain: 10011n,sourceGateway: config.deployments.sourceGateway };
   const t = name => tableName(config.schema,name);
@@ -206,10 +206,13 @@ export async function runFaultDemo({ config,pool,scenario,pipeline,processes,pro
         assert.deepEqual(await verifyQuorumCertificate(certificate,{ ...protocol,expected: target }),certificate);
         await durable({ prepared: true,committed: true }); await registry();
         progress(`VALID: only canonical root committed with exactly three honest PREPARE/COMMIT voters ${target.honest.join(", ")}; QC ${certificate.qcDigest}; exactly one READY job; view change not required`);
+        await afterConsensus({ target,certificate,restore: recover });
       },
       async afterConfirmed() {
-        // The crashed node stays offline through the actual destination grant.
-        if (scenario === "validator-crash") assert.equal(processes.at(index).child.signalCode,"SIGKILL");
+        await options.afterConfirmed?.();
+        // The standalone crash case stays offline through the grant. Composed
+        // recovery can restore the same member earlier during its RPC outage.
+        if (scenario === "validator-crash" && !restored) assert.equal(processes.at(index).child.signalCode,"SIGKILL");
         else await health([target.target]);
         await durable({ prepared: true,committed: true });
         await recover();
@@ -217,7 +220,7 @@ export async function runFaultDemo({ config,pool,scenario,pipeline,processes,pro
     });
     assert.equal(result.qcDigest,certificate.qcDigest); assert.equal(result.messageRoot,target.messageRoot);
     await durable({ prepared: true,committed: true }); await registry();
-    assert.deepEqual(await readHistory(),history,"prior committed authority and signed transaction history changed");
+    assert.ok(jsonText(await readHistory()) === jsonText(history),"prior committed authority and signed transaction history changed");
     const b = clients(config.chainB,2001).publicClient;
     for (const [address,name,eventName] of [[config.deployments.destinationGateway,"DestinationGateway","CrossChainMessageExecuted"],
       [config.deployments.applicationB,"ApplicationB","VerifiedSupplierGranted"]]) {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
-import { access,mkdir } from "node:fs/promises";
+import { access,mkdir,rm } from "node:fs/promises";
 import { join } from "node:path";
 import { privateKeyToAccount } from "viem/accounts";
 import { createDatabasePool,applyMigrations } from "../../src/db.mjs";
@@ -15,6 +15,8 @@ import { ROOT,assertPortFree,binary,httpJson,pause,processIdentity,readJson,safe
 import { runLocalDemo } from "./demo.mjs";
 import { localRpc } from "./ipc.mjs";
 import { assertOwnedValidator,runFaultDemo } from "./pbft-faults.mjs";
+import { destinationAccessPath } from "../lib/destination-access-path.mjs";
+import { runRecoveryDemo } from "./recovery-demos.mjs";
 
 export async function supervise(config) {
   const registry = join(config.directory,"processes.json");
@@ -24,6 +26,11 @@ export async function supervise(config) {
   const controller = new AbortController();
   const degraded = new Set();
   const expectedCrashes = new Set();
+  const expectedStops = new Set();
+  const paths = [];
+  const cleanupErrors = [];
+  const relayerChildren = new Map();
+  const relayerEnvironments = new Map();
   const validatorChildren = [];
   const validatorEnvironments = [];
   let pipeline;
@@ -36,11 +43,14 @@ export async function supervise(config) {
     stopping = true; stopped = true; ready = false;
     controller.abort();
     for (const { record } of [...children].reverse()) {
-      try { await stopRecordedProcess(record); } catch (error) { console.error(`Cleanup ${record.name}: ${safeError(error)}`); process.exitCode = 1; }
+      try { await stopRecordedProcess(record); } catch (error) { cleanupErrors.push(`Cleanup ${record.name}: ${safeError(error)}`); console.error(cleanupErrors.at(-1)); process.exitCode = 1; }
     }
-    await pool?.end();
-    try { await disposeOwnedPostgres(pgRegistry); } catch (error) { console.error(`Owned database cleanup: ${safeError(error)}`); process.exitCode = 1; }
-    await writeJson(manifestPath,{ ...manifest,ready: false,stoppedAt: new Date().toISOString(),failure: failure ? safeError(failure) : undefined });
+    for (const path of paths) {
+      try { path.state.available = true; await path.close(); } catch (error) { cleanupErrors.push("RPC gate cleanup: " + safeError(error)); console.error(cleanupErrors.at(-1)); process.exitCode = 1; }
+    }
+    try { await pool?.end(); } catch (error) { cleanupErrors.push("Database pool cleanup: " + safeError(error)); console.error(cleanupErrors.at(-1)); process.exitCode = 1; }
+    try { await disposeOwnedPostgres(pgRegistry); } catch (error) { cleanupErrors.push(`Owned database cleanup: ${safeError(error)}`); console.error(cleanupErrors.at(-1)); process.exitCode = 1; }
+    await writeJson(manifestPath,{ ...manifest,ready: false,stoppedAt: new Date().toISOString(),cleanupErrors,failure: failure ? safeError(failure) : undefined });
     if (server?.listening) { server.closeAllConnections(); await new Promise(accept => server.close(accept)); }
   }
   const requestStop = () => { stopping = true; controller.abort(); };
@@ -51,6 +61,7 @@ export async function supervise(config) {
       onExit: (name,code,signal,pid) => {
         if (stopping) return;
         if (signal === "SIGKILL" && expectedCrashes.delete(pid)) return;
+        if (expectedStops.delete(pid) && (code === 0 || ["SIGTERM","SIGKILL"].includes(signal))) return;
         if (phase === "ready" && ["prometheus","grafana","api"].includes(name)) {
           degraded.add(name); ready = false;
           manifest.ready = false; manifest.degraded = [...degraded];
@@ -81,6 +92,38 @@ export async function supervise(config) {
     await publishComponents();
     return owned;
   }
+  async function startRelayer(role,env = relayerEnvironments.get(role)) {
+    const readyFile = join(config.directory,role + "-ready.json");
+    await rm(readyFile,{ force: true });
+    const owned = await node(role,"indexer/scripts/local/worker.mjs",[role],{ ...env,LOCAL_READY_FILE: readyFile },true);
+    relayerChildren.set(role,owned);
+    await wait(role,async () => { await access(readyFile); const value = await readJson(readyFile); return value.ready && value.pid === owned.record.pid; });
+    const identity = await owned.rpc("status");
+    assert.equal(identity.pid,owned.record.pid); assert.equal(identity.workerId,role); assert.equal(identity.schema,config.schema);
+    await publishComponents(); return owned;
+  }
+  const exited = owned => owned.child.exitCode !== null || owned.child.signalCode !== null;
+  async function crashRegistered(owned) {
+    assert.ok(children.includes(owned)); assert.equal(exited(owned),false);
+    assert.equal(await processIdentity(owned.record.pid),owned.record.identity);
+    const recorded = (await readJson(registry)).find(value => value.pid === owned.record.pid);
+    assert.deepEqual(recorded,owned.record);
+    const published = (await readJson(manifestPath)).components.find(value => value.name === owned.record.name);
+    assert.equal(published.pid,owned.record.pid);
+    const identity = await owned.rpc("status"); assert.equal(identity.pid,owned.record.pid);
+    if (owned.record.name.startsWith("relayer-")) assert.equal(identity.workerId,owned.record.name);
+    ready = false; manifest.ready = false; await publishComponents();
+    expectedCrashes.add(owned.record.pid); assert.equal(owned.child.kill("SIGKILL"),true);
+    await wait("owned process abrupt exit",async () => owned.child.signalCode === "SIGKILL",10000);
+    assert.equal(await processIdentity(owned.record.pid),null); return owned.record.pid;
+  }
+  async function observationsReady() {
+    await wait("all observation targets after recovery",async () => {
+      const targets = (await httpJson(config.prometheus + "/api/v1/targets")).data.activeTargets;
+      return targets.length === 10 && targets.every(target => target.health === "up");
+    });
+    ready = degraded.size === 0; manifest.ready = ready; await publishComponents(); assert.equal(ready,true);
+  }
   const faultProcesses = {
     at: index => validatorChildren[index],
     fail(error) { ready = false; manifest.ready = false; failure = new Error("Fault control restoration failed: " + safeError(error)); },
@@ -93,12 +136,7 @@ export async function supervise(config) {
       const health = await httpJson(manifest.peers[index].url + "/health");
       const published = (await readJson(manifestPath)).components.find(value => value.name === owned.record.name);
       assertOwnedValidator({ record: owned.record,observedIdentity,registered: recorded,published,health,address: manifest.peers[index].address });
-      ready = false; manifest.ready = false; await publishComponents();
-      expectedCrashes.add(owned.record.pid);
-      owned.child.kill("SIGKILL");
-      await wait("designated validator abrupt exit",async () => owned.child.signalCode === "SIGKILL",10000);
-      assert.equal(await processIdentity(owned.record.pid),null);
-      return owned.record.pid;
+      return crashRegistered(owned);
     },
     async restore(index) {
       const old = validatorChildren[index];
@@ -108,19 +146,50 @@ export async function supervise(config) {
         assert.equal(health.ready,true); assert.equal(health.validatorAddress,peer.address);
         assert.equal(health.pid,validatorChildren[position].record.pid);
       }
-      await wait("all observation targets after validator recovery",async () => {
-        const targets = (await httpJson(config.prometheus + "/api/v1/targets")).data.activeTargets;
-        return targets.length === 10 && targets.every(target => target.health === "up");
-      });
-      ready = degraded.size === 0; manifest.ready = ready; await publishComponents();
-      assert.equal(ready,true); return validatorChildren[index].record.pid;
+      if (![...relayerChildren.values()].some(exited)) await observationsReady();
+      return validatorChildren[index].record.pid;
+    },
+  };
+  const transportProcesses = {
+    at: role => { const owned = relayerChildren.get(role); assert.ok(owned); return owned; },
+    crash: role => crashRegistered(transportProcesses.at(role)),
+    async restore(role) {
+      let owned = transportProcesses.at(role);
+      if (exited(owned)) owned = await startRelayer(role);
+      return owned.record.pid;
+    },
+    async healthy() {
+      for (const role of ["relayer-a","relayer-b"]) {
+        const owned = transportProcesses.at(role); assert.equal(exited(owned),false);
+        const value = await owned.rpc("status"); assert.equal(value.pid,owned.record.pid); assert.equal(value.workerId,role);
+      }
+      for (const [index,peer] of manifest.peers.entries()) {
+        const owned = validatorChildren[index]; assert.equal(exited(owned),false);
+        const health = await httpJson(peer.url + "/health");
+        assert.equal(health.ready,true); assert.equal(health.pid,owned.record.pid); assert.equal(health.validatorAddress,peer.address);
+      }
+      await observationsReady();
+    },
+    async startReplay() {
+      assert.equal(config.isolated,true);
+      const key = "0x" + "5".padStart(64,"0");
+      const address = privateKeyToAccount(key).address.toLowerCase();
+      const b = clients(config.chainB,2001);
+      const hash = await b.wallet.sendTransaction({ to: address,value: 10n ** 18n });
+      const receipt = await b.publicClient.waitForTransactionReceipt({ hash }); assert.equal(receipt.status,"success");
+      return startRelayer("replay",{ ...relayerEnvironments.get("relayer-a"),RELAYER_WORKER_ID: "replay",RELAYER_A_PRIVATE_KEY: key,METRICS_PORT: "" });
+    },
+    async stopReplay() {
+      const owned = relayerChildren.get("replay"); if (!owned || exited(owned)) return;
+      expectedStops.add(owned.record.pid); await stopRecordedProcess(owned.record);
+      await wait("duplicate transport stopped",async () => exited(owned),10000);
     },
   };
   try {
     await mkdir(config.directory,{ recursive: true,mode: 0o700 });
     await mkdir(join(config.directory,"private"),{ mode: 0o700 });
     for (const port of [config.ports.chainA,config.ports.chainB,config.ports.api,config.ports.prometheus,config.ports.grafana,
-      ...config.ports.validators,...config.ports.metrics,config.ports.control]) await assertPortFree(port);
+      ...config.ports.validators,...config.ports.metrics,config.ports.control,...config.ports.rpcGates]) await assertPortFree(port);
     const anvil = await binary("anvil",process.env.ANVIL_BIN);
     const observation = await observabilityConfiguration(config);
     const artifacts = await snapshotArtifacts(config.directory);
@@ -131,17 +200,19 @@ export async function supervise(config) {
       if (request.method === "GET" && request.url === "/status") return send(200,{ runId: config.runId,ready,phase,degraded: [...degraded],failure: failure ? safeError(failure) : null });
       if (request.headers["x-local-run"] !== config.runId) return send(403,{ error: "Run ownership mismatch" });
       if (request.method === "POST" && request.url === "/stop") { send(200,{ stopping: true }); requestStop(); return; }
-      const scenario = ({ "/demo": "happy-path","/demo/byzantine-validator": "byzantine-validator","/demo/validator-crash": "validator-crash" })[request.url];
+      const scenario = ({ "/demo": "happy-path","/demo/byzantine-validator": "byzantine-validator","/demo/validator-crash": "validator-crash",
+        "/demo/relayer-failover": "relayer-failover","/demo/source-reorg": "source-reorg","/demo/replay-attack": "replay-attack","/demo/recovery": "recovery" })[request.url];
       if (request.method !== "POST" || !scenario) return send(404,{ error: "Unknown local control operation" });
-      if (scenario !== "happy-path" && !config.isolated) return send(404,{ error: "Validator faults are restricted to full verification" });
+      if (scenario !== "happy-path" && !config.isolated) return send(404,{ error: "Fault demonstrations are restricted to full verification" });
       if (!ready || busy) return send(409,{ error: busy ? "A demonstration is already running" : "Stack is not ready" });
       busy = true;
       response.writeHead(200,{ "content-type": "application/x-ndjson" });
       const progress = message => { if (!response.destroyed) response.write(JSON.stringify({ progress: message }) + "\n"); };
       try {
         const options = { config: manifest,pool,issuer,artifacts,alive,progress,signal: controller.signal };
-        const result = scenario === "happy-path" ? await runLocalDemo(options) :
-          await runFaultDemo({ ...options,scenario,pipeline: pipeline.rpc,processes: faultProcesses });
+        const result = scenario === "happy-path" ? await runLocalDemo(options) : ["byzantine-validator","validator-crash"].includes(scenario) ?
+          await runFaultDemo({ ...options,scenario,pipeline: pipeline.rpc,processes: faultProcesses }) :
+          await runRecoveryDemo({ ...options,scenario,pipeline: pipeline.rpc,processes: faultProcesses,relayers: transportProcesses,paths });
         await writeJson(join(config.directory,"demo-result.json"),result);
         await writeJson(join(config.directory,`demo-${result.messageId}.json`),result);
         if (!response.destroyed) response.write(JSON.stringify({ result }) + "\n");
@@ -179,16 +250,19 @@ export async function supervise(config) {
     phase = "deployment";
     manifest.deployments = await deployLocalProtocol(config,issuer,peers.map(value => value.address),artifacts);
     manifest.genesisHash = (await b.getBlock({ blockNumber: 0n })).hash;
+    if (config.isolated) for (const port of config.ports.rpcGates) paths.push(await destinationAccessPath(config.chainB,{ port }));
+    const destinationUrls = paths.length ? paths.map(path => path.url) : [config.chainB];
     const environment = { DATABASE_URL: databaseUrl,INDEXER_DB_SCHEMA: config.schema,
       CHAIN_A_DOMAIN: "10011",CHAIN_A_RPC_URL: config.chainA,SOURCE_GATEWAY_ADDRESS: manifest.deployments.sourceGateway,SOURCE_GATEWAY_START_BLOCK: "0",
       INDEXER_BLOCK_RANGE: "2000",INDEXER_POLL_INTERVAL_MS: "200",FINALITY_POLL_INTERVAL_MS: "200",FINALITY_BLOCK_DEPTH: "2",
       VALIDATOR_SET_HISTORY: JSON.stringify(history),VALIDATOR_SET_HISTORY_FILE: "",VALIDATOR_PEERS: JSON.stringify(peers),
-      CHAIN_B_RPC_URL: config.chainB,CHAIN_B_RPC_URLS: JSON.stringify([config.chainB]),CHAIN_B_CHAIN_ID: "2001",CHAIN_B_GENESIS_HASH: manifest.genesisHash,
+      CHAIN_B_RPC_URL: destinationUrls[0],CHAIN_B_RPC_URLS: JSON.stringify(destinationUrls),CHAIN_B_CHAIN_ID: "2001",CHAIN_B_GENESIS_HASH: manifest.genesisHash,
       RELAYER_A_PRIVATE_KEY: LOCAL_DEVELOPMENT_KEY,RELAYER_LEASE_MS: "30000",RELAYER_MAX_JOBS_PER_RUN: "10",DESTINATION_CONFIRMATIONS: "3",
       METRICS_HOST: "127.0.0.1",IDENTITY_APPLICATION_ADDRESS: manifest.deployments.identityApplication,
       PRODUCTION_DESTINATION_GATEWAY_ADDRESS: manifest.deployments.destinationGateway,
       MESSAGE_QUERY_API_HOST: "127.0.0.1",MESSAGE_QUERY_API_PORT: String(config.ports.api),
       MESSAGE_QUERY_VALIDATOR_STORES: JSON.stringify(peers.map((peer,index) => ({ validatorAddress: peer.address,databaseSchema: manifest.validatorSchemas[index] }))),
+      LOCAL_CONFIG_FILE: join(config.directory,"config.json"),
     };
     phase = "validators";
     for (const index of peers.keys()) {
@@ -202,10 +276,12 @@ export async function supervise(config) {
     await node("indexer","indexer/src/main.mjs",[],{ ...environment,METRICS_PORT: String(config.ports.metrics[0]) });
     await node("finality","indexer/src/main.mjs",["finality"],{ ...environment,METRICS_PORT: String(config.ports.metrics[1]) });
     for (const [index,role] of ["pipeline","relayer-a","relayer-b"].entries()) {
-      const readyFile = join(config.directory,role + "-ready.json");
-      const owned = await node(role,"indexer/scripts/local/worker.mjs",[role],{ ...environment,RELAYER_WORKER_ID: role,LOCAL_READY_FILE: readyFile,METRICS_PORT: String(config.ports.metrics[index + 2]) },role === "pipeline");
-      if (role === "pipeline") pipeline = owned;
-      await wait(role,async () => { await access(readyFile); return (await readJson(readyFile)).ready; });
+      const env = { ...environment,RELAYER_WORKER_ID: role,METRICS_PORT: String(config.ports.metrics[index + 2]) };
+      if (role === "pipeline") {
+        const readyFile = join(config.directory,role + "-ready.json");
+        pipeline = await node(role,"indexer/scripts/local/worker.mjs",[role],{ ...env,LOCAL_READY_FILE: readyFile },true);
+        await wait(role,async () => { await access(readyFile); return (await readJson(readyFile)).ready; });
+      } else { relayerEnvironments.set(role,env); await startRelayer(role); }
     }
     await node("api","indexer/src/api/main.mjs",[],{ ...environment,METRICS_PORT: "" });
     await wait("Explorer/API",async () => { await httpJson(config.api + "/api/v1/messages"); return true; });

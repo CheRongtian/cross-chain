@@ -119,9 +119,9 @@ export async function startLocalStack(config = undefined) {
 
 export async function demonstrateLocalStack(record,onMessage = console.log,scenario = "happy-path",signal) {
   assertLocalOwnership(record);
-  if (!["happy-path","byzantine-validator","validator-crash"].includes(scenario)) throw new Error("Unknown local demonstration scenario");
+  if (!["happy-path","byzantine-validator","validator-crash","relayer-failover","source-reorg","replay-attack","recovery"].includes(scenario)) throw new Error("Unknown local demonstration scenario");
   const path = scenario === "happy-path" ? "/demo" : "/demo/" + scenario;
-  const deadline = AbortSignal.timeout(360000);
+  const deadline = AbortSignal.timeout(600000);
   const response = await fetch(record.control + path,{ method: "POST",headers: { "x-local-run": record.runId },
     signal: signal ? AbortSignal.any([deadline,signal]) : deadline });
   if (!response.ok) throw new Error((await response.json()).error ?? "Local demonstration request failed");

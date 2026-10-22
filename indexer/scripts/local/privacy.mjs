@@ -38,7 +38,7 @@ export function renderExplorerText(view) {
   const target = document.createElement("main"); renderMessageView(document,target,view); return target.textContent;
 }
 
-export async function inspectLocalPrivacy({ config,messageId,privateCredential,destination,progress }) {
+export async function inspectLocalPrivacy({ config,messageId,privateCredential,destination,progress,expectedStatus = "CONFIRMED" }) {
   assertNoPrivateCredential(destination,privateCredential,"destination calldata/events/state");
   const body = await httpJson(config.api + "/api/v1/messages/" + messageId);
   const list = await httpJson(config.api + "/api/v1/messages");
@@ -47,7 +47,7 @@ export async function inspectLocalPrivacy({ config,messageId,privateCredential,d
   const rendered = await fetchMessageView(messageId,{ fetchImpl: (path,options) => fetch(config.api + path,{ ...options,signal: AbortSignal.timeout(10000) }) });
   assert.equal(rendered.state,"ready"); assert.equal(rendered.view.messageId,messageId);
   const text = renderExplorerText(rendered.view);
-  assert.ok(text.includes(messageId)); assert.ok(text.includes("CONFIRMED"));
+  assert.ok(text.includes(messageId)); assert.ok(text.includes(expectedStatus));
   assertNoPrivateCredential(text,privateCredential,"actual Explorer view-model/renderer");
   for (const path of ["/?messageId=" + messageId,"/assets/explorer/app.js","/assets/explorer/client.js","/assets/explorer/view-model.js","/assets/explorer/render.js"]) {
     const response = await fetch(config.api + path,{ signal: AbortSignal.timeout(10000) }); assert.ok(response.ok);

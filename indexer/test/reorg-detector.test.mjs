@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { CanonicalHistoryChangedError, NoCommonAncestorError } from "../src/canonical-block.mjs";
+import { CanonicalHistoryBootstrapError, CanonicalHistoryChangedError, NoCommonAncestorError } from "../src/canonical-block.mjs";
 import { createCanonicalReconciler } from "../src/reorg-detector.mjs";
 
 const CONFIG = {
@@ -32,6 +32,81 @@ function publicClientFor(blocks, head = [...blocks.keys()].reduce((highest, numb
     },
   };
 }
+
+for (const advanced of [false, true]) {
+  test(`reconciles a concurrent bootstrap${advanced ? " and cursor advance" : ""} without moving its snapshot`, async () => {
+    let initializedElsewhere = false;
+    let bootstrapCalls = 0;
+    let retries = 0;
+    const reads = [];
+    const firstCursor = 10n;
+    const currentCursor = advanced ? 14n : firstCursor;
+    const currentHead = advanced ? 13n : 9n;
+    const result = await createCanonicalReconciler({
+      config: CONFIG,
+      publicClient: {
+        async request({ method }) { assert.equal(method, "eth_blockNumber"); return "0xd"; },
+        async getBlock({ blockNumber }) { reads.push(blockNumber); assert.ok(blockNumber <= 10n); return block(blockNumber); },
+      },
+      canonicalStore: {
+        async readCanonicalHistoryState() {
+          return initializedElsewhere ? { count: advanced ? 5 : 1, firstBlock: 9n, lastBlock: currentHead } : { count: 0 };
+        },
+        async bootstrapCanonicalHistory(_scope, input) {
+          bootstrapCalls++;
+          assert.equal(input.expectedNextBlock, firstCursor);
+          assert.deepEqual(input.blocks, [block(9n)]);
+          initializedElsewhere = true;
+          throw new CanonicalHistoryChangedError(advanced ? "cursor advanced" : "history initialized");
+        },
+        async readCanonicalBlock(_scope, number) { return block(number); },
+        async recoverCanonicalReorg() { assert.fail("concurrent canonical startup must not rewind history"); },
+      },
+      cursorStore: { async loadOrInitializeCursor() { return initializedElsewhere ? currentCursor : firstCursor; } },
+      logger: { log(message) { if (message.includes("same fixed snapshot again")) retries++; }, error() {} },
+    }).reconcile({ headBlock: 10n });
+    assert.equal(result.detected, false); assert.equal(result.bootstrapped, false);
+    assert.equal(result.headBlock, 10n); assert.equal(result.oldIndexedHead, currentHead);
+    assert.equal(result.rewoundNextBlock, currentCursor);
+    assert.equal(bootstrapCalls, 1); assert.equal(retries, 1);
+    assert.deepEqual(reads, [9n, advanced ? 10n : 9n]);
+  });
+}
+
+test("a concurrent bootstrap still checks the committed branch and fails without a common ancestor", async () => {
+  let initializedElsewhere = false;
+  let retries = 0;
+  await assert.rejects(createCanonicalReconciler({
+    config: CONFIG,
+    publicClient: publicClientFor(new Map([[9n, block(9n)], [10n, block(10n)]])),
+    canonicalStore: {
+      async readCanonicalHistoryState() { return initializedElsewhere ? { count: 2, firstBlock: 9n, lastBlock: 10n } : { count: 0 }; },
+      async bootstrapCanonicalHistory() { initializedElsewhere = true; throw new CanonicalHistoryChangedError(); },
+      async readCanonicalBlock(_scope, number) { return block(number, number + 101n, number + 100n); },
+      async readCanonicalBlocksDescending() { return [block(10n, 111n, 110n), block(9n, 110n, 109n)]; },
+      async recoverCanonicalReorg() { assert.fail("a missing common ancestor must remain fail-closed"); },
+    },
+    cursorStore: { async loadOrInitializeCursor() { return initializedElsewhere ? 11n : 10n; } },
+    logger: { log() { retries++; }, error() {} },
+  }).reconcile({ headBlock: 10n }), NoCommonAncestorError);
+  assert.equal(retries, 1);
+});
+
+test("unsafe legacy bootstrap remains fatal and is never retried as concurrent progress", async () => {
+  const failure = new CanonicalHistoryBootstrapError("pre-existing message block hash disagrees");
+  let bootstrapCalls = 0;
+  await assert.rejects(createCanonicalReconciler({
+    config: CONFIG,
+    publicClient: publicClientFor(new Map([[9n, block(9n)]])),
+    canonicalStore: {
+      async readCanonicalHistoryState() { return { count: 0 }; },
+      async bootstrapCanonicalHistory() { bootstrapCalls++; throw failure; },
+    },
+    cursorStore: { async loadOrInitializeCursor() { return 10n; } },
+    logger: { log() { assert.fail("unsafe bootstrap must not be retried"); }, error() {} },
+  }).reconcile({ headBlock: 10n }), error => error === failure);
+  assert.equal(bootstrapCalls, 1);
+});
 
 test("takes the fast path when the tracked head remains canonical", async () => {
   const recoveryCalls = [];

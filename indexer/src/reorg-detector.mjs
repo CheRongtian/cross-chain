@@ -66,7 +66,7 @@ export function createCanonicalReconciler({
           return await reconcileSnapshot(normalizedHead);
         } catch (error) {
           if (!(error instanceof CanonicalHistoryChangedError)) throw error;
-          logger.log("Canonical history changed before recovery; reconciling the same fixed snapshot again");
+          logger.log("Canonical history changed during source reconciliation; reconciling the same fixed snapshot again");
         }
       }
     },
